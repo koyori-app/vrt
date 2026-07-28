@@ -26,7 +26,10 @@ function IndexPage() {
     <div className="mx-auto max-w-lg py-16">
       <Card>
         <CardHeader>
-          <CardTitle>Create your first tenant</CardTitle>
+          <CardTitle>
+            {/* shadcn の CardTitle は div なので、ページ見出しはここで実タグにする */}
+            <h1>Create your first tenant</h1>
+          </CardTitle>
           <CardDescription>
             Projects, builds and GitHub installations all live inside a tenant. You need one before
             you can upload screenshots.
