@@ -34,7 +34,10 @@ function LoginPage() {
     <div className="flex min-h-screen items-center justify-center px-4">
       <Card className="w-full max-w-sm">
         <CardHeader className="text-center">
-          <CardTitle className="text-2xl">VRT</CardTitle>
+          <CardTitle className="text-2xl">
+            {/* shadcn の CardTitle は div なので、ページ見出しはここで実タグにする */}
+            <h1>VRT</h1>
+          </CardTitle>
           <CardDescription>Visual regression testing for your pull requests</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
