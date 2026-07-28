@@ -34,3 +34,16 @@ try {
 } finally {
   await client.end();
 }
+
+// `migration fresh` drops the app tables AND apalis's applied-migrations
+// tracker (public._sqlx_migrations), but not the `apalis` schema itself.
+// Without this drop, the backend's second boot re-runs apalis's migrations
+// from scratch and dies on `CREATE SCHEMA apalis` (already exists).
+const appDb = new Client({ connectionString: url.toString() });
+await appDb.connect();
+try {
+  await appDb.query("DROP SCHEMA IF EXISTS apalis CASCADE");
+  console.log("dropped apalis schema (recreated by backend boot)");
+} finally {
+  await appDb.end();
+}
