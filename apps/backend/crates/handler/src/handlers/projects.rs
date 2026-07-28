@@ -146,7 +146,8 @@ pub async fn get_project(
     path = "/{project_id}",
     tag = "Projects",
     summary = "プロジェクト設定を更新",
-    description = "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0。",
+    description = "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0、\
+                   `viewport_width` / `viewport_height` は 64〜10000（storybook モードのレンダリング用）。",
     params(("project_id" = Uuid, Path, description = "プロジェクトID")),
     request_body = UpdateProjectRequest,
     responses(
@@ -174,6 +175,8 @@ pub async fn update_project(
             default_branch: payload.default_branch,
             diff_threshold: payload.diff_threshold,
             diff_ratio_fail: payload.diff_ratio_fail,
+            viewport_width: payload.viewport_width,
+            viewport_height: payload.viewport_height,
         },
     )
     .await?;

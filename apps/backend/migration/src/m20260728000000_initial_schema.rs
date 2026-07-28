@@ -111,6 +111,9 @@ impl MigrationTrait for Migration {
                 default_branch         VARCHAR NOT NULL DEFAULT 'main',
                 diff_threshold         DOUBLE PRECISION NOT NULL DEFAULT 0.1,
                 diff_ratio_fail        DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+                -- storybook モードのレンダリングに使うビューポート。
+                viewport_width         INTEGER NOT NULL DEFAULT 1280,
+                viewport_height        INTEGER NOT NULL DEFAULT 720,
                 -- github_installations.installation_id を指すが FK は張らない。
                 -- installation は論理削除（deleted_at）で行が残る運用のため FK に
                 -- 守らせるものが無く、テスト DB を作る entity のスキーマ同期
@@ -178,6 +181,10 @@ impl MigrationTrait for Migration {
                 commit_message      TEXT,
                 pull_request_number INTEGER,
                 status              VARCHAR(255) NOT NULL,
+                -- 入力形式。'screenshots' は CI がアップロード、'storybook' はサーバーがレンダリングする。
+                mode                VARCHAR(255) NOT NULL DEFAULT 'screenshots',
+                -- storybook モードでアップロードされたバンドル zip のストレージキー。
+                storybook_key       TEXT,
                 -- baselines.source_build_id との循環参照を避けるため FK は張らない。
                 baseline_id         UUID,
                 total_count         INTEGER NOT NULL DEFAULT 0,

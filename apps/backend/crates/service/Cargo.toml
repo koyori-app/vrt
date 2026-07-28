@@ -15,6 +15,7 @@ auth-core-gitlab = { workspace = true }
 axum = { workspace = true }
 base64 = { workspace = true }
 bytes = "1"
+chromiumoxide = { workspace = true }
 chrono = { workspace = true }
 forge-github = { workspace = true }
 futures = "0.3"
@@ -32,4 +33,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 tokio = { version = "1.52.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "net"] }
 tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.7", features = ["fs"] }
+tempfile = { workspace = true }
+zip = { workspace = true }
 tracing = { workspace = true }

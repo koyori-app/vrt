@@ -17,12 +17,30 @@ pub const DEFAULT_BRANCH: &str = "main";
 pub const DEFAULT_DIFF_THRESHOLD: f64 = 0.1;
 /// 既定の失敗判定比率（0.0 = 1px でも差分があれば失敗扱い）。
 pub const DEFAULT_DIFF_RATIO_FAIL: f64 = 0.0;
+/// storybook モードのレンダリングに使う既定ビューポート幅。
+pub const DEFAULT_VIEWPORT_WIDTH: i32 = 1280;
+/// storybook モードのレンダリングに使う既定ビューポート高さ。
+pub const DEFAULT_VIEWPORT_HEIGHT: i32 = 720;
+/// ビューポートに指定できる下限（px）。
+pub const MIN_VIEWPORT: i32 = 64;
+/// ビューポートに指定できる上限（px）。`screenshots::MAX_DIMENSION` と揃える。
+pub const MAX_VIEWPORT: i32 = 10_000;
 
 /// 0.0〜1.0 の比率パラメータを検証する。
 pub fn validate_ratio(field: &str, value: f64) -> Result<(), AppError> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(AppError::BadRequestDetail(format!(
             "{field} must be between 0.0 and 1.0"
+        )));
+    }
+    Ok(())
+}
+
+/// ビューポート寸法を検証する。
+pub fn validate_viewport(field: &str, value: i32) -> Result<(), AppError> {
+    if !(MIN_VIEWPORT..=MAX_VIEWPORT).contains(&value) {
+        return Err(AppError::BadRequestDetail(format!(
+            "{field} must be between {MIN_VIEWPORT} and {MAX_VIEWPORT}"
         )));
     }
     Ok(())
@@ -35,6 +53,8 @@ pub struct ProjectSettings {
     pub default_branch: Option<String>,
     pub diff_threshold: Option<f64>,
     pub diff_ratio_fail: Option<f64>,
+    pub viewport_width: Option<i32>,
+    pub viewport_height: Option<i32>,
 }
 
 /// テナント内のプロジェクト一覧（作成順）。
@@ -123,6 +143,8 @@ pub async fn create_project<C: ConnectionTrait>(
         default_branch: Set(default_branch.unwrap_or_else(|| DEFAULT_BRANCH.to_string())),
         diff_threshold: Set(DEFAULT_DIFF_THRESHOLD),
         diff_ratio_fail: Set(DEFAULT_DIFF_RATIO_FAIL),
+        viewport_width: Set(DEFAULT_VIEWPORT_WIDTH),
+        viewport_height: Set(DEFAULT_VIEWPORT_HEIGHT),
         github_installation_id: Set(None),
         github_repo: Set(None),
         created_at: Set(now),
@@ -144,6 +166,12 @@ pub async fn update_project<C: ConnectionTrait>(
     if let Some(value) = settings.diff_ratio_fail {
         validate_ratio("diff_ratio_fail", value)?;
     }
+    if let Some(value) = settings.viewport_width {
+        validate_viewport("viewport_width", value)?;
+    }
+    if let Some(value) = settings.viewport_height {
+        validate_viewport("viewport_height", value)?;
+    }
 
     let mut active: projects::ActiveModel = project.into();
     if let Some(name) = settings.name {
@@ -158,6 +186,12 @@ pub async fn update_project<C: ConnectionTrait>(
     if let Some(diff_ratio_fail) = settings.diff_ratio_fail {
         active.diff_ratio_fail = Set(diff_ratio_fail);
     }
+    if let Some(viewport_width) = settings.viewport_width {
+        active.viewport_width = Set(viewport_width);
+    }
+    if let Some(viewport_height) = settings.viewport_height {
+        active.viewport_height = Set(viewport_height);
+    }
     active.updated_at = Set(Utc::now().fixed_offset());
     Ok(active.update(db).await?)
 }
@@ -166,4 +200,20 @@ pub async fn update_project<C: ConnectionTrait>(
 pub async fn delete_project<C: ConnectionTrait>(db: &C, project_id: Uuid) -> Result<(), AppError> {
     projects::Entity::delete_by_id(project_id).exec(db).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viewport_bounds_are_enforced() {
+        assert!(validate_viewport("viewport_width", DEFAULT_VIEWPORT_WIDTH).is_ok());
+        assert!(validate_viewport("viewport_width", MIN_VIEWPORT).is_ok());
+        assert!(validate_viewport("viewport_width", MAX_VIEWPORT).is_ok());
+        assert!(validate_viewport("viewport_width", MIN_VIEWPORT - 1).is_err());
+        assert!(validate_viewport("viewport_height", MAX_VIEWPORT + 1).is_err());
+        assert!(validate_viewport("viewport_height", 0).is_err());
+        assert!(validate_viewport("viewport_height", -1).is_err());
+    }
 }

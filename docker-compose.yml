@@ -82,6 +82,12 @@ services:
       APP_URL: http://localhost:3000
       STORAGE_BACKEND: local
       LOCAL_UPLOAD_DIR: /home/app/uploads
+      # storybook モード（サーバーサイドレンダリング）に使う Chromium。
+      # イメージに同梱してある（そのぶんイメージが ~450MB 太っている。
+      # 詳細は apps/backend/Dockerfile の runtime-base のコメント）。
+      # 空文字にすると storybook モードだけが無効になり、mode=storybook の
+      # ビルド作成が 400 で拒否される。
+      CHROMIUM_PATH: /usr/bin/chromium
       # --- 開発専用ダミーシークレット（本番使用禁止） ---
       PERSONAL_TOKEN_SECRET: "dev-only-dummy-personal-token-00"
       OAUTH_TOKEN_ENCRYPTION_KEY: "dev-only-dummy-oauth-token-key-0"

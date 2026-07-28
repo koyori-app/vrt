@@ -3,6 +3,7 @@
 pub mod compare_build;
 pub mod github_status;
 pub mod github_webhook;
+pub mod render_build;
 
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use apalis_postgres::PgPool;
 pub use compare_build::{CompareBuildJob, CompareBuildStorage};
 pub use github_status::{GithubStatusJob, GithubStatusStorage};
 pub use github_webhook::{GithubWebhookJob, GithubWebhookStorage};
+pub use render_build::{RenderBuildJob, RenderBuildStorage};
 use sea_orm::DatabaseConnection;
 
 use common::settings::Settings;
@@ -29,6 +31,8 @@ pub struct JobState {
     pub http: reqwest::Client,
     /// `compare_build` の完了時に `GithubStatusJob` を投入するために持つ。
     pub github_status_storage: Arc<GithubStatusStorage>,
+    /// `render_build` の完了時に `CompareBuildJob` を投入するために持つ。
+    pub compare_build_storage: Arc<CompareBuildStorage>,
 }
 
 /// apalis 用 Postgres プールの既定上限。
@@ -125,4 +129,19 @@ pub async fn setup_github_webhook_storage_with_queue(
     queue: &str,
 ) -> Result<Arc<GithubWebhookStorage>, anyhow::Error> {
     github_webhook::setup_with_queue(pool, queue).await
+}
+
+/// `RenderBuildJob` のストレージ。
+pub async fn setup_render_build_storage(
+    pool: &PgPool,
+) -> Result<Arc<RenderBuildStorage>, anyhow::Error> {
+    render_build::setup(pool).await
+}
+
+/// キュー名を指定して `RenderBuildJob` のストレージを作る（統合テスト用）。
+pub async fn setup_render_build_storage_with_queue(
+    pool: &PgPool,
+    queue: &str,
+) -> Result<Arc<RenderBuildStorage>, anyhow::Error> {
+    render_build::setup_with_queue(pool, queue).await
 }

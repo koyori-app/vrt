@@ -161,12 +161,16 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
   const [defaultBranch, setDefaultBranch] = useState(project.default_branch);
   const [threshold, setThreshold] = useState(String(project.diff_threshold));
   const [ratioFail, setRatioFail] = useState(String(project.diff_ratio_fail));
+  const [viewportWidth, setViewportWidth] = useState(String(project.viewport_width));
+  const [viewportHeight, setViewportHeight] = useState(String(project.viewport_height));
 
   useEffect(() => {
     setName(project.name);
     setDefaultBranch(project.default_branch);
     setThreshold(String(project.diff_threshold));
     setRatioFail(String(project.diff_ratio_fail));
+    setViewportWidth(String(project.viewport_width));
+    setViewportHeight(String(project.viewport_height));
   }, [project]);
 
   const update = $api.useMutation("patch", "/v1/projects/{project_id}", {
@@ -188,6 +192,8 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
         default_branch: defaultBranch.trim(),
         diff_threshold: Number(threshold),
         diff_ratio_fail: Number(ratioFail),
+        viewport_width: Number(viewportWidth),
+        viewport_height: Number(viewportHeight),
       },
     });
   }
@@ -198,7 +204,8 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
         <CardTitle>Project settings</CardTitle>
         <CardDescription>
           The pixel threshold controls per-pixel colour tolerance; the fail ratio is the share of
-          changed pixels that marks a comparison as changed.
+          changed pixels that marks a comparison as changed. The viewport is the window size VRT
+          renders Storybook stories at (storybook-mode builds only).
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -245,6 +252,32 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
               value={ratioFail}
               disabled={!canEdit}
               onChange={(event) => setRatioFail(event.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="p-viewport-w">Storybook viewport width (px)</Label>
+            <Input
+              id="p-viewport-w"
+              type="number"
+              step="1"
+              min="64"
+              max="10000"
+              value={viewportWidth}
+              disabled={!canEdit}
+              onChange={(event) => setViewportWidth(event.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="p-viewport-h">Storybook viewport height (px)</Label>
+            <Input
+              id="p-viewport-h"
+              type="number"
+              step="1"
+              min="64"
+              max="10000"
+              value={viewportHeight}
+              disabled={!canEdit}
+              onChange={(event) => setViewportHeight(event.target.value)}
             />
           </div>
           <div className="sm:col-span-2">
@@ -356,13 +389,45 @@ function GithubLink({
   );
 }
 
-function CiUsage({ tenantSlug, projectSlug }: { tenantSlug: string; projectSlug: string }) {
-  const snippet = `# 1. create a build (PAT needs write:build)
+type CiMode = "screenshots" | "storybook";
+
+const CI_MODE_DESCRIPTION: Record<CiMode, string> = {
+  screenshots: "Your CI captures the PNGs and uploads them one by one.",
+  storybook:
+    "Your CI uploads a built Storybook (a zip of storybook-static) and VRT renders every story " +
+    "server-side in headless Chromium. Rendering happens between finalize and the comparison, so " +
+    "the build passes through the “Rendering” state first.",
+};
+
+function ciSnippet(mode: CiMode, tenantSlug: string, projectSlug: string) {
+  const createBuild = (body: string) => `# 1. create a build (PAT needs write:build)
 BUILD=$(curl -sS -X POST \\
   "$VRT_URL/v1/ci/projects/${tenantSlug}/${projectSlug}/builds" \\
   -H "Authorization: Bearer $VRT_TOKEN" \\
   -H "Content-Type: application/json" \\
-  -d '{"branch":"'"$GIT_BRANCH"'","commit_sha":"'"$GIT_SHA"'"}' | jq -r .id)
+  -d '${body}' | jq -r .id)`;
+
+  if (mode === "storybook") {
+    return `${createBuild(
+      `{"branch":"'"$GIT_BRANCH"'","commit_sha":"'"$GIT_SHA"'","mode":"storybook"}`,
+    )}
+
+# 2. zip the built Storybook and upload it (one bundle per build, max 200MB)
+pnpm build-storybook
+(cd storybook-static && zip -qr ../storybook-static.zip .)
+curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/storybook" \\
+  -H "Authorization: Bearer $VRT_TOKEN" \\
+  -F "file=@./storybook-static.zip"
+
+# 3. finalize — VRT renders every story, then compares against the baseline
+curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
+  -H "Authorization: Bearer $VRT_TOKEN"
+
+# 4. poll until the build leaves "rendering"/"processing"
+curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
+  }
+
+  return `${createBuild(`{"branch":"'"$GIT_BRANCH"'","commit_sha":"'"$GIT_SHA"'"}`)}
 
 # 2. upload one screenshot per snapshot
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/screenshots" \\
@@ -376,6 +441,11 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
 
 # 4. poll until the build leaves "processing"
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
+}
+
+function CiUsage({ tenantSlug, projectSlug }: { tenantSlug: string; projectSlug: string }) {
+  const [mode, setMode] = useState<CiMode>("screenshots");
+  const snippet = ciSnippet(mode, tenantSlug, projectSlug);
 
   return (
     <Card>
@@ -398,7 +468,20 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
           Copy
         </Button>
       </CardHeader>
-      <CardContent>
+      <CardContent className="space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="ci-mode">Build mode</Label>
+          <Select value={mode} onValueChange={(value) => setMode(value as CiMode)}>
+            <SelectTrigger id="ci-mode" className="w-full max-w-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="screenshots">screenshots — CI uploads PNGs</SelectItem>
+              <SelectItem value="storybook">storybook — VRT renders the stories</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">{CI_MODE_DESCRIPTION[mode]}</p>
+        </div>
         <pre className="overflow-x-auto rounded-md bg-muted p-4 text-xs leading-relaxed">
           {snippet}
         </pre>

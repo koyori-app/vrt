@@ -19,7 +19,7 @@ use backend::{
     AppState,
     jobs::{
         setup_compare_build_storage_with_queue, setup_github_status_storage_with_queue,
-        setup_github_webhook_storage_with_queue, setup_pool,
+        setup_github_webhook_storage_with_queue, setup_pool, setup_render_build_storage_with_queue,
     },
     routes, settings,
 };
@@ -183,10 +183,11 @@ fn ensure_test_env() {
         // 常時ポーリングして接続を掴むため、既定(10+10)のままだと
         // Postgres の max_connections を超えて PoolTimedOut になる。
         //
-        // apalis 側は「ワーカー数（compare_build / github_status / github_webhook の 3 本）」を
-        // 下回らせない。2 本のままだと 3 ワーカーが 1 本を奪い合ってフェッチが詰まる。
+        // apalis 側は「ワーカー数（compare_build / github_status / github_webhook /
+        // render_build の 4 本）」を下回らせない。少ないとワーカーが接続を奪い合って
+        // フェッチが詰まる。
         set_default_env("DATABASE_MAX_CONNECTIONS", "5");
-        set_default_env("APALIS_MAX_CONNECTIONS", "3");
+        set_default_env("APALIS_MAX_CONNECTIONS", "4");
 
         set_default_env("APP_URL", "http://localhost:3000");
         set_default_env("ALLOW_ORIGIN", "http://localhost:3000");
@@ -196,6 +197,13 @@ fn ensure_test_env() {
         set_default_env("GITHUB_CLIENT_SECRET", "test-github-secret");
         set_default_env("GITLAB_CLIENT_ID", TEST_OAUTH_CLIENT_ID);
         set_default_env("GITLAB_CLIENT_SECRET", TEST_OAUTH_CLIENT_SECRET);
+        // storybook モードのレンダリングに使う Chromium。
+        // システムに無ければ e2e が入れた Playwright のキャッシュを拾う。
+        // どこにも無ければ未設定のままにして、レンダリング系のテストが自分でスキップする。
+        if let Some(chromium) = service::render::discover_chromium() {
+            set_default_env("CHROMIUM_PATH", &chromium);
+        }
+
         set_default_env(
             "LOCAL_UPLOAD_DIR",
             std::env::temp_dir()
@@ -494,6 +502,12 @@ impl TestApp {
         )
         .await
         .expect("github webhook storage");
+        let render_build_storage = setup_render_build_storage_with_queue(
+            &pg_pool,
+            &format!("render_build_test_{}", Uuid::new_v4().simple()),
+        )
+        .await
+        .expect("render build storage");
         let storage = service::storage::setup_storage()
             .await
             .expect("storage backend");
@@ -517,6 +531,7 @@ impl TestApp {
             compare_build_storage,
             github_status_storage,
             github_webhook_storage,
+            render_build_storage,
             http: http_client,
         };
 
@@ -545,7 +560,8 @@ impl TestApp {
         let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
         backend::server::spawn_compare_build_worker(&state, worker_shutdown_rx.clone());
         backend::server::spawn_github_status_worker(&state, worker_shutdown_rx.clone());
-        backend::server::spawn_github_webhook_worker(&state, worker_shutdown_rx);
+        backend::server::spawn_github_webhook_worker(&state, worker_shutdown_rx.clone());
+        backend::server::spawn_render_build_worker(&state, worker_shutdown_rx);
 
         let client = Client::builder()
             .cookie_store(true)
@@ -674,6 +690,31 @@ impl TestApp {
             .send()
             .await
             .expect("multipart upload")
+    }
+
+    /// `file`（zip）だけの multipart で Storybook バンドルをアップロードする。
+    pub async fn upload_storybook_bundle(
+        &self,
+        build_id: Uuid,
+        token: &str,
+        zip: Vec<u8>,
+    ) -> Response {
+        let part = reqwest::multipart::Part::bytes(zip)
+            .file_name("storybook-static.zip")
+            .mime_str("application/zip")
+            .expect("zip mime");
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        self.client
+            .post(format!(
+                "{}/v1/ci/builds/{build_id}/storybook",
+                self.base_url
+            ))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await
+            .expect("storybook bundle upload")
     }
 
     /// GitHub からの webhook 配信を模した POST。
