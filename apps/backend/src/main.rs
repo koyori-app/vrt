@@ -15,6 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let compare_build_storage = backend::jobs::setup_compare_build_storage(&pg_pool).await?;
     let github_status_storage = backend::jobs::setup_github_status_storage(&pg_pool).await?;
     let github_webhook_storage = backend::jobs::setup_github_webhook_storage(&pg_pool).await?;
+    let render_build_storage = backend::jobs::setup_render_build_storage(&pg_pool).await?;
 
     let storage = backend::utils::storage::setup_storage().await.map_err(|e| {
         std::io::Error::other(format!(
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compare_build_storage,
         github_status_storage,
         github_webhook_storage,
+        render_build_storage,
         http: http_client,
     };
     run(state).await?;

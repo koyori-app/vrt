@@ -19,6 +19,11 @@ pub struct Model {
     pub commit_message: Option<String>,
     pub pull_request_number: Option<i32>,
     pub status: super::super::builds::BuildStatus,
+    /// 入力形式（`screenshots` = CI が PNG を送る / `storybook` = サーバーが撮る）。
+    pub mode: super::super::builds::BuildMode,
+    /// storybook モードでアップロードされた zip のストレージキー。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub storybook_key: Option<String>,
     /// 比較に使った baseline。FK にすると `baselines.source_build_id` と循環するため素のカラム。
     pub baseline_id: Option<Uuid>,
     pub total_count: i32,

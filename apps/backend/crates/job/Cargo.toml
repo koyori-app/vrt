@@ -8,6 +8,8 @@ common = { path = "../common" }
 entity = { path = "../entity" }
 anyhow = { workspace = true }
 service = { path = "../service" }
+bytes = "1"
+tempfile = { workspace = true }
 apalis = { version = "1.0.0-rc.9", features = ["limit", "retry", "tracing"] }
 apalis-postgres = { version = "1.0.0-rc.8", default-features = false, features = ["migrate", "tokio-comp", "time"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

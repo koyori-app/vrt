@@ -14,6 +14,9 @@ forge-github = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab0
 axum = { version = "0.8.8", features = ["macros"] }
 base64 = "0.22.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Storybook バンドルのレンダリング用ヘッドレス Chromium ドライバ。
+# 0.9 系は tokio 専用（async-std feature が廃止された）ため runtime feature の指定は不要。
+chromiumoxide = "0.9.1"
 config = "0.15.22"
 dotenvy = "0.15"
 hex = "0.4"
@@ -35,6 +38,9 @@ tracing = "0.1"
 url = "2.5"
 utoipa = { version = "5.4.0", features = ["uuid", "chrono", "time"] }
 validator = { version = "0.20.0", features = ["derive"] }
+# Storybook バンドル（storybook-static.zip）の展開用。
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+tempfile = "3"
 
 [package]
 name = "backend"
@@ -87,6 +93,8 @@ url = { workspace = true }
 urlencoding = "2.1"
 uuid = { workspace = true }
 wiremock = "0.6"
+# render_flow_integration が手書きの Storybook バンドル zip を組み立てるのに使う。
+zip = { workspace = true }
 
 [profile.dev]
 debug = 1

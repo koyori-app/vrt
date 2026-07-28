@@ -4,11 +4,47 @@ use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// ビルドの入力形式。
+///
+/// - [`BuildMode::Screenshots`]: CI が自前で撮った PNG をアップロードする（従来モード）
+/// - [`BuildMode::Storybook`]: CI がビルド済み Storybook の zip をアップロードし、
+///   サーバー側（`RenderBuildJob`）がヘッドレス Chromium で全ストーリーを撮る
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    EnumIter,
+    DeriveActiveEnum,
+    Serialize,
+    Deserialize,
+    ToSchema,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::N(255))")]
+#[serde(rename_all = "snake_case")]
+pub enum BuildMode {
+    /// CI がスクリーンショットをアップロードする（既定）。
+    #[default]
+    #[sea_orm(string_value = "screenshots")]
+    Screenshots,
+    /// CI が storybook-static の zip をアップロードし、サーバーがレンダリングする。
+    #[sea_orm(string_value = "storybook")]
+    Storybook,
+}
+
 /// ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。
 ///
 /// ```text
+/// screenshots モード:
 /// pending ──finalize──▶ processing ──▶ passed | changes_detected | failed
-///                                          changes_detected ──▶ approved | rejected
+///
+/// storybook モード:
+/// pending ──finalize──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed
+///                          └──────────────────────▶ failed
+///
+/// どちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved
 /// ```
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, ToSchema,
@@ -16,9 +52,12 @@ use utoipa::ToSchema;
 #[sea_orm(rs_type = "String", db_type = "String(StringLen::N(255))")]
 #[serde(rename_all = "snake_case")]
 pub enum BuildStatus {
-    /// CI が作成した直後。スクリーンショットのアップロードを受け付ける。
+    /// CI が作成した直後。スクリーンショット（または Storybook バンドル）のアップロードを受け付ける。
     #[sea_orm(string_value = "pending")]
     Pending,
+    /// storybook モードで finalize 済み。`RenderBuildJob` がストーリーを撮影中。
+    #[sea_orm(string_value = "rendering")]
+    Rendering,
     /// finalize 済み。`CompareBuildJob` が処理中。
     #[sea_orm(string_value = "processing")]
     Processing,
@@ -56,6 +95,9 @@ impl BuildStatus {
         use BuildStatus::*;
         match (self, to) {
             (Pending, Processing) => true,
+            // storybook モードの finalize。レンダリングが終わると processing に繋ぐ。
+            (Pending, Rendering) => true,
+            (Rendering, Processing | Failed) => true,
             (Processing, Passed | ChangesDetected | Failed) => true,
             // レビュー結果の反映。差分検出済みのビルドだけがレビュー対象。
             (ChangesDetected, Approved | Rejected) => true,
@@ -71,6 +113,21 @@ pub use super::_generated::builds::*;
 #[cfg(test)]
 mod tests {
     use super::BuildStatus::*;
+
+    #[test]
+    fn storybook_mode_transitions() {
+        assert!(Pending.can_transition_to(Rendering));
+        assert!(Rendering.can_transition_to(Processing));
+        assert!(Rendering.can_transition_to(Failed));
+        // レンダリング中のビルドは比較を飛ばして終端に行けない。
+        assert!(!Rendering.can_transition_to(Passed));
+        assert!(!Rendering.can_transition_to(ChangesDetected));
+        assert!(!Rendering.can_transition_to(Approved));
+        assert!(!Rendering.is_terminal());
+        // rendering に戻る経路は無い。
+        assert!(!Processing.can_transition_to(Rendering));
+        assert!(!Failed.can_transition_to(Rendering));
+    }
 
     #[test]
     fn happy_path_transitions_are_allowed() {

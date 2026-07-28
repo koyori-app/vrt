@@ -20,6 +20,10 @@ pub struct ProjectResponse {
     pub diff_threshold: f64,
     /// ビルドを失敗扱いにする差分ピクセル比率（0.0〜1.0）。
     pub diff_ratio_fail: f64,
+    /// storybook モードのレンダリングに使うビューポート幅（px）。
+    pub viewport_width: i32,
+    /// storybook モードのレンダリングに使うビューポート高さ（px）。
+    pub viewport_height: i32,
     #[schema(nullable)]
     pub github_installation_id: Option<i64>,
     #[schema(nullable)]
@@ -40,6 +44,8 @@ impl From<projects::Model> for ProjectResponse {
             default_branch: model.default_branch,
             diff_threshold: model.diff_threshold,
             diff_ratio_fail: model.diff_ratio_fail,
+            viewport_width: model.viewport_width,
+            viewport_height: model.viewport_height,
             github_installation_id: model.github_installation_id,
             github_repo: model.github_repo,
             created_at: model.created_at.with_timezone(&Utc),
@@ -69,4 +75,10 @@ pub struct UpdateProjectRequest {
     pub diff_threshold: Option<f64>,
     #[validate(range(min = 0.0, max = 1.0))]
     pub diff_ratio_fail: Option<f64>,
+    /// storybook モードのレンダリングに使うビューポート幅（px、64〜10000）。
+    #[validate(range(min = 64, max = 10000))]
+    pub viewport_width: Option<i32>,
+    /// storybook モードのレンダリングに使うビューポート高さ（px、64〜10000）。
+    #[validate(range(min = 64, max = 10000))]
+    pub viewport_height: Option<i32>,
 }

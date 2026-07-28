@@ -58,9 +58,25 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 ########## runtime 共通 ##########
 FROM debian:bookworm-slim AS runtime-base
+# chromium は storybook モード（サーバーサイドレンダリング）にだけ必要。
+#
+# ⚠️ イメージサイズへの影響: chromium とその依存（フォント含む）で
+#    展開後 +400〜500MB 程度になる（slim ベースの ~80MB から ~550MB 前後）。
+#    storybook モードを使わない配布形態では、この apt 行と ENV CHROMIUM_PATH を
+#    落としたバリアントを作ればサイズは元に戻る（CHROMIUM_PATH 未設定なら
+#    mode=storybook のビルド作成が 400 で拒否されるだけで、他機能は影響を受けない）。
+#
+# fonts-liberation は「フォントが 1 つも無いと文字が豆腐になる」のを避ける最小限。
+# レンダリング結果の決定性のため、これ以上フォントは足さないこと
+# （増やすとフォント選択が変わって既存 baseline が全部差分になる）。
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates postgresql-client \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates postgresql-client chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
+
+# service::render はこのパスの実行ファイルを起動する。
+# 未設定だと storybook モードが無効になる（起動時に warn を出す）。
+ENV CHROMIUM_PATH=/usr/bin/chromium
 
 # root では動かさない
 RUN useradd --system --create-home --uid 10001 app

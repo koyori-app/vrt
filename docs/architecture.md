@@ -12,7 +12,8 @@
                  │                └──▶ Valkey（セッション / OAuth state）
                  │
                  ├─ apalis ワーカー（同一プロセス、Postgres がキュー）
-                 │    compare_build / github_status / github_webhook
+                 │    render_build / compare_build / github_status / github_webhook
+                 ├─ ヘッドレス Chromium（storybook モードのレンダリング。CHROMIUM_PATH）
                  └─ ストレージ（local ディレクトリ or S3 互換）
 
 CI ──────────▶ backend /v1/ci/*（PAT の Bearer 認証。ブラウザを経由しない）
@@ -53,7 +54,7 @@ docker-compose.yml  db / redis / migration / backend / frontend
    └────▲─────┘          └─────▲─────┘
         │                      │
         │                ┌─────┴─────┐
-        │                │    job    │  apalis ワーカー（比較・PR ステータス・webhook）
+        │                │    job    │  apalis ワーカー（レンダリング・比較・PR ステータス・webhook）
         │                └─────▲─────┘
         │                      │
    ┌────┴──────────────────────┴─────┐
@@ -151,9 +152,13 @@ GET /v1/auth/{provider}/callback
 ### ビルド
 
 ```
-                  finalize
-   pending ──────────────────▶ processing
-                                  │
+              finalize (mode=screenshots)
+   pending ──────────────────────────────────────▶ processing
+      │                                              ▲
+      │  finalize (mode=storybook)                   │ 撮影完了
+      └────────────────────▶ rendering ──────────────┘
+                                │ 撮影失敗
+                                ▼
               ┌───────────────────┼───────────────────┐
               │                   │                   │
               ▼                   ▼                   ▼
@@ -164,8 +169,12 @@ GET /v1/auth/{provider}/callback
                                   └── reject  ──▶ rejected (終端)
 ```
 
-- `pending` … ビルド行を作った直後。スクリーンショットを受け付けている。
-- `processing` … `finalize` 後、`compare_build` ジョブが走っている。
+- `pending` … ビルド行を作った直後。スクリーンショット（`screenshots` モード）
+  か Storybook バンドル（`storybook` モード）を受け付けている。
+- `rendering` … `storybook` モードの `finalize` 後、`render_build` ジョブが
+  ヘッドレス Chromium でストーリーを撮っている。撮り終えると `processing` に
+  自動で繋がる。`screenshots` モードでは通らない。
+- `processing` … `compare_build` ジョブが走っている。
 - `passed` … 差分ゼロ。レビュー不要。ただし baseline 昇格のために明示承認はできる。
 - `changes_detected` … 差分あり。人間のレビュー待ち。
 - `failed` … 比較そのものが失敗（画像が壊れている等）。
@@ -224,6 +233,35 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 
 キューは Postgres（apalis-postgres）。Redis を落としてもジョブは消えない。
 
+## レンダリングジョブ（storybook モード）
+
+`mode = storybook` のビルドは、CI が撮った PNG ではなく **ビルド済み Storybook
+の zip** を受け取り、サーバー側で撮る（Chromatic 方式）。`finalize` はビルドを
+`rendering` にして `render_build` ジョブを積むだけで、実処理はワーカーが行う:
+
+1. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリに展開する。
+   展開は `service::render::bundle` が担当し、**zip-slip（`..` / 絶対パス /
+   `\` 区切り）・シンボリックリンク・エントリ数（20,000）・展開後サイズ（500MB）**
+   を検査して弾く。`index.json` はアーカイブ直下と 1 階層下まで探す
+2. `index.json`（v4/v5 の `entries`、6 系の `stories` も可）からストーリー一覧を作る。
+   `type: "docs"` のエントリは撮らない
+3. 展開先を `127.0.0.1:0`（OS 任せの空きポート）でループバック配信する
+4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、ストーリーを**逐次**
+   `iframe.html?id=<storyId>&viewMode=story` で開く。`#storybook-root`（6 系は
+   `#root`）に中身が入るまでポーリングし、settle 待ちのあとビューポートを PNG で撮る。
+   ビューポートはプロジェクトの `viewport_width` / `viewport_height`（既定 1280x720）
+5. `{title}/{name}` の名前で `screenshots` 行に保存する
+   （`metadata` に `story_id` / `title` を残す）
+6. `rendering → processing` に遷移し、`compare_build` ジョブを積んで
+   既存の比較経路に合流する
+
+ジョブ開始時にそのビルドの `screenshots` 行を全削除するので、途中で落ちて
+リトライされても `(build_id, name)` の UNIQUE にぶつからない。
+1 ストーリーでも撮れなければビルドは `failed` になり、`error_message` に
+どのストーリーで落ちたかが入る（Chromium が無い / 起動できない場合も同じ経路で
+`failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンスで、
+ワーカーの同時実行数は 1 に絞ってある。
+
 ## ストレージ
 
 `STORAGE_BACKEND` で切り替える trait 実装（`service::storage`）:
@@ -231,5 +269,11 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 - `local` … `LOCAL_UPLOAD_DIR` 配下に置き、backend 自身が配信する
 - `s3` … S3 互換にアップロードし、`S3_PUBLIC_BASE_URL` の URL を返す
 
-アップロードは 1 枚 25MB まで。frontend の `/api` プロキシも同じ上限を持つ
-（超過は転送せず 413）。
+スクリーンショットのアップロードは 1 枚 25MB まで。frontend の `/api` プロキシも
+同じ上限を持つ（超過は転送せず 413）。
+
+Storybook バンドル（`POST /v1/ci/builds/{id}/storybook`）だけは桁が違うので、
+ルーターのボディ上限を分けてある（zip 1 本 200MB まで。展開後 500MB /
+20,000 エントリで打ち切り）。CI が直接 backend を叩く経路なので、frontend の
+プロキシは通らない。バンドルは
+`tenants/{tenant}/projects/{project}/builds/{build}/storybook.zip` に置かれる。
