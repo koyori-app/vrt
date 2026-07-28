@@ -1,0 +1,8 @@
+# mold linker — Linux のみ対象（macOS は system linker、Windows は lld を使用）
+# 依存パッケージ: Linux → mold (apt install mold / dnf install mold)
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

@@ -1,0 +1,7 @@
+# backend イメージのビルドコンテキストは apps/backend なので、リポジトリルートの
+# .dockerignore は効かない。ビルド成果物と秘密情報はここで除外する。
+target
+migration/target
+.env
+.env.*
+**/*.log

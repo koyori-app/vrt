@@ -1,0 +1,35 @@
+[package]
+name = "service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+entity = { path = "../entity" }
+common = { path = "../common" }
+payload = { path = "../payload" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+auth-core = { workspace = true }
+auth-core-github = { workspace = true }
+auth-core-gitlab = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = "1"
+chrono = { workspace = true }
+forge-github = { workspace = true }
+futures = "0.3"
+hmac = { workspace = true }
+image = { workspace = true }
+object_store = { version = "0.11", features = ["aws", "http"] }
+rand = { workspace = true }
+redis = { workspace = true }
+reqwest = { workspace = true }
+sea-orm = { workspace = true, features = ["with-chrono", "postgres-array"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tokio = { version = "1.52.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = { workspace = true }

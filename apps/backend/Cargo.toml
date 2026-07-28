@@ -1,0 +1,95 @@
+[workspace]
+members = ["crates/entity", "crates/common", "crates/payload", "crates/service", "crates/job", "crates/handler"]
+exclude = ["migration"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1"
+# auth-core は未公開のため git 依存で rev をピンする（forge-* も同じリポジトリ・同じ rev）。
+auth-core = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab00f9a40c321f6b07b0e45376fd2cc018b0" }
+auth-core-github = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab00f9a40c321f6b07b0e45376fd2cc018b0" }
+auth-core-gitlab = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab00f9a40c321f6b07b0e45376fd2cc018b0" }
+forge-core = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab00f9a40c321f6b07b0e45376fd2cc018b0" }
+forge-github = { git = "https://github.com/koyori-app/auth-core", rev = "f63bab00f9a40c321f6b07b0e45376fd2cc018b0" }
+axum = { version = "0.8.8", features = ["macros"] }
+base64 = "0.22.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+config = "0.15.22"
+dotenvy = "0.15"
+hex = "0.4"
+hmac = "0.13"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+sha2 = "0.11"
+uuid = { version = "1", features = ["serde", "v4"] }
+redis = { version = "1.2.1", features = ["tokio-comp"] }
+redis_pool = "0.10.0"
+regex = "1"
+sea-orm = { version = "2.0.0-rc.38", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+subtle = "2.6"
+thiserror = "2.0.10"
+tracing = "0.1"
+url = "2.5"
+utoipa = { version = "5.4.0", features = ["uuid", "chrono", "time"] }
+validator = { version = "0.20.0", features = ["derive"] }
+
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2024"
+default-run = "backend"
+
+[dependencies]
+entity = { path = "crates/entity" }
+common = { path = "crates/common" }
+service = { path = "crates/service" }
+job = { path = "crates/job" }
+handler = { path = "crates/handler" }
+apalis = { version = "1.0.0-rc.9", features = ["limit", "retry", "tracing"] }
+axum = { workspace = true, features = ["multipart"] }
+axum_session = { version = "0.20.0" }
+axum_session_redispool = { version = "0.11.0" }
+sea-orm = { workspace = true, features = [
+    "entity-registry",
+    "schema-sync",
+    "with-chrono",
+    "postgres-array",
+] }
+serde_json = { workspace = true }
+tokio = { version = "1.52.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "net", "signal"] }
+tower = "0.5.2"
+tower-http = { version = "0.7", features = ["cors", "limit"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa-axum = "0.2.0"
+utoipa-scalar = { version = "0.3.0", features = ["axum"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+image = { workspace = true }
+cookie = "0.18"
+dotenvy = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
+http-body-util = "0.1"
+libc = "0.2.186"
+redis = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "multipart", "rustls"] }
+serde = { workspace = true }
+sha2 = { workspace = true }
+testcontainers-modules = { version = "0.15.0", features = ["postgres", "blocking"] }
+tower = { version = "0.5.2", features = ["util"] }
+url = { workspace = true }
+urlencoding = "2.1"
+uuid = { workspace = true }
+wiremock = "0.6"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3

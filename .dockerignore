@@ -1,0 +1,16 @@
+.git
+.claude
+.env
+**/.env
+**/.env.*
+**/coverage
+**/node_modules
+apps/backend/target
+apps/backend/migration/target
+apps/frontend/dist
+apps/frontend/.output
+apps/frontend/src/generated
+e2e/test-results
+e2e/playwright-report
+storage-dev
+**/*.log

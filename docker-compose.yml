@@ -1,0 +1,139 @@
+# 開発・動作確認用の構成。本番運用は想定していない。
+#
+#   起動:     docker compose up --build
+#   停止:     docker compose down
+#   DB も破棄: docker compose down -v
+#
+#   - frontend: http://localhost:3000
+#   - backend : http://localhost:3500
+#
+# ※ 下の環境変数のシークレット類はすべて開発専用のダミー値。本番では絶対に使わないこと。
+#    値自体に意味はなく、backend の設定バリデーション（32 バイト以上）を満たすためだけの文字列。
+#
+# ※ 公開ポートはすべて 127.0.0.1 に固定している。ホスト IP を省略した短縮記法
+#    （"5432:5432"）は 0.0.0.0 に bind するため、DB・認証なしの Valkey・
+#    既知のダミーシークレットを持つ backend が同一 LAN や VPN から到達可能になる。
+#    Docker は iptables を直接操作するのでホスト側のファイアウォールでは塞げない。
+#    実機確認などで LAN に出す必要があるときだけ、その場で 127.0.0.1 を外すこと。
+#
+# ※ ホスト側ポートは task リポジトリの compose（5432/6379/3400）と同時起動できるよう
+#    ずらしてある（db: 5433, redis: 6380, backend: 3500）。
+#    ただし frontend の 3000 だけは task と重なる。backend の ALLOW_ORIGIN / APP_URL と
+#    `pnpm dev`（vite）の待受がどちらも http://localhost:3000 に固定されているため、
+#    ここをずらすと「compose の backend にローカルの vite dev を繋ぐ」開発フローが壊れる。
+#    task の frontend と同時に上げたいときは、その場でどちらかの公開ポートを変えること。
+#
+# マイグレーションは migration サービス（one-shot）が `up` で適用する。`up` は冪等で
+# 既存データを保持する。まっさらにしたい時だけ明示的に:
+#   docker compose run --rm migration /app/migration fresh
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: vrt
+      POSTGRES_PASSWORD: vrt
+      POSTGRES_DB: vrt
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vrt -d vrt"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: valkey/valkey:8.1
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # マイグレーション適用（one-shot）
+  migration:
+    build:
+      context: ./apps/backend
+      # 省略すると配布用の production（release ビルド）になるので明示する
+      target: runtime
+    image: vrt-backend:dev
+    command: ["/app/run-migration.sh"]
+    environment:
+      DATABASE_URL: postgresql://vrt:vrt@db:5432/vrt
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ./apps/backend
+      target: runtime
+    image: vrt-backend:dev
+    environment:
+      DATABASE_URL: postgresql://vrt:vrt@db:5432/vrt
+      REDIS_URL: redis://redis:6379
+      LISTEN_ADDR: 0.0.0.0:3400
+      ALLOW_ORIGIN: http://localhost:3000
+      APP_URL: http://localhost:3000
+      STORAGE_BACKEND: local
+      LOCAL_UPLOAD_DIR: /home/app/uploads
+      # --- 開発専用ダミーシークレット（本番使用禁止） ---
+      PERSONAL_TOKEN_SECRET: "dev-only-dummy-personal-token-00"
+      OAUTH_TOKEN_ENCRYPTION_KEY: "dev-only-dummy-oauth-token-key-0"
+      # --- OAuth クライアントはダミー（実際のログインは各自の資格情報を設定） ---
+      GITHUB_CLIENT_ID: dev-dummy-github-client-id
+      GITHUB_CLIENT_SECRET: dev-dummy-github-client-secret
+      GITLAB_CLIENT_ID: dev-dummy-gitlab-client-id
+      GITLAB_CLIENT_SECRET: dev-dummy-gitlab-client-secret
+      # --- GitHub App（PR ステータス連携）---
+      # 未設定なら連携は無効のまま起動する。有効にするには docs/github-app.md を参照して
+      # 3 つとも設定すること（PEM は改行を \n でエスケープして 1 行に入れる）。
+      # GITHUB_APP_ID: "123456"
+      # GITHUB_APP_PRIVATE_KEY_PEM: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
+      # GITHUB_WEBHOOK_SECRET: "..."
+      # GitHub Enterprise を使う場合のみ（既定は https://api.github.com）。
+      # GITHUB_API_BASE_URL: https://github.example.com/api/v3
+    ports:
+      - "127.0.0.1:3500:3400"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3400"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  frontend:
+    build:
+      # pnpm workspace のルート（package.json / pnpm-workspace.yaml）が要るので
+      # コンテキストはリポジトリルート。除外は .dockerignore を参照。
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      # 省略すると配布用の production になるので明示する（中身は runtime と同一）
+      target: runtime
+    image: vrt-frontend:dev
+    environment:
+      # SSR の /api/* プロキシ（src/routes/api.$.ts）の転送先。compose ネットワーク内の
+      # サービス名で引く。ブラウザは常に frontend の同一 origin だけを見る。
+      API_BASE: http://backend:3400
+      PORT: "3000"
+      HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:

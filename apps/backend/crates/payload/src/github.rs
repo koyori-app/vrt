@@ -1,0 +1,78 @@
+//! GitHub App 連携の DTO。
+
+use chrono::{DateTime, Utc};
+use sea_orm::prelude::Uuid;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+
+use entity::github_installations;
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubInstallationResponse {
+    #[schema(value_type = String, format = "uuid")]
+    pub id: Uuid,
+    /// claim 済みのテナント。未 claim なら `null`。
+    #[schema(value_type = Option<String>, format = "uuid", nullable)]
+    pub tenant_id: Option<Uuid>,
+    /// GitHub 側の installation ID（プロジェクト紐付けで使う）。
+    pub installation_id: i64,
+    pub account_login: String,
+    /// `User` | `Organization`。
+    pub account_type: String,
+    /// GitHub 側で suspend されているか。
+    pub suspended: bool,
+    #[schema(value_type = String, format = "date-time")]
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<github_installations::Model> for GithubInstallationResponse {
+    fn from(model: github_installations::Model) -> Self {
+        Self {
+            id: model.id,
+            tenant_id: model.tenant_id,
+            installation_id: model.installation_id,
+            account_login: model.account_login,
+            account_type: model.account_type,
+            suspended: model.suspended_at.is_some(),
+            created_at: model.created_at.with_timezone(&Utc),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubInstallationListResponse {
+    pub installations: Vec<GithubInstallationResponse>,
+    pub total: u64,
+}
+
+/// `GET /v1/github/installations` のクエリ。
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct InstallationListQuery {
+    /// 対象テナント。メンバーであることが必要。
+    #[param(value_type = String, format = "uuid")]
+    pub tenant_id: Uuid,
+}
+
+/// `POST /v1/github/installations/{installation_id}/claim` のボディ。
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ClaimInstallationRequest {
+    /// この installation を紐付けるテナント。admin 以上であることが必要。
+    #[schema(value_type = String, format = "uuid")]
+    pub tenant_id: Uuid,
+}
+
+/// `PATCH /v1/projects/{project_id}/github` のボディ。
+///
+/// 2 つのフィールドは常にセットで扱う。両方 `null` なら連携解除。
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateProjectGithubRequest {
+    /// 紐付ける installation の GitHub ID。解除するときは `null`。
+    #[serde(default)]
+    #[schema(nullable)]
+    pub installation_id: Option<i64>,
+    /// `owner/name` 形式。解除するときは `null`。
+    #[serde(default)]
+    #[schema(nullable, example = "octocat/hello-world")]
+    pub github_repo: Option<String>,
+}

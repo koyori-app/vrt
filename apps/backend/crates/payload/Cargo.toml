@@ -1,0 +1,14 @@
+[package]
+name = "payload"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+entity = { path = "../entity" }
+common = { path = "../common" }
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
+sea-orm = { workspace = true, features = ["with-chrono", "postgres-array"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+validator = { workspace = true }
