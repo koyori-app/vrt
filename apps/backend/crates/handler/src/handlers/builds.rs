@@ -1,0 +1,314 @@
+//! ビルドの HTTP ハンドラ（UI 側）。
+//!
+//! すべてのアクセスは `build → project → tenant メンバーシップ` まで辿って検査する。
+//! 非メンバーには「存在しない」と「権限がない」を区別させないため 403 に揃える
+//! （`handlers::projects::load_project_with_role` と同じ方針）。
+
+use axum::{
+    Json,
+    extract::{Path, Query, State},
+};
+use sea_orm::prelude::Uuid;
+
+use crate::AppState;
+use crate::error::{AppError, ServerError};
+use crate::extractors::AuthUser;
+use crate::openapi::CrudErrors;
+use entity::{
+    baseline_entries, builds, comparisons, projects, scopes::Scope, screenshots,
+    tenant_members::TenantRole,
+};
+use payload::builds::*;
+use payload::comparisons::*;
+use service::builds as build_service;
+use service::comparisons as comparison_service;
+use service::projects as project_service;
+use service::tenants as tenant_service;
+
+// ── アクセス解決ヘルパー ─────────────────────────────────────────────────
+
+/// プロジェクトを読み込み、所有テナントに対する `min_role` を要求する。
+pub(crate) async fn load_project_with_role(
+    state: &AppState,
+    project_id: Uuid,
+    user_id: Uuid,
+    min_role: TenantRole,
+) -> Result<projects::Model, AppError> {
+    let project = project_service::get_project(&state.db, project_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    tenant_service::require_role(&state.db, project.tenant_id, user_id, min_role).await?;
+    Ok(project)
+}
+
+/// ビルドと所有プロジェクトを解決し、テナントのロールを検査する。
+pub(crate) async fn load_build_with_role(
+    state: &AppState,
+    build_id: Uuid,
+    user_id: Uuid,
+    min_role: TenantRole,
+) -> Result<(builds::Model, projects::Model), AppError> {
+    let build = build_service::get_build(&state.db, build_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    let project = load_project_with_role(state, build.project_id, user_id, min_role).await?;
+    Ok((build, project))
+}
+
+/// スクリーンショット → ビルド → プロジェクト → テナントまで辿る。
+pub(crate) async fn load_screenshot_with_role(
+    state: &AppState,
+    screenshot_id: Uuid,
+    user_id: Uuid,
+    min_role: TenantRole,
+) -> Result<(screenshots::Model, projects::Model), AppError> {
+    let shot = service::screenshots::get_screenshot(&state.db, screenshot_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    let (_, project) = load_build_with_role(state, shot.build_id, user_id, min_role).await?;
+    Ok((shot, project))
+}
+
+/// baseline エントリ → baseline → プロジェクト → テナントまで辿る。
+pub(crate) async fn load_baseline_entry_with_role(
+    state: &AppState,
+    entry_id: Uuid,
+    user_id: Uuid,
+    min_role: TenantRole,
+) -> Result<(baseline_entries::Model, projects::Model), AppError> {
+    let entry = service::baselines::get_entry(&state.db, entry_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    let baseline = service::baselines::get_baseline(&state.db, entry.baseline_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    let project = load_project_with_role(state, baseline.project_id, user_id, min_role).await?;
+    Ok((entry, project))
+}
+
+/// 比較 → ビルド → プロジェクト → テナントまで辿る。
+pub(crate) async fn load_comparison_with_role(
+    state: &AppState,
+    comparison_id: Uuid,
+    user_id: Uuid,
+    min_role: TenantRole,
+) -> Result<(comparisons::Model, builds::Model, projects::Model), AppError> {
+    let comparison = comparison_service::get_comparison(&state.db, comparison_id)
+        .await
+        .map_err(|e| match e {
+            AppError::NotFound => AppError::Forbidden,
+            other => other,
+        })?;
+    let (build, project) =
+        load_build_with_role(state, comparison.build_id, user_id, min_role).await?;
+    Ok((comparison, build, project))
+}
+
+// ── /v1/projects/{project_id}/builds ────────────────────────────────────
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/{project_id}/builds",
+    tag = "Builds",
+    summary = "プロジェクトのビルド一覧",
+    description = "ビルド番号の降順。テナントのメンバーであること。PAT は `read:build` で参照できる。",
+    params(
+        ("project_id" = Uuid, Path, description = "プロジェクトID"),
+        BuildListQuery,
+    ),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "ビルド一覧", body = BuildListResponse),
+        CrudErrors,
+    )
+)]
+pub async fn list_builds(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(project_id): Path<Uuid>,
+    Query(query): Query<BuildListQuery>,
+) -> Result<Json<BuildListResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let project =
+        load_project_with_role(&state, project_id, auth.user_id, TenantRole::Member).await?;
+
+    let limit = query.limit.unwrap_or(build_service::DEFAULT_LIST_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+
+    let list = build_service::list_builds(&state.db, project.id, limit, offset).await?;
+    let total = build_service::count_builds(&state.db, project.id).await?;
+
+    Ok(Json(BuildListResponse {
+        builds: list.into_iter().map(Into::into).collect(),
+        total,
+    }))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/{project_id}/builds/{number}",
+    tag = "Builds",
+    summary = "ビルド番号でビルドを取得",
+    description = "プロジェクト内で連番のビルド番号から引く。UI の URL が番号ベースなので \
+                   一覧を舐めずに 1 件だけ取れるようにしてある。認可は ID 直参照と同じ。",
+    params(
+        ("project_id" = Uuid, Path, description = "プロジェクトID"),
+        ("number" = i64, Path, description = "プロジェクト内のビルド番号"),
+    ),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "ビルド情報", body = BuildResponse),
+        CrudErrors,
+    )
+)]
+pub async fn get_build_by_number(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((project_id, number)): Path<(Uuid, i64)>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let project =
+        load_project_with_role(&state, project_id, auth.user_id, TenantRole::Member).await?;
+    let build = build_service::get_build_by_number(&state.db, project.id, number).await?;
+    Ok(Json(build.into()))
+}
+
+// ── /v1/builds/{build_id} ───────────────────────────────────────────────
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/{build_id}",
+    tag = "Builds",
+    summary = "ビルドを取得",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "ビルド情報", body = BuildResponse),
+        CrudErrors,
+    )
+)]
+pub async fn get_build(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+    Ok(Json(build.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/{build_id}/comparisons",
+    tag = "Builds",
+    summary = "ビルドの比較結果一覧",
+    description = "スクリーンショット名の昇順。レビュー UI が使う。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "比較結果一覧", body = ComparisonListResponse),
+        CrudErrors,
+    )
+)]
+pub async fn list_comparisons(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+) -> Result<Json<ComparisonListResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+
+    let list = comparison_service::list_for_build(&state.db, build.id).await?;
+    let total = list.len() as u64;
+    Ok(Json(ComparisonListResponse {
+        comparisons: list.into_iter().map(Into::into).collect(),
+        total,
+    }))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/{build_id}/approve",
+    tag = "Builds",
+    summary = "ビルドを承認して baseline に昇格",
+    description = "admin 以上が必要。承認するとこのビルドの全スクリーンショットが \
+                   `(project, branch)` の新しい baseline になる。\
+                   未レビューの比較が残っている場合は 409。`force: true` で一括承認できる。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    request_body = ApproveBuildRequest,
+    responses(
+        (status = 200, description = "承認後のビルド", body = BuildResponse),
+        (status = 409, description = "承認できない状態、または未レビューの比較が残っています", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn approve_build(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+    body: Option<Json<ApproveBuildRequest>>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_session()?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Admin).await?;
+
+    let force = body.map(|Json(b)| b.force).unwrap_or(false);
+    let approved = build_service::approve_build(&state.db, build, auth.user_id, force).await?;
+
+    // レビュー結果を PR に反映する。job を handler に依存させないため、
+    // 投入はサービス呼び出しが成功したあとのここで行う。
+    job::github_status::enqueue_best_effort(&state.github_status_storage, approved.id).await;
+
+    Ok(Json(approved.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/{build_id}/reject",
+    tag = "Builds",
+    summary = "ビルドを却下",
+    description = "admin 以上が必要。baseline は更新されず、未レビューの比較は rejected になる。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    responses(
+        (status = 200, description = "却下後のビルド", body = BuildResponse),
+        (status = 409, description = "却下できない状態です", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn reject_build(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_session()?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Admin).await?;
+    let rejected = build_service::reject_build(&state.db, build, auth.user_id).await?;
+
+    job::github_status::enqueue_best_effort(&state.github_status_storage, rejected.id).await;
+
+    Ok(Json(rejected.into()))
+}
