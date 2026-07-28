@@ -80,6 +80,9 @@ pub enum BuildStatus {
 
 impl BuildStatus {
     /// 終端状態（これ以上遷移しない）か。
+    ///
+    /// `changes_detected` は**含まない**。パイプラインとしては終わっているが、
+    /// レビューで `approved` / `rejected` に動くため。
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -87,6 +90,31 @@ impl BuildStatus {
                 | BuildStatus::Failed
                 | BuildStatus::Approved
                 | BuildStatus::Rejected
+        )
+    }
+
+    /// **パイプラインが完走した**状態か（= `builds.completed_at` を打つ状態）。
+    ///
+    /// ## `completed_at` のセマンティクス
+    ///
+    /// `completed_at` は「**自動処理が終わった時刻**」であって「レビューが終わった時刻」ではない。
+    /// レンダリングと比較が終わって結果が確定した瞬間（`passed` / `changes_detected` / `failed`）に
+    /// 一度だけ打ち、以降は上書きしない。
+    ///
+    /// こう決めた理由:
+    ///
+    /// - `created_at → completed_at` がそのまま「ビルドにかかった時間」になる。
+    ///   人間が 3 日後に承認した時刻で上書きされると、この差分が意味を失う
+    /// - レビュー結果には専用の列がある（`approved_by` / `approved_at`、
+    ///   比較ごとの `reviewed_by` / `reviewed_at`）。`completed_at` に兼務させない
+    ///
+    /// 旧実装は [`is_terminal`](Self::is_terminal) で判定していたため、
+    /// `changes_detected` だけ `completed_at` が NULL のまま残り、
+    /// 逆に承認・却下の時刻で上書きされていた。
+    pub fn completes_pipeline(self) -> bool {
+        matches!(
+            self,
+            BuildStatus::Passed | BuildStatus::ChangesDetected | BuildStatus::Failed
         )
     }
 

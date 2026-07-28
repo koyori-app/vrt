@@ -1,1 +1,2 @@
 Cargo.lock merge=union
+graphify-out/graph.json merge=graphify

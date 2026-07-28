@@ -16,3 +16,4 @@ storage-dev/
 # e2e が backend をローカル起動するときのアップロード先
 apps/backend/.uploads
 e2e/.uploads
+docker-compose.override.yml

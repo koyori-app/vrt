@@ -172,7 +172,9 @@ pub async fn count_builds<C: ConnectionTrait>(db: &C, project_id: Uuid) -> Resul
 
 /// 状態遷移。許可されていない遷移は [`AppError::Conflict`]。
 ///
-/// 終端状態（passed / failed / approved / rejected）に入るときは `completed_at` を打つ。
+/// パイプラインが完走した状態（passed / changes_detected / failed）に入るときに
+/// `completed_at` を打つ。承認・却下では触らない
+/// （セマンティクスは [`BuildStatus::completes_pipeline`] 参照）。
 pub async fn transition<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
@@ -184,7 +186,7 @@ pub async fn transition<C: ConnectionTrait>(
 
     let mut active: builds::ActiveModel = build.into();
     active.status = Set(to);
-    if to.is_terminal() {
+    if to.completes_pipeline() {
         active.completed_at = Set(Some(Utc::now().fixed_offset()));
     }
     Ok(active.update(db).await?)
@@ -357,11 +359,16 @@ pub async fn approve_build(
                 .await?;
             }
 
+            // 承認時刻は `approved_at`。`completed_at`（自動処理が終わった時刻）は
+            // 比較フェーズで打ったものを保持する。未設定の古い行だけ埋める。
+            let backfill = build.completed_at.is_none();
             let mut active: builds::ActiveModel = build.into();
             active.status = Set(BuildStatus::Approved);
             active.approved_by = Set(Some(reviewer_id));
             active.approved_at = Set(Some(now));
-            active.completed_at = Set(Some(now));
+            if backfill {
+                active.completed_at = Set(Some(now));
+            }
             Ok(active.update(txn).await?)
         })
     })
@@ -411,9 +418,14 @@ pub async fn reject_build<C: ConnectionTrait>(
     let now = Utc::now().fixed_offset();
     let build_id = build.id;
 
+    // 却下は比較フェーズの完了時刻を動かさない（承認と同じ方針）。
+    // 却下の時刻は比較ごとの `reviewed_at` に残る。
+    let backfill = build.completed_at.is_none();
     let mut active: builds::ActiveModel = build.into();
     active.status = Set(BuildStatus::Rejected);
-    active.completed_at = Set(Some(now));
+    if backfill {
+        active.completed_at = Set(Some(now));
+    }
     let updated = active.update(db).await?;
 
     // 未レビューの比較は rejected に倒す。

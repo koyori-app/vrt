@@ -23,6 +23,22 @@ import { createFileRoute } from "@tanstack/react-router";
 /** 25MB, matching the backend's per-screenshot multipart limit. */
 export const MAX_PROXY_BODY_BYTES = Number(process.env.UPLOAD_MAX_SIZE_MB ?? 25) * 1024 * 1024;
 
+/**
+ * 200MB, matching the backend's Storybook bundle limit
+ * (`service::render::MAX_BUNDLE_BYTES`). The bundle route is the only endpoint
+ * that legitimately carries hundreds of megabytes, so the cap is path-aware
+ * rather than globally raised: everything else stays at the 25MB screenshot cap.
+ */
+export const MAX_BUNDLE_PROXY_BODY_BYTES =
+  Number(process.env.BUNDLE_MAX_SIZE_MB ?? 200) * 1024 * 1024;
+
+const BUNDLE_PATH = /^\/api\/v1\/ci\/builds\/[^/]+\/storybook\/?$/;
+
+/** Per-path body cap. Bodies stream through, so this only bounds the byte count. */
+export function maxBodyBytesForPath(pathname: string): number {
+  return BUNDLE_PATH.test(pathname) ? MAX_BUNDLE_PROXY_BODY_BYTES : MAX_PROXY_BODY_BYTES;
+}
+
 const API_BASE = process.env.API_BASE ?? "http://localhost:3500";
 
 const HOP_BY_HOP = new Set([
@@ -39,6 +55,12 @@ const HOP_BY_HOP = new Set([
   // content-encoding/content-length would describe bytes we no longer send.
   "content-encoding",
   "content-length",
+  // `Expect: 100-continue` is a hop-by-hop negotiation between the client and
+  // *this* proxy; Node's HTTP server already answered it before the handler ran.
+  // Forwarding it makes undici throw `NotSupportedError: expect header not
+  // supported`, which surfaces as a failed upstream fetch. curl sends this
+  // automatically for bodies over 1KB, so every multi-MB upload hit it.
+  "expect",
 ]);
 
 class BodyTooLargeError extends Error {
@@ -68,12 +90,12 @@ function copyHeaders(source: Headers): Headers {
   return headers;
 }
 
-function rejectIfContentLengthTooLarge(request: Request): Response | null {
+function rejectIfContentLengthTooLarge(request: Request, maxBytes: number): Response | null {
   const contentLength = request.headers.get("content-length");
   if (!contentLength) return null;
   const length = Number(contentLength);
   if (!Number.isFinite(length) || length < 0) return null;
-  if (length > MAX_PROXY_BODY_BYTES) return new Response("Payload Too Large", { status: 413 });
+  if (length > maxBytes) return new Response("Payload Too Large", { status: 413 });
   return null;
 }
 
@@ -120,13 +142,14 @@ export function limitReadableStream(
 }
 
 async function proxyToBackend(request: Request): Promise<Response> {
-  const rejected = rejectIfContentLengthTooLarge(request);
+  const maxBodyBytes = maxBodyBytesForPath(new URL(request.url).pathname);
+  const rejected = rejectIfContentLengthTooLarge(request, maxBodyBytes);
   if (rejected) return rejected;
 
   const backendUrl = buildBackendUrl(request);
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   const limited =
-    hasBody && request.body ? limitReadableStream(request.body, MAX_PROXY_BODY_BYTES) : undefined;
+    hasBody && request.body ? limitReadableStream(request.body, maxBodyBytes) : undefined;
 
   try {
     const backendResponse = await fetch(backendUrl, {
@@ -152,7 +175,19 @@ async function proxyToBackend(request: Request): Promise<Response> {
     ) {
       return new Response("Payload Too Large", { status: 413 });
     }
-    throw error;
+    // 上流への fetch が失敗した（接続拒否・接続リセット・上流が過大ボディで
+    // 中断した等）。ここで投げ返すと Start のエラー境界が
+    // `{"status":500,"unhandled":true,"message":"HTTPError"}` を返してしまい、
+    // 障害がプロキシ側なのか API 側なのか区別がつかなくなる。502 に正規化する。
+    console.error("[api-proxy] upstream request failed", {
+      url: backendUrl,
+      method: request.method,
+      error,
+    });
+    return new Response(JSON.stringify({ message: "upstream request failed" }), {
+      status: 502,
+      headers: { "content-type": "application/json" },
+    });
   }
 }
 

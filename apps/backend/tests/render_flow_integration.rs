@@ -39,10 +39,21 @@ const VIEWPORT_HEIGHT: u32 = 240;
 
 // ── フィクスチャ ────────────────────────────────────────────────────────
 
-/// ストーリー 2 件 + docs 1 件の最小 index。
+/// ストーリー 3 件 + docs 1 件の最小 index。
+///
+/// `demo-box--empty` は**何も描かない**ストーリー。DOM ヒューリスティックだけの
+/// 旧実装ではここで 30 秒タイムアウトし、ビルドが丸ごと落ちていた
+/// （実バンドルの `auth-passwordstrengthbar--empty` と同じ形）。
 const INDEX_JSON: &str = r#"{
   "v": 5,
   "entries": {
+    "demo-box--empty": {
+      "type": "story",
+      "id": "demo-box--empty",
+      "title": "Demo/Box",
+      "name": "Empty",
+      "importPath": "./src/Box.stories.tsx"
+    },
     "demo-box--red": {
       "type": "story",
       "id": "demo-box--red",
@@ -71,6 +82,9 @@ const INDEX_JSON: &str = r#"{
 ///
 /// - フォントもアニメーションも使わない（= ピクセルが揺れない）
 /// - `RED_OVERRIDE` を差し替えると「変更のあった 2 回目のビルド」を作れる
+/// - 本物の Storybook と同じく `window.__STORYBOOK_ADDONS_CHANNEL__` を**後から**代入し、
+///   描画後に `storyRendered` を撃つ。レンダラのシグナル経路を通す
+/// - `demo-box--empty` は何も描かずにシグナルだけ出す（空ストーリーは正当な白紙）
 fn iframe_html(red: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -80,19 +94,60 @@ fn iframe_html(red: &str) -> String {
 <div id="storybook-root"></div>
 <script>
   var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {{}};
+  var channel = {{
+    on: function (event, cb) {{ (listeners[event] = listeners[event] || []).push(cb); }},
+    emit: function (event, payload) {{
+      (listeners[event] || []).forEach(function (cb) {{ cb(payload); }});
+    }}
+  }};
   var colors = {{ 'demo-box--red': '{red}', 'demo-box--blue': '#0000ff' }};
-  var el = document.createElement('div');
-  el.style.width = '100vw';
-  el.style.height = '100vh';
-  el.style.background = colors[id] || '#00ff00';
-  document.getElementById('storybook-root').appendChild(el);
+  setTimeout(function () {{
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    if (id !== 'demo-box--empty') {{
+      var el = document.createElement('div');
+      el.style.width = '100vw';
+      el.style.height = '100vh';
+      el.style.background = colors[id] || '#00ff00';
+      document.getElementById('storybook-root').appendChild(el);
+    }}
+    channel.emit('storyRendered', id);
+  }}, 0);
 </script>
 </body>
 </html>"#
     )
 }
 
+/// バンドルに混ぜる「実バンドルらしさ」のためのダミー資産のサイズ。
+///
+/// axum の `DefaultBodyLimit` 既定値（2MB）を必ず超えるようにしてある。
+/// 実際の storybook-static は JS チャンクだけで軽く数 MB あり、
+/// 上限を上げ忘れると 400（`Error parsing multipart/form-data request`）になる。
+/// この定数のおかげで通常の統合テストが常にその回帰を踏む。
+const PADDING_BYTES: usize = 2_621_440; // 2.5MiB
+
+/// 圧縮の効かないバイト列（xorshift による決定的な擬似乱数）。
+///
+/// Deflate で縮んでしまうと転送量が上限を超えず、回帰テストにならない。
+fn incompressible_bytes(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 /// `storybook-static/` 相当を zip に固める（アーカイブ直下に index.json を置く形）。
+///
+/// `index.json` / `iframe.html` に加えて、非圧縮（stored）の 2.5MiB ダミー資産を
+/// 1 つ入れる。これでアップロードは必ず 2MB を超え、`DefaultBodyLimit` の
+/// 引き上げ漏れがテストで検出できる。
 fn bundle_zip(red: &str) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
@@ -108,9 +163,26 @@ fn bundle_zip(red: &str) -> Vec<u8> {
                 .write_all(contents.as_bytes())
                 .expect("write zip entry");
         }
+
+        // Stored（無圧縮）で入れる。zip 全体が 2.5MiB 超になる。
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("assets/chunk.bin", stored)
+            .expect("start padding entry");
+        writer
+            .write_all(&incompressible_bytes(PADDING_BYTES))
+            .expect("write padding entry");
+
         writer.finish().expect("finish zip");
     }
-    buf.into_inner()
+    let zip = buf.into_inner();
+    assert!(
+        zip.len() > PADDING_BYTES,
+        "padded bundle must exceed the old 2MB body limit (got {} bytes)",
+        zip.len()
+    );
+    zip
 }
 
 // ── セットアップ ────────────────────────────────────────────────────────
@@ -237,6 +309,7 @@ impl Fixture {
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
             if !matches!(status.as_str(), "pending" | "rendering" | "processing") {
+                assert_completed_at_is_stamped(&build);
                 return build;
             }
             if std::time::Instant::now() >= deadline {
@@ -270,6 +343,22 @@ impl Fixture {
             .expect("comparisons array")
             .clone()
     }
+}
+
+/// パイプラインが完走した状態なら `completed_at` が必ず入っていること。
+///
+/// `changes_detected` は `is_terminal()` が false なので、旧実装ではここだけ
+/// NULL のまま残っていた（実機のドッグフードで発覚）。
+fn assert_completed_at_is_stamped(build: &Value) {
+    let status = build["status"].as_str().unwrap_or_default();
+    if !matches!(status, "passed" | "changes_detected" | "failed") {
+        return;
+    }
+    assert!(
+        build["completed_at"].as_str().is_some(),
+        "build in status {status:?} must carry completed_at, got {:?}",
+        build["completed_at"]
+    );
 }
 
 fn build_id_of(build: &Value) -> Uuid {
@@ -357,15 +446,19 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
     );
     assert_eq!(
         build1["total_count"].as_i64(),
-        Some(2),
+        Some(3),
         "docs entry skipped"
     );
-    assert_eq!(build1["added_count"].as_i64(), Some(2));
+    assert_eq!(build1["added_count"].as_i64(), Some(3));
 
     // サーバーが撮ったスクリーンショットは `{title}/{name}` で並ぶ。
+    // 何も描かない Empty も 1 枚（白紙）として撮れていること。
     let shots = fx.screenshots(build1_id).await;
     let names: Vec<&str> = shots.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["Demo/Box/Blue", "Demo/Box/Red"]);
+    assert_eq!(
+        names,
+        vec!["Demo/Box/Blue", "Demo/Box/Empty", "Demo/Box/Red"]
+    );
 
     for shot in &shots {
         // 撮影サイズはプロジェクトのビューポート設定どおり。
@@ -398,6 +491,17 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "force approve build 1");
+    let approved: Value = res.json().await.expect("approve json");
+
+    // 承認は「自動処理が終わった時刻」を動かさない。承認の時刻は approved_at。
+    assert_eq!(
+        approved["completed_at"], build1["completed_at"],
+        "approving must not overwrite completed_at (it is the pipeline finish time)"
+    );
+    assert!(
+        approved["approved_at"].as_str().is_some(),
+        "approving must stamp approved_at"
+    );
 
     // ── ビルド #2: 同じバンドル → 差分ゼロ（レンダリングが決定的なことの証明）
     let build2 = fx.create_storybook_build("sb00002").await;
@@ -417,7 +521,7 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
         "identical bundle renders identically (error: {:?})",
         build2["error_message"]
     );
-    assert_eq!(build2["unchanged_count"].as_i64(), Some(2));
+    assert_eq!(build2["unchanged_count"].as_i64(), Some(3));
 
     // ── ビルド #3: 赤 → 緑に変えたバンドル → 1 枚だけ changed ────────────
     let build3 = fx.create_storybook_build("sb00003").await;
@@ -438,7 +542,7 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
         build3["error_message"]
     );
     assert_eq!(build3["changed_count"].as_i64(), Some(1));
-    assert_eq!(build3["unchanged_count"].as_i64(), Some(1));
+    assert_eq!(build3["unchanged_count"].as_i64(), Some(2));
 
     let cmps = fx.comparisons(build3_id).await;
     let changed: Vec<&str> = cmps
@@ -501,6 +605,37 @@ async fn non_zip_uploads_are_rejected() {
         fx.finalize(build_id).await.status(),
         StatusCode::BAD_REQUEST
     );
+}
+
+/// 2MB を超えるバンドルが受け付けられる（axum の既定ボディ上限の回帰テスト）。
+///
+/// `DefaultBodyLimit` を上げていないと `Multipart` が 2MB で読み込みを打ち切り、
+/// ハンドラは 400（`invalid file field: Error parsing multipart/form-data request`）
+/// を返す。実際の storybook-static は数 MB〜数十 MB あるので、これが本番の障害だった。
+/// Chromium を必要としないので、どの環境でも必ず走る。
+#[tokio::test(flavor = "multi_thread")]
+async fn bundles_larger_than_the_default_body_limit_are_accepted() {
+    let fx = setup().await;
+
+    let build = fx.create_storybook_build("sb0big1").await;
+    let build_id = build_id_of(&build);
+
+    let zip = bundle_zip("#ff0000");
+    assert!(
+        zip.len() > 2 * 1024 * 1024,
+        "fixture must exceed axum's 2MB default body limit, got {} bytes",
+        zip.len()
+    );
+
+    let res = fx.upload_bundle(build_id, zip).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "multi-megabyte bundle upload"
+    );
+
+    let build = fx.get_build(build_id).await;
+    assert_eq!(build["storybook_uploaded"].as_bool(), Some(true));
 }
 
 /// screenshots モードのビルドにバンドルを投げるのは 409。

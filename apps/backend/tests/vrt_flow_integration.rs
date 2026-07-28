@@ -49,6 +49,44 @@ fn png_with_rect(
     encode(&image)
 }
 
+/// 圧縮の効かないノイズ PNG。エンコード後でも 2.5MiB を超える。
+///
+/// axum の `DefaultBodyLimit`（既定 2MB）を実際に踏み越えるためのフィクスチャなので、
+/// 単色 PNG のように縮んでしまっては意味がない。決定的な xorshift でノイズを作る。
+fn noise_png(width: u32, height: u32) -> Vec<u8> {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut image = RgbaImage::new(width, height);
+    for pixel in image.pixels_mut() {
+        let r = next().to_le_bytes();
+        *pixel = Rgba([r[0], r[1], r[2], 255]);
+    }
+    encode(&image)
+}
+
+/// パイプラインが完走した状態なら `completed_at` が必ず入っていること。
+///
+/// `completed_at` は「自動処理が終わった時刻」。`changes_detected` は
+/// `is_terminal()` が false（レビューでまだ動く）なので、旧実装ではここだけ
+/// NULL のまま残っていた。`created_at → completed_at` を所要時間として読むには、
+/// 3 つの完走状態すべてで埋まっている必要がある。
+fn assert_completed_at_is_stamped(build: &Value) {
+    let status = build["status"].as_str().unwrap_or_default();
+    if !matches!(status, "passed" | "changes_detected" | "failed") {
+        return;
+    }
+    assert!(
+        build["completed_at"].as_str().is_some(),
+        "build in status {status:?} must carry completed_at, got {:?}",
+        build["completed_at"]
+    );
+}
+
 fn encode(image: &RgbaImage) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     image
@@ -155,6 +193,7 @@ impl Fixture {
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
             if !matches!(status.as_str(), "pending" | "processing") {
+                assert_completed_at_is_stamped(&build);
                 return build;
             }
             if std::time::Instant::now() >= deadline {
@@ -598,6 +637,31 @@ async fn duplicate_screenshot_name_is_conflict() {
         fx.upload(build_id, "home", png(8, 8, [4, 5, 6, 255])).await,
         StatusCode::CONFLICT,
         "duplicate screenshot name in one build must be rejected"
+    );
+}
+
+/// 2MB を超える PNG が受け付けられる（axum の既定ボディ上限の回帰テスト）。
+///
+/// `DefaultBodyLimit` を 25MB に上げていないと、`Multipart` が 2MB で読み込みを
+/// 打ち切って 400（`Error parsing multipart/form-data request`）になる。
+/// 実機のフルページスクリーンショットは平気で 2MB を超える。
+#[tokio::test(flavor = "multi_thread")]
+async fn screenshots_larger_than_the_default_body_limit_are_accepted() {
+    let fx = setup().await;
+    let build = fx.create_build("main", "bigpng01").await;
+    let build_id = build_id_of(&build);
+
+    let png = noise_png(1024, 1024);
+    assert!(
+        png.len() > 2 * 1024 * 1024,
+        "fixture must exceed axum's 2MB default body limit, got {} bytes",
+        png.len()
+    );
+
+    assert_eq!(
+        fx.upload(build_id, "home", png).await,
+        StatusCode::CREATED,
+        "multi-megabyte screenshot upload"
     );
 }
 

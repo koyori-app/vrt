@@ -6,8 +6,28 @@
 //!    ループバック限定なので外部からは触れない
 //! 2. [`StoryRenderer`] が chromiumoxide で Chromium を起動し、
 //!    `http://127.0.0.1:{port}/iframe.html?id={story_id}&viewMode=story` を開く
-//! 3. `#storybook-root` に中身が入る（= ストーリーが描画された）まで
-//!    ポーリングし、短い settle 待ちのあとビューポートを PNG で撮る
+//! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
+//!    短い settle 待ちのあとビューポートを PNG で撮る
+//!
+//! ## 描画完了の判定
+//!
+//! かつては「`#storybook-root` に子要素が入ったら完了」という DOM ヒューリスティックだった。
+//! これは**中身が空のストーリーで永久に成立しない**。実際に
+//! `v-if="strength"` で何も描かない `PasswordStrengthBar` の `strength ''` が
+//! 30 秒タイムアウトでビルドを落とした。空の描画結果は正当な「真っ白なスクリーンショット」であって、
+//! 失敗ではない。
+//!
+//! そこで判定はシグナル優先の 2 段構えにする。
+//!
+//! 1. **Storybook のシグナル（主）**: ナビゲーション前に [`READY_HOOK_SCRIPT`] を注入し、
+//!    `window.__STORYBOOK_ADDONS_CHANNEL__` に生えた瞬間へリスナーを差し込む。
+//!    `storyRendered` で完了、`storyErrored` / `storyThrewException` /
+//!    `playFunctionThrewException` / `storyMissing` はそのストーリーのエラーとして扱う
+//!    （30 秒待たされずに理由が出る）。チャンネルを掴み損ねた場合の保険として
+//!    `__STORYBOOK_PREVIEW__.storyRenders[].phase` も見る
+//! 2. **DOM フォールバック（従）**: Storybook ランタイムがまったく存在しないバンドル
+//!    （手書きの最小 iframe.html など）でだけ効く。ランタイムの起動を待ち損ねないよう
+//!    [`SIGNAL_GRACE`] の猶予を置いてから、旧ヒューリスティックで判定する
 //!
 //! ## 後始末
 //!
@@ -39,15 +59,101 @@ pub const DEFAULT_STORY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const SETTLE_DELAY: Duration = Duration::from_millis(250);
 /// 描画完了判定のポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Storybook ランタイムの起動を待つ猶予。
+///
+/// これを過ぎてもチャンネルもプレビューも現れないバンドルは
+/// 「Storybook ランタイムを持たない」と判断して DOM ヒューリスティックに落ちる。
+/// 短すぎるとランタイム起動前の DOM で誤判定し、長すぎると手書きバンドルが遅くなる。
+pub const SIGNAL_GRACE: Duration = Duration::from_millis(1500);
 
-/// 描画完了の判定式。`#storybook-root`（7 以降）か `#root`（6 系）に子要素が入ったら完了とみなす。
-const READY_EXPRESSION: &str = r#"
+/// ナビゲーション前に document へ注入するフック。
+///
+/// `__STORYBOOK_ADDONS_CHANNEL__` はプレビューランタイムが**後から**代入するので、
+/// アクセサを先に張っておいて代入の瞬間にリスナーを差し込む。
+/// こうしないと `storyRendered` を取りこぼす（イベントは再送されない）。
+const READY_HOOK_SCRIPT: &str = r#"
 (() => {
-  if (document.readyState !== 'complete' && document.readyState !== 'interactive') return false;
-  const root = document.querySelector('#storybook-root') || document.querySelector('#root');
-  if (!root) return false;
-  return root.childElementCount > 0 || (root.textContent || '').trim().length > 0;
+  if (window.__VRT_READY__) return;
+  const state = { rendered: false, error: null };
+  window.__VRT_READY__ = state;
+
+  const describe = (payload) => {
+    if (payload == null) return 'unknown error';
+    if (typeof payload === 'string') return payload;
+    const err = payload.error || payload;
+    const message = err.message || err.title || err.name;
+    if (message) return String(message);
+    try { return JSON.stringify(payload); } catch (e) { return String(payload); }
+  };
+
+  const attach = (channel) => {
+    if (!channel || typeof channel.on !== 'function' || channel.__vrtAttached) return;
+    channel.__vrtAttached = true;
+    channel.on('storyRendered', () => { state.rendered = true; });
+    // play 関数の例外は「描画は終わったが検証に失敗した」状態。撮影より診断を優先する。
+    for (const event of [
+      'storyErrored',
+      'storyThrewException',
+      'playFunctionThrewException',
+      'unhandledErrorsWhilePlaying',
+    ]) {
+      channel.on(event, (payload) => {
+        if (!state.error) state.error = event + ': ' + describe(payload);
+      });
+    }
+    channel.on('storyMissing', (id) => {
+      if (!state.error) state.error = 'storyMissing: ' + String(id);
+    });
+  };
+
+  let channel = window.__STORYBOOK_ADDONS_CHANNEL__;
+  try {
+    Object.defineProperty(window, '__STORYBOOK_ADDONS_CHANNEL__', {
+      configurable: true,
+      get: () => channel,
+      set: (value) => { channel = value; attach(value); },
+    });
+  } catch (e) {
+    // 定義できない環境ではポーリング側の保険（storyRenders）に任せる。
+  }
+  attach(channel);
 })()
+"#;
+
+/// 描画状態を問い合わせる式。JSON 文字列を返す（`state` は ready / error / pending / absent）。
+///
+/// `absent` は「Storybook ランタイムが見当たらない」。呼び出し側が
+/// [`SIGNAL_GRACE`] 経過後に `dom_ready` を見て判断する。
+const READY_PROBE: &str = r#"
+JSON.stringify((() => {
+  const loaded = document.readyState === 'complete' || document.readyState === 'interactive';
+  const root = document.querySelector('#storybook-root') || document.querySelector('#root');
+  const domReady = !!root && (root.childElementCount > 0 || (root.textContent || '').trim().length > 0);
+
+  const hook = window.__VRT_READY__;
+  if (hook && hook.error) return { state: 'error', message: String(hook.error) };
+  if (hook && hook.rendered) return { state: 'ready' };
+
+  // フックがチャンネルを掴めなかったときの保険。SB 8〜10 のプレビューは
+  // 進行中/完了したレンダーを storyRenders に持ち、phase で状態を出す。
+  try {
+    const renders = window.__STORYBOOK_PREVIEW__ && window.__STORYBOOK_PREVIEW__.storyRenders;
+    if (Array.isArray(renders) && renders.length > 0) {
+      const phase = renders[renders.length - 1].phase;
+      if (phase === 'completed') return { state: 'ready' };
+      if (phase === 'errored' || phase === 'aborted') {
+        return { state: 'error', message: 'render phase: ' + String(phase) };
+      }
+      return { state: 'pending', dom_ready: domReady };
+    }
+  } catch (e) {
+    // プレビュー内部形が変わっていても致命ではない。シグナル待ちを続ける。
+  }
+
+  const runtime = !!(window.__STORYBOOK_ADDONS_CHANNEL__ || window.__STORYBOOK_PREVIEW__);
+  if (runtime) return { state: 'pending', dom_ready: domReady };
+  return { state: 'absent', dom_ready: domReady && loaded };
+})())
 "#;
 
 #[derive(Debug, Error)]
@@ -62,12 +168,61 @@ pub enum RenderError {
     Server(String),
     #[error("story `{story_id}` did not render within {timeout:?}")]
     Timeout { story_id: String, timeout: Duration },
+    /// Storybook 自身が「このストーリーは失敗した」と言ってきた場合。
+    /// タイムアウトより遥かに早く、理由つきで返せる。
+    #[error("story `{story_id}` reported a render error: {message}")]
+    Story { story_id: String, message: String },
     #[error("story `{story_id}` failed to render: {source}")]
     Cdp {
         story_id: String,
         #[source]
         source: chromiumoxide::error::CdpError,
     },
+}
+
+/// [`READY_PROBE`] の返り値。
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    /// Storybook が描画完了を通知した（または DOM フォールバックが成立した）。
+    Ready,
+    /// Storybook がこのストーリーの失敗を通知した。
+    Error(String),
+    /// ランタイムはいる。まだ描画中。
+    Pending,
+    /// Storybook ランタイムが見当たらない。`dom_ready` は旧ヒューリスティックの結果。
+    Absent { dom_ready: bool },
+}
+
+impl Readiness {
+    /// プローブが返した JSON 文字列を解釈する。
+    ///
+    /// 壊れた値・想定外の値は「まだ待つ」に倒す。誤って完了扱いにして
+    /// 白紙を撮るより、タイムアウトさせたほうが原因が分かりやすい。
+    fn parse(value: Option<&serde_json::Value>) -> Self {
+        let Some(raw) = value.and_then(|v| v.as_str()) else {
+            return Readiness::Pending;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return Readiness::Pending;
+        };
+        match parsed.get("state").and_then(|v| v.as_str()) {
+            Some("ready") => Readiness::Ready,
+            Some("error") => Readiness::Error(
+                parsed
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            ),
+            Some("absent") => Readiness::Absent {
+                dom_ready: parsed
+                    .get("dom_ready")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            },
+            _ => Readiness::Pending,
+        }
+    }
 }
 
 /// レンダリングのパラメータ。ビューポートはプロジェクト設定から渡す。
@@ -199,16 +354,34 @@ impl StoryRenderer {
     ) -> Result<Vec<u8>, RenderError> {
         let url = story_url(base_url, story_id);
 
+        // 空ページで開いてからフックを仕込み、そのあとで遷移する。
+        // `new_page(url)` で直接開くと、フックが載る前に Storybook が
+        // `storyRendered` を撃ち終えてしまう可能性がある。
         let page = self
             .browser
-            .new_page(url.as_str())
+            .new_page("about:blank")
             .await
             .map_err(|source| RenderError::Cdp {
                 story_id: story_id.to_string(),
                 source,
             })?;
 
-        let result = self.render_on_page(&page, story_id).await;
+        let result = async {
+            page.evaluate_on_new_document(READY_HOOK_SCRIPT)
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+            page.goto(url.as_str())
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+            self.render_on_page(&page, story_id).await
+        }
+        .await;
 
         // 撮影の成否によらずタブは閉じる（開きっぱなしだとメモリを食う）。
         if let Err(e) = page.close().await {
@@ -223,15 +396,31 @@ impl StoryRenderer {
         page: &chromiumoxide::page::Page,
         story_id: &str,
     ) -> Result<Vec<u8>, RenderError> {
-        let deadline = std::time::Instant::now() + self.options.story_timeout;
+        let started = std::time::Instant::now();
+        let deadline = started + self.options.story_timeout;
 
         loop {
-            match page.evaluate(READY_EXPRESSION).await {
-                Ok(result) => {
-                    if result.value().and_then(|v| v.as_bool()).unwrap_or(false) {
-                        break;
+            match page.evaluate(READY_PROBE).await {
+                Ok(result) => match Readiness::parse(result.value()) {
+                    Readiness::Ready => break,
+                    Readiness::Error(message) => {
+                        return Err(RenderError::Story {
+                            story_id: story_id.to_string(),
+                            message,
+                        });
                     }
-                }
+                    // Storybook ランタイムが無いバンドルだけ、猶予を置いて DOM で判定する。
+                    Readiness::Absent { dom_ready } => {
+                        if dom_ready && started.elapsed() >= SIGNAL_GRACE {
+                            tracing::debug!(
+                                %story_id,
+                                "no storybook render signal; falling back to the DOM heuristic"
+                            );
+                            break;
+                        }
+                    }
+                    Readiness::Pending => {}
+                },
                 // ナビゲーション中は実行コンテキストが差し替わって一時的に失敗する。
                 // タイムアウトまではリトライし続ける。
                 Err(e) => {
@@ -404,11 +593,17 @@ mod tests {
         );
     }
 
-    /// 最小の「Storybook っぽい」バンドル。
+    /// 最小の「Storybook っぽい」バンドル（**ランタイム無し**）。
     ///
-    /// 本物の Storybook をビルドしなくても、レンダラが必要とするのは
-    /// 「`?id=` を読んで `#storybook-root` に何か描く `iframe.html`」だけ。
-    /// ここでは id ごとに決まった色の矩形を塗る（= 決定的なスクリーンショット）。
+    /// `?id=` を読んで `#storybook-root` に何か描くだけ。シグナルを一切出さないので、
+    /// DOM フォールバック経路の回帰テストになる。
+    /// Chromium の起動を直列化するロック。
+    ///
+    /// 同じホストで複数インスタンスを同時に起動すると、まれに
+    /// `LaunchExit(status 0)` で即死する（プロファイル/シングルトンの競合）。
+    /// テストの本題ではないので、起動を跨がないように 1 本ずつ動かす。
+    static BROWSER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn write_fixture_bundle(root: &Path) {
         std::fs::write(
             root.join("iframe.html"),
@@ -430,6 +625,75 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// Storybook のアドオンチャンネルを模したバンドル。
+    ///
+    /// 本物と同じく `window.__STORYBOOK_ADDONS_CHANNEL__` を**後から**代入し、
+    /// `storyRendered` / `storyErrored` を撃つ。id で挙動を変える。
+    ///
+    /// - `demo-box--red`   : 塗ってから storyRendered
+    /// - `demo-box--empty` : **何も描かずに** storyRendered（空ストーリーは正当）
+    /// - `demo-box--boom`  : storyErrored
+    fn write_storybook_runtime_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  // 本物のプレビューランタイムと同じく「あとから代入」する。
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      if (id === 'demo-box--boom') {
+        channel.emit('storyErrored', { message: 'kaboom in the play function' });
+        return;
+      }
+      if (id !== 'demo-box--empty') {
+        var el = document.createElement('div');
+        el.style.width = '100%';
+        el.style.height = '100vh';
+        el.style.background = '#ff0000';
+        document.getElementById('storybook-root').appendChild(el);
+      }
+      channel.emit('storyRendered', id);
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    #[test]
+    fn readiness_parses_probe_results() {
+        let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
+
+        assert_eq!(probe(r#"{"state":"ready"}"#), Readiness::Ready);
+        assert_eq!(
+            probe(r#"{"state":"error","message":"storyErrored: boom"}"#),
+            Readiness::Error("storyErrored: boom".to_string())
+        );
+        assert_eq!(
+            probe(r#"{"state":"absent","dom_ready":true}"#),
+            Readiness::Absent { dom_ready: true }
+        );
+        assert_eq!(
+            probe(r#"{"state":"pending","dom_ready":false}"#),
+            Readiness::Pending
+        );
+        // 壊れた値は「まだ待つ」。誤って白紙を撮らない。
+        assert_eq!(probe("not json"), Readiness::Pending);
+        assert_eq!(Readiness::parse(None), Readiness::Pending);
+    }
+
     /// Chromium を実際に起動する煙テスト。実行ファイルが無ければスキップする。
     #[tokio::test(flavor = "multi_thread")]
     async fn renders_a_story_to_a_png_with_the_requested_viewport() {
@@ -441,6 +705,7 @@ mod tests {
             );
             return;
         };
+        let _guard = BROWSER_LOCK.lock().await;
 
         let dir = tempfile::tempdir().expect("tempdir");
         write_fixture_bundle(dir.path());
@@ -479,6 +744,110 @@ mod tests {
             (center[0], center[1], center[2]),
             (255, 0, 0),
             "story content must actually be painted"
+        );
+    }
+
+    /// **中身が空のストーリーでも撮れる**こと（30 秒タイムアウトの回帰テスト）。
+    ///
+    /// `#storybook-root` が空のままでも Storybook が `storyRendered` を出したなら
+    /// 描画は完了している。旧実装（DOM ヒューリスティックのみ）はここでタイムアウトし、
+    /// 実バンドルの `auth-passwordstrengthbar--empty`（`v-if` で何も描かない）で
+    /// ビルドを丸ごと落としていた。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_story_that_renders_nothing_still_produces_a_screenshot() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_story_that_renders_nothing_still_produces_a_screenshot: no chromium");
+            return;
+        };
+
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_runtime_bundle(dir.path());
+
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        // シグナル経路が効いていれば猶予もタイムアウトも待たずに戻るはず。
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let started = std::time::Instant::now();
+        let png = renderer
+            .render_story(&server.base_url(), "demo-box--empty")
+            .await
+            .expect("an empty story is a legitimate blank screenshot");
+        let elapsed = started.elapsed();
+
+        // 塗る側も同じ経路で撮れること（シグナル経路の正常系）。
+        let painted = renderer
+            .render_story(&server.base_url(), "demo-box--red")
+            .await
+            .expect("render painted story");
+        renderer.close().await;
+
+        assert!(
+            elapsed < SIGNAL_GRACE,
+            "the render signal must be used instead of the DOM fallback grace, took {elapsed:?}"
+        );
+
+        let image =
+            image::ImageReader::with_format(std::io::Cursor::new(&png), image::ImageFormat::Png)
+                .decode()
+                .expect("decode screenshot")
+                .to_rgba8();
+        assert_eq!(image.dimensions(), (320, 240));
+        let center = image.get_pixel(160, 120);
+        assert_eq!(
+            (center[0], center[1], center[2]),
+            (255, 255, 255),
+            "an empty story must screenshot as the blank viewport"
+        );
+
+        let painted = image::ImageReader::with_format(
+            std::io::Cursor::new(&painted),
+            image::ImageFormat::Png,
+        )
+        .decode()
+        .expect("decode screenshot")
+        .to_rgba8();
+        let center = painted.get_pixel(160, 120);
+        assert_eq!((center[0], center[1], center[2]), (255, 0, 0));
+    }
+
+    /// `storyErrored` は 30 秒待たずに、理由つきで失敗すること。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_story_error_signal_fails_fast_with_the_reason() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_story_error_signal_fails_fast_with_the_reason: no chromium");
+            return;
+        };
+
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_runtime_bundle(dir.path());
+
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let started = std::time::Instant::now();
+        let err = renderer
+            .render_story(&server.base_url(), "demo-box--boom")
+            .await
+            .expect_err("a story error must fail the story");
+        let elapsed = started.elapsed();
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("kaboom in the play function") && message.contains("storyErrored"),
+            "the error must carry the reason, got {message:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "an error signal must not wait for the timeout, took {elapsed:?}"
         );
     }
 
