@@ -1,0 +1,5 @@
+# Marks e2e as its own pnpm root so `pnpm install` here does not resolve up to
+# the repo-root workspace (which deliberately does not list e2e — a browser
+# download has no business in a `pnpm install` at the root).
+packages: []
+saveExact: true

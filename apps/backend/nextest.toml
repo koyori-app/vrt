@@ -1,0 +1,4 @@
+[profile.default]
+# Integration tests share a single PostgreSQL database,
+# so they must run serially to avoid data races.
+test-threads = 1

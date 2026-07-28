@@ -1,0 +1,10 @@
+[package]
+name = "entity"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sea-orm = { workspace = true, features = ["with-chrono", "postgres-array"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }

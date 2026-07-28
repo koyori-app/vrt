@@ -1,0 +1,22 @@
+[package]
+name = "job"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+common = { path = "../common" }
+entity = { path = "../entity" }
+anyhow = { workspace = true }
+service = { path = "../service" }
+apalis = { version = "1.0.0-rc.9", features = ["limit", "retry", "tracing"] }
+apalis-postgres = { version = "1.0.0-rc.8", default-features = false, features = ["migrate", "tokio-comp", "time"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest = { workspace = true }
+sea-orm = { workspace = true, features = ["with-chrono", "postgres-array"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# apalis-postgres 1.0.0-rc.8 が使う sqlx と同じメジャー系に合わせる（PgPool の型が一致する必要がある）。
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "sync"] }
+tracing = { workspace = true }
+uuid = { version = "1", features = ["serde"] }

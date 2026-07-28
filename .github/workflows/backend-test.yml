@@ -1,0 +1,71 @@
+name: Backend Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/backend/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/backend-test.yml'
+  pull_request:
+    paths:
+      - 'apps/backend/**'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/backend-test.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # No `services:` block on purpose. apps/backend/tests/common/mod.rs starts
+    # Postgres and Valkey with testcontainers whenever DATABASE_URL / REDIS_URL
+    # are unset, and it starts Postgres with `max_connections=500` — one test
+    # binary keeps up to nine live app instances, each holding a SeaORM pool and
+    # an apalis pool. A GitHub `services:` Postgres is stuck on the default 100
+    # and the suite would flake on PoolTimedOut. Docker is available on the
+    # runner, so let the tests own their own containers, exactly as they do
+    # locally.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/backend -> target
+
+      - name: Pre-pull test container images
+        run: |
+          docker pull postgres:17
+          docker pull valkey/valkey:8.1
+
+      # `cargo test`, not `cargo nextest`: nextest runs every test in its own
+      # process, and each process would spin up its own pair of testcontainers.
+      - name: Run tests
+        run: cargo test --workspace
+        working-directory: apps/backend

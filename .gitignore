@@ -1,0 +1,18 @@
+.env
+*.rdb
+
+.worktrees/
+node_modules
+target/
+dist/
+apps/frontend/src/generated
+apps/frontend/.tanstack
+apps/frontend/.output
+apps/frontend/.nitro
+e2e/test-results
+e2e/playwright-report
+storage-dev/
+
+# e2e が backend をローカル起動するときのアップロード先
+apps/backend/.uploads
+e2e/.uploads

@@ -1,0 +1,21 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+entity = { path = "../entity" }
+anyhow = { workspace = true }
+axum = { workspace = true }
+config = { workspace = true }
+dotenvy = { workspace = true }
+redis = { workspace = true }
+redis_pool = { workspace = true }
+regex = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+utoipa = { workspace = true }
+validator = { workspace = true }

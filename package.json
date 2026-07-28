@@ -1,0 +1,12 @@
+{
+  "name": "koyori-vrt",
+  "private": true,
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "9.1.7",
+    "lint-staged": "17.1.0"
+  }
+}
