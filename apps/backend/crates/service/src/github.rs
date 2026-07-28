@@ -197,6 +197,10 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
 
     match build.status {
         Pending => (CommitState::Pending, "Waiting for screenshots".to_string()),
+        Rendering => (
+            CommitState::Pending,
+            "Rendering stories from the Storybook bundle".to_string(),
+        ),
         Processing => (
             CommitState::Pending,
             "Comparing screenshots against baseline".to_string(),
@@ -420,6 +424,8 @@ mod tests {
             commit_message: None,
             pull_request_number: None,
             status,
+            mode: builds::BuildMode::Screenshots,
+            storybook_key: None,
             baseline_id: None,
             total_count: 0,
             changed_count: changed,
@@ -528,6 +534,7 @@ mod tests {
             s3_secret_access_key: None,
             s3_public_base_url: None,
             s3_force_path_style: None,
+            chromium_path: None,
             test_login_enabled: false,
         };
         assert!(github_app(&settings, &http).is_none());
@@ -568,6 +575,7 @@ mod tests {
             s3_secret_access_key: None,
             s3_public_base_url: None,
             s3_force_path_style: None,
+            chromium_path: None,
             test_login_enabled: false,
         };
         assert_eq!(settings.github_api_base_url(), "https://api.github.com");

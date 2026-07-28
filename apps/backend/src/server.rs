@@ -16,7 +16,7 @@ use utoipa_scalar::{Scalar, Servable};
 use handler::AppState;
 use handler::middlewares::logging::logging_middleware;
 use job::JobState;
-use job::{compare_build, github_status, github_webhook};
+use job::{compare_build, github_status, github_webhook, render_build};
 
 /// `AppState` からワーカー用の依存だけを取り出す。
 ///
@@ -30,6 +30,7 @@ pub fn job_state_from(state: &AppState) -> JobState {
         storage: state.storage.clone(),
         http: state.http.clone(),
         github_status_storage: state.github_status_storage.clone(),
+        compare_build_storage: state.compare_build_storage.clone(),
     }
 }
 
@@ -105,6 +106,32 @@ pub fn spawn_github_status_worker(
         .concurrency(github_status::WORKER_CONCURRENCY)
         .data(job_state)
         .build(github_status::process);
+
+    tokio::spawn(async move { worker.run_until(wait_for_shutdown(shutdown)).await })
+}
+
+/// `RenderBuildJob` のワーカーを spawn する（ワーカー名の一意性は [`worker_name`] 参照）。
+///
+/// Chromium を起動するため 1 ジョブが重い。同時実行数は
+/// [`render_build::WORKER_CONCURRENCY`]（= 1）に絞る。
+pub fn spawn_render_build_worker(
+    state: &AppState,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<Result<(), apalis::prelude::WorkerError>> {
+    let storage = state.render_build_storage.as_ref().clone();
+    let job_state = job_state_from(state);
+
+    let queue = storage.config().queue().to_string();
+    let name = worker_name(&queue);
+    info!(%queue, worker = %name, "starting render_build worker");
+
+    let worker = WorkerBuilder::new(name)
+        .backend(storage)
+        .retry(RetryPolicy::retries(render_build::MAX_RETRIES))
+        .enable_tracing()
+        .concurrency(render_build::WORKER_CONCURRENCY)
+        .data(job_state)
+        .build(render_build::process);
 
     tokio::spawn(async move { worker.run_until(wait_for_shutdown(shutdown)).await })
 }
@@ -190,7 +217,17 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let compare_worker_handle = spawn_compare_build_worker(&state, shutdown_rx.clone());
     let github_status_worker_handle = spawn_github_status_worker(&state, shutdown_rx.clone());
-    let github_webhook_worker_handle = spawn_github_webhook_worker(&state, shutdown_rx);
+    let github_webhook_worker_handle = spawn_github_webhook_worker(&state, shutdown_rx.clone());
+    let render_worker_handle = spawn_render_build_worker(&state, shutdown_rx);
+
+    if state.settings.storybook_render_enabled() {
+        info!(
+            chromium = %state.settings.chromium_path.clone().unwrap_or_default(),
+            "storybook rendering enabled"
+        );
+    } else {
+        warn!("CHROMIUM_PATH is not set; storybook-mode builds will be rejected at creation");
+    }
 
     let api = router
         .merge(Scalar::with_url("/scalar", openapi.clone()))
@@ -220,6 +257,7 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
         ("compare build", compare_worker_handle),
         ("github status", github_status_worker_handle),
         ("github webhook", github_webhook_worker_handle),
+        ("render build", render_worker_handle),
     ] {
         match handle.await {
             Ok(Ok(())) => info!("{label} worker stopped"),

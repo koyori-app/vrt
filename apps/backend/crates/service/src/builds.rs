@@ -14,7 +14,7 @@ use sea_orm::{
 use common::db::with_transaction;
 use common::error::AppError;
 use entity::{
-    baseline_entries, baselines, builds, builds::BuildStatus, comparisons,
+    baseline_entries, baselines, builds, builds::BuildMode, builds::BuildStatus, comparisons,
     comparisons::ComparisonStatus, comparisons::ReviewStatus, projects, screenshots,
 };
 
@@ -70,6 +70,10 @@ pub async fn next_build_number<C: ConnectionTrait>(
 }
 
 /// 新しいビルドを `pending` で作成する。
+///
+/// `mode` は入力形式。`storybook` のときは screenshot のアップロードを受け付けず、
+/// 代わりに `POST /v1/ci/builds/{id}/storybook` でバンドルを受け取る。
+#[allow(clippy::too_many_arguments)]
 pub async fn create_build<C: ConnectionTrait>(
     db: &C,
     project_id: Uuid,
@@ -77,6 +81,7 @@ pub async fn create_build<C: ConnectionTrait>(
     commit_sha: String,
     commit_message: Option<String>,
     pull_request_number: Option<i32>,
+    mode: BuildMode,
 ) -> Result<builds::Model, AppError> {
     if branch.trim().is_empty() {
         return Err(AppError::BadRequestDetail("branch is required".into()));
@@ -96,6 +101,8 @@ pub async fn create_build<C: ConnectionTrait>(
         commit_message: Set(commit_message),
         pull_request_number: Set(pull_request_number),
         status: Set(BuildStatus::Pending),
+        mode: Set(mode),
+        storybook_key: Set(None),
         baseline_id: Set(None),
         total_count: Set(0),
         changed_count: Set(0),
@@ -189,6 +196,45 @@ pub async fn finalize<C: ConnectionTrait>(
     build: builds::Model,
 ) -> Result<builds::Model, AppError> {
     transition(db, build, BuildStatus::Processing).await
+}
+
+/// storybook モードの finalize: `pending → rendering`。
+///
+/// バンドルが未アップロードなら 409（`RenderBuildJob` が拾うものが無いため）。
+/// ジョブ投入は呼び出し側（ハンドラ）が行う。
+pub async fn finalize_storybook<C: ConnectionTrait>(
+    db: &C,
+    build: builds::Model,
+) -> Result<builds::Model, AppError> {
+    if build.storybook_key.is_none() {
+        return Err(AppError::BadRequestDetail(
+            "storybook bundle has not been uploaded for this build".into(),
+        ));
+    }
+    transition(db, build, BuildStatus::Rendering).await
+}
+
+/// アップロードされた Storybook バンドルのストレージキーを記録する。
+///
+/// 1 ビルドにつき 1 本だけ。既に記録済みなら [`AppError::Conflict`]。
+pub async fn attach_storybook_bundle<C: ConnectionTrait>(
+    db: &C,
+    build: builds::Model,
+    key: String,
+) -> Result<builds::Model, AppError> {
+    if build.mode != BuildMode::Storybook {
+        return Err(AppError::Conflict);
+    }
+    if build.status != BuildStatus::Pending {
+        return Err(AppError::Conflict);
+    }
+    if build.storybook_key.is_some() {
+        return Err(AppError::Conflict);
+    }
+
+    let mut active: builds::ActiveModel = build.into();
+    active.storybook_key = Set(Some(key));
+    Ok(active.update(db).await?)
 }
 
 /// 比較結果のカウントを集計して build に書き戻す。

@@ -22,10 +22,11 @@ use crate::error::{AppError, ServerError};
 use crate::extractors::AuthUser;
 use crate::handlers::builds::load_build_with_role;
 use crate::openapi::{CrudErrors, SessionAuthErrors};
-use entity::{builds::BuildStatus, scopes::Scope, tenant_members::TenantRole};
+use entity::{builds::BuildMode, builds::BuildStatus, scopes::Scope, tenant_members::TenantRole};
 use payload::builds::*;
 use service::builds as build_service;
 use service::projects as project_service;
+use service::render as render_service;
 use service::screenshots::{self as screenshot_service, MAX_UPLOAD_BYTES};
 use service::tenants as tenant_service;
 
@@ -105,6 +106,16 @@ pub async fn create_build(
     )
     .await?;
 
+    let mode = payload.mode.unwrap_or_default();
+
+    // Chromium が無いサーバーで storybook ビルドを作らせると、
+    // finalize 後に必ずジョブが落ちる。作成時点で断る。
+    if mode == BuildMode::Storybook && !state.settings.storybook_render_enabled() {
+        return Err(AppError::BadRequestDetail(
+            "storybook rendering not configured".into(),
+        ));
+    }
+
     let build = build_service::create_build(
         &state.db,
         project.id,
@@ -112,6 +123,7 @@ pub async fn create_build(
         payload.commit_sha,
         payload.commit_message,
         payload.pull_request_number,
+        mode,
     )
     .await?;
 
@@ -149,6 +161,10 @@ pub async fn upload_screenshot(
 
     // finalize 後のアップロードは受け付けない。
     if build.status != BuildStatus::Pending {
+        return Err(AppError::Conflict);
+    }
+    // storybook モードのビルドはサーバー側が撮る。CI からの直アップロードは受け付けない。
+    if build.mode != BuildMode::Screenshots {
         return Err(AppError::Conflict);
     }
 
@@ -207,15 +223,101 @@ pub async fn upload_screenshot(
 #[axum::debug_handler]
 #[utoipa::path(
     post,
+    path = "/builds/{build_id}/storybook",
+    tag = "CI",
+    summary = "ビルド済み Storybook（storybook-static の zip）をアップロードする",
+    description = "multipart/form-data の `file` フィールドに zip を送る（最大 200MB）。\
+                   `mode = storybook` かつ `pending` のビルドにだけ許可され、\
+                   1 ビルドにつき 1 本まで（再アップロードは 409）。\
+                   アップロード後 `POST /v1/ci/builds/{build_id}/finalize` を呼ぶと\
+                   サーバー側でヘッドレス Chromium が全ストーリーを撮影する。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 201, description = "保存されたバンドル", body = StorybookBundleResponse),
+        (status = 400, description = "zip ではない / フィールドが足りません", body = ServerError),
+        (status = 409, description = "storybook モードでない・pending でない・既にアップロード済み", body = ServerError),
+        (status = 413, description = "ファイルが大きすぎます", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn upload_storybook_bundle(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<StorybookBundleResponse>), AppError> {
+    auth.require_scope(Scope::WriteBuild)?;
+    let (build, project) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+
+    // モード・状態・重複は、バイト列を読む前に弾く。
+    if build.mode != BuildMode::Storybook || build.status != BuildStatus::Pending {
+        return Err(AppError::Conflict);
+    }
+    if build.storybook_key.is_some() {
+        return Err(AppError::Conflict);
+    }
+
+    let mut file: Option<Bytes> = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequestDetail(format!("invalid multipart body: {e}")))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        // 上限を超えた時点で打ち切る（全部読んでから弾かない）。
+        let mut buf = BytesMut::new();
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::BadRequestDetail(format!("invalid file field: {e}")))?
+        {
+            if buf.len() + chunk.len() > render_service::MAX_BUNDLE_BYTES {
+                return Err(AppError::ContentTooLarge);
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        file = Some(buf.freeze());
+    }
+
+    let file = file.ok_or_else(|| AppError::BadRequestDetail("file field is required".into()))?;
+    render_service::validate_zip(&file)?;
+    let size_bytes = file.len() as u64;
+
+    let key = render_service::storybook_key(project.tenant_id, project.id, build.id);
+    render_service::upload_bundle(&state.storage, &key, file)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("upload storybook bundle: {e}")))?;
+
+    build_service::attach_storybook_bundle(&state.db, build, key).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StorybookBundleResponse {
+            build_id,
+            size_bytes,
+        }),
+    ))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
     path = "/builds/{build_id}/finalize",
     tag = "CI",
-    summary = "アップロードを締めて比較ジョブを投入する",
-    description = "`pending → processing` に遷移し、`CompareBuildJob` を投入する。\
+    summary = "アップロードを締めてジョブを投入する",
+    description = "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、\
+                   `storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する\
+                   （レンダリングが済むと自動で `processing` に繋がる）。\
                    以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
     security(("bearerAuth" = [])),
     responses(
-        (status = 200, description = "processing に遷移したビルド", body = BuildResponse),
+        (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
+        (status = 400, description = "storybook バンドルが未アップロードです", body = ServerError),
         (status = 409, description = "既に finalize 済みです", body = ServerError),
         CrudErrors,
     )
@@ -229,14 +331,28 @@ pub async fn finalize_build(
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
-    let build = build_service::finalize(&state.db, build).await?;
-
-    job::compare_build::enqueue(
-        &state.compare_build_storage,
-        job::CompareBuildJob { build_id: build.id },
-    )
-    .await
-    .map_err(AppError::Internal)?;
+    let build = match build.mode {
+        BuildMode::Screenshots => {
+            let build = build_service::finalize(&state.db, build).await?;
+            job::compare_build::enqueue(
+                &state.compare_build_storage,
+                job::CompareBuildJob { build_id: build.id },
+            )
+            .await
+            .map_err(AppError::Internal)?;
+            build
+        }
+        BuildMode::Storybook => {
+            let build = build_service::finalize_storybook(&state.db, build).await?;
+            job::render_build::enqueue(
+                &state.render_build_storage,
+                job::RenderBuildJob { build_id: build.id },
+            )
+            .await
+            .map_err(AppError::Internal)?;
+            build
+        }
+    };
 
     // `processing` を GitHub の pending ステータスとして先に見せる。
     // 連携が無ければジョブ側が何もせず終わる。

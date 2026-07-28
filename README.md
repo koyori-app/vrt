@@ -63,6 +63,13 @@ cargo fmt --all
 
 Linux では `.cargo/config.toml` が mold リンカを要求するので `mold` を入れておく。
 
+storybook モード（サーバーサイドレンダリング）を動かすには Chromium が要る。
+`CHROMIUM_PATH` に実行ファイルのパスを渡す（未設定なら storybook モードだけが
+無効になり、起動時に warn が出る）。`cargo test` のレンダリング系テストは
+`CHROMIUM_PATH` → `PATH` 上の chromium/chrome → Playwright のキャッシュ
+（`~/.cache/ms-playwright`。e2e の `pnpm exec playwright install chromium` が入れる）
+の順に探し、どこにも無ければスキップする。
+
 ### frontend
 
 ```bash
@@ -98,6 +105,17 @@ backend と frontend は Playwright の `webServer` が自前で起動する。
 
 ## CI からスクリーンショットを送る
 
+ビルドには 2 つのモードがある。
+
+| mode | 誰が撮るか | CI が送るもの |
+| --- | --- | --- |
+| `screenshots`（既定） | CI | PNG を 1 枚ずつ |
+| `storybook` | **VRT のサーバー** | ビルド済み Storybook の zip 1 本 |
+
+どちらも finalize 以降（比較・レビュー・baseline 昇格）は同じ経路を通る。
+
+### screenshots モード（既定）
+
 1. UI の **Settings → Personal access tokens** で `write:build` と `read:build`
    を持つ PAT を発行する
 2. `VRT_TOKEN` として CI のシークレットに入れる
@@ -132,6 +150,51 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 `failed`。`changes_detected` で CI を落としたいなら 4 のレスポンスの
 `status` を見て終了コードを決める。同じスニペットはプロジェクト画面の
 **CI usage** タブにもテナント / プロジェクトの slug 入りで出る。
+
+### storybook モード（サーバーサイドレンダリング）
+
+CI 側にブラウザを用意せず、**ビルド済み Storybook の zip を投げるだけ**にする形。
+VRT がバンドルを展開してローカルに配信し、ヘッドレス Chromium で全ストーリーを
+`iframe.html?id=<storyId>&viewMode=story` から撮る。スクリーンショット名は
+`{title}/{name}`（例 `Components/Button/Primary`）で、`index.json` の `docs`
+エントリは撮らない。
+
+```bash
+# 1. mode を指定してビルドを作る
+BUILD=$(curl -sS -X POST \
+  "$VRT_URL/v1/ci/projects/<tenant-slug>/<project-slug>/builds" \
+  -H "Authorization: Bearer $VRT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"branch":"'"$GIT_BRANCH"'","commit_sha":"'"$GIT_SHA"'","mode":"storybook"}' | jq -r .id)
+
+# 2. storybook-static を固めて 1 本だけ上げる（zip は 200MB まで）
+pnpm build-storybook
+(cd storybook-static && zip -qr ../storybook-static.zip .)
+curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/storybook" \
+  -H "Authorization: Bearer $VRT_TOKEN" \
+  -F "file=@./storybook-static.zip"
+
+# 3. finalize。ここでレンダリングジョブが積まれる
+curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
+  -H "Authorization: Bearer $VRT_TOKEN"
+
+# 4. rendering / processing を抜けるまでポーリングする
+curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
+```
+
+補足:
+
+- `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
+  1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
+- finalize 後は `pending → rendering → processing → …` と進む。
+  `rendering` 中に 1 ストーリーでも撮れなければビルドは `failed` になり、
+  `error_message` にどのストーリーで落ちたかが入る
+- 撮影サイズはプロジェクト設定の **Storybook viewport**（既定 1280x720）。
+  UI の **Settings** タブか `PATCH /v1/projects/{id}` の
+  `viewport_width` / `viewport_height` で変えられる
+- サーバー側に Chromium が必要（`CHROMIUM_PATH`）。未設定のサーバーでは
+  `mode=storybook` のビルド作成が 400 で拒否される。同梱の Docker イメージには
+  Chromium が入っている
 
 GitHub App を設定してあれば、承認 / 却下の結果は PR の commit status に返る
 （[docs/github-app.md](docs/github-app.md)）。

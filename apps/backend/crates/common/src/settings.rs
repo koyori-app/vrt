@@ -64,6 +64,11 @@ pub struct Settings {
     pub s3_secret_access_key: Option<String>,
     pub s3_public_base_url: Option<String>,
     pub s3_force_path_style: Option<bool>,
+    /// ヘッドレス Chromium の実行ファイルパス（env `CHROMIUM_PATH`）。
+    ///
+    /// 未設定なら Storybook レンダリング機能そのものが無効になり、
+    /// `mode = storybook` のビルド作成は 400 で拒否される。
+    pub chromium_path: Option<String>,
     /// e2e テスト専用のログイン口 `POST /v1/auth/test-login` を開くフラグ。
     ///
     /// **本番では絶対に有効にしないこと。** 有効にすると、認証情報なしで任意の
@@ -81,6 +86,14 @@ impl Settings {
     /// GitHub App が設定されているか（App ID + 秘密鍵の両方が必要）。
     pub fn github_app_enabled(&self) -> bool {
         self.github_app_id.is_some() && self.github_app_private_key_pem.is_some()
+    }
+
+    /// Storybook レンダリング（`mode = storybook`）が使えるか。
+    /// Chromium の実行ファイルが設定されているときだけ有効。
+    pub fn storybook_render_enabled(&self) -> bool {
+        self.chromium_path
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
     }
 
     /// GitHub API のベース URL（末尾スラッシュを落とした形）。
@@ -206,6 +219,7 @@ mod tests {
             s3_secret_access_key: None,
             s3_public_base_url: None,
             s3_force_path_style: None,
+            chromium_path: None,
             test_login_enabled: false,
         }
     }

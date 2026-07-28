@@ -151,6 +151,26 @@ pub async fn store_screenshot<C: ConnectionTrait>(
     name: String,
     bytes: Bytes,
 ) -> Result<screenshots::Model, AppError> {
+    store_screenshot_with_metadata(
+        db, storage, tenant_id, project_id, build_id, name, bytes, None,
+    )
+    .await
+}
+
+/// [`store_screenshot`] と同じだが、`metadata` を添えて保存する。
+///
+/// storybook モードのレンダリングが `{"story_id": ..., "title": ...}` を入れる。
+#[allow(clippy::too_many_arguments)]
+pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
+    db: &C,
+    storage: &Arc<dyn StorageBackend>,
+    tenant_id: Uuid,
+    project_id: Uuid,
+    build_id: Uuid,
+    name: String,
+    bytes: Bytes,
+    metadata: Option<serde_json::Value>,
+) -> Result<screenshots::Model, AppError> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(AppError::BadRequestDetail("name is required".into()));
@@ -185,7 +205,7 @@ pub async fn store_screenshot<C: ConnectionTrait>(
         storage_key: Set(key),
         width: Set(width as i32),
         height: Set(height as i32),
-        metadata: Set(None),
+        metadata: Set(metadata),
         created_at: Set(Utc::now().fixed_offset()),
     }
     .insert(db)

@@ -20,6 +20,10 @@ pub struct Model {
     /// ビルドを失敗扱いにする差分ピクセル比率（0.0〜1.0、0.0 は「1px でも差分があれば失敗」）。
     #[sea_orm(column_type = "Double")]
     pub diff_ratio_fail: f64,
+    /// storybook モードのレンダリングに使うビューポート幅（px）。
+    pub viewport_width: i32,
+    /// storybook モードのレンダリングに使うビューポート高さ（px）。
+    pub viewport_height: i32,
     /// GitHub App のインストール ID。Phase 6 で `github_installations` への FK にする。
     pub github_installation_id: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]

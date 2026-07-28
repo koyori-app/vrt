@@ -5,7 +5,7 @@ use std::sync::Arc;
 use apalis_postgres::PgPool;
 use common::cache::redis::RedisConnection;
 use common::settings::Settings;
-use job::{CompareBuildStorage, GithubStatusStorage, GithubWebhookStorage};
+use job::{CompareBuildStorage, GithubStatusStorage, GithubWebhookStorage, RenderBuildStorage};
 use sea_orm::DatabaseConnection;
 use service::oauth::OAuthRegistry;
 use service::storage::StorageBackend;
@@ -34,6 +34,8 @@ pub struct AppState {
     pub github_status_storage: Arc<GithubStatusStorage>,
     /// `GithubWebhookJob` の apalis ストレージ（webhook ハンドラが push する）。
     pub github_webhook_storage: Arc<GithubWebhookStorage>,
+    /// `RenderBuildJob` の apalis ストレージ（storybook モードの finalize が push する）。
+    pub render_build_storage: Arc<RenderBuildStorage>,
     /// 外部 API 呼び出し用の共有 HTTP クライアント（GitHub API）。
     pub http: reqwest::Client,
 }

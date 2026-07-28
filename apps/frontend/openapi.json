@@ -1133,8 +1133,8 @@
         "tags": [
           "CI"
         ],
-        "summary": "アップロードを締めて比較ジョブを投入する",
-        "description": "`pending → processing` に遷移し、`CompareBuildJob` を投入する。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。",
+        "summary": "アップロードを締めてジョブを投入する",
+        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。",
         "operationId": "finalize_build",
         "parameters": [
           {
@@ -1150,11 +1150,21 @@
         ],
         "responses": {
           "200": {
-            "description": "processing に遷移したビルド",
+            "description": "processing / rendering に遷移したビルド",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BuildResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "storybook バンドルが未アップロードです",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
                 }
               }
             }
@@ -1360,6 +1370,155 @@
           },
           "409": {
             "description": "ビルドが pending ではない、または同名が既に存在します",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "ファイルが大きすぎます",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/ci/builds/{build_id}/storybook": {
+      "post": {
+        "tags": [
+          "CI"
+        ],
+        "summary": "ビルド済み Storybook（storybook-static の zip）をアップロードする",
+        "description": "multipart/form-data の `file` フィールドに zip を送る（最大 200MB）。`mode = storybook` かつ `pending` のビルドにだけ許可され、1 ビルドにつき 1 本まで（再アップロードは 409）。アップロード後 `POST /v1/ci/builds/{build_id}/finalize` を呼ぶとサーバー側でヘッドレス Chromium が全ストーリーを撮影する。",
+        "operationId": "upload_storybook_bundle",
+        "parameters": [
+          {
+            "name": "build_id",
+            "in": "path",
+            "description": "ビルドID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "保存されたバンドル",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorybookBundleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "zip ではない / フィールドが足りません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "storybook モードでない・pending でない・既にアップロード済み",
             "content": {
               "application/json": {
                 "schema": {
@@ -2802,7 +2961,7 @@
           "Projects"
         ],
         "summary": "プロジェクト設定を更新",
-        "description": "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0。",
+        "description": "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0、`viewport_width` / `viewport_height` は 64〜10000（storybook モードのレンダリング用）。",
         "operationId": "update_project",
         "parameters": [
           {
@@ -4918,6 +5077,14 @@
           }
         }
       },
+      "BuildMode": {
+        "type": "string",
+        "description": "ビルドの入力形式。\n\n- [`BuildMode::Screenshots`]: CI が自前で撮った PNG をアップロードする（従来モード）\n- [`BuildMode::Storybook`]: CI がビルド済み Storybook の zip をアップロードし、\n  サーバー側（`RenderBuildJob`）がヘッドレス Chromium で全ストーリーを撮る",
+        "enum": [
+          "screenshots",
+          "storybook"
+        ]
+      },
       "BuildResponse": {
         "type": "object",
         "required": [
@@ -4927,6 +5094,8 @@
           "branch",
           "commit_sha",
           "status",
+          "mode",
+          "storybook_uploaded",
           "total_count",
           "changed_count",
           "added_count",
@@ -4998,6 +5167,10 @@
             "type": "string",
             "format": "uuid"
           },
+          "mode": {
+            "$ref": "#/components/schemas/BuildMode",
+            "description": "入力形式（`screenshots` = CI がアップロード / `storybook` = サーバーがレンダリング）。"
+          },
           "number": {
             "type": "integer",
             "format": "int64",
@@ -5021,6 +5194,10 @@
           "status": {
             "$ref": "#/components/schemas/BuildStatus"
           },
+          "storybook_uploaded": {
+            "type": "boolean",
+            "description": "storybook モードでバンドルがアップロード済みか。"
+          },
           "total_count": {
             "type": "integer",
             "format": "int32"
@@ -5033,9 +5210,10 @@
       },
       "BuildStatus": {
         "type": "string",
-        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\npending ──finalize──▶ processing ──▶ passed | changes_detected | failed\n                                         changes_detected ──▶ approved | rejected\n```",
+        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                         └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n```",
         "enum": [
           "pending",
+          "rendering",
           "processing",
           "passed",
           "changes_detected",
@@ -5221,6 +5399,17 @@
           },
           "commit_sha": {
             "type": "string"
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BuildMode",
+                "description": "入力形式。省略時は `screenshots`（従来どおり CI が PNG をアップロードする）。\n`storybook` を指定すると `POST /v1/ci/builds/{id}/storybook` でバンドルを送る形になる。"
+              }
+            ]
           },
           "pull_request_number": {
             "type": [
@@ -5500,6 +5689,8 @@
           "default_branch",
           "diff_threshold",
           "diff_ratio_fail",
+          "viewport_width",
+          "viewport_height",
           "created_at",
           "updated_at"
         ],
@@ -5552,6 +5743,16 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "viewport_height": {
+            "type": "integer",
+            "format": "int32",
+            "description": "storybook モードのレンダリングに使うビューポート高さ（px）。"
+          },
+          "viewport_width": {
+            "type": "integer",
+            "format": "int32",
+            "description": "storybook モードのレンダリングに使うビューポート幅（px）。"
           }
         }
       },
@@ -5644,6 +5845,26 @@
           "message": {
             "type": "string",
             "example": "internal-error"
+          }
+        }
+      },
+      "StorybookBundleResponse": {
+        "type": "object",
+        "description": "Storybook バンドルのアップロード結果。",
+        "required": [
+          "build_id",
+          "size_bytes"
+        ],
+        "properties": {
+          "build_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "受け取った zip のバイト数。",
+            "minimum": 0
           }
         }
       },
@@ -5828,6 +6049,22 @@
               "string",
               "null"
             ]
+          },
+          "viewport_height": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "storybook モードのレンダリングに使うビューポート高さ（px、64〜10000）。"
+          },
+          "viewport_width": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "storybook モードのレンダリングに使うビューポート幅（px、64〜10000）。"
           }
         }
       },
