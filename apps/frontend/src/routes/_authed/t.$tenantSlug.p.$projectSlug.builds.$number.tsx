@@ -10,12 +10,13 @@ import {
   useComparisonFilter,
 } from "@/components/comparison-list";
 import { ComparisonViewer } from "@/components/comparison-viewer";
+import { CommitLink } from "@/components/commit-link";
 import { BuildLogPanel } from "@/components/build-log-panel";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { $api, errorMessage, type Build, type Comparison } from "@/lib/api";
 import { useResolvedProject, useResolvedTenant } from "@/lib/queries";
-import { formatDate, shortSha } from "@/lib/utils";
+import { formatDate } from "@/lib/utils";
 
 export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/builds/$number")({
   component: BuildReviewPage,
@@ -65,12 +66,20 @@ function BuildReviewPage() {
         {project?.name ?? projectSlug}
       </Link>
 
-      <BuildReview buildId={build.id} initialBuild={build} />
+      <BuildReview buildId={build.id} initialBuild={build} githubRepo={project?.github_repo} />
     </div>
   );
 }
 
-function BuildReview({ buildId, initialBuild }: { buildId: string; initialBuild: Build }) {
+function BuildReview({
+  buildId,
+  initialBuild,
+  githubRepo,
+}: {
+  buildId: string;
+  initialBuild: Build;
+  githubRepo: string | null | undefined;
+}) {
   const queryClient = useQueryClient();
   const [filter, setFilter] = useComparisonFilter();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -236,7 +245,8 @@ function BuildReview({ buildId, initialBuild }: { buildId: string; initialBuild:
         <h1 className="text-2xl font-semibold tracking-tight">Build #{build.number}</h1>
         <BuildStatusBadge status={build.status} />
         <span className="text-sm text-muted-foreground">
-          {build.branch} · <span className="font-mono">{shortSha(build.commit_sha)}</span>
+          {build.branch} ·{" "}
+          <CommitLink githubRepo={githubRepo} commitSha={build.commit_sha} className="font-mono" />
           {build.pull_request_number ? ` · PR #${build.pull_request_number}` : ""}
         </span>
         <span className="text-xs text-muted-foreground">{formatDate(build.created_at)}</span>

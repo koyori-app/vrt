@@ -4,6 +4,7 @@ import { ArrowRightIcon, CopyIcon } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
+import { CommitLink } from "@/components/commit-link";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -33,7 +34,7 @@ import {
   useResolvedProject,
   useResolvedTenant,
 } from "@/lib/queries";
-import { formatDate, shortSha } from "@/lib/utils";
+import { formatDate } from "@/lib/utils";
 
 /** Radix Select treats "" as "clear", so the GitHub link form needs a sentinel. */
 const NO_INSTALLATION = "none";
@@ -74,7 +75,12 @@ function ProjectPage() {
         </TabsList>
 
         <TabsContent value="builds">
-          <BuildsTable projectId={project.id} tenantSlug={tenantSlug} projectSlug={project.slug} />
+          <BuildsTable
+            projectId={project.id}
+            githubRepo={project.github_repo}
+            tenantSlug={tenantSlug}
+            projectSlug={project.slug}
+          />
         </TabsContent>
 
         <TabsContent value="settings" className="space-y-4">
@@ -92,10 +98,12 @@ function ProjectPage() {
 
 function BuildsTable({
   projectId,
+  githubRepo,
   tenantSlug,
   projectSlug,
 }: {
   projectId: string;
+  githubRepo: string | null | undefined;
   tenantSlug: string;
   projectSlug: string;
 }) {
@@ -145,7 +153,13 @@ function BuildsTable({
                     </Link>
                   </TableCell>
                   <TableCell className="truncate">{build.branch}</TableCell>
-                  <TableCell className="font-mono text-xs">{shortSha(build.commit_sha)}</TableCell>
+                  <TableCell className="text-xs">
+                    <CommitLink
+                      githubRepo={githubRepo}
+                      commitSha={build.commit_sha}
+                      className="font-mono"
+                    />
+                  </TableCell>
                   <TableCell>
                     <BuildStatusBadge status={build.status} />
                   </TableCell>
