@@ -81,6 +81,10 @@ services:
       ALLOW_ORIGIN: http://localhost:3000
       APP_URL: http://localhost:3000
       STORAGE_BACKEND: local
+      # アップロード（スクリーンショット・diff 画像・storybook バンドル）の保存先。
+      # 下の named volume `uploads` をここにマウントしているので、コンテナを作り直しても
+      # 消えない。ボリュームが無いと `--force-recreate` 等で全画像が消え、DB 行だけ残って
+      # レビュー UI が 404 画像だらけになる。
       LOCAL_UPLOAD_DIR: /home/app/uploads
       # storybook モード（サーバーサイドレンダリング）に使う Chromium。
       # イメージに同梱してある（そのぶんイメージが ~450MB 太っている。
@@ -106,6 +110,11 @@ services:
       # GITHUB_API_BASE_URL: https://github.example.com/api/v3
     ports:
       - "127.0.0.1:3500:3400"
+    volumes:
+      # アップロード永続化。これが無いとコンテナ作り直しで全画像が消える。
+      # マウント先はイメージ内で app 所有に作ってあるので非 root でも書ける
+      # （apps/backend/Dockerfile の runtime-base 参照）。
+      - uploads:/home/app/uploads
     depends_on:
       db:
         condition: service_healthy
@@ -143,3 +152,4 @@ services:
 
 volumes:
   pgdata:
+  uploads:

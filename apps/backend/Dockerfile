@@ -80,6 +80,15 @@ ENV CHROMIUM_PATH=/usr/bin/chromium
 
 # root では動かさない
 RUN useradd --system --create-home --uid 10001 app
+
+# ローカルストレージ（LOCAL_UPLOAD_DIR の既定マウント先）を app 所有で用意しておく。
+# docker-compose.yml がここに空の named volume `uploads` をマウントする。Docker は
+# 「空の named volume を、イメージ内に既存のディレクトリへ当てると、そのディレクトリの
+# 所有権を volume ルートへコピーする」ため、これで uid 10001(app) が書き込める。
+# このディレクトリが無いと volume ルートが root 所有になり、非 root の backend が
+# create_dir_all で EACCES になってアップロードが全部失敗する。
+RUN mkdir -p /home/app/uploads && chown app:app /home/app/uploads
+
 WORKDIR /app
 
 COPY --chown=app:app --chmod=755 docker/run-migration.sh /app/run-migration.sh

@@ -1,6 +1,6 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { CopyIcon } from "lucide-react";
+import { ArrowRightIcon, CopyIcon } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
@@ -100,6 +100,7 @@ function BuildsTable({
   projectSlug: string;
 }) {
   const builds = useBuilds(projectId);
+  const navigate = useNavigate();
 
   return (
     <Card>
@@ -113,37 +114,60 @@ function BuildsTable({
               <TableHead className="w-44">Status</TableHead>
               <TableHead>Comparisons</TableHead>
               <TableHead className="w-48">Created</TableHead>
+              <TableHead className="w-16">
+                <span className="sr-only">Open</span>
+              </TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {builds.data?.builds.map((build) => (
-              <TableRow key={build.id} className="cursor-pointer">
-                <TableCell>
-                  <Link
-                    to="/t/$tenantSlug/p/$projectSlug/builds/$number"
-                    params={{ tenantSlug, projectSlug, number: String(build.number) }}
-                    className="font-medium underline-offset-4 hover:underline"
-                  >
-                    #{build.number}
-                  </Link>
-                </TableCell>
-                <TableCell className="truncate">{build.branch}</TableCell>
-                <TableCell className="font-mono text-xs">{shortSha(build.commit_sha)}</TableCell>
-                <TableCell>
-                  <BuildStatusBadge status={build.status} />
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  {build.total_count} total · {build.changed_count} changed · {build.added_count}{" "}
-                  added · {build.removed_count} removed
-                </TableCell>
-                <TableCell className="text-xs text-muted-foreground">
-                  {formatDate(build.created_at)}
-                </TableCell>
-              </TableRow>
-            ))}
+            {builds.data?.builds.map((build) => {
+              const to = "/t/$tenantSlug/p/$projectSlug/builds/$number" as const;
+              const params = { tenantSlug, projectSlug, number: String(build.number) };
+              return (
+                <TableRow
+                  key={build.id}
+                  className="group cursor-pointer hover:bg-muted/50"
+                  onClick={() => {
+                    // Don't hijack the click when the user is selecting text in a cell.
+                    if (window.getSelection()?.toString()) return;
+                    void navigate({ to, params });
+                  }}
+                >
+                  <TableCell>
+                    {/* The real, keyboard-focusable navigation. The row onClick above is
+                        a mouse-only enhancement that points at the same destination. */}
+                    <Link
+                      to={to}
+                      params={params}
+                      className="font-medium underline-offset-4 hover:underline"
+                    >
+                      #{build.number}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="truncate">{build.branch}</TableCell>
+                  <TableCell className="font-mono text-xs">{shortSha(build.commit_sha)}</TableCell>
+                  <TableCell>
+                    <BuildStatusBadge status={build.status} />
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {build.total_count} total · {build.changed_count} changed · {build.added_count}{" "}
+                    added · {build.removed_count} removed
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {formatDate(build.created_at)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
+                      view
+                      <ArrowRightIcon className="size-3" />
+                    </span>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
             {!builds.data?.builds.length ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-sm text-muted-foreground">
+                <TableCell colSpan={7} className="text-sm text-muted-foreground">
                   {builds.isLoading ? "Loading…" : "No builds yet. Upload screenshots from CI."}
                 </TableCell>
               </TableRow>
