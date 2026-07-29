@@ -303,13 +303,26 @@ pub struct StoryRenderer {
     browser: Browser,
     handler_task: JoinHandle<()>,
     options: RenderOptions,
+    /// このインスタンス専用のユーザーデータディレクトリ。
+    /// フィールドとして持つのは drop 時に自動で消すため（`_` で握るだけ）。
+    _user_data_dir: tempfile::TempDir,
 }
 
 impl StoryRenderer {
     /// Chromium を起動する。
     pub async fn launch(options: RenderOptions) -> Result<Self, RenderError> {
+        // 起動ごとに専用のユーザーデータディレクトリを与える。
+        // 指定しないと chromiumoxide は固定パス（`/tmp/chromiumoxide-runner`）を使い、
+        // 複数のブラウザが同時に立つと `SingletonLock` を奪い合って起動に失敗する
+        // （クラッシュで残ったロックが次の起動を止めることもある）。
+        let user_data_dir = tempfile::Builder::new()
+            .prefix("vrt-chromium-")
+            .tempdir()
+            .map_err(|e| RenderError::Server(format!("create chromium profile dir: {e}")))?;
+
         let config = BrowserConfig::builder()
             .chrome_executable(&options.chromium_path)
+            .user_data_dir(user_data_dir.path())
             .viewport(Viewport {
                 width: options.viewport_width,
                 height: options.viewport_height,
@@ -343,6 +356,7 @@ impl StoryRenderer {
             browser,
             handler_task,
             options,
+            _user_data_dir: user_data_dir,
         })
     }
 

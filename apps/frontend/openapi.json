@@ -1370,7 +1370,7 @@
           "CI"
         ],
         "summary": "アップロードを締めてジョブを投入する",
-        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。",
+        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。ボディは任意。`storybook` モードで `only_story_ids` を渡すと、そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。",
         "operationId": "finalize_build",
         "parameters": [
           {
@@ -1384,6 +1384,17 @@
             }
           }
         ],
+        "requestBody": {
+          "description": "任意。省略・空ボディ可",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FinalizeBuildRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "description": "processing / rendering に遷移したビルド",
@@ -1396,7 +1407,7 @@
             }
           },
           "400": {
-            "description": "storybook バンドルが未アップロードです",
+            "description": "storybook バンドルが未アップロード / only_story_ids が不正 / screenshots モードで only_story_ids 指定",
             "content": {
               "application/json": {
                 "schema": {
@@ -5358,6 +5369,13 @@
             ],
             "format": "uuid"
           },
+          "baseline_commit_sha": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "このビルドが比較する baseline のコミット SHA。\n\n将来の CLI が「どのコミットとの差分か」を知り、\n撮り直しの必要なストーリーを自分で絞り込めるように公開する。\nビルド作成（`POST /v1/ci/builds`）のレスポンスでのみ埋まり、\nそれ以外の経路（一覧・状態ポーリング等）では常に `None`。\nbaseline が無い、または昇格元ビルドが削除済みなら `None`。"
+          },
           "baseline_id": {
             "type": [
               "string",
@@ -5745,6 +5763,22 @@
           "slug": {
             "type": "string",
             "description": "小文字英数とハイフンのみ。予約語は使用できない。"
+          }
+        }
+      },
+      "FinalizeBuildRequest": {
+        "type": "object",
+        "description": "finalize（アップロード締め）リクエスト。\n\nボディは任意。無し・空・`only_story_ids: null` はすべて「全ストーリー撮影」\nを意味し、従来どおりの挙動になる（後方互換）。",
+        "properties": {
+          "only_story_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "実際に撮影が必要なストーリー ID のリスト（TurboSnap 相当）。\n\nここに載っていないストーリーは baseline のスクリーンショットを流用する\n（baseline に該当が無い新規ストーリーは見逃さないよう撮影する）。\n`storybook` モードのビルドでのみ意味を持つ。`screenshots` モードで\n指定すると 400 になる（サーバーがレンダリングしないため）。"
           }
         }
       },

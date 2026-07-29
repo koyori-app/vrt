@@ -21,9 +21,10 @@ use apalis_postgres::{Config, PgPool, PostgresStorage};
 use sea_orm::prelude::Uuid;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use entity::{builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
 use service::render::{RenderOptions, StaticServer, StoryRenderer};
 
 use crate::JobState;
@@ -36,6 +37,14 @@ pub const WORKER_CONCURRENCY: usize = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderBuildJob {
     pub build_id: Uuid,
+    /// 撮影が必要なストーリー ID のリスト（TurboSnap 相当のスキップ制御）。
+    ///
+    /// `None` のときは全ストーリーを撮影する（従来どおり）。`Some` のときは
+    /// ここに無いストーリーを baseline から流用する。
+    /// `#[serde(default)]` はキューに残る旧ジョブ（このフィールドを持たない
+    /// JSON）との後方互換のため必須。
+    #[serde(default)]
+    pub only_story_ids: Option<Vec<String>>,
 }
 
 /// `RenderBuildJob` のストレージ。
@@ -84,7 +93,7 @@ pub async fn enqueue(
 pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
 
-    match run(build_id, &state).await {
+    match run(build_id, job.only_story_ids, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "render build job failed");
@@ -111,7 +120,11 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
+async fn run(
+    build_id: Uuid,
+    only_story_ids: Option<Vec<String>>,
+    state: &JobState,
+) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
@@ -167,9 +180,25 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         anyhow::bail!("storybook bundle contains no stories (only docs entries?)");
     }
 
+    // `only_story_ids` が来ているときだけ baseline を解決して name→entry の
+    // 流用テーブルを作る。baseline が無ければ空になり、結果的に全撮影になる。
+    let baseline_entries: HashMap<String, baseline_entries::Model> = match &only_story_ids {
+        Some(_) => {
+            let baseline = service::baselines::latest_for(db, &project, &build.branch).await?;
+            let entries = match &baseline {
+                Some(b) => service::baselines::entries(db, b.id).await?,
+                None => Vec::new(),
+            };
+            entries.into_iter().map(|e| (e.name.clone(), e)).collect()
+        }
+        None => HashMap::new(),
+    };
+
     tracing::info!(
         %build_id,
         stories = bundle.stories.len(),
+        skip_mode = only_story_ids.is_some(),
+        baseline_entries = baseline_entries.len(),
         "rendering storybook bundle"
     );
 
@@ -184,7 +213,17 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let renderer = StoryRenderer::launch(options).await?;
 
     // ブラウザは成功・失敗どちらでも必ず閉じる（`?` で早期 return しない）。
-    let outcome = render_all(state, &project, &build, &renderer, &base_url, &bundle).await;
+    let outcome = render_all(
+        state,
+        &project,
+        &build,
+        &renderer,
+        &base_url,
+        &bundle,
+        only_story_ids.as_deref(),
+        &baseline_entries,
+    )
+    .await;
     renderer.close().await;
     drop(server);
     outcome?;
@@ -205,11 +244,48 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// 全ストーリーを逐次レンダリングして保存する。
+/// ストーリー 1 件をどう処理するか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoryAction {
+    /// Chromium で撮影する。
+    Render,
+    /// baseline のスクリーンショットを流用する。
+    Reuse,
+}
+
+/// `only_story_ids` モードでの 1 ストーリーの処理方針を決める純関数。
+///
+/// - `only_story_ids` に含まれる → 撮影（変更があったと分かっているもの）
+/// - 含まれず、baseline に同名エントリがある → 流用
+/// - 含まれず、baseline にも無い（新規ストーリー） → 撮影（見逃し防止）
+///
+/// baseline が存在しないケースは `baseline_names` が空になるので、
+/// すべて「新規扱い」で撮影に倒れる（= 全撮影）。
+fn decide_story_action(
+    story_id: &str,
+    screenshot_name: &str,
+    only_story_ids: &HashSet<&str>,
+    baseline_names: &HashSet<&str>,
+) -> StoryAction {
+    if only_story_ids.contains(story_id) {
+        StoryAction::Render
+    } else if baseline_names.contains(screenshot_name) {
+        StoryAction::Reuse
+    } else {
+        StoryAction::Render
+    }
+}
+
+/// 全ストーリーを逐次処理して保存する。
+///
+/// `only_story_ids` が `None` のときは全ストーリーを撮影する（従来どおり。
+/// metadata に `reused` は付けない）。`Some` のときは [`decide_story_action`]
+/// に従い、撮影対象外のストーリーを baseline のスクリーンショットで流用する。
 ///
 /// MVP では 1 件でも失敗したらビルドごと失敗にする。
 /// （代替案: 失敗したストーリーだけ `comparisons` に error 行を作って残りは通す。
 /// レビュー UI に「撮れなかった」を出す設計が必要なので、そこは後続で扱う。）
+#[allow(clippy::too_many_arguments)]
 async fn render_all(
     state: &JobState,
     project: &entity::projects::Model,
@@ -217,31 +293,109 @@ async fn render_all(
     renderer: &StoryRenderer,
     base_url: &str,
     bundle: &service::render::ExtractedBundle,
+    only_story_ids: Option<&[String]>,
+    baseline_entries: &HashMap<String, baseline_entries::Model>,
 ) -> Result<(), anyhow::Error> {
+    // 撮影対象 ID と baseline 名を借用のハッシュ集合にしておく（ループ内で使い回す）。
+    let only_set: Option<HashSet<&str>> =
+        only_story_ids.map(|ids| ids.iter().map(String::as_str).collect());
+    let baseline_names: HashSet<&str> = baseline_entries.keys().map(String::as_str).collect();
+
+    let mut rendered = 0usize;
+    let mut reused = 0usize;
+
     for story in &bundle.stories {
-        let png = renderer
-            .render_story(base_url, &story.id)
-            .await
-            .map_err(|e| anyhow::anyhow!("render story `{}`: {e}", story.id))?;
+        let screenshot_name = story.screenshot_name();
 
-        let metadata = serde_json::json!({
-            "story_id": story.id,
-            "title": story.title,
-        });
+        // `only_story_ids` 無しは常に撮影（後方互換）。
+        let action = match &only_set {
+            Some(ids) => decide_story_action(&story.id, &screenshot_name, ids, &baseline_names),
+            None => StoryAction::Render,
+        };
 
-        service::screenshots::store_screenshot_with_metadata(
-            &state.db,
-            &state.storage,
-            project.tenant_id,
-            project.id,
-            build.id,
-            story.screenshot_name(),
-            bytes::Bytes::from(png),
-            Some(metadata),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("store screenshot for story `{}`: {e}", story.id))?;
+        match action {
+            StoryAction::Render => {
+                let png = renderer
+                    .render_story(base_url, &story.id)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("render story `{}`: {e}", story.id))?;
+
+                // `only_story_ids` モードのときだけ reused を明示する
+                // （`None` の従来経路は metadata を変えない）。
+                let metadata = if only_set.is_some() {
+                    serde_json::json!({
+                        "story_id": story.id,
+                        "title": story.title,
+                        "reused": false,
+                    })
+                } else {
+                    serde_json::json!({
+                        "story_id": story.id,
+                        "title": story.title,
+                    })
+                };
+
+                service::screenshots::store_screenshot_with_metadata(
+                    &state.db,
+                    &state.storage,
+                    project.tenant_id,
+                    project.id,
+                    build.id,
+                    screenshot_name,
+                    bytes::Bytes::from(png),
+                    Some(metadata),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("store screenshot for story `{}`: {e}", story.id))?;
+                rendered += 1;
+            }
+            StoryAction::Reuse => {
+                // decide_story_action が Reuse を返す時点で必ず存在する。
+                let entry = baseline_entries.get(&screenshot_name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "baseline entry for `{screenshot_name}` disappeared during reuse"
+                    )
+                })?;
+
+                // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
+                // バイト列が同一なので、後段の compare_build が unchanged と判定する。
+                let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("download baseline for `{screenshot_name}`: {e}")
+                    })?;
+
+                let metadata = serde_json::json!({
+                    "story_id": story.id,
+                    "title": story.title,
+                    "reused": true,
+                });
+
+                service::screenshots::store_screenshot_with_metadata(
+                    &state.db,
+                    &state.storage,
+                    project.tenant_id,
+                    project.id,
+                    build.id,
+                    screenshot_name,
+                    bytes::Bytes::from(png),
+                    Some(metadata),
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("store reused screenshot for story `{}`: {e}", story.id)
+                })?;
+                reused += 1;
+            }
+        }
     }
+
+    tracing::info!(
+        build_id = %build.id,
+        rendered,
+        reused,
+        "storybook stories processed"
+    );
 
     Ok(())
 }
@@ -260,5 +414,53 @@ mod tests {
     fn queue_name_is_stable() {
         // ワーカー名は `{queue}-worker-{uuid}` で組み立てられる（server.rs 参照）。
         assert_eq!(QUEUE_NAME, "render_build");
+    }
+
+    fn set<'a>(items: &[&'a str]) -> HashSet<&'a str> {
+        items.iter().copied().collect()
+    }
+
+    #[test]
+    fn requested_story_is_rendered() {
+        let only = set(&["button--primary"]);
+        let baseline = set(&["Button/Primary"]);
+        // 撮影対象に入っていれば baseline にあっても撮影する。
+        assert_eq!(
+            decide_story_action("button--primary", "Button/Primary", &only, &baseline),
+            StoryAction::Render
+        );
+    }
+
+    #[test]
+    fn unrequested_story_with_baseline_is_reused() {
+        let only = set(&["button--primary"]);
+        let baseline = set(&["Card/Default"]);
+        // 撮影対象外だが baseline に同名がある → 流用。
+        assert_eq!(
+            decide_story_action("card--default", "Card/Default", &only, &baseline),
+            StoryAction::Reuse
+        );
+    }
+
+    #[test]
+    fn new_story_without_baseline_is_rendered() {
+        let only = set(&["button--primary"]);
+        let baseline = set(&["Card/Default"]);
+        // 撮影対象外で baseline にも無い（新規） → 見逃さず撮影。
+        assert_eq!(
+            decide_story_action("badge--new", "Badge/New", &only, &baseline),
+            StoryAction::Render
+        );
+    }
+
+    #[test]
+    fn empty_baseline_falls_back_to_render() {
+        let only = set(&["button--primary"]);
+        let baseline: HashSet<&str> = HashSet::new();
+        // baseline が無ければ撮影対象外でも撮影に倒れる（= 全撮影）。
+        assert_eq!(
+            decide_story_action("card--default", "Card/Default", &only, &baseline),
+            StoryAction::Render
+        );
     }
 }

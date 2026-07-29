@@ -78,6 +78,51 @@ const INDEX_JSON: &str = r#"{
   }
 }"#;
 
+/// [`INDEX_JSON`] に新しいストーリー `demo-box--green` を 1 件足した index。
+///
+/// only_story_ids に**入れていない**新規ストーリーがちゃんと撮影される
+/// （= 見逃されない）ことを確かめるために使う。
+const INDEX_JSON_WITH_EXTRA: &str = r#"{
+  "v": 5,
+  "entries": {
+    "demo-box--empty": {
+      "type": "story",
+      "id": "demo-box--empty",
+      "title": "Demo/Box",
+      "name": "Empty",
+      "importPath": "./src/Box.stories.tsx"
+    },
+    "demo-box--red": {
+      "type": "story",
+      "id": "demo-box--red",
+      "title": "Demo/Box",
+      "name": "Red",
+      "importPath": "./src/Box.stories.tsx"
+    },
+    "demo-box--blue": {
+      "type": "story",
+      "id": "demo-box--blue",
+      "title": "Demo/Box",
+      "name": "Blue",
+      "importPath": "./src/Box.stories.tsx"
+    },
+    "demo-box--green": {
+      "type": "story",
+      "id": "demo-box--green",
+      "title": "Demo/Box",
+      "name": "Green",
+      "importPath": "./src/Box.stories.tsx"
+    },
+    "demo-box--docs": {
+      "type": "docs",
+      "id": "demo-box--docs",
+      "title": "Demo/Box",
+      "name": "Docs",
+      "importPath": "./src/Box.mdx"
+    }
+  }
+}"#;
+
 /// `?id=` に対応する色でビューポート全面を塗る `iframe.html`。
 ///
 /// - フォントもアニメーションも使わない（= ピクセルが揺れない）
@@ -149,13 +194,18 @@ fn incompressible_bytes(len: usize) -> Vec<u8> {
 /// 1 つ入れる。これでアップロードは必ず 2MB を超え、`DefaultBodyLimit` の
 /// 引き上げ漏れがテストで検出できる。
 fn bundle_zip(red: &str) -> Vec<u8> {
+    bundle_zip_with_index(INDEX_JSON, red)
+}
+
+/// [`bundle_zip`] と同じだが index.json を差し替えられる版。
+fn bundle_zip_with_index(index_json: &str, red: &str) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
         for (name, contents) in [
-            ("index.json", INDEX_JSON.to_string()),
+            ("index.json", index_json.to_string()),
             ("iframe.html", iframe_html(red)),
         ] {
             writer.start_file(name, options).expect("start zip entry");
@@ -289,6 +339,21 @@ impl Fixture {
     async fn finalize(&self, build_id: Uuid) -> reqwest::Response {
         self.app
             .post_with_bearer(&format!("/v1/ci/builds/{build_id}/finalize"), &self.token)
+            .await
+    }
+
+    /// `only_story_ids` を添えて finalize する（撮影対象を絞る）。
+    async fn finalize_with_only(
+        &self,
+        build_id: Uuid,
+        only_story_ids: &[&str],
+    ) -> reqwest::Response {
+        self.app
+            .post_json_with_bearer(
+                &format!("/v1/ci/builds/{build_id}/finalize"),
+                &self.token,
+                json!({ "only_story_ids": only_story_ids }),
+            )
             .await
     }
 
@@ -551,6 +616,174 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
         .filter_map(|c| c["name"].as_str())
         .collect();
     assert_eq!(changed, vec!["Demo/Box/Red"], "only the red story changed");
+}
+
+/// `only_story_ids` を指定すると、対象外のストーリーは baseline を流用し、
+/// 新規ストーリーだけは（指定外でも）撮影される（TurboSnap 相当）。
+#[tokio::test(flavor = "multi_thread")]
+async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
+    if !chromium_or_skip("only_story_ids_reuses_baseline_and_still_renders_new_stories") {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 全撮影 → 承認して baseline 化 ───────────────────────────
+    let build_a = fx.create_storybook_build("only001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    let build_a = fx.wait_for_terminal(build_a_id).await;
+    assert_eq!(build_a["status"].as_str(), Some("changes_detected"));
+    assert_eq!(build_a["added_count"].as_i64(), Some(3));
+
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "force approve build A");
+
+    // ── ビルド B: 同じ bundle + only_story_ids に Red だけ指定 ────────────
+    // Red は撮影、Blue / Empty は baseline を流用する。
+    let build_b = fx.create_storybook_build("only002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let res = fx.finalize_with_only(build_b_id, &["demo-box--red"]).await;
+    assert_eq!(res.status(), StatusCode::OK, "finalize with only_story_ids");
+    let finalized: Value = res.json().await.expect("finalize json");
+    assert_eq!(
+        finalized["status"].as_str(),
+        Some("rendering"),
+        "storybook finalize goes to rendering"
+    );
+
+    let build_b = fx.wait_for_terminal(build_b_id).await;
+    // 同じ bundle なので撮影ぶんも流用ぶんも baseline と一致 → 全部 unchanged。
+    assert_eq!(
+        build_b["status"].as_str(),
+        Some("passed"),
+        "reused + re-rendered identical bytes are all unchanged (error: {:?})",
+        build_b["error_message"]
+    );
+    assert_eq!(build_b["total_count"].as_i64(), Some(3));
+    assert_eq!(build_b["unchanged_count"].as_i64(), Some(3));
+
+    // 指定外の Blue / Empty は流用（reused: true）、Red は撮影（reused: false）。
+    let shots = fx.screenshots(build_b_id).await;
+    let names: Vec<&str> = shots.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Demo/Box/Blue", "Demo/Box/Empty", "Demo/Box/Red"],
+        "all three stories have a screenshot for this build"
+    );
+    for shot in &shots {
+        let reused = shot
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("reused"))
+            .and_then(|v| v.as_bool());
+        let expected = shot.name != "Demo/Box/Red";
+        assert_eq!(
+            reused,
+            Some(expected),
+            "screenshot {} reused flag ({expected} expected)",
+            shot.name
+        );
+    }
+
+    // 比較は全ストーリーぶん揃い、流用ぶんも unchanged になっている。
+    let cmps = fx.comparisons(build_b_id).await;
+    assert_eq!(cmps.len(), 3, "comparisons cover every story");
+    assert!(
+        cmps.iter().all(|c| c["status"] == "unchanged"),
+        "every comparison is unchanged, got {cmps:?}"
+    );
+
+    // ── ビルド C: 新規ストーリー Green を足す。only_story_ids に入れない ───
+    // baseline に Green が無いので、指定外でも撮影されて added になる。
+    let build_c = fx.create_storybook_build("only003").await;
+    let build_c_id = build_id_of(&build_c);
+    assert_eq!(
+        fx.upload_bundle(
+            build_c_id,
+            bundle_zip_with_index(INDEX_JSON_WITH_EXTRA, "#ff0000")
+        )
+        .await
+        .status(),
+        StatusCode::CREATED
+    );
+    // Red だけ指定。Green は指定に入れない（新規なので撮影されるはず）。
+    assert_eq!(
+        fx.finalize_with_only(build_c_id, &["demo-box--red"])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let build_c = fx.wait_for_terminal(build_c_id).await;
+    assert_eq!(
+        build_c["status"].as_str(),
+        Some("changes_detected"),
+        "new story is added, so build has differences (error: {:?})",
+        build_c["error_message"]
+    );
+    assert_eq!(build_c["total_count"].as_i64(), Some(4));
+    assert_eq!(build_c["added_count"].as_i64(), Some(1));
+    assert_eq!(build_c["unchanged_count"].as_i64(), Some(3));
+
+    let shots = fx.screenshots(build_c_id).await;
+    let green = shots
+        .iter()
+        .find(|s| s.name == "Demo/Box/Green")
+        .expect("new Green story was rendered");
+    // 新規ストーリーは baseline に無いので流用ではなく撮影される。
+    assert_eq!(
+        green
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("reused"))
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "new story must be rendered, not reused"
+    );
+
+    let cmps = fx.comparisons(build_c_id).await;
+    let added: Vec<&str> = cmps
+        .iter()
+        .filter(|c| c["status"] == "added")
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    assert_eq!(added, vec!["Demo/Box/Green"], "only the new story is added");
+}
+
+/// `screenshots` モードに `only_story_ids` を渡すと 400（サーバー撮影しない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn only_story_ids_is_rejected_for_screenshot_mode() {
+    let fx = setup().await;
+
+    let res = fx.create_build("screenshots", "onlyscr").await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let build: Value = res.json().await.expect("build json");
+    let build_id = build_id_of(&build);
+
+    let res = fx.finalize_with_only(build_id, &["button--primary"]).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "only_story_ids is meaningless for screenshots mode"
+    );
 }
 
 /// 壊れたバンドルはビルドを `failed` にし、原因が `error_message` に残る。

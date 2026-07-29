@@ -127,7 +127,36 @@ pub async fn create_build(
     )
     .await?;
 
-    Ok((StatusCode::CREATED, Json(build.into())))
+    // 将来の CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
+    // 作成レスポンスにだけ baseline のコミット SHA を載せる。
+    let baseline_commit_sha = resolve_baseline_commit_sha(&state, &project, &build.branch).await?;
+
+    let mut response: BuildResponse = build.into();
+    response.baseline_commit_sha = baseline_commit_sha;
+
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// 対象ブランチの baseline の昇格元ビルドのコミット SHA を解決する。
+///
+/// baseline が無い、または昇格元ビルドが削除済み（`source_build_id` が NULL、
+/// あるいは行が消えている）なら `None`。
+async fn resolve_baseline_commit_sha(
+    state: &AppState,
+    project: &entity::projects::Model,
+    branch: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(baseline) = service::baselines::latest_for(&state.db, project, branch).await? else {
+        return Ok(None);
+    };
+    let Some(source_build_id) = baseline.source_build_id else {
+        return Ok(None);
+    };
+    match build_service::get_build(&state.db, source_build_id).await {
+        Ok(source) => Ok(Some(source.commit_sha)),
+        Err(AppError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[axum::debug_handler]
@@ -312,12 +341,15 @@ pub async fn upload_storybook_bundle(
     description = "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、\
                    `storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する\
                    （レンダリングが済むと自動で `processing` に繋がる）。\
-                   以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。",
+                   以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。\
+                   ボディは任意。`storybook` モードで `only_story_ids` を渡すと、\
+                   そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
+    request_body(content = FinalizeBuildRequest, description = "任意。省略・空ボディ可"),
     security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
-        (status = 400, description = "storybook バンドルが未アップロードです", body = ServerError),
+        (status = 400, description = "storybook バンドルが未アップロード / only_story_ids が不正 / screenshots モードで only_story_ids 指定", body = ServerError),
         (status = 409, description = "既に finalize 済みです", body = ServerError),
         CrudErrors,
     )
@@ -326,13 +358,35 @@ pub async fn finalize_build(
     State(state): State<AppState>,
     auth: AuthUser,
     Path(build_id): Path<Uuid>,
+    // ボディは任意。Content-Type 無しの空 POST も従来どおり受けたいので、
+    // `Json<T>` ではなく生の `Bytes` で受けて自前でパースする
+    // （`Json<T>` は Content-Type: application/json を要求して弾いてしまう）。
+    body: Bytes,
 ) -> Result<Json<BuildResponse>, AppError> {
     auth.require_scope(Scope::WriteBuild)?;
+
+    // 空ボディ = 全撮影（従来どおり）。中身があるときだけ JSON として解釈する。
+    let payload: FinalizeBuildRequest = if body.is_empty() {
+        FinalizeBuildRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::BadRequestDetail(format!("invalid finalize body: {e}")))?
+    };
+    payload
+        .validate_story_ids()
+        .map_err(AppError::BadRequestDetail)?;
+
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
     let build = match build.mode {
         BuildMode::Screenshots => {
+            // screenshots モードはサーバーがレンダリングしないので流用制御は無意味。
+            if payload.only_story_ids.is_some() {
+                return Err(AppError::BadRequestDetail(
+                    "only_story_ids is not supported for screenshots-mode builds".into(),
+                ));
+            }
             let build = build_service::finalize(&state.db, build).await?;
             job::compare_build::enqueue(
                 &state.compare_build_storage,
@@ -346,7 +400,10 @@ pub async fn finalize_build(
             let build = build_service::finalize_storybook(&state.db, build).await?;
             job::render_build::enqueue(
                 &state.render_build_storage,
-                job::RenderBuildJob { build_id: build.id },
+                job::RenderBuildJob {
+                    build_id: build.id,
+                    only_story_ids: payload.only_story_ids,
+                },
             )
             .await
             .map_err(AppError::Internal)?;

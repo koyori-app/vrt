@@ -30,6 +30,15 @@ pub struct BuildResponse {
     /// 比較に使った baseline（未確定なら null）。
     #[schema(value_type = Option<String>, format = "uuid", nullable)]
     pub baseline_id: Option<Uuid>,
+    /// このビルドが比較する baseline のコミット SHA。
+    ///
+    /// 将来の CLI が「どのコミットとの差分か」を知り、
+    /// 撮り直しの必要なストーリーを自分で絞り込めるように公開する。
+    /// ビルド作成（`POST /v1/ci/builds`）のレスポンスでのみ埋まり、
+    /// それ以外の経路（一覧・状態ポーリング等）では常に `None`。
+    /// baseline が無い、または昇格元ビルドが削除済みなら `None`。
+    #[schema(nullable)]
+    pub baseline_commit_sha: Option<String>,
     pub total_count: i32,
     pub changed_count: i32,
     pub added_count: i32,
@@ -62,6 +71,9 @@ impl From<builds::Model> for BuildResponse {
             // ストレージキー自体は内部情報なので露出させず、有無だけ返す。
             storybook_uploaded: model.storybook_key.is_some(),
             baseline_id: model.baseline_id,
+            // baseline のコミット SHA は DB の追加参照が必要なので From では解決しない。
+            // 必要な経路（create_build）が組み立て後に明示的に埋める。
+            baseline_commit_sha: None,
             total_count: model.total_count,
             changed_count: model.changed_count,
             added_count: model.added_count,
@@ -97,6 +109,54 @@ pub struct CreateBuildRequest {
     /// `storybook` を指定すると `POST /v1/ci/builds/{id}/storybook` でバンドルを送る形になる。
     #[serde(default)]
     pub mode: Option<BuildMode>,
+}
+
+/// finalize（アップロード締め）リクエスト。
+///
+/// ボディは任意。無し・空・`only_story_ids: null` はすべて「全ストーリー撮影」
+/// を意味し、従来どおりの挙動になる（後方互換）。
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct FinalizeBuildRequest {
+    /// 実際に撮影が必要なストーリー ID のリスト（TurboSnap 相当）。
+    ///
+    /// ここに載っていないストーリーは baseline のスクリーンショットを流用する
+    /// （baseline に該当が無い新規ストーリーは見逃さないよう撮影する）。
+    /// `storybook` モードのビルドでのみ意味を持つ。`screenshots` モードで
+    /// 指定すると 400 になる（サーバーがレンダリングしないため）。
+    #[serde(default)]
+    pub only_story_ids: Option<Vec<String>>,
+}
+
+/// `only_story_ids` の要素数上限。DoS 対策の緩い上限。
+pub const MAX_ONLY_STORY_IDS: usize = 10_000;
+/// ストーリー ID 1 件あたりの最大長。
+pub const MAX_STORY_ID_LEN: usize = 512;
+
+impl FinalizeBuildRequest {
+    /// `only_story_ids` の要素数・各 ID の長さを検証する。
+    ///
+    /// 違反時はエラーメッセージを返す（呼び出し側で 400 にする）。
+    pub fn validate_story_ids(&self) -> Result<(), String> {
+        let Some(ids) = &self.only_story_ids else {
+            return Ok(());
+        };
+        if ids.len() > MAX_ONLY_STORY_IDS {
+            return Err(format!(
+                "only_story_ids must contain at most {MAX_ONLY_STORY_IDS} entries"
+            ));
+        }
+        for id in ids {
+            if id.is_empty() {
+                return Err("only_story_ids must not contain empty ids".into());
+            }
+            if id.len() > MAX_STORY_ID_LEN {
+                return Err(format!(
+                    "each story id must be {MAX_STORY_ID_LEN} characters or fewer"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Storybook バンドルのアップロード結果。
@@ -150,4 +210,52 @@ pub struct BuildListQuery {
     pub limit: Option<u64>,
     /// スキップ件数（既定 0）。
     pub offset: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(ids: Option<Vec<&str>>) -> FinalizeBuildRequest {
+        FinalizeBuildRequest {
+            only_story_ids: ids.map(|v| v.into_iter().map(String::from).collect()),
+        }
+    }
+
+    #[test]
+    fn none_and_empty_are_valid() {
+        assert!(req(None).validate_story_ids().is_ok());
+        assert!(req(Some(vec![])).validate_story_ids().is_ok());
+    }
+
+    #[test]
+    fn normal_ids_are_valid() {
+        assert!(
+            req(Some(vec!["button--primary", "card--default"]))
+                .validate_story_ids()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn empty_id_is_rejected() {
+        assert!(req(Some(vec!["ok", ""])).validate_story_ids().is_err());
+    }
+
+    #[test]
+    fn too_long_id_is_rejected() {
+        let long = "a".repeat(MAX_STORY_ID_LEN + 1);
+        assert!(req(Some(vec![long.as_str()])).validate_story_ids().is_err());
+        let ok = "a".repeat(MAX_STORY_ID_LEN);
+        assert!(req(Some(vec![ok.as_str()])).validate_story_ids().is_ok());
+    }
+
+    #[test]
+    fn too_many_ids_are_rejected() {
+        let ids: Vec<String> = (0..=MAX_ONLY_STORY_IDS).map(|i| i.to_string()).collect();
+        let r = FinalizeBuildRequest {
+            only_story_ids: Some(ids),
+        };
+        assert!(r.validate_story_ids().is_err());
+    }
 }

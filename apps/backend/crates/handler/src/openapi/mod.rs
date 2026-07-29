@@ -41,6 +41,7 @@ pub fn register_schemas(openapi: &mut OpenApi) {
     register_schema::<payload::builds::BuildResponse>(components);
     register_schema::<payload::builds::BuildListResponse>(components);
     register_schema::<payload::builds::CreateBuildRequest>(components);
+    register_schema::<payload::builds::FinalizeBuildRequest>(components);
     register_schema::<payload::builds::ScreenshotResponse>(components);
     register_schema::<payload::builds::ApproveBuildRequest>(components);
     register_schema::<payload::comparisons::ComparisonResponse>(components);
