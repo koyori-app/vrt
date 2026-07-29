@@ -240,6 +240,20 @@ function BuildReview({ buildId, initialBuild }: { buildId: string; initialBuild:
         </span>
         <span className="text-xs text-muted-foreground">{formatDate(build.created_at)}</span>
         <div className="flex-1" />
+        {build.mode === "storybook" && build.storybook_uploaded ? (
+          <Button variant="outline" asChild>
+            {/* Opens the actual uploaded Storybook (Chromatic's "View Storybook").
+                Served by the backend under the /api proxy; the manager UI loads its
+                assets with relative paths so it resolves under the prefixed base. */}
+            <a
+              href={`/api/v1/builds/${build.id}/storybook/`}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Open Storybook
+            </a>
+          </Button>
+        ) : null}
         <Button variant="success" disabled={approveBuild.isPending} onClick={onApproveBuild}>
           Approve build
         </Button>

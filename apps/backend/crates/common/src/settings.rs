@@ -56,6 +56,14 @@ pub struct Settings {
     /// `local` バックエンドの保存先ディレクトリ。
     #[serde(default = "default_local_upload_dir")]
     pub local_upload_dir: String,
+    /// アップロード済み Storybook バンドル（zip）を「Open Storybook」で配信するために
+    /// ローカル展開しておくキャッシュディレクトリ。
+    ///
+    /// ビルドごとに `{storybook_cache_dir}/{build_id}/` へ 1 度だけ展開し、以降はそこから
+    /// 静的配信する。バンドルは 1 ビルドにつき不変なので中身も不変。
+    /// MVP では自動退避（eviction）は行わない（ディスクが逼迫したら手動でこのディレクトリを消す）。
+    #[serde(default = "default_storybook_cache_dir")]
+    pub storybook_cache_dir: String,
     /// S3 互換バックエンド設定（`storage_backend = "s3"` のときのみ必須）。
     pub s3_endpoint: Option<String>,
     pub s3_bucket: Option<String>,
@@ -120,6 +128,10 @@ fn default_storage_backend() -> String {
 
 fn default_local_upload_dir() -> String {
     "./uploads".to_string()
+}
+
+fn default_storybook_cache_dir() -> String {
+    "./storybook-cache".to_string()
 }
 
 pub fn load_settings() -> Result<Settings, anyhow::Error> {
@@ -212,6 +224,7 @@ mod tests {
             github_api_base_url: None,
             storage_backend: default_storage_backend(),
             local_upload_dir: default_local_upload_dir(),
+            storybook_cache_dir: default_storybook_cache_dir(),
             s3_endpoint: None,
             s3_bucket: None,
             s3_region: None,

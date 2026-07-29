@@ -61,17 +61,26 @@ FROM debian:bookworm-slim AS runtime-base
 # chromium は storybook モード（サーバーサイドレンダリング）にだけ必要。
 #
 # ⚠️ イメージサイズへの影響: chromium とその依存（フォント含む）で
-#    展開後 +400〜500MB 程度になる（slim ベースの ~80MB から ~550MB 前後）。
+#    展開後 +400〜500MB 程度、さらに CJK フォント（fonts-noto-cjk）で +90MB 程度。
+#    合計 slim ベースの ~80MB から ~640MB 前後になる。
 #    storybook モードを使わない配布形態では、この apt 行と ENV CHROMIUM_PATH を
 #    落としたバリアントを作ればサイズは元に戻る（CHROMIUM_PATH 未設定なら
 #    mode=storybook のビルド作成が 400 で拒否されるだけで、他機能は影響を受けない）。
 #
-# fonts-liberation は「フォントが 1 つも無いと文字が豆腐になる」のを避ける最小限。
-# レンダリング結果の決定性のため、これ以上フォントは足さないこと
-# （増やすとフォント選択が変わって既存 baseline が全部差分になる）。
+# フォントセットはレンダリング出力を決める入力そのもの。
+# fonts-liberation は「フォントが 1 つも無いと欧文が豆腐になる」のを避ける最小限、
+# fonts-noto-cjk は日本語・中国語・韓国語（CJK）が豆腐/文字化けになるのを避けるため
+# （Noto CJK は単一ファミリで JP/CN/KR を賄うので、フォールバック順が安定し
+#  決定的にレンダリングされる。fontconfig の追加設定は不要）。
+#
+# ⚠️ フォントの増減はレンダリング結果を変え、既存 baseline を全滅させる（全比較が差分になる）。
+#    このリストはチームが baseline を承認し始めたら凍結すること。CJK を足すなら
+#    「実運用の baseline がまだ無い今」が唯一の正しいタイミング。以後は追加しない。
+#
+# なお fonts-noto-cjk は展開後 +90MB 前後あり、runtime イメージがそのぶん太る。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates postgresql-client chromium fonts-liberation \
+        ca-certificates postgresql-client chromium fonts-liberation fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 # service::render はこのパスの実行ファイルを起動する。
@@ -88,6 +97,12 @@ RUN useradd --system --create-home --uid 10001 app
 # このディレクトリが無いと volume ルートが root 所有になり、非 root の backend が
 # create_dir_all で EACCES になってアップロードが全部失敗する。
 RUN mkdir -p /home/app/uploads && chown app:app /home/app/uploads
+
+# 「Open Storybook」がアップロード済みバンドルを展開して静的配信するためのキャッシュ。
+# STORYBOOK_CACHE_DIR の既定マウント先。派生データ（元は storybook.zip）なので永続化は不要
+# ＝ named volume は当てない。コンテナを作り直すと空になり、初回アクセスで再展開されるだけ。
+# app 所有で用意しておかないと非 root の backend が create_dir_all で EACCES になる。
+RUN mkdir -p /home/app/storybook-cache && chown app:app /home/app/storybook-cache
 
 WORKDIR /app
 

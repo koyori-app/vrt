@@ -775,8 +775,8 @@
     "semantic_hash": ""
   },
   "apps/frontend/src/routes/_authed/t.$tenantSlug.p.$projectSlug.index.tsx": {
-    "mtime": 1785253242.959417,
-    "ast_hash": "f808ea55db326df8e097f2083f28a13c",
+    "mtime": 1785300338.9277637,
+    "ast_hash": "55bbb434f8289743003bccc17ca3e7f3",
     "semantic_hash": ""
   },
   "apps/frontend/src/routes/_authed/t.$tenantSlug.settings.tsx": {
@@ -910,8 +910,8 @@
     "semantic_hash": ""
   },
   "docker-compose.yml": {
-    "mtime": 1785253365.574807,
-    "ast_hash": "fb00f2429b076e888230bf9c13590ec5",
+    "mtime": 1785300403.1205168,
+    "ast_hash": "f0201be81f9562c85d972666c6239765",
     "semantic_hash": ""
   },
   "docs/architecture.md": {

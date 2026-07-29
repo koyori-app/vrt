@@ -11,6 +11,7 @@
 
 pub mod browser;
 pub mod bundle;
+pub mod cache;
 
 pub use browser::{
     DEFAULT_STORY_TIMEOUT, RenderError, RenderOptions, StaticServer, StoryRenderer,
@@ -21,6 +22,7 @@ pub use bundle::{
     MAX_UNCOMPRESSED_BYTES, Story, extract_and_index, extract_zip, extract_zip_with_limits,
     locate_index, parse_index,
 };
+pub use cache::{StorybookAsset, StorybookServeError, serve_asset};
 
 /// storybook バンドルのストレージキー。1 ビルドにつき 1 本だけ。
 pub fn storybook_key(

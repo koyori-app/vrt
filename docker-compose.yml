@@ -86,6 +86,9 @@ services:
       # 消えない。ボリュームが無いと `--force-recreate` 等で全画像が消え、DB 行だけ残って
       # レビュー UI が 404 画像だらけになる。
       LOCAL_UPLOAD_DIR: /home/app/uploads
+      # 「Open Storybook」がアップロード済みバンドルを展開して配信するためのキャッシュ先。
+      # 派生データなので永続化しない（イメージ内で app 所有に作ってある。Dockerfile 参照）。
+      STORYBOOK_CACHE_DIR: /home/app/storybook-cache
       # storybook モード（サーバーサイドレンダリング）に使う Chromium。
       # イメージに同梱してある（そのぶんイメージが ~450MB 太っている。
       # 詳細は apps/backend/Dockerfile の runtime-base のコメント）。

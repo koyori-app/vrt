@@ -211,6 +211,13 @@ fn ensure_test_env() {
                 .to_str()
                 .expect("temp dir utf8"),
         );
+        set_default_env(
+            "STORYBOOK_CACHE_DIR",
+            std::env::temp_dir()
+                .join("vrt-test-storybook-cache")
+                .to_str()
+                .expect("temp dir utf8"),
+        );
     });
 }
 
