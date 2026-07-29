@@ -159,6 +159,51 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 `{title}/{name}`（例 `Components/Button/Primary`）で、`index.json` の `docs`
 エントリは撮らない。
 
+#### `vrt` CLI で 1 コマンド（推奨）
+
+同梱の CLI（`apps/backend/crates/cli`、バイナリ名 `vrt`）を使うと、ビルド作成 →
+zip 化 → アップロード → finalize までを 1 コマンドで済ませられる。branch / commit
+は git から自動で拾う。
+
+```bash
+cargo build --release -p vrt-cli   # target/release/vrt が生成される
+
+export VRT_URL=https://vrt.example.com
+export VRT_TOKEN=...                # write:build（--wait を使うなら read:build も）
+export VRT_PROJECT=<tenant-slug>/<project-slug>   # CI usage タブに出る値
+
+# 全ストーリーを撮る（storybook-static を丸ごと送る）
+pnpm build-storybook
+vrt upload --dir ./storybook-static
+
+# 変更されたストーリーだけ撮り直す（TurboSnap 相当）
+pnpm build-storybook --stats-json          # preview-stats.json を出す
+vrt upload --dir ./storybook-static --only-changed --wait
+```
+
+`--wait` を付けるとビルドが決着するまでポーリングし、終了コードで結果を返す
+（`passed`=0 / `changes_detected`=1 / `failed`=2）。CI のジョブをそのまま
+落とせる。`--url` / `--token` / `--project` はフラグでも環境変数
+（`VRT_URL` / `VRT_TOKEN` / `VRT_PROJECT`）でも渡せる。トークンはログに出さない。
+
+`--only-changed` の前提:
+
+- **stats-json が必要**: `storybook build --stats-json` で `preview-stats.json`
+  を出す（既定の探索先は `<dir>/preview-stats.json`、`--stats-json` で変更可）。
+  無い場合は警告して全撮影にフォールバックする
+- **git 履歴が baseline コミットまで必要**: 差分は
+  `git diff <baseline> HEAD` で取る。shallow clone で baseline が手元に無いと
+  全撮影に倒れる。CI では `fetch-depth: 0`（または baseline に届く深さ）で clone する
+- **自動で全撮影に倒れるケース**: baseline がまだ無い（初回・新規ブランチ）、
+  `package.json` / lockfile（`pnpm-lock.yaml` / `yarn.lock` / `package-lock.json`）
+  の変更、`.storybook/` 配下の変更、依存グラフに載っていない変更ファイル
+  （拾い漏れを避けるため安全側に倒す）。`*.md` などレンダリングに無関係な
+  グラフ外ファイルは無視する
+
+#### 低レベル API（curl で直接叩く）
+
+CLI を使わず生の API を叩く場合はこちら。
+
 ```bash
 # 1. mode を指定してビルドを作る
 BUILD=$(curl -sS -X POST \
@@ -177,6 +222,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/storybook" \
 # 3. finalize。ここでレンダリングジョブが積まれる
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
   -H "Authorization: Bearer $VRT_TOKEN"
+# 撮り直しを絞りたいときは only_story_ids を渡す（下の補足を参照）
 
 # 4. rendering / processing を抜けるまでポーリングする
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
@@ -184,6 +230,11 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 
 補足:
 
+- finalize のボディは任意。`{"only_story_ids": ["button--primary", …]}` を渡すと、
+  そのストーリー ID だけを撮影し、残りは baseline のスクリーンショットを流用する
+  （TurboSnap 相当。baseline に無い新規ストーリーは指定に無くても撮影される）。
+  ボディ無し・空・`only_story_ids: null` は従来どおり全撮影。`screenshots`
+  モードで渡すと 400。どのストーリーを渡すべきかを決める CLI は後続で用意する
 - `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
   1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
 - finalize 後は `pending → rendering → processing → …` と進む。

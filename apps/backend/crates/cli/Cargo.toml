@@ -1,0 +1,31 @@
+[package]
+name = "vrt-cli"
+version = "0.1.0"
+edition = "2024"
+
+# バイナリ名は `vrt`。CI からは `vrt upload ...` の 1 コマンドで呼ぶ。
+[[bin]]
+name = "vrt"
+path = "src/main.rs"
+
+# TurboSnap 相当の影響ストーリー算出（純関数群）をテストから直接叩けるよう、
+# バイナリとは別に lib も出す。tests/ は lib の関数を呼ぶ。
+[lib]
+name = "vrt_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# env feature で VRT_URL / VRT_TOKEN 等をフラグ未指定時に環境変数から拾う。
+clap = { version = "4.5", features = ["derive", "env"] }
+# multipart で zip アップロード。TLS は workspace 同様 rustls に寄せる。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

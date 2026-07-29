@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/entity", "crates/common", "crates/payload", "crates/service", "crates/job", "crates/handler"]
+members = ["crates/entity", "crates/common", "crates/payload", "crates/service", "crates/job", "crates/handler", "crates/cli"]
 exclude = ["migration"]
 
 [workspace.dependencies]
