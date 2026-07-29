@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { ComparisonStatusBadge, ReviewStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -31,6 +31,113 @@ function Frame({
         </div>
       )}
     </figure>
+  );
+}
+
+function SwipeView({
+  baselineSrc,
+  currentSrc,
+}: {
+  baselineSrc: string | null;
+  currentSrc: string | null;
+}) {
+  const [position, setPosition] = useState(50);
+  const [dragging, setDragging] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  if (!baselineSrc || !currentSrc) {
+    return (
+      <div className="grid h-40 place-items-center rounded-md border border-dashed border-border text-xs text-muted-foreground">
+        Not available
+      </div>
+    );
+  }
+
+  const clamp = (value: number) => Math.min(100, Math.max(0, value));
+
+  const positionFromEvent = (clientX: number) => {
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0) return position;
+    return clamp(((clientX - rect.left) / rect.width) * 100);
+  };
+
+  const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragging(true);
+    setPosition(positionFromEvent(e.clientX));
+  };
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging) return;
+    setPosition(positionFromEvent(e.clientX));
+  };
+
+  const stopDragging = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setDragging(false);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = e.shiftKey ? 10 : 1;
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      setPosition((prev) => clamp(prev - step));
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault();
+      setPosition((prev) => clamp(prev + step));
+    }
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={stopDragging}
+      onPointerCancel={stopDragging}
+      className="vrt-checkerboard relative w-full cursor-col-resize select-none overflow-hidden rounded-md border border-border"
+    >
+      <img
+        src={baselineSrc}
+        alt="Baseline"
+        draggable={false}
+        className="w-full object-contain object-top"
+      />
+      <img
+        src={currentSrc}
+        alt="Current"
+        draggable={false}
+        style={{ clipPath: `inset(0 ${100 - position}% 0 0)` }}
+        className="absolute inset-0 h-full w-full object-contain object-top"
+      />
+
+      <span className="pointer-events-none absolute left-2 top-2 rounded bg-background/80 px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
+        Current
+      </span>
+      <span className="pointer-events-none absolute right-2 top-2 rounded bg-background/80 px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
+        Baseline
+      </span>
+
+      <div
+        className="pointer-events-none absolute inset-y-0 w-0.5 -translate-x-1/2 bg-primary"
+        style={{ left: `${position}%` }}
+      >
+        <div
+          role="slider"
+          aria-valuenow={Math.round(position)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label="Comparison position"
+          tabIndex={0}
+          onKeyDown={handleKeyDown}
+          className="pointer-events-auto absolute left-1/2 top-1/2 grid h-6 w-6 -translate-x-1/2 -translate-y-1/2 cursor-col-resize place-items-center rounded-full border border-border bg-background shadow"
+        >
+          <span className="text-xs leading-none text-muted-foreground">↔</span>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -93,6 +200,7 @@ export function ComparisonViewer({
       <Tabs defaultValue="side-by-side" className="min-h-0 flex-1 overflow-y-auto p-4">
         <TabsList>
           <TabsTrigger value="side-by-side">Side-by-side</TabsTrigger>
+          <TabsTrigger value="swipe">Swipe</TabsTrigger>
           <TabsTrigger value="diff">Diff</TabsTrigger>
           <TabsTrigger value="onion">Onion-skin</TabsTrigger>
         </TabsList>
@@ -102,6 +210,10 @@ export function ComparisonViewer({
             <Frame label="Baseline" src={baselineSrc} />
             <Frame label="Current" src={currentSrc} />
           </div>
+        </TabsContent>
+
+        <TabsContent value="swipe" className="pt-4">
+          <SwipeView baselineSrc={baselineSrc} currentSrc={currentSrc} />
         </TabsContent>
 
         <TabsContent value="diff" className="pt-4">
