@@ -1,10 +1,24 @@
 use chrono::{DateTime, Utc};
 use sea_orm::prelude::Uuid;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
 use entity::projects;
+
+/// `Option<Option<T>>` を「フィールド省略 = `None`」「`null` 送信 = `Some(None)`」
+/// 「値送信 = `Some(Some(v))`」に分離してデシリアライズする。
+///
+/// 素の `Option<Option<T>>` は serde が最外の `null` を `None` に潰してしまい、
+/// 「未指定（据え置き）」と「明示的な NULL 化」を区別できないため、`#[serde(default,
+/// deserialize_with = "double_option")]` と併用してこの区別を復元する。
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProjectResponse {
@@ -24,6 +38,9 @@ pub struct ProjectResponse {
     pub viewport_width: i32,
     /// storybook モードのレンダリングに使うビューポート高さ（px）。
     pub viewport_height: i32,
+    /// 保持する完了ビルド数の上限。null は無制限。
+    #[schema(nullable)]
+    pub build_retention_limit: Option<i32>,
     #[schema(nullable)]
     pub github_installation_id: Option<i64>,
     #[schema(nullable)]
@@ -46,6 +63,7 @@ impl From<projects::Model> for ProjectResponse {
             diff_ratio_fail: model.diff_ratio_fail,
             viewport_width: model.viewport_width,
             viewport_height: model.viewport_height,
+            build_retention_limit: model.build_retention_limit,
             github_installation_id: model.github_installation_id,
             github_repo: model.github_repo,
             created_at: model.created_at.with_timezone(&Utc),
@@ -81,4 +99,9 @@ pub struct UpdateProjectRequest {
     /// storybook モードのレンダリングに使うビューポート高さ（px、64〜10000）。
     #[validate(range(min = 64, max = 10000))]
     pub viewport_height: Option<i32>,
+    /// 保持する完了ビルド数の上限（1 以上）。`null` を送ると無制限に戻す。
+    /// フィールド自体を省略すると現在値を据え置く。
+    #[schema(nullable, value_type = Option<i32>)]
+    #[serde(default, deserialize_with = "double_option")]
+    pub build_retention_limit: Option<Option<i32>>,
 }

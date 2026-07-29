@@ -177,9 +177,15 @@ pub async fn update_project(
             diff_ratio_fail: payload.diff_ratio_fail,
             viewport_width: payload.viewport_width,
             viewport_height: payload.viewport_height,
+            build_retention_limit: payload.build_retention_limit,
         },
     )
     .await?;
+
+    // 保持数設定を更新した直後にプルーニングを走らせる（超過分の掃除）。
+    // 失敗しても更新自体は成功として扱う（ログのみ）。
+    service::builds::prune_project_builds_best_effort(&state.db, &state.storage, updated.id).await;
+
     Ok(Json(updated.into()))
 }
 

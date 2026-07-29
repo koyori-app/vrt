@@ -2,6 +2,7 @@ pub use sea_orm_migration::prelude::*;
 
 mod m20260728000000_initial_schema;
 mod m20260729000000_build_logs;
+mod m20260730000000_build_retention_limit;
 
 pub struct Migrator;
 
@@ -11,6 +12,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20260728000000_initial_schema::Migration),
             Box::new(m20260729000000_build_logs::Migration),
+            Box::new(m20260730000000_build_retention_limit::Migration),
         ]
     }
 }

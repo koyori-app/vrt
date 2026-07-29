@@ -154,6 +154,17 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
     // ジョブ側が何もせず終わるため、ここでは条件を見ない。
     crate::github_status::enqueue_best_effort(&state.github_status_storage, build_id).await;
 
+    // 完了ビルドが増えたので、保持数の上限を超えた古いビルドを掃除する。
+    // 失敗してもビルド完了自体は失敗させない（ベストエフォート）。
+    if let Ok(build) = service::builds::get_build(&state.db, build_id).await {
+        service::builds::prune_project_builds_best_effort(
+            &state.db,
+            &state.storage,
+            build.project_id,
+        )
+        .await;
+    }
+
     outcome
 }
 

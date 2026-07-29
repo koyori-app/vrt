@@ -201,6 +201,9 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
   const [ratioFail, setRatioFail] = useState(String(project.diff_ratio_fail));
   const [viewportWidth, setViewportWidth] = useState(String(project.viewport_width));
   const [viewportHeight, setViewportHeight] = useState(String(project.viewport_height));
+  const [retention, setRetention] = useState(
+    project.build_retention_limit == null ? "" : String(project.build_retention_limit),
+  );
 
   useEffect(() => {
     setName(project.name);
@@ -209,6 +212,9 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
     setRatioFail(String(project.diff_ratio_fail));
     setViewportWidth(String(project.viewport_width));
     setViewportHeight(String(project.viewport_height));
+    setRetention(
+      project.build_retention_limit == null ? "" : String(project.build_retention_limit),
+    );
   }, [project]);
 
   const update = $api.useMutation("patch", "/v1/projects/{project_id}", {
@@ -232,6 +238,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
         diff_ratio_fail: Number(ratioFail),
         viewport_width: Number(viewportWidth),
         viewport_height: Number(viewportHeight),
+        build_retention_limit: retention.trim() === "" ? null : Number(retention),
       },
     });
   }
@@ -317,6 +324,23 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
               disabled={!canEdit}
               onChange={(event) => setViewportHeight(event.target.value)}
             />
+          </div>
+          <div className="space-y-2 sm:col-span-2">
+            <Label htmlFor="p-retention">Build retention (blank = unlimited)</Label>
+            <Input
+              id="p-retention"
+              type="number"
+              step="1"
+              min="1"
+              placeholder="Unlimited"
+              value={retention}
+              disabled={!canEdit}
+              onChange={(event) => setRetention(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Keep only this many completed builds per project. Older builds (and their screenshots)
+              are deleted automatically; builds referenced by the current baseline are always kept.
+            </p>
           </div>
           <div className="sm:col-span-2">
             <Button type="submit" disabled={!canEdit || update.isPending}>

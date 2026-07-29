@@ -6273,6 +6273,14 @@
           "updated_at"
         ],
         "properties": {
+          "build_retention_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "保持する完了ビルド数の上限。null は無制限。"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -6602,6 +6610,14 @@
       "UpdateProjectRequest": {
         "type": "object",
         "properties": {
+          "build_retention_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "保持する完了ビルド数の上限（1 以上）。`null` を送ると無制限に戻す。\nフィールド自体を省略すると現在値を据え置く。"
+          },
           "default_branch": {
             "type": [
               "string",

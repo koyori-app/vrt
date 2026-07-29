@@ -4,6 +4,9 @@
 //! 承認 ([`approve_build`]) はプロジェクト行を `SELECT ... FOR UPDATE` で直列化してから
 //! baseline を作るため、同一プロジェクトの並行承認でも baseline が競合しない。
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
@@ -17,6 +20,8 @@ use entity::{
     baseline_entries, baselines, builds, builds::BuildMode, builds::BuildStatus, comparisons,
     comparisons::ComparisonStatus, comparisons::ReviewStatus, projects, screenshots,
 };
+
+use crate::storage::StorageBackend;
 
 /// ビルド一覧のデフォルト件数。
 pub const DEFAULT_LIST_LIMIT: u64 = 30;
@@ -452,6 +457,148 @@ pub async fn reject_build<C: ConnectionTrait>(
         .await?;
 
     Ok(updated)
+}
+
+/// 保持数の設定に従って古い完了ビルドを掃除する（ベストエフォート）。
+///
+/// プロジェクトの `build_retention_limit` が NULL（無制限）なら何もしない。
+/// エラーはログに残すだけで呼び出し側の処理は失敗させないため、ビルド完了処理や
+/// 設定更新の後処理からそのまま呼べる。
+pub async fn prune_project_builds_best_effort(
+    db: &DatabaseConnection,
+    storage: &Arc<dyn StorageBackend>,
+    project_id: Uuid,
+) {
+    let project = match projects::Entity::find_by_id(project_id).one(db).await {
+        Ok(Some(project)) => project,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(%project_id, error = %e, "build pruning: failed to load project");
+            return;
+        }
+    };
+    let Some(limit) = project.build_retention_limit else {
+        return;
+    };
+    match prune_old_builds(db, storage, project_id, limit).await {
+        Ok(0) => {}
+        Ok(deleted) => tracing::info!(%project_id, deleted, "pruned old builds"),
+        Err(e) => tracing::warn!(%project_id, error = %e, "build pruning failed"),
+    }
+}
+
+/// 完了（terminal 状態）ビルドを新しい順に `limit` 件残し、超過した古いものを削除する。
+///
+/// 削除対象からの除外:
+///
+/// - 現行 baseline の参照元ビルド（`baselines.source_build_id`）。baseline エントリは
+///   ビルドのスクリーンショットと**同じストレージキーを共有**するため、参照元を消すと
+///   baseline の実体まで失われる
+/// - 進行中（非 terminal）のビルド。数えも消しもしない
+///
+/// 削除順序は「先に DB 行 → その後ストレージ」。DB は builds を消せば screenshots /
+/// comparisons / build_logs が FK cascade で消える。ストレージ削除はベストエフォートで、
+/// 失敗しても警告ログを残して続行する（既存の削除方針に合わせる）。
+///
+/// 戻り値は削除したビルド数。
+pub async fn prune_old_builds(
+    db: &DatabaseConnection,
+    storage: &Arc<dyn StorageBackend>,
+    project_id: Uuid,
+    limit: i32,
+) -> Result<u64, AppError> {
+    if limit < 1 {
+        return Ok(0);
+    }
+
+    // terminal 状態のビルドを新しい順に取得する。changes_detected は含めない
+    // （レビュー待ちでパイプラインは終わっていないため、is_terminal と揃える）。
+    let terminal = [
+        BuildStatus::Passed,
+        BuildStatus::Failed,
+        BuildStatus::Approved,
+        BuildStatus::Rejected,
+    ];
+    let builds = builds::Entity::find()
+        .filter(builds::Column::ProjectId.eq(project_id))
+        .filter(builds::Column::Status.is_in(terminal))
+        .order_by_desc(builds::Column::Number)
+        .all(db)
+        .await?;
+
+    if builds.len() <= limit as usize {
+        return Ok(0);
+    }
+
+    // baseline に参照されているビルドは保護する。
+    let protected: HashSet<Uuid> = baselines::Entity::find()
+        .filter(baselines::Column::ProjectId.eq(project_id))
+        .filter(baselines::Column::SourceBuildId.is_not_null())
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|baseline| baseline.source_build_id)
+        .collect();
+
+    let mut deleted = 0u64;
+    for build in builds.into_iter().skip(limit as usize) {
+        if protected.contains(&build.id) {
+            continue;
+        }
+
+        // ストレージキーは DB 削除で cascade 消去される前に集めておく。
+        let shots = screenshots::Entity::find()
+            .filter(screenshots::Column::BuildId.eq(build.id))
+            .all(db)
+            .await?;
+        let diff_keys: Vec<String> = comparisons::Entity::find()
+            .filter(comparisons::Column::BuildId.eq(build.id))
+            .all(db)
+            .await?
+            .into_iter()
+            .filter_map(|comparison| comparison.diff_storage_key)
+            .collect();
+        let storybook_key = build.storybook_key.clone();
+
+        // 先に DB 行を消す（screenshots / comparisons / build_logs は FK cascade）。
+        builds::Entity::delete_by_id(build.id).exec(db).await?;
+
+        // ストレージ削除はベストエフォート。失敗は警告ログのみで無視する。
+        for shot in &shots {
+            if let Err(e) = storage.delete(&shot.storage_key).await {
+                tracing::warn!(
+                    build_id = %build.id,
+                    key = %shot.storage_key,
+                    error = %e,
+                    "failed to delete pruned screenshot object"
+                );
+            }
+        }
+        for key in &diff_keys {
+            if let Err(e) = storage.delete(key).await {
+                tracing::warn!(
+                    build_id = %build.id,
+                    key = %key,
+                    error = %e,
+                    "failed to delete pruned diff object"
+                );
+            }
+        }
+        if let Some(key) = &storybook_key
+            && let Err(e) = storage.delete(key).await
+        {
+            tracing::warn!(
+                build_id = %build.id,
+                key = %key,
+                error = %e,
+                "failed to delete pruned storybook bundle"
+            );
+        }
+
+        deleted += 1;
+    }
+
+    Ok(deleted)
 }
 
 #[cfg(test)]

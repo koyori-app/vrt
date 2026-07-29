@@ -176,6 +176,65 @@ async fn diff_threshold_out_of_range_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn build_retention_limit_update_and_validation() {
+    let app = TestApp::new().await;
+    app.login_as_new_user().await;
+    let tenant_id = create_tenant(&app, "retention").await;
+    let project_id = create_project(&app, tenant_id, "web").await;
+
+    // 既定は無制限（null）。
+    let get = app.get(&format!("/v1/projects/{project_id}")).await;
+    let body: serde_json::Value = get.json().await.expect("project json");
+    assert!(body["build_retention_limit"].is_null());
+
+    // 0 / 負数は 400。
+    for bad in [
+        json!({ "build_retention_limit": 0 }),
+        json!({ "build_retention_limit": -1 }),
+    ] {
+        assert_eq!(
+            app.patch_json(&format!("/v1/projects/{project_id}"), bad.clone())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "{bad} should be rejected"
+        );
+    }
+
+    // 1 以上は設定できる。
+    let patch = app
+        .patch_json(
+            &format!("/v1/projects/{project_id}"),
+            json!({ "build_retention_limit": 5 }),
+        )
+        .await;
+    assert_eq!(patch.status(), StatusCode::OK);
+    let body: serde_json::Value = patch.json().await.expect("patch json");
+    assert_eq!(body["build_retention_limit"].as_i64(), Some(5));
+
+    // フィールドを省略すると据え置き。
+    let patch = app
+        .patch_json(
+            &format!("/v1/projects/{project_id}"),
+            json!({ "name": "Renamed" }),
+        )
+        .await;
+    let body: serde_json::Value = patch.json().await.expect("patch json");
+    assert_eq!(body["build_retention_limit"].as_i64(), Some(5));
+
+    // null を送ると無制限に戻せる。
+    let patch = app
+        .patch_json(
+            &format!("/v1/projects/{project_id}"),
+            json!({ "build_retention_limit": null }),
+        )
+        .await;
+    assert_eq!(patch.status(), StatusCode::OK);
+    let body: serde_json::Value = patch.json().await.expect("patch json");
+    assert!(body["build_retention_limit"].is_null());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cross_tenant_project_access_is_denied() {
     let owner_app = TestApp::new().await;
     owner_app.login_as_new_user().await;

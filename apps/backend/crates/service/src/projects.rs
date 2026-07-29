@@ -46,6 +46,16 @@ pub fn validate_viewport(field: &str, value: i32) -> Result<(), AppError> {
     Ok(())
 }
 
+/// ビルド保持数の上限を検証する（1 以上）。
+pub fn validate_retention_limit(field: &str, value: i32) -> Result<(), AppError> {
+    if value < 1 {
+        return Err(AppError::BadRequestDetail(format!(
+            "{field} must be at least 1"
+        )));
+    }
+    Ok(())
+}
+
 /// 更新可能なプロジェクト設定。`None` のフィールドは据え置き。
 #[derive(Debug, Default, Clone)]
 pub struct ProjectSettings {
@@ -55,6 +65,9 @@ pub struct ProjectSettings {
     pub diff_ratio_fail: Option<f64>,
     pub viewport_width: Option<i32>,
     pub viewport_height: Option<i32>,
+    /// ビルド保持数の上限。外側 `None` は据え置き、`Some(None)` は無制限（NULL）に設定、
+    /// `Some(Some(n))` は上限を `n` に設定する。
+    pub build_retention_limit: Option<Option<i32>>,
 }
 
 /// テナント内のプロジェクト一覧（作成順）。
@@ -145,6 +158,7 @@ pub async fn create_project<C: ConnectionTrait>(
         diff_ratio_fail: Set(DEFAULT_DIFF_RATIO_FAIL),
         viewport_width: Set(DEFAULT_VIEWPORT_WIDTH),
         viewport_height: Set(DEFAULT_VIEWPORT_HEIGHT),
+        build_retention_limit: Set(None),
         github_installation_id: Set(None),
         github_repo: Set(None),
         created_at: Set(now),
@@ -172,6 +186,9 @@ pub async fn update_project<C: ConnectionTrait>(
     if let Some(value) = settings.viewport_height {
         validate_viewport("viewport_height", value)?;
     }
+    if let Some(Some(value)) = settings.build_retention_limit {
+        validate_retention_limit("build_retention_limit", value)?;
+    }
 
     let mut active: projects::ActiveModel = project.into();
     if let Some(name) = settings.name {
@@ -191,6 +208,9 @@ pub async fn update_project<C: ConnectionTrait>(
     }
     if let Some(viewport_height) = settings.viewport_height {
         active.viewport_height = Set(viewport_height);
+    }
+    if let Some(build_retention_limit) = settings.build_retention_limit {
+        active.build_retention_limit = Set(build_retention_limit);
     }
     active.updated_at = Set(Utc::now().fixed_offset());
     Ok(active.update(db).await?)

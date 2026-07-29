@@ -118,6 +118,16 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
 
             // レンダリング失敗もビルドの終端なので GitHub にステータスを返す。
             crate::github_status::enqueue_best_effort(&state.github_status_storage, build_id).await;
+
+            // 終端（failed）に落ちたので保持数超過分を掃除する（ベストエフォート）。
+            if let Ok(build) = service::builds::get_build(&state.db, build_id).await {
+                service::builds::prune_project_builds_best_effort(
+                    &state.db,
+                    &state.storage,
+                    build.project_id,
+                )
+                .await;
+            }
             Ok(())
         }
     }

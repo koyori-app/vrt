@@ -24,6 +24,9 @@ pub struct Model {
     pub viewport_width: i32,
     /// storybook モードのレンダリングに使うビューポート高さ（px）。
     pub viewport_height: i32,
+    /// プロジェクトごとに保持する完了ビルド数の上限。NULL は無制限（既定）。
+    /// 超過した古い完了ビルドは自動削除される（現行 baseline の参照元は残す）。
+    pub build_retention_limit: Option<i32>,
     /// GitHub App のインストール ID。Phase 6 で `github_installations` への FK にする。
     pub github_installation_id: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]
