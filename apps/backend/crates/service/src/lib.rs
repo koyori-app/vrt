@@ -5,6 +5,7 @@ pub use common::{error, settings};
 
 pub mod auth;
 pub mod baselines;
+pub mod build_logs;
 pub mod builds;
 pub mod comparisons;
 pub mod diff;

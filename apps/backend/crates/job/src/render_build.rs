@@ -25,6 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
+use service::build_logs::LogLevel;
 use service::render::{RenderOptions, StaticServer, StoryRenderer};
 
 use crate::JobState;
@@ -97,6 +98,15 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "render build job failed");
+            // 失敗理由を成果物のログにも 1 行残す（UI/CI から追える）。
+            service::build_logs::append(
+                &state.db,
+                build_id,
+                LogLevel::Error,
+                format!("render failed: {}", truncate(&err.to_string(), 2000)),
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("append render failure log: {e}").into() })?;
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
@@ -179,6 +189,15 @@ async fn run(
     if bundle.stories.is_empty() {
         anyhow::bail!("storybook bundle contains no stories (only docs entries?)");
     }
+
+    // バンドル展開が終わり、撮影対象のストーリー数が確定した時点で開始行を残す。
+    service::build_logs::append(
+        db,
+        build_id,
+        LogLevel::Info,
+        format!("render started: {} stories", bundle.stories.len()),
+    )
+    .await?;
 
     // `only_story_ids` が来ているときだけ baseline を解決して name→entry の
     // 流用テーブルを作る。baseline が無ければ空になり、結果的に全撮影になる。
@@ -303,8 +322,10 @@ async fn render_all(
 
     let mut rendered = 0usize;
     let mut reused = 0usize;
+    let total = bundle.stories.len();
 
-    for story in &bundle.stories {
+    for (idx, story) in bundle.stories.iter().enumerate() {
+        let position = idx + 1;
         let screenshot_name = story.screenshot_name();
 
         // `only_story_ids` 無しは常に撮影（後方互換）。
@@ -348,6 +369,13 @@ async fn render_all(
                 .await
                 .map_err(|e| anyhow::anyhow!("store screenshot for story `{}`: {e}", story.id))?;
                 rendered += 1;
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Info,
+                    format!("rendered {position}/{total} {}", story.id),
+                )
+                .await?;
             }
             StoryAction::Reuse => {
                 // decide_story_action が Reuse を返す時点で必ず存在する。
@@ -386,9 +414,25 @@ async fn render_all(
                     anyhow::anyhow!("store reused screenshot for story `{}`: {e}", story.id)
                 })?;
                 reused += 1;
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Info,
+                    format!("reused {position}/{total} {}", story.id),
+                )
+                .await?;
             }
         }
     }
+
+    // 完了サマリ。撮影と流用の内訳を 1 行で残す。
+    service::build_logs::append(
+        &state.db,
+        build.id,
+        LogLevel::Info,
+        format!("render complete: rendered {rendered} reused {reused}"),
+    )
+    .await?;
 
     tracing::info!(
         build_id = %build.id,

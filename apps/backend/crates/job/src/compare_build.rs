@@ -27,6 +27,7 @@ use entity::{
     baseline_entries, builds, builds::BuildStatus, comparisons, comparisons::ComparisonStatus,
     projects, screenshots,
 };
+use service::build_logs::LogLevel;
 use service::builds::BuildCounts;
 use service::diff::{DiffOptions, diff_images};
 use service::storage::StorageBackend;
@@ -127,6 +128,15 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "compare build job failed");
+            // 失敗理由を成果物のログにも 1 行残す（UI/CI から追える）。
+            service::build_logs::append(
+                &state.db,
+                build_id,
+                LogLevel::Error,
+                format!("compare failed: {}", truncate(&err.to_string(), 2000)),
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("append compare failure log: {e}").into() })?;
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
@@ -177,8 +187,19 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let shots = service::screenshots::list_for_build(db, build_id).await?;
 
     let pairs = join_by_name(shots, baseline_entries);
+    let total = pairs.len();
+
+    // 比較対象数が確定した時点で開始行を残す。
+    service::build_logs::append(
+        db,
+        build_id,
+        LogLevel::Info,
+        format!("compare started: {total} comparisons"),
+    )
+    .await?;
 
     let mut counts = BuildCounts::default();
+    let mut processed = 0usize;
     let now = Utc::now().fixed_offset();
 
     for (name, (shot, entry)) in pairs {
@@ -219,7 +240,31 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         }
         .insert(db)
         .await?;
+
+        // 進捗は 10 件ごと + 最後の 1 件だけ残す（117 件で 117 行は過剰なため）。
+        processed += 1;
+        if processed.is_multiple_of(10) || processed == total {
+            service::build_logs::append(
+                db,
+                build_id,
+                LogLevel::Info,
+                format!("compared {processed}/{total}"),
+            )
+            .await?;
+        }
     }
+
+    // 完了サマリ。内訳を 1 行で残す。
+    service::build_logs::append(
+        db,
+        build_id,
+        LogLevel::Info,
+        format!(
+            "compare complete: total {} changed {} added {} removed {} unchanged {}",
+            counts.total, counts.changed, counts.added, counts.removed, counts.unchanged
+        ),
+    )
+    .await?;
 
     let build =
         service::builds::apply_counts(db, build, counts, baseline.as_ref().map(|b| b.id)).await?;

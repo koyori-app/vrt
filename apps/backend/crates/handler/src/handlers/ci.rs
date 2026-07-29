@@ -8,7 +8,7 @@
 
 use axum::{
     Json,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
 };
 use bytes::{Bytes, BytesMut};
@@ -441,4 +441,48 @@ pub async fn get_build_status(
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
     Ok(Json(build.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/builds/{build_id}/logs",
+    tag = "CI",
+    summary = "ビルドの進捗ログを取得する（CI の追尾用）",
+    description = "`read:build` スコープが必要。`after` カーソルで増分取得する。\
+                   CLI の `--wait` がポーリング中に新着行を stdout へ流すために使う。",
+    params(
+        ("build_id" = Uuid, Path, description = "ビルドID"),
+        BuildLogsQuery,
+    ),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "進捗ログの行", body = BuildLogsResponse),
+        CrudErrors,
+    )
+)]
+pub async fn get_build_logs(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+    Query(query): Query<BuildLogsQuery>,
+) -> Result<Json<BuildLogsResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+
+    let after = query.after.unwrap_or(0);
+    let entries = service::build_logs::list_after(
+        &state.db,
+        build.id,
+        after,
+        service::build_logs::MAX_LIST_LIMIT,
+    )
+    .await?;
+    let last_id = service::build_logs::resolve_last_id(after, &entries);
+
+    Ok(Json(BuildLogsResponse {
+        entries: entries.into_iter().map(Into::into).collect(),
+        last_id,
+    }))
 }

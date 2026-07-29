@@ -10,6 +10,7 @@ import {
   useComparisonFilter,
 } from "@/components/comparison-list";
 import { ComparisonViewer } from "@/components/comparison-viewer";
+import { BuildLogPanel } from "@/components/build-log-panel";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { $api, errorMessage, type Build, type Comparison } from "@/lib/api";
@@ -279,6 +280,8 @@ function BuildReview({ buildId, initialBuild }: { buildId: string; initialBuild:
           {build.error_message}
         </p>
       ) : null}
+
+      <BuildLogPanel buildId={buildId} status={build.status} />
 
       <div className="grid min-h-[70vh] grid-cols-1 gap-0 overflow-hidden rounded-xl border border-border lg:grid-cols-[280px_1fr]">
         <aside className="min-h-0 border-b border-border lg:border-b-0 lg:border-r">

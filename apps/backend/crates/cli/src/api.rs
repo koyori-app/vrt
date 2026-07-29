@@ -53,6 +53,21 @@ pub struct BuildResponse {
     pub error_message: Option<String>,
 }
 
+/// ビルド進捗ログの 1 行（payload::builds::BuildLogEntry に一致）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildLogEntry {
+    pub id: i64,
+    pub level: String,
+    pub message: String,
+}
+
+/// ログの増分取得レスポンス（payload::builds::BuildLogsResponse に一致）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildLogsResponse {
+    pub entries: Vec<BuildLogEntry>,
+    pub last_id: i64,
+}
+
 impl Client {
     pub fn new(base_url: String, token: String) -> Result<Self> {
         // 末尾スラッシュを一度落として URL 組み立てを安定させる。
@@ -164,5 +179,19 @@ impl Client {
             .await
             .context("get build request failed")?;
         Self::read_json(resp, "get build").await
+    }
+
+    /// ビルド進捗ログを `after` カーソルで増分取得する。
+    pub async fn get_build_logs(&self, build_id: &str, after: i64) -> Result<BuildLogsResponse> {
+        let url = format!(
+            "{}/v1/ci/builds/{}/logs?after={}",
+            self.base_url, build_id, after
+        );
+        let resp = self
+            .bearer(self.http.get(&url))
+            .send()
+            .await
+            .context("get build logs request failed")?;
+        Self::read_json(resp, "get build logs").await
     }
 }

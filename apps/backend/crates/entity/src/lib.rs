@@ -1,6 +1,7 @@
 pub mod _generated;
 pub mod baseline_entries;
 pub mod baselines;
+pub mod build_logs;
 pub mod builds;
 pub mod comparisons;
 pub mod github_installations;

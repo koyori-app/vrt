@@ -20,6 +20,7 @@ use entity::{
 };
 use payload::builds::*;
 use payload::comparisons::*;
+use service::build_logs as log_service;
 use service::builds as build_service;
 use service::comparisons as comparison_service;
 use service::projects as project_service;
@@ -214,6 +215,46 @@ pub async fn get_build(
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
     Ok(Json(build.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/{build_id}/logs",
+    tag = "Builds",
+    summary = "ビルドの進捗ログ（増分取得）",
+    description = "render / compare ジョブが追記した進捗ログを `after` カーソルで増分取得する。\
+                   テナントのメンバーであること。進行中は UI がポーリングする。",
+    params(
+        ("build_id" = Uuid, Path, description = "ビルドID"),
+        BuildLogsQuery,
+    ),
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "進捗ログの行", body = BuildLogsResponse),
+        CrudErrors,
+    )
+)]
+pub async fn get_build_logs(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+    Query(query): Query<BuildLogsQuery>,
+) -> Result<Json<BuildLogsResponse>, AppError> {
+    auth.require_scope(Scope::ReadBuild)?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+
+    let after = query.after.unwrap_or(0);
+    let entries =
+        service::build_logs::list_after(&state.db, build.id, after, log_service::MAX_LIST_LIMIT)
+            .await?;
+    let last_id = log_service::resolve_last_id(after, &entries);
+
+    Ok(Json(BuildLogsResponse {
+        entries: entries.into_iter().map(Into::into).collect(),
+        last_id,
+    }))
 }
 
 #[axum::debug_handler]

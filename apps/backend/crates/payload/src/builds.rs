@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use entity::{builds, builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{build_logs, builds, builds::BuildMode, builds::BuildStatus, screenshots};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BuildResponse {
@@ -210,6 +210,47 @@ pub struct BuildListQuery {
     pub limit: Option<u64>,
     /// スキップ件数（既定 0）。
     pub offset: Option<u64>,
+}
+
+/// ビルド進捗ログの 1 行。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BuildLogEntry {
+    /// グローバル連番。増分取得のカーソルにそのまま使う。
+    pub id: i64,
+    /// `info` | `warn` | `error`。
+    pub level: String,
+    pub message: String,
+    #[schema(value_type = String, format = "date-time")]
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<build_logs::Model> for BuildLogEntry {
+    fn from(model: build_logs::Model) -> Self {
+        Self {
+            id: model.id,
+            level: model.level,
+            message: model.message,
+            created_at: model.created_at.with_timezone(&Utc),
+        }
+    }
+}
+
+/// ビルド進捗ログの増分取得レスポンス。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BuildLogsResponse {
+    /// `after` より後の行（id 昇順）。
+    pub entries: Vec<BuildLogEntry>,
+    /// クライアントが次のポーリングで `after` に渡す値。
+    /// 行が無ければリクエストされた `after` が据え置かれる。
+    pub last_id: i64,
+}
+
+/// ビルド進捗ログの増分取得パラメータ。
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BuildLogsQuery {
+    /// この id より後の行だけを返す（省略時は 0 = 先頭から）。
+    pub after: Option<i64>,
 }
 
 #[cfg(test)]

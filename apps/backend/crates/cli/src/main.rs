@@ -219,15 +219,24 @@ fn resolve_only_story_ids(
 }
 
 /// ビルドが終端（またはレビュー待ちの changes_detected）になるまでポーリングする。
+///
+/// 状態取得のたびに進捗ログも増分取得して stdout に流す。終端後にも 1 回引いて、
+/// 最後の状態遷移と同時に書かれた行を取りこぼさないようにする。
 async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildResponse> {
     const INTERVAL: Duration = Duration::from_secs(3);
     // ジョブが詰まったまま無限待機しないよう上限を設ける。
     const TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
     let start = std::time::Instant::now();
+    // 追尾済みログの末尾 id。ここより後の行だけを毎回引く。
+    let mut log_cursor: i64 = 0;
     loop {
+        log_cursor = flush_logs(client, build_id, log_cursor).await;
+
         let build = client.get_build(build_id).await?;
         if is_settled(&build.status) {
+            // 終端遷移と同時に書かれた行（完了サマリ・失敗理由）を最後に流し切る。
+            flush_logs(client, build_id, log_cursor).await;
             return Ok(build);
         }
         if start.elapsed() >= TIMEOUT {
@@ -238,6 +247,25 @@ async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildRes
             );
         }
         tokio::time::sleep(INTERVAL).await;
+    }
+}
+
+/// `cursor` より後のログ行を `[level] message` 形式で stdout に印字し、新しいカーソルを返す。
+///
+/// ログ取得の失敗はビルド待機の失敗にはしない（警告だけ出して次に進む）。
+/// 進捗ログは補助情報であり、これで終了コードを狂わせたくない。
+async fn flush_logs(client: &Client, build_id: &str, cursor: i64) -> i64 {
+    match client.get_build_logs(build_id, cursor).await {
+        Ok(logs) => {
+            for entry in &logs.entries {
+                println!("[{}] {}", entry.level, entry.message);
+            }
+            logs.last_id
+        }
+        Err(e) => {
+            tracing::warn!("could not fetch build logs ({e:#}); continuing");
+            cursor
+        }
     }
 }
 

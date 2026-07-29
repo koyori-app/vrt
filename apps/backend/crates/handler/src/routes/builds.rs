@@ -7,6 +7,7 @@ use crate::AppState;
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::<AppState>::new()
         .routes(routes!(crate::handlers::builds::get_build))
+        .routes(routes!(crate::handlers::builds::get_build_logs))
         .routes(routes!(crate::handlers::builds::list_comparisons))
         .routes(routes!(crate::handlers::builds::approve_build))
         .routes(routes!(crate::handlers::builds::reject_build))

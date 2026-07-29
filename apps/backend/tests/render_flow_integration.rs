@@ -396,6 +396,18 @@ impl Fixture {
             .expect("load screenshots")
     }
 
+    /// サーバーのジョブが追記した build_logs 行を DB から直接読む（id 昇順）。
+    async fn build_logs(&self, build_id: Uuid) -> Vec<entity::build_logs::Model> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+        entity::build_logs::Entity::find()
+            .filter(entity::build_logs::Column::BuildId.eq(build_id))
+            .order_by_asc(entity::build_logs::Column::Id)
+            .all(&self.app.state.db)
+            .await
+            .expect("load build logs")
+    }
+
     async fn comparisons(&self, build_id: Uuid) -> Vec<Value> {
         let res = self
             .app
@@ -914,4 +926,182 @@ async fn omitting_mode_keeps_the_screenshots_behaviour() {
     let build: Value = res.json().await.expect("build json");
     assert_eq!(build["mode"].as_str(), Some("screenshots"));
     assert_eq!(build["storybook_uploaded"].as_bool(), Some(false));
+}
+
+// ── ビルド進捗ログ ────────────────────────────────────────────────────────
+
+/// 件数の数え上げ（ログメッセージの接頭辞ごと）。
+fn count_prefix(logs: &[entity::build_logs::Model], prefix: &str) -> usize {
+    logs.iter()
+        .filter(|l| l.message.starts_with(prefix))
+        .count()
+}
+
+/// render / compare のジョブが進捗ログを行単位で残し、rendered / reused の行が
+/// 期待どおりの数だけ出ること。CI/UI の増分取得エンドポイントも通す。
+#[tokio::test(flavor = "multi_thread")]
+async fn build_logs_capture_render_and_compare_progress() {
+    if !chromium_or_skip("build_logs_capture_render_and_compare_progress") {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 全撮影 → 承認して baseline 化 ───────────────────────────
+    let build_a = fx.create_storybook_build("log0001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_a_id).await;
+
+    let logs_a = fx.build_logs(build_a_id).await;
+    // 開始 1 + rendered 3 + render complete 1、加えて compare 側の start/summary。
+    assert_eq!(
+        count_prefix(&logs_a, "render started"),
+        1,
+        "one render-start line, got {logs_a:?}"
+    );
+    assert_eq!(
+        count_prefix(&logs_a, "rendered "),
+        3,
+        "three stories rendered on the first build"
+    );
+    assert_eq!(count_prefix(&logs_a, "reused "), 0, "nothing reused yet");
+    assert_eq!(count_prefix(&logs_a, "render complete"), 1);
+    assert_eq!(count_prefix(&logs_a, "compare started"), 1);
+    assert_eq!(count_prefix(&logs_a, "compare complete"), 1);
+    // ログは id 昇順（= 追記順）で並ぶ。
+    assert!(
+        logs_a.windows(2).all(|w| w[0].id < w[1].id),
+        "logs are strictly ascending by id"
+    );
+
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "force approve build A");
+
+    // ── ビルド B: only_story_ids に Red だけ → 1 撮影 + 2 流用 ─────────────
+    let build_b = fx.create_storybook_build("log0002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--red"])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    fx.wait_for_terminal(build_b_id).await;
+
+    let logs_b = fx.build_logs(build_b_id).await;
+    assert_eq!(
+        count_prefix(&logs_b, "rendered "),
+        1,
+        "only Red is rendered, got {logs_b:?}"
+    );
+    assert_eq!(
+        count_prefix(&logs_b, "reused "),
+        2,
+        "Blue and Empty are reused from baseline"
+    );
+
+    // ── 増分取得エンドポイント（セッション認証）────────────────────────────
+    let res = fx.app.get(&format!("/v1/builds/{build_a_id}/logs")).await;
+    assert_eq!(res.status(), StatusCode::OK, "list build logs");
+    let body: Value = res.json().await.expect("logs json");
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(
+        entries.len(),
+        logs_a.len(),
+        "endpoint returns every recorded line"
+    );
+    let last_id = body["last_id"].as_i64().expect("last_id");
+    assert_eq!(
+        last_id,
+        entries.last().and_then(|e| e["id"].as_i64()).unwrap(),
+        "last_id points at the final entry"
+    );
+    assert_eq!(entries[0]["level"].as_str(), Some("info"));
+
+    // after=last_id なら新着なし、カーソルは据え置き。
+    let res = fx
+        .app
+        .get(&format!("/v1/builds/{build_a_id}/logs?after={last_id}"))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = res.json().await.expect("logs json");
+    assert_eq!(
+        body["entries"].as_array().map(|a| a.len()),
+        Some(0),
+        "no new lines past the cursor"
+    );
+    assert_eq!(body["last_id"].as_i64(), Some(last_id), "cursor held");
+
+    // ── CI トークン経由の増分取得も同形 ────────────────────────────────────
+    let res = fx
+        .app
+        .get_with_bearer(&format!("/v1/ci/builds/{build_a_id}/logs"), &fx.token)
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "ci logs endpoint");
+    let body: Value = res.json().await.expect("ci logs json");
+    assert_eq!(
+        body["entries"].as_array().map(|a| a.len()),
+        Some(logs_a.len())
+    );
+}
+
+/// 他テナントの CI トークンでは他人のビルドのログを引けない（403）。
+///
+/// Chromium 不要。ビルドは finalize せず pending のままでよい（認可の検査だけ）。
+#[tokio::test(flavor = "multi_thread")]
+async fn ci_build_logs_endpoint_is_tenant_scoped() {
+    // ビルドの所有者。
+    let owner = setup().await;
+    let build = owner.create_storybook_build("logacl1").await;
+    let build_id = build_id_of(&build);
+
+    // 別テナント・別ユーザー・別トークン（DB はプロセス内で共有される）。
+    let outsider = setup().await;
+
+    // 部外者の CI トークンでは、存在するビルドでも 403（存在の有無を漏らさない）。
+    let res = outsider
+        .app
+        .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &outsider.token)
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "outsider must not read another tenant's build logs (ci)"
+    );
+
+    // UI 側（セッション認証）の口も同じくテナント境界で弾く。
+    let res = outsider
+        .app
+        .get(&format!("/v1/builds/{build_id}/logs"))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "outsider must not read another tenant's build logs (ui)"
+    );
+
+    // 所有者本人は自分のビルドのログ口に 200 でアクセスできる。
+    let res = owner
+        .app
+        .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &owner.token)
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "owner can read its own logs");
 }
