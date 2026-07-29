@@ -1005,8 +1005,8 @@
     "semantic_hash": ""
   },
   "apps/frontend/src/components/build-log-panel.tsx": {
-    "mtime": 1785341031.009222,
-    "ast_hash": "d2aa861996af712e3c7a89c9e6e47997",
+    "mtime": 1785337028.8936453,
+    "ast_hash": "164e9c44869b0e12cc4e7d7f2f7cf552",
     "semantic_hash": ""
   }
 }

@@ -1,29 +1,29 @@
 # Graph Report - vrt  (2026-07-30)
 
 ## Corpus Check
-- 192 files · ~87,968 words
+- 192 files · ~87,970 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 2273 nodes · 4843 edges · 177 communities (111 shown, 66 thin omitted)
-- Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 56 edges (avg confidence: 0.75)
+- 2235 nodes · 4850 edges · 154 communities (120 shown, 34 thin omitted)
+- Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 57 edges (avg confidence: 0.75)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `70c10e7b`
+- Built from commit: `4bfad984`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
 - vrt_flow_integration.rs
 - render_flow_integration.rs
-- AppError
+- service/src/builds.rs
 - routeTree.gen.ts
 - browser.rs
-- Model
+- payload/src/builds.rs
 - src/auth.rs
 - service/src/github.rs
-- validation.rs
+- service/src/tenants.rs
 - render_build.rs
 - PersonalTokenResponse
 - post-commit
@@ -33,25 +33,25 @@
 - pixelmatch.rs
 - handlers/github.rs
 - bundle.rs
-- compare_build.rs
-- card.tsx
+- service/src/screenshots.rs
+- .from_request_parts
 - アーキテクチャ
-- comparison-viewer.tsx
+- service/src/projects.rs
 - turbosnap.rs
 - devDependencies
 - settings.tokens.tsx
-- StorageError
+- S3StorageBackend
 - compilerOptions
 - dependencies
 - AuthUser
 - .new_with
 - TestApp
-- job/src/lib.rs
+- compare_build.rs
 - csrf.rs
 - github_integration.rs
 - components.json
-- service/src/screenshots.rs
-- Model
+- cache.rs
+- load_build_with_role
 - e2e/package.json
 - TenantResponse
 - ProjectResponse
@@ -60,14 +60,14 @@
 - ComparisonResponse
 - ServerError
 - cn
-- Bytes
-- C
-- me
+- handlers/ci.rs
+- service/src/build_logs.rs
+- t.$tenantSlug.p.$projectSlug.builds.$number.tsx
 - tenants_integration.rs
-- routes/builds.rs
+- service/src/comparisons.rs
 - auth_oauth_integration.rs
-- Uuid
-- routes/ci.rs
+- Model
+- StorageError
 - Client
 - projects_integration.rs
 - package.json
@@ -78,7 +78,7 @@
 - Model
 - Model
 - review_comparison
-- get_baseline_entry_content
+- AppError
 - MeResponse
 - Model
 - Model
@@ -97,7 +97,7 @@
 - Model
 - TenantRole
 - health.rs
-- T
+- GithubInstallationResponse
 - main
 - main
 - frontend/package.json
@@ -135,110 +135,88 @@
 - start-backend.sh
 - seaorm_generate.sh
 - t.$tenantSlug.p.$projectSlug.index.tsx
-- PathBuf
-- ActiveModelBehavior
-- Entity
+- store_screenshot_with_metadata
+- latest_on_branch
+- api.$.ts
 - server.rs
-- HasOne
 - Migration
-- DateTimeWithTimeZone
+- Model
 - collect_files
-- Model
-- ActiveModelBehavior
-- TenantRole
-- Model
-- StatusCode
-- BTreeMap
-- CompareBuildStorage
-- ComparisonStatus
-- Model
-- HashMap
-- HashSet
-- Model
-- RenderBuildStorage
-- BuildStatus
-- DateTime
-- From
-- Model
-- Utc
-- Into
-- Model
-- Box
-- DbErr
-- SchemaManager
-- Model
-- Value
+- setup_storage
+- ActiveModel
 
 ## God Nodes (most connected - your core abstractions)
-1. `AppError` - 116 edges
-2. `AppState` - 94 edges
-3. `cn()` - 72 edges
-4. `TestApp` - 53 edges
-5. `AuthUser` - 45 edges
-6. `Model` - 30 edges
+1. `AppError` - 139 edges
+2. `AppState` - 119 edges
+3. `cn()` - 73 edges
+4. `AuthUser` - 61 edges
+5. `TestApp` - 55 edges
+6. `JobState` - 25 edges
 7. `compute_affected_stories()` - 22 edges
 8. `AuthError` - 22 edges
 9. `Client` - 21 edges
-10. `StorageBackend` - 21 edges
+10. `load_build_with_role()` - 21 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `serve_storybook()` --calls--> `load_build_with_role()`  [INFERRED]
-  apps/backend/crates/handler/src/handlers/content.rs → apps/backend/crates/handler/src/handlers/builds.rs
-- `get_screenshot_content()` --calls--> `load_screenshot_with_role()`  [INFERRED]
-  apps/backend/crates/handler/src/handlers/content.rs → apps/backend/crates/handler/src/handlers/builds.rs
-- `get_baseline_entry_content()` --calls--> `load_baseline_entry_with_role()`  [INFERRED]
-  apps/backend/crates/handler/src/handlers/content.rs → apps/backend/crates/handler/src/handlers/builds.rs
-- `get_diff_content()` --calls--> `load_comparison_with_role()`  [INFERRED]
-  apps/backend/crates/handler/src/handlers/comparisons.rs → apps/backend/crates/handler/src/handlers/builds.rs
-- `review_comparison()` --calls--> `load_comparison_with_role()`  [INFERRED]
-  apps/backend/crates/handler/src/handlers/comparisons.rs → apps/backend/crates/handler/src/handlers/builds.rs
+- `approve_build()` --calls--> `with_transaction()`  [INFERRED]
+  apps/backend/crates/service/src/builds.rs → apps/backend/crates/common/src/db.rs
+- `create_tenant()` --calls--> `with_transaction()`  [INFERRED]
+  apps/backend/crates/service/src/tenants.rs → apps/backend/crates/common/src/db.rs
+- `create_personal_token()` --calls--> `ScopeList`  [INFERRED]
+  apps/backend/crates/handler/src/handlers/personal_tokens.rs → apps/backend/crates/entity/src/scopes.rs
+- `oauth_callback()` --calls--> `encrypt_oauth_token()`  [INFERRED]
+  apps/backend/crates/handler/src/handlers/auth.rs → apps/backend/crates/service/src/auth.rs
+- `oauth_callback()` --calls--> `upsert_oauth_user()`  [INFERRED]
+  apps/backend/crates/handler/src/handlers/auth.rs → apps/backend/crates/service/src/auth.rs
 
 ## Import Cycles
+- 2-file cycle: `apps/backend/crates/job/src/compare_build.rs -> apps/backend/crates/job/src/lib.rs -> apps/backend/crates/job/src/compare_build.rs`
 - 2-file cycle: `apps/backend/crates/job/src/github_status.rs -> apps/backend/crates/job/src/lib.rs -> apps/backend/crates/job/src/github_status.rs`
 - 2-file cycle: `apps/backend/crates/job/src/github_webhook.rs -> apps/backend/crates/job/src/lib.rs -> apps/backend/crates/job/src/github_webhook.rs`
+- 2-file cycle: `apps/backend/crates/job/src/lib.rs -> apps/backend/crates/job/src/render_build.rs -> apps/backend/crates/job/src/lib.rs`
 - 2-file cycle: `apps/backend/crates/cli/src/git.rs -> apps/backend/crates/cli/src/main.rs -> apps/backend/crates/cli/src/git.rs`
 
-## Communities (177 total, 66 thin omitted)
+## Communities (154 total, 34 thin omitted)
 
 ### Community 0 - "vrt_flow_integration.rs"
 Cohesion: 0.15
 Nodes (28): assert_completed_at_is_stamped(), baseline_entry_count(), build_can_be_fetched_by_project_scoped_number(), build_id_of(), counts(), dump_apalis_state(), duplicate_screenshot_name_is_conflict(), encode() (+20 more)
 
 ### Community 1 - "render_flow_integration.rs"
-Cohesion: 0.19
-Nodes (25): a_bundle_without_an_index_fails_the_build_with_a_reason(), assert_completed_at_is_stamped(), build_id_of(), build_logs_capture_render_and_compare_progress(), bundle_zip(), bundle_zip_with_index(), bundles_larger_than_the_default_body_limit_are_accepted(), chromium_or_skip() (+17 more)
+Cohesion: 0.18
+Nodes (26): a_bundle_without_an_index_fails_the_build_with_a_reason(), assert_completed_at_is_stamped(), build_id_of(), build_logs_capture_render_and_compare_progress(), bundle_zip(), bundle_zip_with_index(), bundles_larger_than_the_default_body_limit_are_accepted(), chromium_or_skip() (+18 more)
 
-### Community 2 - "AppError"
-Cohesion: 0.06
-Nodes (95): AppError, DbErr, From, IntoResponse, Self, entries(), get_baseline(), get_entry() (+87 more)
+### Community 2 - "service/src/builds.rs"
+Cohesion: 0.22
+Nodes (26): apply_counts(), approve_all_pending(), approve_build(), attach_storybook_bundle(), BuildCounts, count_builds(), create_build(), finalize() (+18 more)
 
 ### Community 3 - "routeTree.gen.ts"
-Cohesion: 0.05
-Nodes (47): Toaster(), getRouter(), Register, @tanstack/react-router, BodyTooLargeError, buildBackendUrl(), copyHeaders(), handler() (+39 more)
+Cohesion: 0.06
+Nodes (37): Toaster(), meQueryOptions(), getRouter(), Register, @tanstack/react-router, Route, Route, Route (+29 more)
 
 ### Community 4 - "browser.rs"
 Cohesion: 0.10
 Nodes (34): a_story_error_signal_fails_fast_with_the_reason(), a_story_that_renders_nothing_still_produces_a_screenshot(), discover_chromium(), launching_a_missing_chromium_fails_fast(), playwright_chromium(), Readiness, readiness_parses_probe_results(), RenderError (+26 more)
 
-### Community 5 - "Model"
-Cohesion: 0.09
-Nodes (21): BuildMode, BuildStatus, Model, BuildStatus, DateTimeWithTimeZone, Entity, HasMany, HasOne (+13 more)
+### Community 5 - "payload/src/builds.rs"
+Cohesion: 0.05
+Nodes (44): BuildMode, BuildStatus, Model, BuildStatus, DateTimeWithTimeZone, Entity, HasMany, HasOne (+36 more)
 
 ### Community 6 - "src/auth.rs"
-Cohesion: 0.06
-Nodes (68): bind_sql(), column_exists(), connect_database(), db_max_connections(), execute_bound(), is_postgres_unique_violation(), query_one_bool(), C (+60 more)
+Cohesion: 0.08
+Nodes (52): bind_sql(), column_exists(), connect_database(), db_max_connections(), execute_bound(), is_postgres_unique_violation(), query_one_bool(), C (+44 more)
 
 ### Community 7 - "service/src/github.rs"
 Cohesion: 0.05
 Nodes (61): RedisConnection, Error, Result, Self, build_storage(), build_storage_for_queue(), enqueue(), enqueue_best_effort() (+53 more)
 
-### Community 8 - "validation.rs"
-Cohesion: 0.21
-Nodes (6): check_slug(), is_reserved_slug(), Display, Formatter, Result, SlugError
+### Community 8 - "service/src/tenants.rs"
+Cohesion: 0.17
+Nodes (29): check_slug(), is_reserved_slug(), Display, Formatter, Result, SlugError, add_member(), count_owners() (+21 more)
 
 ### Community 9 - "render_build.rs"
-Cohesion: 0.12
-Nodes (29): build_storage(), build_storage_for_queue(), decide_story_action(), enqueue(), process(), render_all(), RenderBuildJob, Arc (+21 more)
+Cohesion: 0.13
+Nodes (27): build_storage(), build_storage_for_queue(), decide_story_action(), enqueue(), process(), render_all(), RenderBuildJob, Arc (+19 more)
 
 ### Community 10 - "PersonalTokenResponse"
 Cohesion: 0.07
@@ -249,44 +227,44 @@ Cohesion: 0.40
 Nodes (4): post-commit script, GRAPHIFY_CHANGED, GRAPHIFY_REBUILD_LOG, PYTHONHASHSEED
 
 ### Community 12 - "AppState"
-Cohesion: 0.08
-Nodes (28): AppState, Arc, CompareBuildStorage, DatabaseConnection, GithubStatusStorage, GithubWebhookStorage, PgPool, RenderBuildStorage (+20 more)
+Cohesion: 0.07
+Nodes (32): AppState, Arc, CompareBuildStorage, DatabaseConnection, GithubStatusStorage, GithubWebhookStorage, PgPool, RenderBuildStorage (+24 more)
 
 ### Community 13 - "post-checkout"
 Cohesion: 0.50
 Nodes (3): post-checkout script, GRAPHIFY_REBUILD_LOG, PYTHONHASHSEED
 
 ### Community 15 - "queries.ts"
-Cohesion: 0.15
-Nodes (14): Build, Project, Tenant, TenantRole, meQueryOptions(), ROLE_RANK, roleAtLeast(), useMyRole() (+6 more)
+Cohesion: 0.18
+Nodes (14): Build, Project, Tenant, TenantRole, ROLE_RANK, roleAtLeast(), useMyRole(), useProjects() (+6 more)
 
 ### Community 16 - "pixelmatch.rs"
 Cohesion: 0.12
 Nodes (33): alpha_difference_is_detected(), antialiased(), antialiasing_is_detected_and_not_counted(), background_is_dimmed_grayscale_of_baseline(), blend(), color_delta(), color_delta_is_zero_for_identical_pixels(), color_delta_sign_encodes_direction() (+25 more)
 
 ### Community 17 - "handlers/github.rs"
-Cohesion: 0.09
-Nodes (32): claim_installation(), github_webhook(), list_installations(), list_unclaimed_installations(), rejects_missing_prefix(), Bytes, HeaderMap, Json (+24 more)
+Cohesion: 0.13
+Nodes (20): claim_installation(), github_webhook(), list_installations(), list_unclaimed_installations(), rejects_missing_prefix(), Bytes, HeaderMap, Json (+12 more)
 
 ### Community 18 - "bundle.rs"
 Cohesion: 0.13
 Nodes (33): BundleError, docs_only_index_yields_no_stories(), extract_and_index(), extract_zip(), extract_zip_with_limits(), ExtractedBundle, ExtractLimits, extracts_bundle_and_lists_stories() (+25 more)
 
-### Community 19 - "compare_build.rs"
-Cohesion: 0.14
-Nodes (29): build_storage(), build_storage_for_queue(), compare_pair(), CompareBuildJob, enqueue(), entry(), full_outer_join_marks_added_and_removed(), join_by_name() (+21 more)
+### Community 19 - "service/src/screenshots.rs"
+Cohesion: 0.18
+Nodes (20): accepts_valid_png(), encode_png(), load_rgba(), one_shot_stream(), open_stream(), png_bytes(), png_roundtrips_through_encode(), read_all() (+12 more)
 
-### Community 20 - "card.tsx"
-Cohesion: 0.23
-Nodes (12): buttonVariants, Card(), CardAction(), CardContent(), CardDescription(), CardFooter(), CardHeader(), CardTitle() (+4 more)
+### Community 20 - ".from_request_parts"
+Cohesion: 0.16
+Nodes (17): bearer_token_from_parts(), CurrentUser, OptionalAuthUser, Model, Option, Result, Scope, Self (+9 more)
 
 ### Community 21 - "アーキテクチャ"
 Cohesion: 0.05
 Nodes (35): backend のクレート依存グラフ, OpenAPI パイプライン, VRT の状態機械, アーキテクチャ, ストレージ, ビルド, モノレポ構成, レンダリングジョブ（storybook モード） (+27 more)
 
-### Community 22 - "comparison-viewer.tsx"
-Cohesion: 0.19
-Nodes (11): ComparisonViewer(), Frame(), ComparisonStatusBadge(), ReviewStatusBadge(), Slider(), Tabs(), TabsContent(), TabsList() (+3 more)
+### Community 22 - "service/src/projects.rs"
+Cohesion: 0.27
+Nodes (17): create_project(), delete_project(), get_project(), get_project_by_slug(), get_project_in_tenant(), list_projects(), ProjectSettings, C (+9 more)
 
 ### Community 23 - "turbosnap.rs"
 Cohesion: 0.10
@@ -297,12 +275,12 @@ Cohesion: 0.07
 Nodes (27): devDependencies, openapi-typescript, prettier, tailwindcss, @tailwindcss/vite, @tanstack/react-query-devtools, @tanstack/react-router-devtools, tw-animate-css (+19 more)
 
 ### Community 25 - "settings.tokens.tsx"
-Cohesion: 0.21
-Nodes (15): CreateTenantDialog(), Button(), Checkbox(), Dialog(), DialogContent(), DialogDescription(), DialogFooter(), DialogHeader() (+7 more)
+Cohesion: 0.14
+Nodes (27): CreateTenantDialog(), Button(), buttonVariants, Card(), CardAction(), CardContent(), CardDescription(), CardFooter() (+19 more)
 
-### Community 26 - "StorageError"
-Cohesion: 0.07
-Nodes (30): LocalStorageBackend, ByteStream, Into, PathBuf, Result, Self, validate_key(), Arc (+22 more)
+### Community 26 - "S3StorageBackend"
+Cohesion: 0.13
+Nodes (17): delete_rejects_invalid_key(), dummy_backend(), get_stream_rejects_invalid_key(), mime_attributes(), Arc, ByteStream, Debug, Formatter (+9 more)
 
 ### Community 27 - "compilerOptions"
 Cohesion: 0.08
@@ -313,20 +291,20 @@ Cohesion: 0.08
 Nodes (25): dependencies, class-variance-authority, clsx, @fontsource-variable/geist, next-themes, openapi-fetch, @radix-ui/react-checkbox, @radix-ui/react-dialog (+17 more)
 
 ### Community 29 - "AuthUser"
-Cohesion: 0.28
-Nodes (22): AuthMethod, AuthUser, Scope, Uuid, add_member(), create_tenant(), delete_tenant(), get_tenant() (+14 more)
+Cohesion: 0.32
+Nodes (21): AuthMethod, AuthUser, Uuid, add_member(), create_tenant(), delete_tenant(), get_tenant(), list_members() (+13 more)
 
 ### Community 30 - ".new_with"
 Cohesion: 0.13
-Nodes (17): ensure_schema(), ensure_test_env(), init_tracing(), is_redirect(), MockGithub, MockProvider, DatabaseConnection, Self (+9 more)
+Nodes (18): ensure_schema(), ensure_test_env(), init_tracing(), is_redirect(), MockGithub, MockProvider, DatabaseConnection, Self (+10 more)
 
 ### Community 31 - "TestApp"
-Cohesion: 0.14
-Nodes (8): Duration, Model, Option, Response, Value, TestApp, Fn, Sender
+Cohesion: 0.20
+Nodes (5): Option, Response, Value, TestApp, Sender
 
-### Community 32 - "job/src/lib.rs"
-Cohesion: 0.13
-Nodes (43): build_storage(), build_storage_for_queue(), delete_installation(), enqueue(), GithubWebhookJob, process(), Arc, BoxDynError (+35 more)
+### Community 32 - "compare_build.rs"
+Cohesion: 0.07
+Nodes (74): build_storage(), build_storage_for_queue(), compare_pair(), CompareBuildJob, enqueue(), entry(), full_outer_join_marks_added_and_removed(), join_by_name() (+66 more)
 
 ### Community 33 - "csrf.rs"
 Cohesion: 0.10
@@ -340,13 +318,13 @@ Nodes (21): build_flow_completes_without_github_app_configured(), build_lifecycl
 Cohesion: 0.09
 Nodes (21): aliases, components, hooks, lib, ui, utils, iconLibrary, menuAccent (+13 more)
 
-### Community 36 - "service/src/screenshots.rs"
-Cohesion: 0.06
-Nodes (67): build_lock(), content_type_for(), ensure_extracted(), extracts_once_and_serves_index_and_nested_asset(), local_storage(), rejects_traversal_and_missing(), resolve_asset(), Arc (+59 more)
+### Community 36 - "cache.rs"
+Cohesion: 0.11
+Nodes (33): build_lock(), content_type_for(), ensure_extracted(), extracts_once_and_serves_index_and_nested_asset(), local_storage(), rejects_traversal_and_missing(), resolve_asset(), Arc (+25 more)
 
-### Community 37 - "Model"
-Cohesion: 0.05
-Nodes (93): Model, String, Uuid, approve_build(), get_build(), get_build_by_number(), get_build_logs(), list_builds() (+85 more)
+### Community 37 - "load_build_with_role"
+Cohesion: 0.32
+Nodes (23): approve_build(), get_build(), get_build_by_number(), get_build_logs(), list_builds(), list_comparisons(), load_baseline_entry_with_role(), load_build_with_role() (+15 more)
 
 ### Community 38 - "e2e/package.json"
 Cohesion: 0.10
@@ -361,8 +339,8 @@ Cohesion: 0.15
 Nodes (28): create_project(), delete_project(), get_project(), list_projects(), load_project_with_role(), Json, Model, Path (+20 more)
 
 ### Community 41 - "api.ts"
-Cohesion: 0.09
-Nodes (34): BuildLogPanel(), isRunning(), levelClass(), ComparisonFilter, ComparisonList(), filterComparisons(), FILTERS, useComparisonFilter() (+26 more)
+Cohesion: 0.10
+Nodes (29): BuildLogPanel(), isRunning(), levelClass(), ToneBadge(), Badge(), badgeVariants, BuildLogEntry, BuildStatus (+21 more)
 
 ### Community 42 - "compilerOptions"
 Cohesion: 0.11
@@ -377,32 +355,40 @@ Cohesion: 0.14
 Nodes (18): internal_server_error(), Json, Response, StatusCode, String, ServerError, register_schema(), register_schemas() (+10 more)
 
 ### Community 45 - "cn"
-Cohesion: 0.15
-Nodes (17): TopNav(), Badge(), badgeVariants, DialogOverlay(), DropdownMenu(), DropdownMenuCheckboxItem(), DropdownMenuContent(), DropdownMenuItem() (+9 more)
+Cohesion: 0.10
+Nodes (26): ComparisonViewer(), Frame(), ComparisonStatusBadge(), ReviewStatusBadge(), TopNav(), DialogOverlay(), DropdownMenu(), DropdownMenuCheckboxItem() (+18 more)
 
-### Community 48 - "me"
-Cohesion: 0.40
-Nodes (4): me(), Json, Result, State
+### Community 46 - "handlers/ci.rs"
+Cohesion: 0.22
+Nodes (23): CiPingResponse, create_build(), finalize_build(), get_build_logs(), get_build_status(), ping(), resolve_baseline_commit_sha(), BuildLogsResponse (+15 more)
+
+### Community 47 - "service/src/build_logs.rs"
+Cohesion: 0.17
+Nodes (13): append(), clamp_limit(), list_after(), LogLevel, resolve_last_id(), row(), C, Into (+5 more)
+
+### Community 48 - "t.$tenantSlug.p.$projectSlug.builds.$number.tsx"
+Cohesion: 0.22
+Nodes (14): ComparisonFilter, ComparisonList(), filterComparisons(), FILTERS, useComparisonFilter(), BuildStatusBadge(), Comparison, useBuilds() (+6 more)
 
 ### Community 49 - "tenants_integration.rs"
 Cohesion: 0.27
 Nodes (13): create_tenant(), last_owner_cannot_be_demoted_or_removed(), list_carries_my_role_and_members_carry_user_profiles(), member_role(), non_member_is_denied_and_sees_nothing(), role_matrix_governs_member_management(), Option, String (+5 more)
 
-### Community 50 - "routes/builds.rs"
-Cohesion: 0.83
-Nodes (3): routes(), AppState, OpenApiRouter
+### Community 50 - "service/src/comparisons.rs"
+Cohesion: 0.22
+Nodes (13): delete_for_build(), get_comparison(), initial_review_status(), list_for_build(), review(), ReviewAction, C, ComparisonStatus (+5 more)
 
 ### Community 51 - "auth_oauth_integration.rs"
 Cohesion: 0.18
 Nodes (4): callback_from_a_different_session_is_rejected(), login_redirect_carries_state_and_pkce_challenge(), replayed_state_is_rejected(), location_of()
 
-### Community 52 - "Uuid"
-Cohesion: 0.28
-Nodes (4): Request, Scope, Uuid, Vec
+### Community 52 - "Model"
+Cohesion: 0.16
+Nodes (7): Duration, Model, Request, Scope, Uuid, Vec, Fn
 
-### Community 53 - "routes/ci.rs"
-Cohesion: 0.83
-Nodes (3): routes(), AppState, OpenApiRouter
+### Community 53 - "StorageError"
+Cohesion: 0.27
+Nodes (10): LocalStorageBackend, ByteStream, Into, PathBuf, Result, Self, validate_key(), Error (+2 more)
 
 ### Community 54 - "Client"
 Cohesion: 0.08
@@ -441,12 +427,12 @@ Cohesion: 0.22
 Nodes (8): Model, DateTimeWithTimeZone, Entity, HasOne, Json, Option, String, Uuid
 
 ### Community 63 - "review_comparison"
-Cohesion: 0.27
-Nodes (9): Error, get_diff_content(), review_comparison(), Json, Path, Response, Result, State (+1 more)
+Cohesion: 0.36
+Nodes (8): get_diff_content(), review_comparison(), Json, Path, Response, Result, State, Uuid
 
-### Community 64 - "get_baseline_entry_content"
-Cohesion: 0.47
-Nodes (12): get_baseline_entry_content(), get_screenshot_content(), get_storybook_asset(), get_storybook_index(), png_response(), Path, Response, Result (+4 more)
+### Community 64 - "AppError"
+Cohesion: 0.18
+Nodes (22): AppError, DbErr, Error, From, IntoResponse, Self, get_baseline_entry_content(), get_screenshot_content() (+14 more)
 
 ### Community 65 - "MeResponse"
 Cohesion: 0.28
@@ -490,7 +476,7 @@ Nodes (6): Model, DateTimeWithTimeZone, Entity, HasOne, TenantRole, Uuid
 
 ### Community 75 - ".migrations"
 Cohesion: 0.29
-Nodes (5): Migrator, MigrationTrait, Vec, Box, MigratorTrait
+Nodes (5): Migrator, Box, MigrationTrait, Vec, MigratorTrait
 
 ### Community 76 - "Model"
 Cohesion: 0.33
@@ -511,6 +497,10 @@ Nodes (4): Model, Entity, HasOne, Uuid
 ### Community 82 - "health.rs"
 Cohesion: 0.60
 Nodes (4): health(), HealthResponse, Json, String
+
+### Community 83 - "GithubInstallationResponse"
+Cohesion: 0.21
+Nodes (12): ClaimInstallationRequest, GithubInstallationResponse, InstallationListQuery, DateTime, From, Model, Option, Self (+4 more)
 
 ### Community 84 - "main"
 Cohesion: 0.40
@@ -533,8 +523,20 @@ Cohesion: 0.28
 Nodes (12): create_personal_token(), get_owned_token(), list_personal_tokens(), revoke_personal_token(), Json, Model, Path, Result (+4 more)
 
 ### Community 141 - "t.$tenantSlug.p.$projectSlug.index.tsx"
-Cohesion: 0.09
-Nodes (39): UserMenu(), Select(), SelectContent(), SelectGroup(), SelectItem(), SelectLabel(), SelectScrollDownButton(), SelectScrollUpButton() (+31 more)
+Cohesion: 0.10
+Nodes (32): UserMenu(), Select(), SelectContent(), SelectGroup(), SelectItem(), SelectLabel(), SelectScrollDownButton(), SelectScrollUpButton() (+24 more)
+
+### Community 142 - "store_screenshot_with_metadata"
+Cohesion: 0.31
+Nodes (13): diff_key(), get_screenshot(), list_for_build(), C, Model, Option, String, Uuid (+5 more)
+
+### Community 143 - "latest_on_branch"
+Cohesion: 0.42
+Nodes (11): entries(), get_baseline(), get_entry(), latest_for(), latest_on_branch(), C, Model, Option (+3 more)
+
+### Community 144 - "api.$.ts"
+Cohesion: 0.27
+Nodes (10): BodyTooLargeError, buildBackendUrl(), copyHeaders(), handler(), HOP_BY_HOP, LimitedReadableStream, limitReadableStream(), maxBodyBytesForPath() (+2 more)
 
 ### Community 145 - "server.rs"
 Cohesion: 0.37
@@ -542,31 +544,39 @@ Nodes (16): job_state_from(), Box, Error, JoinHandle, Result, String, run(), shu
 
 ### Community 147 - "Migration"
 Cohesion: 0.36
-Nodes (5): Migration, MigrationTrait, Result, DbErr, SchemaManager
+Nodes (5): Migration, DbErr, MigrationTrait, Result, SchemaManager
+
+### Community 148 - "Model"
+Cohesion: 0.29
+Nodes (6): Model, DateTimeWithTimeZone, Entity, HasOne, String, Uuid
 
 ### Community 149 - "collect_files"
 Cohesion: 0.52
 Nodes (6): collect_files(), Path, PathBuf, Result, Vec, zip_dir()
 
+### Community 151 - "setup_storage"
+Cohesion: 0.67
+Nodes (3): Arc, Result, setup_storage()
+
 ## Knowledge Gaps
-- **218 isolated node(s):** `ActiveModel`, `resolveBaseUrl`, `Schemas`, `TenantMember`, `PersonalToken` (+213 more)
+- **218 isolated node(s):** `ActiveModel`, `ActiveModel`, `ActiveModel`, `ActiveModel`, `ActiveModel` (+213 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **66 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **34 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `AppState` connect `AppState` to `get_baseline_entry_content`, `csrf.rs`, `service/src/screenshots.rs`, `src/auth.rs`, `Settings`, `ProjectResponse`, `service/src/github.rs`, `me`, `handlers/github.rs`, `server.rs`, `Client`, `create_personal_token`, `TestApp`, `AuthUser`, `review_comparison`?**
-  _High betweenness centrality (0.242) - this node is a cross-community bridge._
-- **Why does `AppError` connect `AppError` to `get_baseline_entry_content`, `service/src/screenshots.rs`, `src/auth.rs`, `service/src/github.rs`, `ProjectResponse`, `ServerError`, `me`, `handlers/github.rs`, `create_personal_token`, `AuthUser`, `review_comparison`?**
-  _High betweenness centrality (0.120) - this node is a cross-community bridge._
-- **Why does `StorageBackend` connect `service/src/screenshots.rs` to `job/src/lib.rs`, `StorageError`, `AppState`?**
-  _High betweenness centrality (0.104) - this node is a cross-community bridge._
-- **What connects `ActiveModel`, `resolveBaseUrl`, `Schemas` to the rest of the system?**
+- **Why does `AppState` connect `AppState` to `AppError`, `csrf.rs`, `load_build_with_role`, `Settings`, `ProjectResponse`, `service/src/github.rs`, `handlers/ci.rs`, `handlers/github.rs`, `server.rs`, `service/src/screenshots.rs`, `.from_request_parts`, `Client`, `create_personal_token`, `TestApp`, `AuthUser`, `review_comparison`?**
+  _High betweenness centrality (0.265) - this node is a cross-community bridge._
+- **Why does `AppError` connect `AppError` to `service/src/builds.rs`, `service/src/github.rs`, `service/src/tenants.rs`, `store_screenshot_with_metadata`, `latest_on_branch`, `handlers/github.rs`, `service/src/screenshots.rs`, `.from_request_parts`, `service/src/projects.rs`, `AuthUser`, `cache.rs`, `load_build_with_role`, `ProjectResponse`, `ServerError`, `handlers/ci.rs`, `service/src/build_logs.rs`, `service/src/comparisons.rs`, `review_comparison`, `create_personal_token`?**
+  _High betweenness centrality (0.132) - this node is a cross-community bridge._
+- **Why does `TestApp` connect `TestApp` to `vrt_flow_integration.rs`, `render_flow_integration.rs`, `github_integration.rs`, `payload/src/builds.rs`, `AppState`, `tenants_integration.rs`, `Model`, `Client`, `projects_integration.rs`, `personal_tokens_integration.rs`, `.new_with`?**
+  _High betweenness centrality (0.114) - this node is a cross-community bridge._
+- **What connects `ActiveModel`, `ActiveModel`, `ActiveModel` to the rest of the system?**
   _218 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `vrt_flow_integration.rs` be split into smaller, more focused modules?**
   _Cohesion score 0.146218487394958 - nodes in this community are weakly interconnected._
-- **Should `AppError` be split into smaller, more focused modules?**
-  _Cohesion score 0.060306824193263976 - nodes in this community are weakly interconnected._
 - **Should `routeTree.gen.ts` be split into smaller, more focused modules?**
-  _Cohesion score 0.052525252525252523 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.06161616161616162 - nodes in this community are weakly interconnected._
+- **Should `browser.rs` be split into smaller, more focused modules?**
+  _Cohesion score 0.10372340425531915 - nodes in this community are weakly interconnected._
