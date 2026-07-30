@@ -2,11 +2,12 @@
 //!
 //! `service::builds::approve_build` は長らく「レビュー結果を見ずに、そのビルドの
 //! スクリーンショット集合をそのまま baseline へ昇格する」実装だった。そのため
-//! 正常操作だけで次が起きた。ここではそれぞれを本物の Postgres + ストレージ +
-//! 比較ジョブに対して再現し、承認が止まることを確認する。
+//! 正常操作だけで次の 3 つが起きた。ここではそれぞれを本物の Postgres +
+//! ストレージ + 比較ジョブに対して再現し、承認が止まることを確認する。
 //!
 //! 1. 却下した比較が baseline に焼き付く
 //! 2. 古いビルドを後追い承認すると baseline が巻き戻る
+//! 3. `force` の一括承認が story の消滅まで飲み込む
 
 mod common;
 
@@ -300,6 +301,51 @@ async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
     // baseline は新しい方のまま。
     let (still, _) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(still, after_third, "baseline は巻き戻っていない");
+}
+
+// ── 穴③: force が story の消滅まで一括承認する ──────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn force_does_not_silently_approve_story_removals() {
+    let fx = setup().await;
+
+    let first = fx
+        .run_build("sha1", &[("home", RED), ("legacy", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    // legacy が撮れなかったビルド（削除なのか撮影漏れなのかは区別できない）。
+    let second = fx.run_build("sha2", &[("home", RED)]).await;
+    let second_id = build_id_of(&second);
+    assert_eq!(second["status"], "changes_detected");
+    assert_eq!(second["removed_count"], 1);
+
+    // force だけでは消滅を飲み込まない。
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "force は removed を一括承認しない"
+    );
+    assert!(
+        error_message(res).await.contains("legacy"),
+        "消える story 名が示されること"
+    );
+
+    // baseline は据え置き。
+    let (_, names) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(names, vec!["home".to_string(), "legacy".to_string()]);
+
+    // 明示確認すれば通り、baseline から legacy が落ちる。
+    let res = fx
+        .approve(second_id, json!({ "force": true, "accept_removals": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "明示確認すれば承認できる");
+    let (_, names) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(names, vec!["home".to_string()]);
 }
 
 // ── 健全挙動の維持 ──────────────────────────────────────────────────────

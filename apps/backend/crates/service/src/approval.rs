@@ -4,9 +4,31 @@
 //! 判定を DB アクセスから切り離してあるのは、承認ガードが**偽陰性**（本来止めるべき
 //! 承認を通してしまう）を起こしていないことを DB 無しの単体テストで固定するため。
 
+use std::collections::HashSet;
+
 use sea_orm::prelude::Uuid;
 
 use entity::comparisons::{ComparisonStatus, ReviewStatus};
+
+/// 承認リクエストのオプション。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ApproveOptions {
+    /// 未レビューの比較をまとめて承認する（`removed` は含めない）。
+    pub force: bool,
+    /// `removed`（baseline から story が消える）を承認対象に含める。
+    ///
+    /// story の消滅は不可逆なので [`force`](Self::force) とは別の明示フラグにしてある。
+    pub accept_removals: bool,
+}
+
+impl ApproveOptions {
+    pub fn force() -> Self {
+        Self {
+            force: true,
+            accept_removals: false,
+        }
+    }
+}
 
 /// 承認判定に必要な 1 比較ぶんの情報。
 ///
@@ -62,6 +84,67 @@ pub fn summarize_names(names: &[String], max: usize) -> String {
     }
     let shown = names[..max].join(", ");
     format!("{shown} (+{} more)", names.len() - max)
+}
+
+/// baseline に載っていたのに今回のビルドから消えた story 名（名前順）。
+///
+/// `approved_removals` は「レビューで消滅を承認した」名前。ここに無い欠落は
+/// 撮影漏れ・アップロード失敗と区別がつかないため、承認を止める材料になる。
+pub fn unexpected_missing_names(
+    baseline_names: &[String],
+    shot_names: &HashSet<String>,
+    approved_removals: &HashSet<String>,
+) -> Vec<String> {
+    let mut names: Vec<String> = baseline_names
+        .iter()
+        .filter(|name| !shot_names.contains(*name) && !approved_removals.contains(*name))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// 承認済みの `removed` 比較の名前集合。
+pub fn approved_removal_names(comparisons: &[ComparisonFacts]) -> HashSet<String> {
+    comparisons
+        .iter()
+        .filter(|c| {
+            c.status == ComparisonStatus::Removed && c.review_status == ReviewStatus::Approved
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// 未レビューのまま残り、承認を止めるべき比較の名前（名前順）。
+///
+/// - `force == false`: 人手判断が要る未レビューはすべてブロックする（従来どおり）
+/// - `force == true`: 一括承認は `removed` を巻き込まない。`removed` の未レビューは
+///   `accept_removals` を明示したときだけ通す
+pub fn blocking_pending_names(
+    comparisons: &[ComparisonFacts],
+    options: ApproveOptions,
+) -> Vec<String> {
+    let mut names: Vec<String> = comparisons
+        .iter()
+        .filter(|c| c.status.needs_review() && c.review_status == ReviewStatus::Pending)
+        .filter(|c| !is_bulk_approvable(c.status, options))
+        .map(|c| c.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// `force` の一括承認が触ってよい比較か。
+///
+/// `removed` は「story を baseline から消す」不可逆操作なので、まとめ承認には含めない。
+/// `accept_removals` を明示したときだけ対象に加える。
+pub fn is_bulk_approvable(status: ComparisonStatus, options: ApproveOptions) -> bool {
+    if !options.force || !status.needs_review() {
+        return false;
+    }
+    status != ComparisonStatus::Removed || options.accept_removals
 }
 
 /// 承認しようとしているビルドが、現行 baseline の生成元より古いか。
@@ -166,5 +249,107 @@ mod tests {
         assert!(baseline_is_current(None, None));
         // 比較時は baseline が無かったが、その後に作られた。
         assert!(!baseline_is_current(None, Some(e)));
+    }
+
+    // ---- 穴③: force が removed まで一括承認する ----
+
+    #[test]
+    fn force_does_not_bulk_approve_removals() {
+        let opts = ApproveOptions::force();
+        assert!(is_bulk_approvable(ComparisonStatus::Changed, opts));
+        assert!(is_bulk_approvable(ComparisonStatus::Added, opts));
+        assert!(is_bulk_approvable(ComparisonStatus::Failed, opts));
+        assert!(
+            !is_bulk_approvable(ComparisonStatus::Removed, opts),
+            "removed は force だけでは承認できない"
+        );
+    }
+
+    #[test]
+    fn accept_removals_opts_into_removal_approval() {
+        let opts = ApproveOptions {
+            force: true,
+            accept_removals: true,
+        };
+        assert!(is_bulk_approvable(ComparisonStatus::Removed, opts));
+    }
+
+    #[test]
+    fn force_without_accept_removals_still_blocks_on_removed() {
+        let list = facts(&[
+            ("home", ComparisonStatus::Changed, ReviewStatus::Pending),
+            ("legacy", ComparisonStatus::Removed, ReviewStatus::Pending),
+        ]);
+        assert_eq!(
+            blocking_pending_names(&list, ApproveOptions::force()),
+            vec!["legacy".to_string()],
+            "changed は force で流せるが removed は残る"
+        );
+        assert!(
+            blocking_pending_names(
+                &list,
+                ApproveOptions {
+                    force: true,
+                    accept_removals: true,
+                }
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn without_force_every_pending_blocks() {
+        let list = facts(&[
+            ("home", ComparisonStatus::Changed, ReviewStatus::Pending),
+            ("legacy", ComparisonStatus::Removed, ReviewStatus::Pending),
+            ("about", ComparisonStatus::Unchanged, ReviewStatus::Approved),
+        ]);
+        assert_eq!(
+            blocking_pending_names(&list, ApproveOptions::default()),
+            vec!["home".to_string(), "legacy".to_string()]
+        );
+    }
+
+    #[test]
+    fn reviewed_comparisons_do_not_block() {
+        let list = facts(&[
+            ("home", ComparisonStatus::Changed, ReviewStatus::Approved),
+            ("legacy", ComparisonStatus::Removed, ReviewStatus::Approved),
+        ]);
+        assert!(blocking_pending_names(&list, ApproveOptions::default()).is_empty());
+    }
+
+    // ---- 穴③: baseline manifest と今回のビルドの照合 ----
+
+    #[test]
+    fn silent_disappearance_is_reported() {
+        let baseline = vec!["about".to_string(), "home".to_string(), "login".to_string()];
+        let shots: HashSet<String> = ["home".to_string()].into_iter().collect();
+        // 「消えてよい」と承認されたのは login だけ。about は説明のつかない欠落。
+        let approved: HashSet<String> = ["login".to_string()].into_iter().collect();
+        assert_eq!(
+            unexpected_missing_names(&baseline, &shots, &approved),
+            vec!["about".to_string()]
+        );
+    }
+
+    #[test]
+    fn fully_covered_removals_pass() {
+        let baseline = vec!["home".to_string(), "legacy".to_string()];
+        let shots: HashSet<String> = ["home".to_string()].into_iter().collect();
+        let approved: HashSet<String> = ["legacy".to_string()].into_iter().collect();
+        assert!(unexpected_missing_names(&baseline, &shots, &approved).is_empty());
+    }
+
+    #[test]
+    fn approved_removal_names_only_collects_approved_removals() {
+        let list = facts(&[
+            ("gone", ComparisonStatus::Removed, ReviewStatus::Approved),
+            ("stay", ComparisonStatus::Removed, ReviewStatus::Pending),
+            ("changed", ComparisonStatus::Changed, ReviewStatus::Approved),
+        ]);
+        let names = approved_removal_names(&list);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("gone"));
     }
 }
