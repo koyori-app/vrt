@@ -171,14 +171,21 @@ CLI の入手方法は 2 つ。**リリース版のバイナリを落とすの�
 ```bash
 # リリースからバイナリを取得（推奨）。cli-v* タグごとに配布している。
 VRT_CLI_VERSION=cli-v0.1.0
-curl -fsSL -o vrt.tar.gz \
-  "https://github.com/koyori-app/vrt/releases/download/${VRT_CLI_VERSION}/vrt-x86_64-unknown-linux-gnu.tar.gz"
-tar xzf vrt.tar.gz && chmod +x vrt
+VRT_CLI_TARGET=x86_64-unknown-linux-gnu
+BASE="https://github.com/koyori-app/vrt/releases/download/${VRT_CLI_VERSION}"
+
+# チェックサムはアーカイブ名込みで記録してあるので、配布時のファイル名のまま落とす。
+curl -fsSL -O "${BASE}/vrt-${VRT_CLI_TARGET}.tar.gz"
+curl -fsSL -O "${BASE}/vrt-${VRT_CLI_TARGET}.tar.gz.sha256"
+
+# 検証してから展開する（macOS は shasum、Linux は sha256sum -c でも同じ）
+shasum -a 256 -c "vrt-${VRT_CLI_TARGET}.tar.gz.sha256"
+
+tar xzf "vrt-${VRT_CLI_TARGET}.tar.gz" && chmod +x vrt
 ```
 
 配布ターゲットは `x86_64` / `aarch64` の Linux（`-unknown-linux-gnu`）と macOS
-（`-apple-darwin`）。各アーカイブには `.sha256`（`sha256sum` 形式）も並べてあるので
-検証に使える。
+（`-apple-darwin`）。
 
 ```bash
 # ソースからビルドする場合（Cargo ワークスペースは apps/backend、Linux は mold が要る）
@@ -208,6 +215,11 @@ vrt upload --dir ./storybook-static --only-changed --wait
 stdout へ JSON で 1 行だけ出す（例
 `{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
 GitHub Action など呼び出し元がパースしやすいよう、このときログはすべて stderr に回る。
+
+ただし **JSON が出るのはビルドを作成して finalize まで到達した場合だけ**。それ以前の
+失敗（設定不備、ネットワークエラー、stats JSON の解析失敗など）では stdout は空のまま
+stderr にエラーを出して終了コード 2 で終わる。呼び出し元は「stdout が空で非ゼロ終了」を
+必ず処理すること。
 
 `--only-changed` の前提:
 

@@ -6,6 +6,8 @@ on:
   push:
     tags:
       - 'cli-v*'
+  # ビルドの素振り用。Release は作らず（下の release ジョブの if を参照）、
+  # 4 ターゲットがビルドとパッケージングを通ることだけを確認できる。
   workflow_dispatch:
 
 # リリース（と成果物アップロード）にだけ書き込みが要る。それ以外は付けない。
@@ -80,9 +82,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # タグ push のときだけ Release を作る。
+  # workflow_dispatch はブランチから手動で回してビルドの素振りをするための入口で、
+  # そのとき GITHUB_REF はタグではない。action-gh-release は tag_name 未指定だと
+  # GITHUB_REF をタグとして扱うため、この if が無いと手動実行が必ず失敗する。
   release:
     name: Create GitHub Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/cli-v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

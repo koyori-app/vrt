@@ -253,7 +253,8 @@ fn resolve_only_story_ids(
 
 /// ビルドが終端（またはレビュー待ちの changes_detected）になるまでポーリングする。
 ///
-/// 状態取得のたびに進捗ログも増分取得して stdout に流す。終端後にも 1 回引いて、
+/// 状態取得のたびに進捗ログも増分取得して流す（出力先は通常 stdout、`--json` の
+/// ときは stdout を JSON 1 行専用に空けるため stderr）。終端後にも 1 回引いて、
 /// 最後の状態遷移と同時に書かれた行を取りこぼさないようにする。
 async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Result<BuildResponse> {
     const INTERVAL: Duration = Duration::from_secs(3);
@@ -338,5 +339,49 @@ fn exit_code_for(status: &str) -> u8 {
         "passed" | "approved" => 0,
         "changes_detected" => 1,
         _ => 2, // failed / rejected / 想定外
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 終了コードは CI の合否判定そのものなので、8 状態すべてを固定する。
+    /// `changes_detected` は「差分あり = レビュー待ち」であって失敗ではないため、
+    /// 1 に割り当てて失敗（2）と区別する。
+    #[test]
+    fn exit_code_covers_every_build_status() {
+        assert_eq!(exit_code_for("passed"), 0);
+        assert_eq!(exit_code_for("approved"), 0);
+        assert_eq!(exit_code_for("changes_detected"), 1);
+        assert_eq!(exit_code_for("failed"), 2);
+        assert_eq!(exit_code_for("rejected"), 2);
+        // 非終端状態がここへ来るのは想定外なので、成功に倒さず 2 にする。
+        assert_eq!(exit_code_for("pending"), 2);
+        assert_eq!(exit_code_for("rendering"), 2);
+        assert_eq!(exit_code_for("processing"), 2);
+    }
+
+    /// サーバー側に未知の状態が増えても、黙って 0（成功）にしないことを固定する。
+    #[test]
+    fn unknown_status_is_not_treated_as_success() {
+        assert_eq!(exit_code_for("some_future_status"), 2);
+        assert_eq!(exit_code_for(""), 2);
+    }
+
+    #[test]
+    fn settled_statuses_stop_the_poll_loop() {
+        for s in [
+            "passed",
+            "changes_detected",
+            "failed",
+            "approved",
+            "rejected",
+        ] {
+            assert!(is_settled(s), "{s} should be terminal");
+        }
+        for s in ["pending", "rendering", "processing"] {
+            assert!(!is_settled(s), "{s} should not be terminal");
+        }
     }
 }
