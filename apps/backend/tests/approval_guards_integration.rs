@@ -2,8 +2,11 @@
 //!
 //! `service::builds::approve_build` は長らく「レビュー結果を見ずに、そのビルドの
 //! スクリーンショット集合をそのまま baseline へ昇格する」実装だった。そのため
-//! 正常操作だけで却下した比較が baseline に焼き付いた。ここではそれを本物の
-//! Postgres + ストレージ + 比較ジョブに対して再現し、承認が止まることを確認する。
+//! 正常操作だけで次が起きた。ここではそれぞれを本物の Postgres + ストレージ +
+//! 比較ジョブに対して再現し、承認が止まることを確認する。
+//!
+//! 1. 却下した比較が baseline に焼き付く
+//! 2. 古いビルドを後追い承認すると baseline が巻き戻る
 
 mod common;
 
@@ -254,6 +257,49 @@ async fn rejected_comparison_blocks_approval_and_keeps_the_baseline() {
     assert_eq!(still, baseline_id, "baseline は進んでいない");
     assert_eq!(names, vec!["home".to_string(), "login".to_string()]);
     assert_eq!(fx.build_status(second_id).await, "changes_detected");
+}
+
+// ── 穴②: 古いビルドの後追い承認で baseline が巻き戻る ───────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    // 2 本とも同じ baseline に対して比較される。
+    let second = fx.run_build("sha2", &[("home", BLUE)]).await;
+    let third = fx.run_build("sha3", &[("home", BLUE)]).await;
+    let second_id = build_id_of(&second);
+    let third_id = build_id_of(&third);
+    assert_eq!(second["status"], "changes_detected");
+    assert_eq!(third["status"], "changes_detected");
+
+    // 新しい方を先に承認する。
+    let res = fx.approve(third_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve newest build");
+    let (after_third, _) = fx.current_baseline().await.expect("baseline exists");
+
+    // 古い方を後追いで承認しようとすると 409。
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "古いビルドの後追い承認で baseline を巻き戻せない"
+    );
+    let message = error_message(res).await;
+    assert!(
+        message.contains("older") || message.contains("baseline moved"),
+        "巻き戻りだと分かるメッセージであること: {message}"
+    );
+
+    // baseline は新しい方のまま。
+    let (still, _) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(still, after_third, "baseline は巻き戻っていない");
 }
 
 // ── 健全挙動の維持 ──────────────────────────────────────────────────────

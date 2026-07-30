@@ -299,6 +299,8 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 ///
 /// - 却下された比較が 1 件でも残っていれば [`AppError::ConflictDetail`]。
 ///   却下したスクリーンショットを baseline に昇格させると、以降そのズレが「正」になる
+/// - 比較に使った baseline がいまも最新でなければ [`AppError::ConflictDetail`]。
+///   古いビルドを後追いで承認すると、新しい baseline が古い画像で上書きされる
 /// - `force == false` のときはレビュー待ちの比較が残っていると [`AppError::Conflict`]
 /// - `force == true` は「一括承認」用。未レビューの比較もまとめて approved にする
 ///
@@ -318,7 +320,7 @@ pub async fn approve_build(
     with_transaction(db, move |txn| {
         Box::pin(async move {
             // プロジェクト行ロックで並行承認を直列化する。
-            projects::Entity::find_by_id(build.project_id)
+            let project = projects::Entity::find_by_id(build.project_id)
                 .lock_exclusive()
                 .one(txn)
                 .await?
@@ -328,6 +330,36 @@ pub async fn approve_build(
             let build = get_build(txn, build.id).await?;
             if !build.status.can_transition_to(BuildStatus::Approved) {
                 return Err(AppError::Conflict);
+            }
+
+            // ── 穴②: baseline の巻き戻り防止 ──────────────────────────────
+            // 比較ジョブが使ったのと同じ解決規則（同一ブランチ → デフォルトブランチ）で
+            // 「いまの baseline」を引き直し、比較時点のものと一致するか確かめる。
+            // ロックを取ったあとに読むので、並行承認との間に隙間は無い。
+            let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
+
+            if let Some(baseline) = &current
+                && let Some(source_build_id) = baseline.source_build_id
+                && source_build_id != build.id
+            {
+                let source_number = get_build(txn, source_build_id).await.ok().map(|b| b.number);
+                if approval::is_older_than_baseline_source(build.number, source_number) {
+                    return Err(AppError::ConflictDetail(format!(
+                        "cannot approve: build #{} is older than the current baseline \
+                         (created from build #{}). approving it would roll the baseline back. \
+                         re-run the build against the current baseline instead.",
+                        build.number,
+                        source_number.unwrap_or_default()
+                    )));
+                }
+            }
+
+            if !approval::baseline_is_current(build.baseline_id, current.as_ref().map(|b| b.id)) {
+                return Err(AppError::ConflictDetail(
+                    "cannot approve: the baseline moved after this build was compared. \
+                     re-run the build so it is compared against the current baseline."
+                        .to_string(),
+                ));
             }
 
             // ── 穴①: 却下されたものを baseline へ昇格させない ─────────────
