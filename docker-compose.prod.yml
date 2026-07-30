@@ -1,0 +1,186 @@
+# 本番デプロイ用の構成。開発・動作確認用の docker-compose.yml とは別物。
+#
+# ● 前提
+#   外部からの HTTP はリバースプロキシ（dokploy/Traefik、Caddy、nginx など）が終端し、
+#   compose ネットワーク経由で frontend の 3000 番へ流す構成を想定している。
+#   このファイル自体はホストにポートを publish しないので、プロキシ側で
+#   「frontend サービスの Container Port 3000」へルーティングする設定が要る。
+#
+#   1. 本ファイルを compose ファイルとして指定する。
+#   2. .env.production.example を元にした値を環境変数として注入する
+#      （シークレットはここで渡す。下の ${VAR} がすべて解決される）。
+#   3. リバースプロキシで公開ドメイン → frontend:3000 を繋ぐ。
+#      dokploy なら Compose アプリの Domains で Container Port に 3000 を指定するだけ。
+#
+# ● なぜ ports: を一切書かないのか（最重要）
+#   このスタックはどのサービスもホストにポートを publish しない。理由は 2 つ:
+#     - 1 台のホストに複数スタックが同居すると、db/redis/backend のホストポートが
+#       他スタックと衝突する（実際に 0.0.0.0:5433 の bind 失敗で起動できなかった）。
+#     - PaaS 経由のデプロイでは `127.0.0.1:` の bind 指定が落ちて 0.0.0.0 公開に化けることがあり、
+#       認証なしの db/redis がインターネットへ露出しかねない。
+#       Docker は iptables を直接操作するため、ホスト側のファイアウォールでは塞げない。
+#   サービス間通信は compose ネットワーク内のサービス名だけで完結する
+#   （backend→db:5432 / backend→redis:6379 / frontend→http://backend:3400）。
+#   外向きの口は frontend の 3000 番だけ。
+#
+# ● CI からの接続方法（VRT_URL）
+#   CI/CLI は frontend のプロキシ経由で backend を叩く。VRT_URL には
+#   frontend の公開 URL に /api を付けたものを指定する:
+#       VRT_URL=https://<公開URL>/api
+#   frontend の /api/* プロキシ（apps/frontend/src/routes/api.$.ts）が先頭の /api を
+#   剥がして backend へ転送する。CLI は {base_url}/v1/ci/... を叩くため、/api を付けないと
+#   パスが噛み合わず 404 になる。backend を直接公開しない以上、この経路が唯一の入口。
+#
+# ● マイグレーション
+#   migration サービス（one-shot）が起動時に `up` を適用する。`up` は冪等で既存データを保持する。
+#   まっさらにしたいときだけ明示的に:
+#       docker compose -f docker-compose.prod.yml run --rm migration /app/migration fresh
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: valkey/valkey:8.1
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # マイグレーション適用（one-shot）。up は冪等でデータを保持する。
+  migration:
+    build:
+      context: ./apps/backend
+      # production は release ビルド。runtime は debug ビルドなので本番では使わない。
+      target: production
+    image: vrt-backend:prod
+    command: ["/app/run-migration.sh"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    build:
+      context: ./apps/backend
+      # release ビルドの production を明示（省略不可）。
+      target: production
+    image: vrt-backend:prod
+    # 必須変数は `KEY=${VAR}` で明示的に渡し、任意変数は `KEY` だけを書いた
+    # pass-through 形式にする（map 形式と list 形式は混在できないので全体を list にしている）。
+    #
+    # なぜ任意変数に `${VAR:-}` を使わないか:
+    #   `${VAR:-}` は未設定でも「空文字」をコンテナへ渡してしまう。backend の設定は
+    #   config crate の Environment ソース（try_parsing なし = 値は文字列のまま）で読むため、
+    #   空文字と未設定が別物になる:
+    #     - GITHUB_APP_ID は Option<u64>、S3_FORCE_PATH_STYLE は Option<bool>。
+    #       空文字は数値・真偽値へ変換できず deserialize に失敗し、backend が起動しない。
+    #     - GITHUB_API_BASE_URL は Option<String> なので Some("") になり、
+    #       未設定時の既定 https://api.github.com が適用されず GitHub API 呼び出しが壊れる。
+    #   list 形式で値を書かずキー名だけにすると、その変数が未設定のときは
+    #   コンテナへ「渡されない」ため、Rust 側は正しく None として扱える。
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      # 待受アドレス。0.0.0.0 でもポートを publish しないので外部には出ない
+      # （リバースプロキシが繋ぐのは frontend だけ）。
+      - "LISTEN_ADDR=0.0.0.0:3400"
+      # 公開 URL。http/https の絶対 URL でバリデーションあり、不正だと起動を拒否する。
+      - APP_URL=${APP_URL}
+      # ★最頻出の罠★ ブラウザからの書き込み（POST/PUT 等）の Origin 検査に使う。
+      #   バリデーションが無いため設定漏れ（既定 http://localhost:3000）でも無警告で起動し、
+      #   本番ドメインからの操作だけが 403 相当で弾かれる。必ず公開 URL に合わせる（APP_URL と同じ値）。
+      - ALLOW_ORIGIN=${ALLOW_ORIGIN}
+      - PERSONAL_TOKEN_SECRET=${PERSONAL_TOKEN_SECRET}
+      - OAUTH_TOKEN_ENCRYPTION_KEY=${OAUTH_TOKEN_ENCRYPTION_KEY}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET}
+      # GitLab を使わなくてもキー自体は必須。無いと deserialize に失敗して起動しない（空文字は可）。
+      - GITLAB_CLIENT_ID=${GITLAB_CLIENT_ID}
+      - GITLAB_CLIENT_SECRET=${GITLAB_CLIENT_SECRET}
+      # ストレージ。local ならアップロードを下の uploads ボリュームへ保存する。s3 なら S3_* が必須。
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+      # local のときのアップロード保存先。uploads ボリュームをここへマウントしている。
+      - LOCAL_UPLOAD_DIR=/home/app/uploads
+      # 「Open Storybook」用の展開キャッシュ。派生データなので永続化しない（イメージ内で app 所有）。
+      - STORYBOOK_CACHE_DIR=/home/app/storybook-cache
+      # storybook モード用 Chromium は apps/backend/Dockerfile が ENV CHROMIUM_PATH=/usr/bin/chromium を
+      # 焼き込んでいるため compose では設定不要。
+      # --- S3（STORAGE_BACKEND=s3 のときだけ有効。欠けると起動時に落ちる）---
+      # バケットは private のままでよい。画像配信は backend の get_stream 経由のプロキシ配信で、
+      # 公開バケットや S3_PUBLIC_BASE_URL は使わない（S3_PUBLIC_BASE_URL は現状コード未使用）。
+      - S3_ENDPOINT
+      - S3_BUCKET
+      - S3_REGION
+      - S3_ACCESS_KEY_ID
+      - S3_SECRET_ACCESS_KEY
+      # MinIO・R2 等パススタイルが要る場合は 1/true/yes を設定する。
+      - S3_FORCE_PATH_STYLE
+      # --- GitHub App（任意。PR ステータス連携）---
+      # GITHUB_APP_ID と GITHUB_APP_PRIVATE_KEY_PEM の両方が揃って初めて有効。
+      # 片方だけだと警告ログのみで無言で無効になる。PEM は改行を \n にエスケープして 1 行で渡す
+      # （起動時に実改行へ戻される）。詳細は docs/github-app.md。
+      - GITHUB_APP_ID
+      - GITHUB_APP_PRIVATE_KEY_PEM
+      - GITHUB_WEBHOOK_SECRET
+      # GitHub Enterprise のときだけ設定（既定は https://api.github.com）。
+      - GITHUB_API_BASE_URL
+    volumes:
+      # アップロード永続化。STORAGE_BACKEND=local のときのみ必要。s3 運用なら不要
+      # （その場合この volumes 行と下の uploads ボリューム定義は消してよい）。
+      # マウント先はイメージ内で app 所有に作ってあるので非 root でも書ける。
+      - uploads:/home/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3400"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      # pnpm workspace のルート（package.json / pnpm-workspace.yaml）が要るので
+      # コンテキストはリポジトリルート。除外は .dockerignore を参照。
+      context: .
+      dockerfile: apps/frontend/Dockerfile
+      # release ビルドの production を明示（省略不可）。
+      target: production
+    image: vrt-frontend:prod
+    environment:
+      # SSR の /api/* プロキシ（src/routes/api.$.ts）の転送先。compose ネットワーク内の
+      # サービス名で引く。ブラウザは常に frontend の同一 origin だけを見る。
+      API_BASE: http://backend:3400
+      # PORT=3000 / HOST=0.0.0.0 / NODE_ENV=production は Dockerfile が焼き込み済み。
+      # リバースプロキシはこの 3000 番へルーティングする。
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  uploads:
