@@ -66,6 +66,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// 短すぎるとランタイム起動前の DOM で誤判定し、長すぎると手書きバンドルが遅くなる。
 pub const SIGNAL_GRACE: Duration = Duration::from_millis(1500);
 
+/// Chromium 起動の websocket URL 解決を待つタイムアウト。
+///
+/// chromiumoxide の既定は 20 秒。CI では 3 本のジョブが同時にコールドスタートし、
+/// 負荷とコンテナの遅さでこの 20 秒に間に合わず `LaunchTimeout` を踏むことがある。
+/// 余裕を持たせて広げておく。
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
+/// 起動の最大試行回数（初回 + リトライ）。
+const LAUNCH_MAX_ATTEMPTS: u32 = 3;
+
 /// ナビゲーション前に document へ注入するフック。
 ///
 /// `__STORYBOOK_ADDONS_CHANNEL__` はプレビューランタイムが**後から**代入するので、
@@ -310,7 +319,44 @@ pub struct StoryRenderer {
 
 impl StoryRenderer {
     /// Chromium を起動する。
+    ///
+    /// CI では複数ジョブが同時にコールドスタートし、負荷で起動タイムアウトや
+    /// プロセスの即死を踏むことがある。1 発失敗で諦めず、短いバックオフ（2s, 4s）を
+    /// 挟んで最大 [`LAUNCH_MAX_ATTEMPTS`] 回まで試す。試行ごとにプロファイルを
+    /// 作り直すので、失敗した試行が残したロックを引き継がない。
+    /// リトライ対象は起動（launch）だけで、起動成功後の描画エラーには適用しない。
     pub async fn launch(options: RenderOptions) -> Result<Self, RenderError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match Self::launch_once(&options).await {
+                Ok(renderer) => return Ok(renderer),
+                Err(err) => {
+                    // 実行ファイルが無い等の恒久的な失敗はリトライしても無駄なので即返す。
+                    let transient = matches!(
+                        &err,
+                        RenderError::Launch { source, .. } if is_transient_launch_error(source)
+                    );
+                    if !transient || attempt >= LAUNCH_MAX_ATTEMPTS {
+                        return Err(err);
+                    }
+                    // 2s, 4s, ... と待ってから、新しいプロファイルでやり直す。
+                    let backoff = Duration::from_secs(1u64 << attempt);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = LAUNCH_MAX_ATTEMPTS,
+                        backoff_secs = backoff.as_secs(),
+                        error = %err,
+                        "chromium launch failed; retrying with a fresh profile"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+
+    /// 1 回ぶんの起動試行。失敗はそのまま返し、リトライ判断は [`Self::launch`] に任せる。
+    async fn launch_once(options: &RenderOptions) -> Result<Self, RenderError> {
         // 起動ごとに専用のユーザーデータディレクトリを与える。
         // 指定しないと chromiumoxide は固定パス（`/tmp/chromiumoxide-runner`）を使い、
         // 複数のブラウザが同時に立つと `SingletonLock` を奪い合って起動に失敗する
@@ -323,6 +369,9 @@ impl StoryRenderer {
         let config = BrowserConfig::builder()
             .chrome_executable(&options.chromium_path)
             .user_data_dir(user_data_dir.path())
+            // CI の並列コールドスタートでは chromiumoxide 既定の 20 秒に間に合わず
+            // 起動タイムアウトを踏むため、明示的に広げる。
+            .launch_timeout(LAUNCH_TIMEOUT)
             .viewport(Viewport {
                 width: options.viewport_width,
                 height: options.viewport_height,
@@ -355,7 +404,7 @@ impl StoryRenderer {
         Ok(Self {
             browser,
             handler_task,
-            options,
+            options: options.clone(),
             _user_data_dir: user_data_dir,
         })
     }
@@ -483,6 +532,20 @@ impl Drop for StoryRenderer {
         // handler タスクを残さない。子プロセスは Browser の Drop が始末する。
         self.handler_task.abort();
     }
+}
+
+/// 起動失敗が一時的（リトライで直りうる）かを判定する。
+///
+/// ブラウザプロセスの立ち上げそのものがこけた系
+/// （websocket URL 解決のタイムアウト・起動直後の即死・起動時 I/O エラー）は、
+/// CI の負荷やコールドスタートのゆらぎで起きうるのでリトライする。
+/// 実行ファイルが見つからない等はここに当たらず（`CdpError::Io` 等）、即座に諦める。
+fn is_transient_launch_error(source: &chromiumoxide::error::CdpError) -> bool {
+    use chromiumoxide::error::CdpError;
+    matches!(
+        source,
+        CdpError::LaunchTimeout(_) | CdpError::LaunchExit(..) | CdpError::LaunchIo(..)
+    )
 }
 
 /// 使えそうな Chromium の実行ファイルを探す。
