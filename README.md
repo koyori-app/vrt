@@ -165,9 +165,27 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 zip 化 → アップロード → finalize までを 1 コマンドで済ませられる。branch / commit
 は git から自動で拾う。
 
-```bash
-cargo build --release -p vrt-cli   # target/release/vrt が生成される
+CLI の入手方法は 2 つ。**リリース版のバイナリを落とすのが速い**（ソースビルドは
+初回 15〜20 分かかる）。
 
+```bash
+# リリースからバイナリを取得（推奨）。cli-v* タグごとに配布している。
+VRT_CLI_VERSION=cli-v0.1.0
+curl -fsSL -o vrt.tar.gz \
+  "https://github.com/koyori-app/vrt/releases/download/${VRT_CLI_VERSION}/vrt-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf vrt.tar.gz && chmod +x vrt
+```
+
+配布ターゲットは `x86_64` / `aarch64` の Linux（`-unknown-linux-gnu`）と macOS
+（`-apple-darwin`）。各アーカイブには `.sha256`（`sha256sum` 形式）も並べてあるので
+検証に使える。
+
+```bash
+# ソースからビルドする場合（Cargo ワークスペースは apps/backend、Linux は mold が要る）
+cargo build --release -p vrt-cli   # target/release/vrt が生成される
+```
+
+```bash
 export VRT_URL=https://vrt.example.com
 export VRT_TOKEN=...                # write:build（--wait を使うなら read:build も）
 export VRT_PROJECT=<tenant-slug>/<project-slug>   # CI usage タブに出る値
@@ -185,6 +203,11 @@ vrt upload --dir ./storybook-static --only-changed --wait
 （`passed`=0 / `changes_detected`=1 / `failed`=2）。CI のジョブをそのまま
 落とせる。`--url` / `--token` / `--project` はフラグでも環境変数
 （`VRT_URL` / `VRT_TOKEN` / `VRT_PROJECT`）でも渡せる。トークンはログに出さない。
+
+`--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
+stdout へ JSON で 1 行だけ出す（例
+`{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
+GitHub Action など呼び出し元がパースしやすいよう、このときログはすべて stderr に回る。
 
 `--only-changed` の前提:
 

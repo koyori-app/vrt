@@ -66,17 +66,24 @@ struct UploadArgs {
     /// ビルドが終端状態になるまでポーリングして待つ。
     #[arg(long)]
     wait: bool,
+
+    /// 機械可読な結果を stdout へ JSON で 1 行出力する。
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     // RUST_LOG で調整可能。既定は info。トークンはどのログにも載せない。
+    // ログは常に stderr へ出す。stdout は結果（`--json` の 1 行 JSON など）専用に
+    // 空けておき、呼び出し元がログと混ざらずに機械可読出力だけをパースできるようにする。
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -139,17 +146,43 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     }
     let finalized = client.finalize(&build.id, only_story_ids).await?;
 
-    // 6. 結果を stdout に出す。
-    println!("build_id={}", finalized.id);
-    println!("status={}", finalized.status);
+    // 6. 結果を出す。--json のときは stdout を JSON 1 行専用にするため、
+    //    人間向けの `key=value` サマリは出さない（ログは既に stderr）。
+    if !args.json {
+        println!("build_id={}", finalized.id);
+        println!("status={}", finalized.status);
+    }
 
     if !args.wait {
+        // --wait 無し: finalize 直後の状態を返し、終了コードは常に 0（既存挙動）。
+        if args.json {
+            print_json_result(&finalized, tenant_slug, project_slug, 0);
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     // --wait: 終端になるまでポーリングして終了コードに反映する。
-    let final_build = poll_until_terminal(&client, &finalized.id).await?;
-    report_and_exit(&final_build)
+    let final_build = poll_until_terminal(&client, &finalized.id, args.json).await?;
+    let code = exit_code_for(&final_build.status);
+    if !args.json {
+        report(&final_build);
+    } else {
+        print_json_result(&final_build, tenant_slug, project_slug, code);
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// 機械可読な結果を stdout へ JSON で 1 行出力する。
+fn print_json_result(build: &BuildResponse, tenant_slug: &str, project_slug: &str, exit_code: u8) {
+    let out = serde_json::json!({
+        "build_id": build.id,
+        "build_number": build.number,
+        "tenant_slug": tenant_slug,
+        "project_slug": project_slug,
+        "status": build.status,
+        "exit_code": exit_code,
+    });
+    println!("{out}");
 }
 
 /// `--only-changed` の影響ストーリーを算出する。
@@ -222,7 +255,7 @@ fn resolve_only_story_ids(
 ///
 /// 状態取得のたびに進捗ログも増分取得して stdout に流す。終端後にも 1 回引いて、
 /// 最後の状態遷移と同時に書かれた行を取りこぼさないようにする。
-async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildResponse> {
+async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Result<BuildResponse> {
     const INTERVAL: Duration = Duration::from_secs(3);
     // ジョブが詰まったまま無限待機しないよう上限を設ける。
     const TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -231,12 +264,12 @@ async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildRes
     // 追尾済みログの末尾 id。ここより後の行だけを毎回引く。
     let mut log_cursor: i64 = 0;
     loop {
-        log_cursor = flush_logs(client, build_id, log_cursor).await;
+        log_cursor = flush_logs(client, build_id, log_cursor, json).await;
 
         let build = client.get_build(build_id).await?;
         if is_settled(&build.status) {
             // 終端遷移と同時に書かれた行（完了サマリ・失敗理由）を最後に流し切る。
-            flush_logs(client, build_id, log_cursor).await;
+            flush_logs(client, build_id, log_cursor, json).await;
             return Ok(build);
         }
         if start.elapsed() >= TIMEOUT {
@@ -254,11 +287,16 @@ async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildRes
 ///
 /// ログ取得の失敗はビルド待機の失敗にはしない（警告だけ出して次に進む）。
 /// 進捗ログは補助情報であり、これで終了コードを狂わせたくない。
-async fn flush_logs(client: &Client, build_id: &str, cursor: i64) -> i64 {
+async fn flush_logs(client: &Client, build_id: &str, cursor: i64, json: bool) -> i64 {
     match client.get_build_logs(build_id, cursor).await {
         Ok(logs) => {
             for entry in &logs.entries {
-                println!("[{}] {}", entry.level, entry.message);
+                // --json のときは stdout を JSON 専用にするため進捗ログは stderr へ回す。
+                if json {
+                    eprintln!("[{}] {}", entry.level, entry.message);
+                } else {
+                    println!("[{}] {}", entry.level, entry.message);
+                }
             }
             logs.last_id
         }
@@ -280,10 +318,8 @@ fn is_settled(status: &str) -> bool {
     )
 }
 
-/// 最終状態を stdout に出し、終了コードを決める。
-///
-/// passed/approved=0、changes_detected=1、failed/rejected=2。
-fn report_and_exit(build: &BuildResponse) -> Result<ExitCode> {
+/// 最終状態を人間向けに stdout へ出す。
+fn report(build: &BuildResponse) {
     println!("final_status={}", build.status);
     println!(
         "counts total={} changed={} added={} removed={}",
@@ -292,10 +328,15 @@ fn report_and_exit(build: &BuildResponse) -> Result<ExitCode> {
     if let Some(msg) = &build.error_message {
         println!("error_message={msg}");
     }
-    let code = match build.status.as_str() {
+}
+
+/// 最終状態から終了コードを決める。
+///
+/// passed/approved=0、changes_detected=1、failed/rejected=2。
+fn exit_code_for(status: &str) -> u8 {
+    match status {
         "passed" | "approved" => 0,
         "changes_detected" => 1,
         _ => 2, // failed / rejected / 想定外
-    };
-    Ok(ExitCode::from(code))
+    }
 }
