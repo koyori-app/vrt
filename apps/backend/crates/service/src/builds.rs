@@ -344,10 +344,15 @@ pub async fn approve_build(
             let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
 
             if let Some(baseline) = &current
+                && baseline.branch == build.branch
                 && let Some(source_build_id) = baseline.source_build_id
                 && source_build_id != build.id
             {
-                let source_number = get_build(txn, source_build_id).await.ok().map(|b| b.number);
+                let source_number = match get_build(txn, source_build_id).await {
+                    Ok(source) => Some(source.number),
+                    Err(AppError::NotFound) => None,
+                    Err(error) => return Err(error),
+                };
                 if approval::is_older_than_baseline_source(build.number, source_number) {
                     return Err(AppError::ConflictDetail(format!(
                         "cannot approve: build #{} is older than the current baseline \

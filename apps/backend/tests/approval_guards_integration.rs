@@ -87,8 +87,7 @@ async fn setup() -> Fixture {
 }
 
 impl Fixture {
-    /// スクリーンショットを上げて finalize し、終端状態まで待つ。
-    async fn run_build(&self, sha: &str, shots: &[(&str, [u8; 4])]) -> Value {
+    async fn create_build(&self, branch: &str, sha: &str, shots: &[(&str, [u8; 4])]) -> Uuid {
         let res = self
             .app
             .post_json_with_bearer(
@@ -97,7 +96,7 @@ impl Fixture {
                     self.tenant_slug, self.project_slug
                 ),
                 &self.token,
-                json!({ "branch": "main", "commit_sha": sha }),
+                json!({ "branch": branch, "commit_sha": sha }),
             )
             .await;
         assert_eq!(res.status(), StatusCode::CREATED, "create build {sha}");
@@ -112,6 +111,13 @@ impl Fixture {
                 .status();
             assert_eq!(status, StatusCode::CREATED, "upload {name}");
         }
+
+        build_id
+    }
+
+    /// スクリーンショットを上げて finalize し、終端状態まで待つ。
+    async fn run_build(&self, sha: &str, shots: &[(&str, [u8; 4])]) -> Value {
+        let build_id = self.create_build("main", sha, shots).await;
 
         let status = self
             .app
@@ -207,6 +213,45 @@ fn build_id_of(build: &Value) -> Uuid {
 async fn error_message(res: reqwest::Response) -> String {
     let body: Value = res.json().await.expect("error json");
     body["message"].as_str().unwrap_or_default().to_string()
+}
+
+// 他ブランチの fallback baseline は、ビルド番号だけで巻き戻り扱いしない。
+#[tokio::test(flavor = "multi_thread")]
+async fn older_feature_build_can_use_a_newer_main_fallback_baseline() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha-main-1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first main build");
+
+    // feature の番号を先に確定させ、main baseline を後発ビルドで前進させる。
+    let feature_id = fx
+        .create_build("feature/older-build", "sha-feature", &[("home", BLUE)])
+        .await;
+    let newer_main = fx.run_build("sha-main-2", &[("home", BLUE)]).await;
+    let res = fx
+        .approve(build_id_of(&newer_main), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve newer main build");
+
+    // feature に固有 baseline は無いため、新しい main baseline を fallback で使う。
+    let status = fx
+        .app
+        .post_with_bearer(&format!("/v1/ci/builds/{feature_id}/finalize"), &fx.token)
+        .await
+        .status();
+    assert_eq!(status, StatusCode::OK, "finalize older feature build");
+    let feature = fx.wait_for_terminal(feature_id).await;
+    assert_eq!(feature["status"], "passed");
+
+    let res = fx.approve(feature_id, json!({ "force": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "他ブランチの fallback baseline を番号だけで巻き戻り扱いしない"
+    );
 }
 
 // 却下された比較を承認できず、baseline が更新されないことを検証する。
