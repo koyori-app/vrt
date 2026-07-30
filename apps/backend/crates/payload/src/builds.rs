@@ -198,16 +198,8 @@ impl From<screenshots::Model> for ScreenshotResponse {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ApproveBuildRequest {
     /// `true` にすると未レビューの比較もまとめて承認する（一括承認）。
-    ///
-    /// `removed`（story の消滅）は含まない。消滅は
-    /// [`accept_removals`](Self::accept_removals) を別途明示したときだけ承認される。
     #[serde(default)]
     pub force: bool,
-    /// `true` にすると story の消滅（`removed`）も承認対象に含める。
-    ///
-    /// baseline から実体が消える不可逆操作なので `force` とは別のフラグにしてある。
-    #[serde(default)]
-    pub accept_removals: bool,
 }
 
 /// ビルド一覧のページネーションパラメータ。

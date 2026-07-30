@@ -21,11 +21,7 @@ use entity::{
     comparisons::ComparisonStatus, comparisons::ReviewStatus, projects, screenshots,
 };
 
-use crate::approval::{self, ApproveOptions, ComparisonFacts};
 use crate::storage::StorageBackend;
-
-/// エラーメッセージに並べる story 名の上限。超過分は件数だけ示す。
-const MAX_REPORTED_NAMES: usize = 10;
 
 /// ビルド一覧のデフォルト件数。
 pub const DEFAULT_LIST_LIMIT: u64 = 30;
@@ -297,17 +293,8 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 
 /// ビルドを承認し、そのビルドの全スクリーンショットを新しい baseline に昇格する。
 ///
-/// 承認ガード（すべて [`AppError::ConflictDetail`] で 409 を返す）:
-///
-/// 1. **却下の焼き付き防止**: 却下された比較が 1 件でも残っていれば承認しない。
-///    却下したスクリーンショットを baseline に昇格させると、以降そのズレが「正」になる
-/// 2. **baseline の巻き戻り防止**: 比較に使った baseline がいまも最新であることを確認する。
-///    古いビルドを後追いで承認すると、新しい baseline が古い画像で上書きされる
-/// 3. **消滅の一括承認防止**: `force` は `removed` を巻き込まない。story の消滅は
-///    `accept_removals` を明示したときだけ通し、さらに現行 baseline の
-///    manifest と今回のスクリーンショットを突き合わせて、説明のつかない欠落を止める
-///
-/// `options.force` が無いときは、レビュー待ちの比較が残っているだけで 409。
+/// - `force == false` のときはレビュー待ちの比較が残っていると [`AppError::Conflict`]
+/// - `force == true` は「一括承認」用。未レビューの比較もまとめて approved にする
 ///
 /// トランザクション内でプロジェクト行を `SELECT ... FOR UPDATE` してから baseline を作る。
 /// これにより同一プロジェクトの並行承認が直列化され、`baselines` の
@@ -316,7 +303,7 @@ pub async fn approve_build(
     db: &DatabaseConnection,
     build: builds::Model,
     reviewer_id: Uuid,
-    options: ApproveOptions,
+    force: bool,
 ) -> Result<builds::Model, AppError> {
     if !build.status.can_transition_to(BuildStatus::Approved) {
         return Err(AppError::Conflict);
@@ -325,7 +312,7 @@ pub async fn approve_build(
     with_transaction(db, move |txn| {
         Box::pin(async move {
             // プロジェクト行ロックで並行承認を直列化する。
-            let project = projects::Entity::find_by_id(build.project_id)
+            projects::Entity::find_by_id(build.project_id)
                 .lock_exclusive()
                 .one(txn)
                 .await?
@@ -337,67 +324,12 @@ pub async fn approve_build(
                 return Err(AppError::Conflict);
             }
 
-            // ── 穴②: baseline の巻き戻り防止 ──────────────────────────────
-            // 比較ジョブが使ったのと同じ解決規則（同一ブランチ → デフォルトブランチ）で
-            // 「いまの baseline」を引き直し、比較時点のものと一致するか確かめる。
-            // ロックを取ったあとに読むので、並行承認との間に隙間は無い。
-            let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
-
-            if let Some(baseline) = &current
-                && let Some(source_build_id) = baseline.source_build_id
-                && source_build_id != build.id
-            {
-                let source_number = get_build(txn, source_build_id).await.ok().map(|b| b.number);
-                if approval::is_older_than_baseline_source(build.number, source_number) {
-                    return Err(AppError::ConflictDetail(format!(
-                        "cannot approve: build #{} is older than the current baseline \
-                         (created from build #{}). approving it would roll the baseline back. \
-                         re-run the build against the current baseline instead.",
-                        build.number,
-                        source_number.unwrap_or_default()
-                    )));
+            let pending = pending_review_count(txn, build.id).await?;
+            if pending > 0 {
+                if !force {
+                    return Err(AppError::Conflict);
                 }
-            }
-
-            if !approval::baseline_is_current(build.baseline_id, current.as_ref().map(|b| b.id)) {
-                return Err(AppError::ConflictDetail(
-                    "cannot approve: the baseline moved after this build was compared. \
-                     re-run the build so it is compared against the current baseline."
-                        .to_string(),
-                ));
-            }
-
-            let mut facts = load_comparison_facts(txn, build.id).await?;
-
-            // ── 穴①: 却下されたものを baseline へ昇格させない ─────────────
-            let rejected = approval::rejected_names(&facts);
-            if !rejected.is_empty() {
-                return Err(AppError::ConflictDetail(format!(
-                    "cannot approve: {} comparison(s) are rejected: {}. \
-                     reject the build, or re-review these comparisons as approved.",
-                    rejected.len(),
-                    approval::summarize_names(&rejected, MAX_REPORTED_NAMES)
-                )));
-            }
-
-            // ── 穴③: 未レビュー（とくに removed）の一括承認を絞る ─────────
-            let blocking = approval::blocking_pending_names(&facts, options);
-            if !blocking.is_empty() {
-                let hint = if options.force {
-                    " these are story removals; set accept_removals to confirm them."
-                } else {
-                    " review them, or set force to bulk-approve."
-                };
-                return Err(AppError::ConflictDetail(format!(
-                    "cannot approve: {} comparison(s) are still awaiting review: {}.{hint}",
-                    blocking.len(),
-                    approval::summarize_names(&blocking, MAX_REPORTED_NAMES)
-                )));
-            }
-
-            if options.force {
-                approve_all_pending(txn, build.id, reviewer_id, options).await?;
-                facts = load_comparison_facts(txn, build.id).await?;
+                approve_all_pending(txn, build.id, reviewer_id).await?;
             }
 
             let now = Utc::now().fixed_offset();
@@ -408,33 +340,6 @@ pub async fn approve_build(
                 .order_by_asc(screenshots::Column::Name)
                 .all(txn)
                 .await?;
-
-            // ── 穴③(続き): 現行 baseline の manifest と突き合わせる ───────
-            // 「消えてよい」と承認された story 以外が今回のビルドから欠けていたら、
-            // 撮影漏れ・アップロード失敗と区別がつかないので承認しない。
-            if let Some(baseline) = &current {
-                let baseline_names: Vec<String> = crate::baselines::entries(txn, baseline.id)
-                    .await?
-                    .into_iter()
-                    .map(|entry| entry.name)
-                    .collect();
-                let shot_names: HashSet<String> =
-                    shots.iter().map(|shot| shot.name.clone()).collect();
-                let missing = approval::unexpected_missing_names(
-                    &baseline_names,
-                    &shot_names,
-                    &approval::approved_removal_names(&facts),
-                );
-                if !missing.is_empty() {
-                    return Err(AppError::ConflictDetail(format!(
-                        "cannot approve: {} story/stories in the current baseline are missing \
-                         from this build without an approved removal: {}. \
-                         re-run the build, or review the removals explicitly.",
-                        missing.len(),
-                        approval::summarize_names(&missing, MAX_REPORTED_NAMES)
-                    )));
-                }
-            }
 
             let baseline = baselines::ActiveModel {
                 id: Set(Uuid::new_v4()),
@@ -475,44 +380,14 @@ pub async fn approve_build(
     .await
 }
 
-/// 承認判定に使う比較の情報を読み込む。
-async fn load_comparison_facts<C: ConnectionTrait>(
-    db: &C,
-    build_id: Uuid,
-) -> Result<Vec<ComparisonFacts>, AppError> {
-    Ok(crate::comparisons::list_for_build(db, build_id)
-        .await?
-        .iter()
-        .map(ComparisonFacts::from)
-        .collect())
-}
-
 /// 未レビューの比較をまとめて approved にする（一括承認）。
-///
-/// `removed` は [`ApproveOptions::accept_removals`] を明示したときだけ対象に含める。
-/// story の消滅は baseline から実体が消える不可逆操作なので、`force` だけでは通さない。
 async fn approve_all_pending<C: ConnectionTrait>(
     db: &C,
     build_id: Uuid,
     reviewer_id: Uuid,
-    options: ApproveOptions,
 ) -> Result<(), AppError> {
-    let bulk_statuses: Vec<ComparisonStatus> = [
-        ComparisonStatus::Changed,
-        ComparisonStatus::Added,
-        ComparisonStatus::Removed,
-        ComparisonStatus::Failed,
-    ]
-    .into_iter()
-    .filter(|status| approval::is_bulk_approvable(*status, options))
-    .collect();
-    if bulk_statuses.is_empty() {
-        return Ok(());
-    }
-
     let now = Utc::now().fixed_offset();
     comparisons::Entity::update_many()
-        .filter(comparisons::Column::Status.is_in(bulk_statuses))
         .col_expr(
             comparisons::Column::ReviewStatus,
             sea_orm::sea_query::Expr::value(ReviewStatus::Approved),

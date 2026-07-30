@@ -3,7 +3,6 @@
 // 旧 crate::error / crate::settings パス互換のための再公開。
 pub use common::{error, settings};
 
-pub mod approval;
 pub mod auth;
 pub mod baselines;
 pub mod build_logs;
