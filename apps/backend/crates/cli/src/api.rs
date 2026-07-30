@@ -39,7 +39,6 @@ struct FinalizeBody {
 pub struct BuildResponse {
     pub id: String,
     /// プロジェクト内で連番のビルド番号（`--json` 出力の build_number）。
-    #[serde(default)]
     pub number: i64,
     pub status: String,
     #[serde(default)]
