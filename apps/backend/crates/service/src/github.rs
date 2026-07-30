@@ -17,6 +17,9 @@
 //! （auth-core 側は変更しない方針）。ベース URL は同じ設定値を使うので、
 //! Enterprise / テストでも一貫して差し替わる。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use common::cache::redis::RedisConnection;
 use common::settings::Settings;
 use entity::builds;
@@ -92,10 +95,34 @@ fn token_cache_key(installation_id: i64) -> String {
     format!("github:installation_token:{installation_id}")
 }
 
+/// installation_id ごとのトークン取得ロック（プロセス内 single-flight）。
+///
+/// 同一 installation に対するトークン取得を直列化し、キャッシュミス時の GitHub
+/// への二重取得を防ぐ。std の `Mutex` は `Arc<tokio::sync::Mutex>` の取り出しだけに
+/// 使い、`await` をまたいで保持しない。
+///
+/// エントリは一度作られると解放しないが、キーは installation_id（高々テナント数
+/// オーダー）なので無限成長にはならず、掃除は不要。
+static TOKEN_FETCH_LOCKS: OnceLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
+
+/// 指定 installation の取得ロックを取り出す（無ければ作る）。
+fn token_fetch_lock(installation_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+    let map = TOKEN_FETCH_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("token fetch lock map poisoned");
+    guard.entry(installation_id).or_default().clone()
+}
+
 /// Installation Access Token を取得する（Valkey キャッシュ経由）。
 ///
-/// キャッシュミス時のみ GitHub に取りに行く。キャッシュの読み書きに失敗しても
-/// 致命的ではないため警告ログだけ出して素通りする（毎回取りに行くだけ）。
+/// まずロック無しで楽観的にキャッシュを読み、ヒットすればそのまま返す。ミス時は
+/// installation_id 単位のプロセス内ロックを取り、キャッシュを再確認（double-checked）
+/// してから GitHub に取りに行き、結果をキャッシュして返す。これによりビルド 1 本で
+/// 複数のコミットステータス送信がほぼ同時に走っても、トークン取得は 1 回に収束する。
+///
+/// single-flight は**プロセス内のみ**で、複数プロセス間の重複取得は許容する
+/// （GitHub API 上は問題ない）。キャッシュの読み書きに失敗しても致命的ではないため
+/// 警告ログだけ出して素通りする（毎回取りに行くだけ）。
 pub async fn installation_token(
     redis: &RedisConnection,
     app: &GithubApp,
@@ -103,6 +130,18 @@ pub async fn installation_token(
 ) -> Result<String, GithubApiError> {
     let key = token_cache_key(installation_id);
 
+    // 楽観的な先読み。ヒット時はロック不要で速い。
+    match cache_get(redis, &key).await {
+        Ok(Some(token)) => return Ok(token),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, installation_id, "github token cache read failed"),
+    }
+
+    // ミス時は per-installation ロックで直列化してから再確認する。
+    let lock = token_fetch_lock(installation_id);
+    let _guard = lock.lock().await;
+
+    // double-checked: ロック待ちの間に別タスクが取得・キャッシュ済みかもしれない。
     match cache_get(redis, &key).await {
         Ok(Some(token)) => return Ok(token),
         Ok(None) => {}
