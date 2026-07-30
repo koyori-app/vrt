@@ -64,6 +64,12 @@ jobs:
         run: cargo build --release -p vrt-cli
         working-directory: apps/backend
 
+      # コンパイル成功だけを根拠に配布しない。起動時に落ちる類の破損
+      # （動的リンク先の欠落など）をパッケージ前にその場で捕まえる。
+      - name: Smoke test binary
+        run: ./target/release/vrt --version
+        working-directory: apps/backend
+
       # 中身はバイナリ vrt 1 つだけ（ディレクトリで包まない）。
       # 併せて sha256sum 形式のチェックサムを出す。
       - name: Package artifact
