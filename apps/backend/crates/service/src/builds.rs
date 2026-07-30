@@ -337,7 +337,7 @@ pub async fn approve_build(
                 return Err(AppError::Conflict);
             }
 
-            // ── 穴②: baseline の巻き戻り防止 ──────────────────────────────
+            // 現行 baseline より古いビルドの承認を拒否する。
             // 比較ジョブが使ったのと同じ解決規則（同一ブランチ → デフォルトブランチ）で
             // 「いまの baseline」を引き直し、比較時点のものと一致するか確かめる。
             // ロックを取ったあとに読むので、並行承認との間に隙間は無い。
@@ -369,7 +369,7 @@ pub async fn approve_build(
 
             let mut facts = load_comparison_facts(txn, build.id).await?;
 
-            // ── 穴①: 却下されたものを baseline へ昇格させない ─────────────
+            // 却下された比較があれば baseline を更新しない。
             let rejected = approval::rejected_names(&facts);
             if !rejected.is_empty() {
                 return Err(AppError::ConflictDetail(format!(
@@ -380,7 +380,7 @@ pub async fn approve_build(
                 )));
             }
 
-            // ── 穴③: 未レビュー（とくに removed）の一括承認を絞る ─────────
+            // 未レビューの削除を一括承認の対象から除く。
             let blocking = approval::blocking_pending_names(&facts, options);
             if !blocking.is_empty() {
                 let hint = if options.force {
@@ -409,7 +409,7 @@ pub async fn approve_build(
                 .all(txn)
                 .await?;
 
-            // ── 穴③(続き): 現行 baseline の manifest と突き合わせる ───────
+            // 現行 baseline から予期せず欠落した story を検出する。
             // 「消えてよい」と承認された story 以外が今回のビルドから欠けていたら、
             // 撮影漏れ・アップロード失敗と区別がつかないので承認しない。
             if let Some(baseline) = &current {

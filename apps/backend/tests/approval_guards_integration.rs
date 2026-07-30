@@ -209,7 +209,7 @@ async fn error_message(res: reqwest::Response) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
 
-// ── 穴①: 却下した比較が baseline に焼き付く ─────────────────────────────
+// 却下された比較を承認できず、baseline が更新されないことを検証する。
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejected_comparison_blocks_approval_and_keeps_the_baseline() {
@@ -260,7 +260,7 @@ async fn rejected_comparison_blocks_approval_and_keeps_the_baseline() {
     assert_eq!(fx.build_status(second_id).await, "changes_detected");
 }
 
-// ── 穴②: 古いビルドの後追い承認で baseline が巻き戻る ───────────────────
+// 古いビルドを後から承認できず、baseline が巻き戻らないことを検証する。
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
@@ -303,7 +303,7 @@ async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
     assert_eq!(still, after_third, "baseline は巻き戻っていない");
 }
 
-// ── 穴③: force が story の消滅まで一括承認する ──────────────────────────
+// force でも story の削除を明示確認なしに承認しないことを検証する。
 
 #[tokio::test(flavor = "multi_thread")]
 async fn force_does_not_silently_approve_story_removals() {
@@ -348,7 +348,7 @@ async fn force_does_not_silently_approve_story_removals() {
     assert_eq!(names, vec!["home".to_string()]);
 }
 
-// ── 健全挙動の維持 ──────────────────────────────────────────────────────
+// 通常のレビューと承認では baseline が更新されることを検証する。
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ordinary_review_and_approval_still_promotes_the_baseline() {

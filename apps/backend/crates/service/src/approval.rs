@@ -182,7 +182,7 @@ mod tests {
             .collect()
     }
 
-    // ---- 穴①: 却下された比較が baseline へ昇格する ----
+    // 却下された比較があれば承認を拒否する。
 
     #[test]
     fn rejected_comparison_blocks_approval() {
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(summarize_names(&names, 2), "s0, s1 (+3 more)");
     }
 
-    // ---- 穴②: 古いビルドの後追い承認で baseline が巻き戻る ----
+    // 現行 baseline より古いビルドの承認を拒否する。
 
     #[test]
     fn older_build_than_baseline_source_is_rejected() {
@@ -251,7 +251,7 @@ mod tests {
         assert!(!baseline_is_current(None, Some(e)));
     }
 
-    // ---- 穴③: force が removed まで一括承認する ----
+    // baseline から予期せず欠落した story を検出する。
 
     #[test]
     fn force_does_not_bulk_approve_removals() {
@@ -319,7 +319,7 @@ mod tests {
         assert!(blocking_pending_names(&list, ApproveOptions::default()).is_empty());
     }
 
-    // ---- 穴③: baseline manifest と今回のビルドの照合 ----
+    // baseline manifest と今回のビルドを照合する。
 
     #[test]
     fn silent_disappearance_is_reported() {
