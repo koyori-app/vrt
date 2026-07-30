@@ -221,6 +221,16 @@ GitHub Action など呼び出し元がパースしやすいよう、このとき
 stderr にエラーを出して終了コード 2 で終わる。呼び出し元は「stdout が空で非ゼロ終了」を
 必ず処理すること。
 
+`--wait` 併用時、finalize には成功したがその後のポーリングが一時的な通信失敗や
+タイムアウト（既定 30 分）で失敗した場合も **JSON は 1 行出る**。このときの JSON は
+finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
+`project_slug` / finalize 直後の `status`）に `exit_code: 2` と失敗理由の `error`
+フィールド（例
+`{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"processing","exit_code":2,"error":"timed out after 1800s …"}`）
+を添えて出す。`error` は失敗時のみ現れ、成功時の JSON 形状は変わらない。これにより
+呼び出し元は少なくとも `build_id` を取り出して後続処理（結果 URL の組み立てや
+再ポーリング）に使える。
+
 `--only-changed` の前提:
 
 - **stats-json が必要**: `storybook build --stats-json` で `preview-stats.json`
