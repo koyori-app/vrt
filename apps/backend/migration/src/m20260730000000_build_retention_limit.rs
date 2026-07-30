@@ -11,9 +11,7 @@ impl MigrationTrait for Migration {
         // 超過した古い完了ビルドは `service::builds::prune_old_builds` が自動削除する。
         manager
             .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE projects ADD COLUMN build_retention_limit INTEGER",
-            )
+            .execute_unprepared("ALTER TABLE projects ADD COLUMN build_retention_limit INTEGER")
             .await?;
         Ok(())
     }
