@@ -25,10 +25,15 @@ jobs:
             runner: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          # macOS のランナーラベルは明示的に固定する。`macos-latest` は 1〜2 か月
+          # かけて新しい OS へ移行するため、リリースの再現性が保てない。
+          # 提供中のイメージは macOS 15 / 26 系（14 は deprecated、13 は提供終了）。
+          # Intel 版は `-intel` サフィックス。`-large` / `-xlarge` は larger runner
+          # （public リポジトリでも課金対象）なので使わない。
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-latest
+            runner: macos-15
 
     steps:
       - name: Checkout
