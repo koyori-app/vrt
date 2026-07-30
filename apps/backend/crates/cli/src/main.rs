@@ -191,7 +191,16 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     if !args.json {
         report(&final_build);
     } else {
-        print_json_result(&final_build, tenant_slug, project_slug, code, None);
+        // ビルドが failed / rejected で終わったら、人間向け report() と同じく
+        // サーバーが返した失敗理由（error_message）を JSON の `error` にも載せる。
+        // 成功時は error_message が None なので `error` キーは出ない契約を保つ。
+        print_json_result(
+            &final_build,
+            tenant_slug,
+            project_slug,
+            code,
+            final_build.error_message.as_deref(),
+        );
     }
     Ok(ExitCode::from(code))
 }
@@ -478,6 +487,24 @@ mod tests {
             value["error"],
             "timed out after 1800s waiting for build build-123 (last status: processing)"
         );
+        assert!(!value.to_string().contains('\n'));
+    }
+
+    /// ビルドが failed / rejected で終わり、サーバーが error_message を返した場合、
+    /// run_upload の終端パス（error_message.as_deref() 経由）で `error` キーに
+    /// その理由が載ること、および exit_code=2 が付くことを固定する。
+    #[test]
+    fn json_result_carries_server_error_message_on_failed_build() {
+        let mut build = sample_build();
+        build.status = "failed".into();
+        build.error_message = Some("render worker crashed for 3 stories".into());
+
+        let code = exit_code_for(&build.status);
+        let value = json_result_value(&build, "acme", "web", code, build.error_message.as_deref());
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["exit_code"], 2);
+        assert_eq!(value["error"], "render worker crashed for 3 stories");
         assert!(!value.to_string().contains('\n'));
     }
 

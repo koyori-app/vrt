@@ -231,6 +231,12 @@ finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
 呼び出し元は少なくとも `build_id` を取り出して後続処理（結果 URL の組み立てや
 再ポーリング）に使える。
 
+`error` が現れるのはポーリング失敗時だけではない。`--wait` でポーリングが終端まで
+到達し、ビルド自体が `failed` / `rejected` で終わってサーバーが失敗理由
+（`error_message`）を返した場合も、その理由が `exit_code: 2` とともに `error` に載る
+（どのストーリーで落ちたか等）。この場合も成功時（`error_message` が無いとき）は
+`error` キーが出ない契約は変わらない。
+
 `--only-changed` の前提:
 
 - **stats-json が必要**: `storybook build --stats-json` で `preview-stats.json`
