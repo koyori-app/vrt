@@ -21,7 +21,11 @@ use entity::{
     comparisons::ComparisonStatus, comparisons::ReviewStatus, projects, screenshots,
 };
 
+use crate::approval::{self, ComparisonFacts};
 use crate::storage::StorageBackend;
+
+/// エラーメッセージに並べる story 名の上限。超過分は件数だけ示す。
+const MAX_REPORTED_NAMES: usize = 10;
 
 /// ビルド一覧のデフォルト件数。
 pub const DEFAULT_LIST_LIMIT: u64 = 30;
@@ -293,6 +297,8 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 
 /// ビルドを承認し、そのビルドの全スクリーンショットを新しい baseline に昇格する。
 ///
+/// - 却下された比較が 1 件でも残っていれば [`AppError::ConflictDetail`]。
+///   却下したスクリーンショットを baseline に昇格させると、以降そのズレが「正」になる
 /// - `force == false` のときはレビュー待ちの比較が残っていると [`AppError::Conflict`]
 /// - `force == true` は「一括承認」用。未レビューの比較もまとめて approved にする
 ///
@@ -322,6 +328,18 @@ pub async fn approve_build(
             let build = get_build(txn, build.id).await?;
             if !build.status.can_transition_to(BuildStatus::Approved) {
                 return Err(AppError::Conflict);
+            }
+
+            // ── 穴①: 却下されたものを baseline へ昇格させない ─────────────
+            let facts = load_comparison_facts(txn, build.id).await?;
+            let rejected = approval::rejected_names(&facts);
+            if !rejected.is_empty() {
+                return Err(AppError::ConflictDetail(format!(
+                    "cannot approve: {} comparison(s) are rejected: {}. \
+                     reject the build, or re-review these comparisons as approved.",
+                    rejected.len(),
+                    approval::summarize_names(&rejected, MAX_REPORTED_NAMES)
+                )));
             }
 
             let pending = pending_review_count(txn, build.id).await?;
@@ -378,6 +396,18 @@ pub async fn approve_build(
         })
     })
     .await
+}
+
+/// 承認判定に使う比較の情報を読み込む。
+async fn load_comparison_facts<C: ConnectionTrait>(
+    db: &C,
+    build_id: Uuid,
+) -> Result<Vec<ComparisonFacts>, AppError> {
+    Ok(crate::comparisons::list_for_build(db, build_id)
+        .await?
+        .iter()
+        .map(ComparisonFacts::from)
+        .collect())
 }
 
 /// 未レビューの比較をまとめて approved にする（一括承認）。
