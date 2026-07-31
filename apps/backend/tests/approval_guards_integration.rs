@@ -519,13 +519,33 @@ async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
     );
     let message = error_message(res).await;
     assert!(
-        message.contains("older") || message.contains("baseline moved"),
-        "巻き戻りだと分かるメッセージであること: {message}"
+        message.contains("accept_revert") && message.contains("re-run"),
+        "巻き戻しの明示経路と安全な代替を示すこと: {message}"
     );
 
     // baseline は新しい方のまま。
     let (still, _) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(still, after_third, "baseline は巻き戻っていない");
+
+    // 専用フラグで意図を明示した場合だけ古いビルドへ戻せる。
+    let res = fx
+        .approve(second_id, json!({ "force": true, "accept_revert": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "明示した revert は承認できる");
+    let reverted: Value = res.json().await.expect("reverted build json");
+    assert_eq!(
+        reverted["approval_evidence"]["reverted_from_build"],
+        third["number"]
+    );
+    assert_eq!(
+        reverted["approval_evidence"]["reverted_to_build"],
+        second["number"]
+    );
+    let (after_revert, _) = fx.current_baseline().await.expect("baseline exists");
+    assert_ne!(
+        after_revert, after_third,
+        "revert は新しい baseline record を作る"
+    );
 }
 
 // force でも story の削除を明示確認なしに承認しないことを検証する。
@@ -569,6 +589,12 @@ async fn force_does_not_silently_approve_story_removals() {
         .approve(second_id, json!({ "force": true, "accept_removals": true }))
         .await;
     assert_eq!(res.status(), StatusCode::OK, "明示確認すれば承認できる");
+    let approved: Value = res.json().await.expect("approved build json");
+    assert_eq!(
+        approved["approval_evidence"]["accepted_removals"],
+        json!(["legacy"]),
+        "消えた story 名を build record に残す"
+    );
     let (_, names) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(names, vec!["home".to_string()]);
 }
@@ -691,6 +717,12 @@ async fn force_requires_explicit_acknowledgement_for_failed_comparisons() {
         res.status(),
         StatusCode::OK,
         "a separate explicit acknowledgement permits the exceptional operation"
+    );
+    let approved: Value = res.json().await.expect("approved build json");
+    assert_eq!(
+        approved["approval_evidence"]["accepted_failures"],
+        json!(["home"]),
+        "failed screenshot name is retained as approval evidence"
     );
 }
 

@@ -33,6 +33,8 @@ pub struct Model {
     pub unchanged_count: i32,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message: Option<String>,
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub approval_evidence: Option<Json>,
     pub approved_by: Option<Uuid>,
     pub approved_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,

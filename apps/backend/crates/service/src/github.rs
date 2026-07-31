@@ -472,6 +472,7 @@ mod tests {
             removed_count: removed,
             unchanged_count: 0,
             error_message: None,
+            approval_evidence: None,
             approved_by: None,
             approved_at: None,
             created_at: Utc::now().fixed_offset(),

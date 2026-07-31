@@ -46,6 +46,9 @@ pub struct BuildResponse {
     pub unchanged_count: i32,
     #[schema(nullable)]
     pub error_message: Option<String>,
+    /// 危険を明示的に承知して承認した場合の証跡。
+    #[schema(nullable)]
+    pub approval_evidence: Option<serde_json::Value>,
     #[schema(value_type = Option<String>, format = "uuid", nullable)]
     pub approved_by: Option<Uuid>,
     #[schema(value_type = Option<String>, format = "date-time", nullable)]
@@ -80,6 +83,7 @@ impl From<builds::Model> for BuildResponse {
             removed_count: model.removed_count,
             unchanged_count: model.unchanged_count,
             error_message: model.error_message,
+            approval_evidence: model.approval_evidence,
             approved_by: model.approved_by,
             approved_at: model.approved_at.map(|t| t.with_timezone(&Utc)),
             created_at: model.created_at.with_timezone(&Utc),
@@ -215,6 +219,12 @@ pub struct ApproveBuildRequest {
     /// このフラグは `force: true` と併用した場合だけ効果があり、単独指定は no-op。
     #[serde(default)]
     pub accept_failures: bool,
+    /// `true` にすると、現行 baseline より古いビルドへの意図的な巻き戻しを許可する。
+    ///
+    /// 巻き戻し対象である場合だけ効果がある。通常の再承認や baseline 移動の bypass には
+    /// 使われず、巻き戻し元・先のビルド番号が承認証跡に保存される。
+    #[serde(default)]
+    pub accept_revert: bool,
 }
 
 /// ビルド一覧のページネーションパラメータ。

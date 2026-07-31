@@ -24,6 +24,10 @@ pub struct ApproveOptions {
     /// 比較できていない画像を baseline に焼き付けないよう、`force` とは別の
     /// 明示フラグにしてある。
     pub accept_failures: bool,
+    /// 現行 baseline より古いビルドを意図的に baseline へ戻す。
+    ///
+    /// 通常の承認ガードを緩めず、巻き戻しに該当すると確認できた場合だけ効く。
+    pub accept_revert: bool,
 }
 
 impl ApproveOptions {
@@ -32,8 +36,26 @@ impl ApproveOptions {
             force: true,
             accept_removals: false,
             accept_failures: false,
+            accept_revert: false,
         }
     }
+}
+
+/// 指定 status の未レビュー比較名（名前順・重複なし）。
+///
+/// 明示フラグで承認した対象を build record に残すために使う。
+pub fn pending_names_with_status(
+    comparisons: &[ComparisonFacts],
+    status: ComparisonStatus,
+) -> Vec<String> {
+    let mut names: Vec<String> = comparisons
+        .iter()
+        .filter(|c| c.status == status && c.review_status == ReviewStatus::Pending)
+        .map(|c| c.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// 承認判定に必要な 1 比較ぶんの情報。
@@ -293,6 +315,7 @@ mod tests {
             force: true,
             accept_removals: true,
             accept_failures: false,
+            accept_revert: false,
         };
         assert!(is_bulk_approvable(ComparisonStatus::Removed, opts));
     }
@@ -315,6 +338,7 @@ mod tests {
                     force: true,
                     accept_removals: true,
                     accept_failures: false,
+                    accept_revert: false,
                 }
             )
             .is_empty()
