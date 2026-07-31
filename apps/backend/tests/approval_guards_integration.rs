@@ -17,7 +17,10 @@ use common::TestApp;
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait,
+    QueryFilter, Statement, TransactionTrait,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -214,6 +217,180 @@ fn build_id_of(build: &Value) -> Uuid {
 async fn error_message(res: reqwest::Response) -> String {
     let body: Value = res.json().await.expect("error json");
     body["message"].as_str().unwrap_or_default().to_string()
+}
+
+/// PostgreSQL trigger を更新処理の直前で止める deterministic barrier。
+///
+/// テスト側の transaction が advisory lock を保持し、対象 UPDATE は trigger 内で同じ
+/// lock を待つ。これにより sleep の速さに依存せず、レビュー/却下が DB 更新へ入った
+/// 瞬間に承認を競合させられる。
+async fn install_update_barrier(
+    fx: &Fixture,
+    table: &str,
+    condition: &str,
+) -> sea_orm::DatabaseTransaction {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let function = format!("approval_race_{suffix}");
+    let trigger = format!("approval_race_trigger_{suffix}");
+    let lock_key = i64::from(u32::from_be_bytes(
+        Uuid::new_v4().as_bytes()[..4].try_into().unwrap(),
+    ));
+    fx.app
+        .state
+        .db
+        .execute_unprepared(&format!(
+            "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$\
+             BEGIN IF {condition} THEN PERFORM pg_advisory_xact_lock({lock_key}); END IF; \
+             RETURN NEW; END $$; \
+             CREATE TRIGGER {trigger} BEFORE UPDATE ON {table} FOR EACH ROW \
+             EXECUTE FUNCTION {function}();"
+        ))
+        .await
+        .expect("install approval race barrier");
+
+    let barrier = fx.app.state.db.begin().await.expect("begin barrier");
+    barrier
+        .execute_unprepared(&format!("SELECT pg_advisory_xact_lock({lock_key})"))
+        .await
+        .expect("hold barrier");
+    barrier
+}
+
+async fn wait_for_advisory_waiter(fx: &Fixture) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let row = fx
+            .app
+            .state
+            .db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS count FROM pg_locks \
+                 WHERE locktype = 'advisory' AND NOT granted",
+            ))
+            .await
+            .expect("query advisory waiters")
+            .expect("count row");
+        let count: i64 = row.try_get("", "count").expect("waiter count");
+        if count > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the update barrier"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// comparison の却下が先に更新へ入った場合、承認はその却下を読み直して止まる。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_comparison_rejection_cannot_be_promoted_to_the_baseline() {
+    let fx = setup().await;
+    let build = fx.run_build("sha-race-review", &[("home", RED)]).await;
+    let build_id = build_id_of(&build);
+    fx.review(build_id, "home", "approve").await;
+
+    let comparison = fx
+        .comparisons(build_id)
+        .await
+        .into_iter()
+        .find(|comparison| comparison["name"] == "home")
+        .expect("home comparison");
+    let comparison_id = comparison["id"].as_str().expect("comparison id");
+    let condition = format!(
+        "NEW.review_status::text = 'rejected' AND EXISTS (\
+         SELECT 1 FROM builds WHERE id = NEW.build_id AND project_id = '{}')",
+        fx.project_id
+    );
+    let barrier = install_update_barrier(&fx, "comparisons", &condition).await;
+
+    let review_client = fx.app.client().clone();
+    let review_url = format!(
+        "{}/v1/comparisons/{comparison_id}/review",
+        fx.app.base_url()
+    );
+    let review_task = tokio::spawn(async move {
+        review_client
+            .post(review_url)
+            .json(&json!({ "action": "reject" }))
+            .send()
+            .await
+            .expect("reject comparison")
+    });
+    wait_for_advisory_waiter(&fx).await;
+
+    let approve_client = fx.app.client().clone();
+    let approve_url = format!("{}/v1/builds/{build_id}/approve", fx.app.base_url());
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("approve build")
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !approve_task.is_finished(),
+        "approval must wait behind an in-flight comparison review"
+    );
+
+    barrier.commit().await.expect("release barrier");
+    let reviewed = review_task.await.expect("review task");
+    assert_eq!(reviewed.status(), StatusCode::OK);
+    let approved = approve_task.await.expect("approve task");
+    assert_eq!(approved.status(), StatusCode::CONFLICT);
+    assert!(fx.current_baseline().await.is_none());
+}
+
+// build 却下が先に更新へ入った場合も、承認は却下後の build を読み直して止まる。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_build_rejection_prevents_baseline_creation() {
+    let fx = setup().await;
+    let build = fx.run_build("sha-race-build", &[("home", RED)]).await;
+    let build_id = build_id_of(&build);
+    fx.review(build_id, "home", "approve").await;
+
+    let condition = format!(
+        "NEW.project_id = '{}' AND NEW.status::text = 'rejected'",
+        fx.project_id
+    );
+    let barrier = install_update_barrier(&fx, "builds", &condition).await;
+
+    let reject_client = fx.app.client().clone();
+    let reject_url = format!("{}/v1/builds/{build_id}/reject", fx.app.base_url());
+    let reject_task = tokio::spawn(async move {
+        reject_client
+            .post(reject_url)
+            .send()
+            .await
+            .expect("reject build")
+    });
+    wait_for_advisory_waiter(&fx).await;
+
+    let approve_client = fx.app.client().clone();
+    let approve_url = format!("{}/v1/builds/{build_id}/approve", fx.app.base_url());
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("approve build")
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !approve_task.is_finished(),
+        "approval must wait behind rejection"
+    );
+
+    barrier.commit().await.expect("release barrier");
+    let rejected = reject_task.await.expect("reject task");
+    assert_eq!(rejected.status(), StatusCode::OK);
+    let approved = approve_task.await.expect("approve task");
+    assert_eq!(approved.status(), StatusCode::CONFLICT);
+    assert!(fx.current_baseline().await.is_none());
 }
 
 // 他ブランチの fallback baseline は、ビルド番号だけで巻き戻り扱いしない。
