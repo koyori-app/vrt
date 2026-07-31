@@ -138,29 +138,26 @@ async fn main() -> ExitCode {
     match cli.command {
         Command::Upload(args) => {
             // ログは stderr。stdout は結果（`--json` の 1 行 JSON や key=value）専用。
-            init_logging(true);
+            init_logging();
             finish(run_upload(args).await)
         }
         Command::Plan(args) => {
             // stdout は計画 JSON 専用。ログが混ざると CI 側の解析が壊れる。
-            init_logging(true);
+            init_logging();
             finish(run_plan(args).await)
         }
     }
 }
 
 /// RUST_LOG で調整可能。既定は info。トークンはどのログにも載せない。
-fn init_logging(logs_to_stderr: bool) {
+fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let builder = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false);
-    if logs_to_stderr {
-        builder.with_writer(std::io::stderr).init();
-    } else {
-        builder.init();
-    }
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 /// 失敗は anyhow のチェーンをまとめて 1 行で出し、終了コード 2 にする。
@@ -251,6 +248,12 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     let final_build = match poll_until_terminal(&client, &finalized.id, args.json).await {
         Ok(build) => build,
         Err(e) => {
+            // finalize は成功済み。`--json` の契約は「finalize まで到達すれば JSON が
+            // 1 行出る」なので、ここでポーリングが一時的な通信失敗やタイムアウトで
+            // Err になっても、`?` で早期リターンして stdout を空にしてはいけない。
+            // 呼び出し元が build_id すら取れなくなるため、既知の finalize 済み情報
+            // （build_id / build_number / slug / finalize 直後の status）に exit_code=2
+            // と失敗理由 `error` を添えて 1 行だけ出す。
             if args.json {
                 print_json_result(
                     &finalized,
@@ -259,9 +262,11 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
                     2,
                     Some(&format!("{e:#}")),
                 );
+                // ログは従来どおり stderr へも残す（main のハンドラは通らないため自前で）。
                 tracing::error!("{e:#}");
                 return Ok(ExitCode::from(2));
             }
+            // `--json` でないときは従来どおり伝播し、main 側で error ログ + exit 2。
             return Err(e);
         }
     };
@@ -473,12 +478,12 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
     }
 
     let json = document.to_json()?;
+    println!("{json}");
     if let Some(path) = &args.output {
         std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
         tracing::info!(path = %path.display(), "wrote the selection plan");
     }
-    println!("{json}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -557,11 +562,13 @@ fn report(build: &BuildResponse) {
 }
 
 /// 最終状態から終了コードを決める。
+///
+/// passed/approved=0、changes_detected=1、failed/rejected=2。
 fn exit_code_for(status: &str) -> u8 {
     match status {
         "passed" | "approved" => 0,
         "changes_detected" => 1,
-        _ => 2,
+        _ => 2, // failed / rejected / 想定外
     }
 }
 
@@ -569,6 +576,9 @@ fn exit_code_for(status: &str) -> u8 {
 mod tests {
     use super::*;
 
+    /// 終了コードは CI の合否判定そのものなので、8 状態すべてを固定する。
+    /// `changes_detected` は「差分あり = レビュー待ち」であって失敗ではないため、
+    /// 1 に割り当てて失敗（2）と区別する。
     #[test]
     fn exit_code_covers_every_build_status() {
         assert_eq!(exit_code_for("passed"), 0);
@@ -576,21 +586,25 @@ mod tests {
         assert_eq!(exit_code_for("changes_detected"), 1);
         assert_eq!(exit_code_for("failed"), 2);
         assert_eq!(exit_code_for("rejected"), 2);
+        // 非終端状態がここへ来るのは想定外なので、成功に倒さず 2 にする。
         assert_eq!(exit_code_for("pending"), 2);
         assert_eq!(exit_code_for("rendering"), 2);
         assert_eq!(exit_code_for("processing"), 2);
     }
 
+    /// サーバー側に未知の状態が増えても、黙って 0（成功）にしないことを固定する。
     #[test]
     fn unknown_status_is_not_treated_as_success() {
         assert_eq!(exit_code_for("some_future_status"), 2);
         assert_eq!(exit_code_for(""), 2);
     }
 
+    /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。
     fn sample_build() -> BuildResponse {
         BuildResponse {
             id: "build-123".into(),
             number: 42,
+            // finalize 直後の（＝最後に判明している）状態を模す。
             status: "processing".into(),
             baseline_commit_sha: None,
             total_count: 0,
@@ -601,6 +615,7 @@ mod tests {
         }
     }
 
+    /// 成功パスでは `error` キーが出現しないこと（JSON 形状を変えない）を固定する。
     #[test]
     fn json_result_omits_error_on_success() {
         let build = sample_build();
@@ -612,10 +627,16 @@ mod tests {
         assert_eq!(value["project_slug"], "web");
         assert_eq!(value["status"], "processing");
         assert_eq!(value["exit_code"], 0);
-        assert!(value.get("error").is_none());
+        assert!(
+            value.get("error").is_none(),
+            "success output must not carry an error field"
+        );
+        // 1 行 JSON の契約: 改行を含まない。
         assert!(!value.to_string().contains('\n'));
     }
 
+    /// ポーリング失敗時は finalize 済みの build_id 等 + exit_code=2 + error を出す。
+    /// finalize 後の状態がそのまま status に出ること（poll 失敗でも既知値を返す）を固定。
     #[test]
     fn json_result_includes_error_and_exit_2_on_poll_failure() {
         let finalized = sample_build();
@@ -627,8 +648,13 @@ mod tests {
             Some("timed out after 1800s waiting for build build-123 (last status: processing)"),
         );
 
+        // build_id / build_number / slug / status は finalize 済みの既知値。
         assert_eq!(value["build_id"], "build-123");
         assert_eq!(value["build_number"], 42);
+        assert_eq!(value["tenant_slug"], "acme");
+        assert_eq!(value["project_slug"], "web");
+        assert_eq!(value["status"], "processing");
+        // 失敗を表す終了コードと理由。
         assert_eq!(value["exit_code"], 2);
         assert_eq!(
             value["error"],
@@ -637,6 +663,9 @@ mod tests {
         assert!(!value.to_string().contains('\n'));
     }
 
+    /// ビルドが failed / rejected で終わり、サーバーが error_message を返した場合、
+    /// run_upload の終端パス（error_message.as_deref() 経由）で `error` キーに
+    /// その理由が載ること、および exit_code=2 が付くことを固定する。
     #[test]
     fn json_result_carries_server_error_message_on_failed_build() {
         let mut build = sample_build();
