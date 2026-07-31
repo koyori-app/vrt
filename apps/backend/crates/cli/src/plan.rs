@@ -235,6 +235,9 @@ impl PlanDocument {
     }
 
     /// CI が読む JSON（末尾改行なし）。
+    ///
+    /// 人間が CI ログで追いやすいよう pretty を使う。`vrt upload --json` は jq 等が
+    /// 1 行でパースする前提のため compact のまま——消費者と用途が異なるので揃えない。
     pub fn to_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self).context("failed to serialize the selection plan")
     }

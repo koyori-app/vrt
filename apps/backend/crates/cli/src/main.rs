@@ -238,6 +238,7 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     }
 
     if !args.wait {
+        // --wait 無し: finalize 直後の状態を返し、終了コードは常に 0（既存挙動）。
         if args.json {
             print_json_result(&finalized, tenant_slug, project_slug, 0, None);
         }
@@ -298,6 +299,9 @@ fn print_json_result(
 }
 
 /// `--json` の 1 行 JSON の値を組み立てる純関数。
+///
+/// `error` は失敗時のみ `Some` を渡す。`None` のときは成功パスと同じ形状
+/// （`error` キーは出現しない）を保つ。
 fn json_result_value(
     build: &BuildResponse,
     tenant_slug: &str,
@@ -401,8 +405,14 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
 
     // baseline の入手経路。明示指定が優先。無ければ screenshots ビルドを作り、
     // その作成レスポンスから受け取る（撮影前に起点を知れる唯一の経路）。
+    let explicit_baseline = args.baseline_commit.clone();
     let (baseline_commit_sha, build_id) = match args.baseline_commit {
-        Some(sha) => (Some(sha), None),
+        Some(sha) => {
+            git::commit_exists(&sha).with_context(|| {
+                format!("baseline commit {sha} is not present locally")
+            })?;
+            (Some(sha), None)
+        }
         None => {
             let (Some(url), Some(token), Some(project)) = (args.url, args.token, args.project)
             else {
@@ -444,7 +454,11 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
             Vec::new(),
         ),
         Some(baseline) => match git::changed_files(baseline) {
-            // 履歴不足（shallow clone 等）→ 全撮影。
+            // 履歴不足（shallow clone 等）→ 全撮影。明示 baseline は上で存在確認済みなので
+            // ここへ来るのはサーバー解決経路のみ。
+            Err(e) if explicit_baseline.is_some() => {
+                return Err(e).context("could not diff against baseline");
+            }
             Err(e) => PlanDocument::capture_all(
                 coords,
                 format!("could not diff against baseline: {e:#}"),
@@ -504,6 +518,7 @@ async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Res
 
         let build = client.get_build(build_id).await?;
         if is_settled(&build.status) {
+            // 終端遷移と同時に書かれた行（完了サマリ・失敗理由）を最後に流し切る。
             flush_logs(client, build_id, log_cursor, json).await;
             return Ok(build);
         }
@@ -519,10 +534,14 @@ async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Res
 }
 
 /// `cursor` より後のログ行を `[level] message` 形式で印字し、新しいカーソルを返す。
+///
+/// ログ取得の失敗はビルド待機の失敗にはしない（警告だけ出して次に進む）。
+/// 進捗ログは補助情報であり、これで終了コードを狂わせたくない。
 async fn flush_logs(client: &Client, build_id: &str, cursor: i64, json: bool) -> i64 {
     match client.get_build_logs(build_id, cursor).await {
         Ok(logs) => {
             for entry in &logs.entries {
+                // --json のときは stdout を JSON 専用にするため進捗ログは stderr へ回す。
                 if json {
                     eprintln!("[{}] {}", entry.level, entry.message);
                 } else {

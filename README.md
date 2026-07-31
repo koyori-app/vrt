@@ -169,11 +169,30 @@ export VRT_PROJECT=<tenant-slug>/<project-slug>
 pnpm build-storybook --stats-json                 # preview-stats.json と index.json を出す
 vrt plan --dir ./storybook-static --output plan.json
 
-BUILD=$(jq -r '.build_id' plan.json)              # この計画のために作られた screenshots ビルド
-case "$(jq -r '.plan' plan.json)" in
-  only)        jq -r '.story_ids[]' plan.json > stories.txt ;;  # 空なら撮る story 無し
-  capture_all) : > stories.txt ;;                               # 全 story を撮る
-  *)           : > stories.txt ;;                               # 未知の値も全撮影へ倒す
+# build_id はキーがあるときだけ使う（--baseline-commit 経路では省略される）。
+BUILD=$(jq -r '.build_id // empty' plan.json)
+
+# 契約 version を確認する。未知の値なら計画を捨てて全撮影へ倒す。
+PLAN_VERSION=$(jq -r '.version' plan.json)
+PLAN_KIND=$(jq -r '.plan' plan.json)
+if [ "$PLAN_VERSION" != "1" ]; then
+  PLAN_KIND=capture_all
+fi
+
+# plan の値をセンチネルとして後段へ渡す（only+空 story_ids と capture_all の取り違え防止）。
+printf '%s\n' "$PLAN_KIND" > .vrt-plan-kind
+
+case "$PLAN_KIND" in
+  only)
+    # 空配列なら「撮る story 無し」。capture_all とは別物。
+    jq -r '.story_ids[]?' plan.json > stories.txt
+    ;;
+  capture_all)
+    # 後段は .vrt-plan-kind を見て全 story を撮ること（空 stories.txt だけでは判断しない）。
+    ;;
+  *)
+    printf '%s\n' capture_all > .vrt-plan-kind
+    ;;
 esac
 ```
 
@@ -190,10 +209,10 @@ esac
 | --- | --- |
 | `version` | 契約 version。未知の値なら計画を捨てて全撮影へ倒す |
 | `plan` | `only`（列挙した story だけ撮る）か `capture_all`（全 story を撮る） |
-| `story_ids` | 撮る story ID。`plan` が `only` のときだけ載る |
-| `reason` | 全撮影へ倒した理由。`plan` が `only` なら `null` |
+| `story_ids` | 撮る story ID。`plan` が `only` のときだけ載る（空配列を含む） |
+| `reason` | 全撮影へ倒した理由。`plan` が `only` では `null` |
 | `baseline_commit_sha` / `head_commit_sha` | 計画が前提とした差分の起点と終点 |
-| `build_id` | 計画のために作成した `screenshots` ビルド。撮影結果はこのビルドへ送る |
+| `build_id` | 計画のために作成した `screenshots` ビルド。撮影結果はこのビルドへ送る。ビルドを作らなかった場合はキーを省略する |
 | `notes` | 判断の補足（レンダリングに無関係として無視したファイルなど） |
 
 `story_ids` が空配列であることと `plan` が `capture_all` であることは別物である。
@@ -213,7 +232,13 @@ esac
 - 依存グラフに載っていない変更ファイル
 
 baseline を自分で決めている場合は `--baseline-commit <sha>` を渡せる。
-その場合はビルドを作らないので、ネットワークにも触らず `build_id` も `null` になる。
+その場合はビルドを作らないので、ネットワークにも触らず `build_id` キーも省略される。
+
+`--baseline-commit` を渡さずサーバーから baseline を解決する経路では、計画用の
+`screenshots` ビルドが作成される。撮影結果をその `build_id` に送らず放置すると
+ビルドは `pending` のまま残る。計画だけ欲しい場合でも、不要ならビルドの破棄運用を
+別途検討するか、`--baseline-commit` でビルド作成を回避する。
+根本対応（計画専用エンドポイント等）は後続 PR で検討する。
 
 ### storybook モード（サーバーサイドレンダリング）
 

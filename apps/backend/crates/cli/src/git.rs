@@ -42,22 +42,30 @@ pub fn head_commit() -> Result<String> {
     git(&["rev-parse", "HEAD"]).context("could not resolve HEAD commit")
 }
 
+/// baseline コミットが手元に存在するか（`git cat-file -e` 相当）。
+///
+/// `--baseline-commit` を明示したときは存在しなければ呼び出し側で終了コード 2 にする。
+pub fn commit_exists(baseline_commit: &str) -> Result<()> {
+    let exists = Command::new("git")
+        .args(["cat-file", "-e", &format!("{baseline_commit}^{{commit}}")])
+        .output()
+        .context("failed to spawn `git cat-file`")?;
+    if exists.status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "baseline commit {baseline_commit} is not present locally \
+             (a shallow clone may be missing history; fetch with enough depth to reach it)"
+        ))
+    }
+}
+
 /// baseline から HEAD までの変更ファイル一覧（リポジトリルート相対）。
 ///
 /// baseline コミットが手元に無い場合（shallow clone 等）はエラーを返し、
 /// 呼び出し側で全撮影にフォールバックさせる。
 pub fn changed_files(baseline_commit: &str) -> Result<Vec<String>> {
-    // baseline が手元に無いと diff は無意味なので、まず存在確認する。
-    let exists = Command::new("git")
-        .args(["cat-file", "-e", &format!("{baseline_commit}^{{commit}}")])
-        .output()
-        .context("failed to spawn `git cat-file`")?;
-    if !exists.status.success() {
-        return Err(anyhow!(
-            "baseline commit {baseline_commit} is not present locally \
-             (a shallow clone may be missing history; fetch with enough depth to reach it)"
-        ));
-    }
+    commit_exists(baseline_commit)?;
 
     let out = git(&["diff", "--name-only", baseline_commit, "HEAD"])?;
     Ok(out
