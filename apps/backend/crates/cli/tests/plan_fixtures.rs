@@ -139,6 +139,34 @@ fn corrupt_index_falls_back_to_capture_all() {
     }
 }
 
+#[test]
+fn empty_index_object_falls_back_to_capture_all() {
+    let selection = plan_selection("empty-object", &["apps/frontend/src/A.tsx"]);
+    assert!(matches!(selection, Selection::CaptureAll { .. }));
+}
+
+#[test]
+fn empty_index_container_falls_back_to_capture_all() {
+    let selection = plan_selection("empty-entries", &["apps/frontend/src/A.tsx"]);
+    assert!(matches!(selection, Selection::CaptureAll { .. }));
+}
+
+#[test]
+fn index_without_import_paths_falls_back_to_capture_all() {
+    let selection = plan_selection("no-import-path", &["apps/frontend/src/A.tsx"]);
+    match selection {
+        Selection::CaptureAll { reason, .. } => {
+            assert!(
+                reason.contains("importPath") || reason.contains("index.json"),
+                "reason: {reason}"
+            );
+        }
+        Selection::Only { .. } => {
+            panic!("index without importPath must not become empty only")
+        }
+    }
+}
+
 // ── storybook モードの既存挙動の固定 ───────────────────────────────────
 
 #[test]
@@ -183,6 +211,21 @@ fn storybook_mode_still_errors_on_corrupt_index() {
     )
     .expect_err("corrupt index must stay an error in storybook mode");
     assert!(format!("{err:#}").contains("index.json"));
+}
+
+#[test]
+fn storybook_mode_errors_on_semantically_empty_index() {
+    let err = select(
+        "empty-object",
+        &["apps/frontend/src/A.tsx"],
+        CorruptInput::Error,
+    )
+    .expect_err("empty index must stay an error in storybook mode");
+    assert!(
+        format!("{err:#}").contains("entries")
+            || format!("{err:#}").contains("stories")
+            || format!("{err:#}").contains("index.json")
+    );
 }
 
 // ── CI へ渡す JSON 契約 ────────────────────────────────────────────────
@@ -271,10 +314,11 @@ fn capture_all_without_baseline_records_the_missing_baseline() {
 
 #[test]
 fn explicit_missing_baseline_commit_is_not_capture_all() {
-    let err = vrt_cli::git::commit_exists("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+    let err = vrt_cli::git::resolve_commit("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
         .expect_err("missing SHA must error");
     assert!(
-        err.to_string().contains("not present locally"),
+        err.to_string().contains("could not resolve commit")
+            || err.to_string().contains("not present"),
         "err={err:#}"
     );
 }
