@@ -188,7 +188,7 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
         None => git::current_branch().context("failed to resolve branch from git")?,
     };
     let commit = match args.commit {
-        Some(c) => c,
+        Some(c) => git::resolve_commit(&c).context("failed to resolve --commit")?,
         None => git::head_commit().context("failed to resolve commit from git")?,
     };
     tracing::info!(%branch, commit = %commit, "resolved build coordinates");
@@ -344,7 +344,8 @@ fn resolve_only_story_ids(
     };
 
     // git 差分。履歴不足（shallow clone 等）は全撮影にフォールバック。
-    let changed_files = match git::changed_files(baseline) {
+    let head = git::head_commit()?;
+    let changed_files = match git::changed_files(baseline, &head) {
         Ok(files) => files,
         Err(e) => {
             tracing::warn!("could not diff against baseline ({e:#}); capturing all stories");
@@ -399,7 +400,7 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
         None => git::current_branch().context("failed to resolve branch from git")?,
     };
     let head_commit_sha = match args.commit {
-        Some(c) => c,
+        Some(c) => git::resolve_commit(&c).context("failed to resolve --commit")?,
         None => git::head_commit().context("failed to resolve commit from git")?,
     };
 
@@ -408,9 +409,9 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
     let explicit_baseline = args.baseline_commit.clone();
     let (baseline_commit_sha, build_id) = match args.baseline_commit {
         Some(sha) => {
-            git::commit_exists(&sha)
+            let oid = git::resolve_commit(&sha)
                 .with_context(|| format!("baseline commit {sha} is not present locally"))?;
-            (Some(sha), None)
+            (Some(oid), None)
         }
         None => {
             let (Some(url), Some(token), Some(project)) = (args.url, args.token, args.project)
@@ -438,6 +439,7 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
         }
     };
 
+    let head_for_diff = head_commit_sha.clone();
     let coords = PlanCoordinates {
         branch,
         baseline_commit_sha: baseline_commit_sha.clone(),
@@ -452,7 +454,7 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
             "no baseline commit for this branch yet".to_string(),
             Vec::new(),
         ),
-        Some(baseline) => match git::changed_files(baseline) {
+        Some(baseline) => match git::changed_files(baseline, &head_for_diff) {
             // 履歴不足（shallow clone 等）→ 全撮影。明示 baseline は上で存在確認済みなので
             // ここへ来るのはサーバー解決経路のみ。
             Err(e) if explicit_baseline.is_some() => {

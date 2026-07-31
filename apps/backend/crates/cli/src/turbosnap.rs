@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// 変更が波及したストーリーだけを撮るか、全部撮り直すかの判断結果。
@@ -94,15 +95,29 @@ pub struct StoryEntry {
 /// index.json の JSON からストーリー一覧を取り出す。
 ///
 /// `type == "story"`（または `type` 欠落）かつ `importPath` を持つものだけ。
-pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>, serde_json::Error> {
-    let index: StorybookIndex = serde_json::from_str(json)?;
-    let entries = index.entries.or(index.stories).unwrap_or_default();
+/// `entries` / `stories` が無い、空、または story として有効な `importPath` を
+/// 1 件も抽出できない場合は意味的に壊れているとみなしエラーにする。
+/// 空集合の `plan:"only"` へ黙って落ちる契約違反を防ぐ。
+pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>> {
+    let index: StorybookIndex = serde_json::from_str(json).context("failed to parse index JSON")?;
+
+    let entries = index
+        .entries
+        .or(index.stories)
+        .ok_or_else(|| anyhow!("index has neither `entries` nor `stories`"))?;
+
+    if entries.is_empty() {
+        bail!("index has no entries");
+    }
+
     let mut out = Vec::new();
+    let mut story_without_import = 0usize;
     for (key, entry) in entries {
         if entry.entry_type.as_deref().unwrap_or("story") != "story" {
             continue;
         }
         let Some(import_path) = entry.import_path else {
+            story_without_import += 1;
             continue;
         };
         out.push(StoryEntry {
@@ -110,6 +125,14 @@ pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>, serde_json::Error> {
             import_path,
         });
     }
+
+    if out.is_empty() {
+        if story_without_import > 0 {
+            bail!("index has story entries but none include `importPath`");
+        }
+        bail!("index has no extractable story entries");
+    }
+
     Ok(out)
 }
 
@@ -439,6 +462,39 @@ mod tests {
         // docs エントリ intro--docs は除外され、story 3 件だけ残る。
         assert_eq!(s.len(), 3);
         assert!(s.iter().all(|e| e.id != "intro--docs"));
+    }
+
+    #[test]
+    fn parse_index_rejects_empty_object() {
+        let err = parse_index("{}").expect_err("empty object must be corrupt");
+        assert!(
+            err.to_string().contains("entries") || err.to_string().contains("stories"),
+            "err={err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_empty_entries_container() {
+        let err = parse_index(r#"{"v":5,"entries":{}}"#).expect_err("empty container");
+        assert!(
+            err.to_string().contains("no entries") || err.to_string().contains("extractable"),
+            "err={err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_all_story_entries_missing_import_path() {
+        let err = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "a--one": { "id": "a--one", "type": "story" },
+                "a--two": { "id": "a--two", "type": "story" }
+              }
+            }"#,
+        )
+        .expect_err("missing importPath on all stories");
+        assert!(err.to_string().contains("importPath"), "err={err:#}");
     }
 
     #[test]
