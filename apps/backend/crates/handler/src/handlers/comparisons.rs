@@ -49,7 +49,8 @@ pub async fn review_comparison(
     };
 
     let updated =
-        comparison_service::review(&state.db, &build, comparison, action, auth.user_id).await?;
+        comparison_service::review(&state.db, build.id, comparison.id, action, auth.user_id)
+            .await?;
     Ok(Json(updated.into()))
 }
 
