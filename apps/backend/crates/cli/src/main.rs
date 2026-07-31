@@ -408,9 +408,8 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
     let explicit_baseline = args.baseline_commit.clone();
     let (baseline_commit_sha, build_id) = match args.baseline_commit {
         Some(sha) => {
-            git::commit_exists(&sha).with_context(|| {
-                format!("baseline commit {sha} is not present locally")
-            })?;
+            git::commit_exists(&sha)
+                .with_context(|| format!("baseline commit {sha} is not present locally"))?;
             (Some(sha), None)
         }
         None => {
