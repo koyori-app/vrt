@@ -229,6 +229,9 @@ function BuildReview({
   // Removals drop a story out of the baseline for good, so the backend keeps them
   // out of `force` and wants a separate opt-in.
   const pendingRemovals = unreviewed.filter((comparison) => comparison.status === "removed");
+  // A failed comparison has no trustworthy diff. Do not let bulk approval turn
+  // its screenshot into the baseline without spelling that consequence out.
+  const pendingFailures = unreviewed.filter((comparison) => comparison.status === "failed");
 
   function onApproveBuild() {
     if (pendingReviews === 0) {
@@ -250,10 +253,23 @@ function BuildReview({
       if (!acceptRemovals) return;
     }
 
+    let acceptFailures = false;
+    if (pendingFailures.length > 0) {
+      const names = pendingFailures.map((comparison) => comparison.name).join(", ");
+      acceptFailures = confirm(
+        `${pendingFailures.length} comparison(s) failed, so no trustworthy visual diff is available: ${names}. If you continue, the screenshots from these failed comparisons will become the baseline. Cancel to review each failed comparison individually first. Continue?`,
+      );
+      if (!acceptFailures) return;
+    }
+
     // `force` is what lets the backend approve past unreviewed comparisons.
     approveBuild.mutate({
       params: { path: { build_id: buildId } },
-      body: { force: true, accept_removals: acceptRemovals },
+      body: {
+        force: true,
+        accept_removals: acceptRemovals,
+        accept_failures: acceptFailures,
+      },
     });
   }
 

@@ -228,7 +228,7 @@ async fn install_update_barrier(
     fx: &Fixture,
     table: &str,
     condition: &str,
-) -> sea_orm::DatabaseTransaction {
+) -> (sea_orm::DatabaseTransaction, i64) {
     let suffix = Uuid::new_v4().simple().to_string();
     let function = format!("approval_race_{suffix}");
     let trigger = format!("approval_race_trigger_{suffix}");
@@ -253,20 +253,22 @@ async fn install_update_barrier(
         .execute_unprepared(&format!("SELECT pg_advisory_xact_lock({lock_key})"))
         .await
         .expect("hold barrier");
-    barrier
+    (barrier, lock_key)
 }
 
-async fn wait_for_advisory_waiter(fx: &Fixture) {
+async fn wait_for_advisory_waiter(fx: &Fixture, lock_key: i64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let row = fx
             .app
             .state
             .db
-            .query_one_raw(Statement::from_string(
+            .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT count(*)::bigint AS count FROM pg_locks \
-                 WHERE locktype = 'advisory' AND NOT granted",
+                 WHERE locktype = 'advisory' AND NOT granted \
+                   AND classid = 0 AND objid = $1 AND objsubid = 1",
+                [lock_key.into()],
             ))
             .await
             .expect("query advisory waiters")
@@ -303,7 +305,7 @@ async fn concurrent_comparison_rejection_cannot_be_promoted_to_the_baseline() {
          SELECT 1 FROM builds WHERE id = NEW.build_id AND project_id = '{}')",
         fx.project_id
     );
-    let barrier = install_update_barrier(&fx, "comparisons", &condition).await;
+    let (barrier, lock_key) = install_update_barrier(&fx, "comparisons", &condition).await;
 
     let review_client = fx.app.client().clone();
     let review_url = format!(
@@ -318,7 +320,7 @@ async fn concurrent_comparison_rejection_cannot_be_promoted_to_the_baseline() {
             .await
             .expect("reject comparison")
     });
-    wait_for_advisory_waiter(&fx).await;
+    wait_for_advisory_waiter(&fx, lock_key).await;
 
     let approve_client = fx.app.client().clone();
     let approve_url = format!("{}/v1/builds/{build_id}/approve", fx.app.base_url());
@@ -356,7 +358,7 @@ async fn concurrent_build_rejection_prevents_baseline_creation() {
         "NEW.project_id = '{}' AND NEW.status::text = 'rejected'",
         fx.project_id
     );
-    let barrier = install_update_barrier(&fx, "builds", &condition).await;
+    let (barrier, lock_key) = install_update_barrier(&fx, "builds", &condition).await;
 
     let reject_client = fx.app.client().clone();
     let reject_url = format!("{}/v1/builds/{build_id}/reject", fx.app.base_url());
@@ -367,7 +369,7 @@ async fn concurrent_build_rejection_prevents_baseline_creation() {
             .await
             .expect("reject build")
     });
-    wait_for_advisory_waiter(&fx).await;
+    wait_for_advisory_waiter(&fx, lock_key).await;
 
     let approve_client = fx.app.client().clone();
     let approve_url = format!("{}/v1/builds/{build_id}/approve", fx.app.base_url());
