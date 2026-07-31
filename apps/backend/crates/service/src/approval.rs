@@ -152,6 +152,8 @@ pub fn is_bulk_approvable(status: ComparisonStatus, options: ApproveOptions) -> 
 /// 古いビルドを後追いで承認すると、新しい baseline が古いスクリーンショットで
 /// 上書きされて**巻き戻る**。`baseline_source_number` が `None`（生成元不明・
 /// baseline 無し）のときは判定材料が無いので `false`。
+/// 呼び出し側は、baseline のブランチがビルドのブランチと一致することを確認してから使う。
+/// 他ブランチの baseline は承認で書き換わらないため、ビルド番号を比較しても巻き戻りを判定できない。
 pub fn is_older_than_baseline_source(
     build_number: i64,
     baseline_source_number: Option<i64>,
