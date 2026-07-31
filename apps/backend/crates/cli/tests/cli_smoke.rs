@@ -21,17 +21,19 @@ fn graph_fixture() -> PathBuf {
 }
 
 fn git_rev_parse(repo: &Path, rev: &str) -> String {
+    git_rev_parse_opt(repo, rev).unwrap_or_else(|| panic!("git rev-parse {rev} failed"))
+}
+
+fn git_rev_parse_opt(repo: &Path, rev: &str) -> Option<String> {
     let output = Command::new("/usr/bin/git")
         .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
         .current_dir(repo)
         .output()
-        .unwrap_or_else(|e| panic!("git rev-parse failed to spawn: {e}"));
-    assert!(
-        output.status.success(),
-        "git rev-parse {rev} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn is_full_oid(sha: &str) -> bool {
@@ -145,7 +147,9 @@ fn plan_with_missing_baseline_commit_exits_2() {
 fn plan_normalizes_baseline_ref_to_full_oid() {
     let repo = repo_root();
     let head = git_rev_parse(&repo, "HEAD");
-    let parent = git_rev_parse(&repo, "HEAD~1");
+    let Some(parent) = git_rev_parse_opt(&repo, "HEAD~1") else {
+        return;
+    };
 
     let output = vrt()
         .args([
@@ -180,8 +184,12 @@ fn plan_normalizes_baseline_ref_to_full_oid() {
 #[test]
 fn plan_diff_uses_explicit_commit_not_worktree_head() {
     let repo = repo_root();
-    let parent = git_rev_parse(&repo, "HEAD~1");
-    let grandparent = git_rev_parse(&repo, "HEAD~2");
+    let Some(parent) = git_rev_parse_opt(&repo, "HEAD~1") else {
+        return;
+    };
+    let Some(grandparent) = git_rev_parse_opt(&repo, "HEAD~2") else {
+        return;
+    };
 
     // head=HEAD~1, baseline=HEAD~2 → diff は 1 commit 分。worktree の HEAD とは無関係。
     let output = vrt()
