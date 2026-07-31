@@ -1,0 +1,6 @@
+{
+  "v": 5,
+  "entries": {
+    "a--one": { "id": "a--one", "type": "story", "importPath": "./src/A.stories.tsx" }
+  }
+}

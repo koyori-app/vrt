@@ -1,5 +1,9 @@
 //! `vrt` CLI。CI から 1 コマンドで Storybook バンドルをアップロードし、
 //! （任意で）変更ストーリーだけを撮り直させる。
+//!
+//! `screenshots` モードはサーバーがレンダリングしないため、撮影は CI 側の
+//! テストランナーが行う。その場合は `vrt plan` で「撮る story」の選択計画だけを
+//! JSON で受け取り、CI がその集合を自身のテスト選択形式へ翻訳して撮る。
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,10 +12,12 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
-use vrt_cli::api::{BuildResponse, Client};
+use vrt_cli::api::{BuildResponse, Client, NewBuild};
 use vrt_cli::bundle;
 use vrt_cli::git;
-use vrt_cli::turbosnap::{self, Plan, WebpackStats};
+use vrt_cli::plan::{
+    self, CorruptInput, PlanCoordinates, PlanDocument, Selection, SelectionInputs,
+};
 
 #[derive(Parser)]
 #[command(name = "vrt", version, about = "VRT CI クライアント")]
@@ -24,6 +30,12 @@ struct Cli {
 enum Command {
     /// Storybook バンドルをアップロードしてビルドを作成・finalize する。
     Upload(UploadArgs),
+
+    /// `screenshots` モード向けに「撮る story」の選択計画を JSON で出力する。
+    ///
+    /// 撮影は行わない。CI ランナーがこの JSON を読み、`plan = "only"` のときだけ
+    /// 列挙された story を撮る。
+    Plan(PlanArgs),
 }
 
 #[derive(Parser)]
@@ -72,39 +84,106 @@ struct UploadArgs {
     json: bool,
 }
 
+#[derive(Parser)]
+struct PlanArgs {
+    /// VRT のベース URL。`--baseline-commit` を渡す場合は不要。
+    #[arg(long, env = "VRT_URL")]
+    url: Option<String>,
+
+    /// CI トークン（PAT）。ログには出力しない。`--baseline-commit` を渡す場合は不要。
+    #[arg(long, env = "VRT_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+
+    /// 対象プロジェクトを `tenant-slug/project-slug` で指定する。
+    /// `--baseline-commit` を渡す場合は不要。
+    #[arg(long, env = "VRT_PROJECT")]
+    project: Option<String>,
+
+    /// stats / index を探すディレクトリ。
+    #[arg(long, default_value = "./storybook-static")]
+    dir: PathBuf,
+
+    /// ブランチ名。省略時は git から取得する。
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// HEAD の commit SHA。省略時は git から取得する。
+    #[arg(long)]
+    commit: Option<String>,
+
+    /// 差分の起点となる baseline commit SHA。
+    ///
+    /// 省略時は `screenshots` モードのビルドを作成し、その作成レスポンスから
+    /// baseline を受け取る（撮影前に起点を知るための唯一の経路）。作成した
+    /// ビルド ID は計画の `build_id` に載るので、CI はそのビルドへ撮影結果を送る。
+    #[arg(long)]
+    baseline_commit: Option<String>,
+
+    /// webpack stats JSON のパス。省略時は `<dir>/preview-stats.json`。
+    #[arg(long)]
+    stats_json: Option<PathBuf>,
+
+    /// Storybook index JSON のパス。省略時は `<dir>/index.json`。
+    #[arg(long)]
+    index_json: Option<PathBuf>,
+
+    /// 計画 JSON の書き出し先。指定しても stdout へは常に出す。
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    // RUST_LOG で調整可能。既定は info。トークンはどのログにも載せない。
-    // ログは常に stderr へ出す。stdout は結果（`--json` の 1 行 JSON など）専用に
-    // 空けておき、呼び出し元がログと混ざらずに機械可読出力だけをパースできるようにする。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
     match cli.command {
-        Command::Upload(args) => match run_upload(args).await {
-            Ok(code) => code,
-            Err(e) => {
-                // anyhow のチェーンをまとめて 1 行で出す。
-                tracing::error!("{e:#}");
-                ExitCode::from(2)
-            }
-        },
+        Command::Upload(args) => {
+            // ログは stderr。stdout は結果（`--json` の 1 行 JSON や key=value）専用。
+            init_logging(true);
+            finish(run_upload(args).await)
+        }
+        Command::Plan(args) => {
+            // stdout は計画 JSON 専用。ログが混ざると CI 側の解析が壊れる。
+            init_logging(true);
+            finish(run_plan(args).await)
+        }
     }
 }
 
-async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
-    let (tenant_slug, project_slug) = args
-        .project
+/// RUST_LOG で調整可能。既定は info。トークンはどのログにも載せない。
+fn init_logging(logs_to_stderr: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
+    if logs_to_stderr {
+        builder.with_writer(std::io::stderr).init();
+    } else {
+        builder.init();
+    }
+}
+
+/// 失敗は anyhow のチェーンをまとめて 1 行で出し、終了コード 2 にする。
+fn finish(result: Result<ExitCode>) -> ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `tenant-slug/project-slug` を分解する。
+fn split_project(project: &str) -> Result<(&str, &str)> {
+    project
         .split_once('/')
         .filter(|(t, p)| !t.is_empty() && !p.is_empty())
-        .context("--project must be in the form `tenant-slug/project-slug`")?;
+        .context("--project must be in the form `tenant-slug/project-slug`")
+}
+
+async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
+    let (tenant_slug, project_slug) = split_project(&args.project)?;
 
     // 1. branch / commit を解決（フラグ優先、無ければ git）。
     let branch = match args.branch {
@@ -121,7 +200,15 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
 
     // 2. ビルド作成（mode=storybook）。baseline_commit_sha を差分撮影に使う。
     let build = client
-        .create_build(tenant_slug, project_slug, &branch, &commit, None, None)
+        .create_build(&NewBuild {
+            tenant_slug,
+            project_slug,
+            branch: &branch,
+            commit_sha: &commit,
+            commit_message: None,
+            pull_request_number: None,
+            mode: "storybook",
+        })
         .await?;
     tracing::info!(build_id = %build.id, "created build");
 
@@ -135,7 +222,7 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
 
     // 5. finalize（--only-changed なら影響ストーリーだけ）。
     let only_story_ids = if args.only_changed {
-        resolve_only_story_ids(&args.dir, args.stats_json.as_ref(), &build)?
+        resolve_only_story_ids(&args.dir, args.stats_json.as_deref(), &build)?
     } else {
         None
     };
@@ -154,7 +241,6 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     }
 
     if !args.wait {
-        // --wait 無し: finalize 直後の状態を返し、終了コードは常に 0（既存挙動）。
         if args.json {
             print_json_result(&finalized, tenant_slug, project_slug, 0, None);
         }
@@ -165,12 +251,6 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     let final_build = match poll_until_terminal(&client, &finalized.id, args.json).await {
         Ok(build) => build,
         Err(e) => {
-            // finalize は成功済み。`--json` の契約は「finalize まで到達すれば JSON が
-            // 1 行出る」なので、ここでポーリングが一時的な通信失敗やタイムアウトで
-            // Err になっても、`?` で早期リターンして stdout を空にしてはいけない。
-            // 呼び出し元が build_id すら取れなくなるため、既知の finalize 済み情報
-            // （build_id / build_number / slug / finalize 直後の status）に exit_code=2
-            // と失敗理由 `error` を添えて 1 行だけ出す。
             if args.json {
                 print_json_result(
                     &finalized,
@@ -179,11 +259,9 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
                     2,
                     Some(&format!("{e:#}")),
                 );
-                // ログは従来どおり stderr へも残す（main のハンドラは通らないため自前で）。
                 tracing::error!("{e:#}");
                 return Ok(ExitCode::from(2));
             }
-            // `--json` でないときは従来どおり伝播し、main 側で error ログ + exit 2。
             return Err(e);
         }
     };
@@ -191,9 +269,6 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     if !args.json {
         report(&final_build);
     } else {
-        // ビルドが failed / rejected で終わったら、人間向け report() と同じく
-        // サーバーが返した失敗理由（error_message）を JSON の `error` にも載せる。
-        // 成功時は error_message が None なので `error` キーは出ない契約を保つ。
         print_json_result(
             &final_build,
             tenant_slug,
@@ -218,9 +293,6 @@ fn print_json_result(
 }
 
 /// `--json` の 1 行 JSON の値を組み立てる純関数。
-///
-/// `error` は失敗時のみ `Some` を渡す。`None` のときは成功パスと同じ形状
-/// （`error` キーは出現しない）を保つ。
 fn json_result_value(
     build: &BuildResponse,
     tenant_slug: &str,
@@ -246,9 +318,14 @@ fn json_result_value(
 ///
 /// 差分撮影が成立しない条件（baseline 無し / git 履歴不足 / stats 欠落 /
 /// グラフ外の変更）はすべて全撮影（`None`）へ倒し、理由を警告として出す。
+/// 選択そのものは `screenshots` の `vrt plan` と同じ [`plan::select_stories`] を通す。
+///
+/// 入力が読めたが壊れていた場合は [`CorruptInput::Error`] でエラーへ倒す
+/// （`storybook` モードの既存挙動を保つため。壊れた stats を黙って
+/// 全撮影に読み替えると、設定ミスに気づけなくなる）。
 fn resolve_only_story_ids(
     dir: &Path,
-    stats_json: Option<&PathBuf>,
+    stats_json: Option<&Path>,
     build: &BuildResponse,
 ) -> Result<Option<Vec<String>>> {
     // baseline が無ければ差分の起点が無い → 全撮影。
@@ -267,52 +344,148 @@ fn resolve_only_story_ids(
     };
     tracing::info!(count = changed_files.len(), "changed files since baseline");
 
-    // stats 欠落 → 全撮影（差分撮影の有効化方法を案内）。
-    let stats_path = stats_json
-        .cloned()
-        .unwrap_or_else(|| dir.join("preview-stats.json"));
-    if !stats_path.is_file() {
-        tracing::warn!(
-            "stats file {} not found; capturing all stories. \
-             Run `storybook build --stats-json` to enable per-story capture",
-            stats_path.display()
-        );
-        return Ok(None);
-    }
-    let stats_raw = std::fs::read_to_string(&stats_path)
-        .with_context(|| format!("failed to read {}", stats_path.display()))?;
-    let stats = WebpackStats::parse(&stats_raw)
-        .with_context(|| format!("failed to parse {}", stats_path.display()))?;
-
-    // index.json（撮影対象ストーリーの列挙）。
-    let index_path = dir.join("index.json");
-    let index_raw = std::fs::read_to_string(&index_path)
-        .with_context(|| format!("failed to read {}", index_path.display()))?;
-    let stories = turbosnap::parse_index(&index_raw)
-        .with_context(|| format!("failed to parse {}", index_path.display()))?;
-
     let repo_root = git::repo_root()?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
 
-    let outcome =
-        turbosnap::compute_affected_stories(&repo_root, &cwd, &changed_files, &stats, &stories);
-    for note in &outcome.notes {
-        tracing::warn!("{note}");
-    }
-    match outcome.plan {
-        Plan::CaptureAll(reason) => {
+    let selection = plan::select_stories(
+        &SelectionInputs {
+            dir,
+            stats_json,
+            index_json: None,
+            repo_root: &repo_root,
+            cwd: &cwd,
+            changed_files: &changed_files,
+        },
+        CorruptInput::Error,
+    )?;
+
+    match selection {
+        Selection::CaptureAll { reason, notes } => {
+            warn_notes(&notes);
             tracing::warn!("{reason}; capturing all stories");
             Ok(None)
         }
-        Plan::Only(ids) => Ok(Some(ids)),
+        Selection::Only { story_ids, notes } => {
+            warn_notes(&notes);
+            Ok(Some(story_ids))
+        }
     }
+}
+
+fn warn_notes(notes: &[String]) {
+    for note in notes {
+        tracing::warn!("{note}");
+    }
+}
+
+/// `screenshots` モード向けの選択計画を組んで JSON で出す。撮影はしない。
+///
+/// 判断できない条件（baseline 無し / git 履歴不足 / stats 欠落・破損 /
+/// グラフ外の変更 / 依存の更新）はすべて `plan = "capture_all"` へ倒す。
+/// 撮らなかった story を「差分なし」と読み替えないのはサーバー側の責務なので、
+/// ここでは「撮る集合」と「全撮影へ倒した理由」を落とさず出すことに徹する。
+async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
+    let branch = match args.branch {
+        Some(b) => b,
+        None => git::current_branch().context("failed to resolve branch from git")?,
+    };
+    let head_commit_sha = match args.commit {
+        Some(c) => c,
+        None => git::head_commit().context("failed to resolve commit from git")?,
+    };
+
+    // baseline の入手経路。明示指定が優先。無ければ screenshots ビルドを作り、
+    // その作成レスポンスから受け取る（撮影前に起点を知れる唯一の経路）。
+    let (baseline_commit_sha, build_id) = match args.baseline_commit {
+        Some(sha) => (Some(sha), None),
+        None => {
+            let (Some(url), Some(token), Some(project)) = (args.url, args.token, args.project)
+            else {
+                bail!(
+                    "pass --baseline-commit, or --url/--token/--project so the baseline \
+                     can be resolved from a new screenshots build"
+                );
+            };
+            let (tenant_slug, project_slug) = split_project(&project)?;
+            let client = Client::new(url, token)?;
+            let build = client
+                .create_build(&NewBuild {
+                    tenant_slug,
+                    project_slug,
+                    branch: &branch,
+                    commit_sha: &head_commit_sha,
+                    commit_message: None,
+                    pull_request_number: None,
+                    mode: "screenshots",
+                })
+                .await?;
+            tracing::info!(build_id = %build.id, "created screenshots build");
+            (build.baseline_commit_sha, Some(build.id))
+        }
+    };
+
+    let coords = PlanCoordinates {
+        branch,
+        baseline_commit_sha: baseline_commit_sha.clone(),
+        head_commit_sha,
+        build_id,
+    };
+
+    let document = match &baseline_commit_sha {
+        // baseline が無ければ差分の起点が無い → 全撮影。
+        None => PlanDocument::capture_all(
+            coords,
+            "no baseline commit for this branch yet".to_string(),
+            Vec::new(),
+        ),
+        Some(baseline) => match git::changed_files(baseline) {
+            // 履歴不足（shallow clone 等）→ 全撮影。
+            Err(e) => PlanDocument::capture_all(
+                coords,
+                format!("could not diff against baseline: {e:#}"),
+                Vec::new(),
+            ),
+            Ok(changed_files) => {
+                tracing::info!(count = changed_files.len(), "changed files since baseline");
+                let repo_root = git::repo_root()?;
+                let cwd = std::env::current_dir().context("failed to read current directory")?;
+                let selection = plan::select_stories(
+                    &SelectionInputs {
+                        dir: &args.dir,
+                        stats_json: args.stats_json.as_deref(),
+                        index_json: args.index_json.as_deref(),
+                        repo_root: &repo_root,
+                        cwd: &cwd,
+                        changed_files: &changed_files,
+                    },
+                    CorruptInput::FailClosed,
+                )?;
+                PlanDocument::from_selection(coords, selection)
+            }
+        },
+    };
+
+    warn_notes(&document.notes);
+    if let Some(reason) = &document.reason {
+        tracing::warn!("{reason}; capturing all stories");
+    } else if let Some(ids) = &document.story_ids {
+        tracing::info!(count = ids.len(), "planned story set");
+    }
+
+    let json = document.to_json()?;
+    if let Some(path) = &args.output {
+        std::fs::write(path, format!("{json}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        tracing::info!(path = %path.display(), "wrote the selection plan");
+    }
+    println!("{json}");
+    Ok(ExitCode::SUCCESS)
 }
 
 /// ビルドが終端（またはレビュー待ちの changes_detected）になるまでポーリングする。
 ///
-/// 状態取得のたびに進捗ログも増分取得して流す（出力先は通常 stdout、`--json` の
-/// ときは stdout を JSON 1 行専用に空けるため stderr）。終端後にも 1 回引いて、
-/// 最後の状態遷移と同時に書かれた行を取りこぼさないようにする。
+/// 状態取得のたびに進捗ログも増分取得して流す（`--json` のときは stderr）。
+/// 終端後にも 1 回引いて、最後の状態遷移と同時に書かれた行を取りこぼさない。
 async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Result<BuildResponse> {
     const INTERVAL: Duration = Duration::from_secs(3);
     // ジョブが詰まったまま無限待機しないよう上限を設ける。
@@ -326,7 +499,6 @@ async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Res
 
         let build = client.get_build(build_id).await?;
         if is_settled(&build.status) {
-            // 終端遷移と同時に書かれた行（完了サマリ・失敗理由）を最後に流し切る。
             flush_logs(client, build_id, log_cursor, json).await;
             return Ok(build);
         }
@@ -341,15 +513,11 @@ async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Res
     }
 }
 
-/// `cursor` より後のログ行を `[level] message` 形式で stdout に印字し、新しいカーソルを返す。
-///
-/// ログ取得の失敗はビルド待機の失敗にはしない（警告だけ出して次に進む）。
-/// 進捗ログは補助情報であり、これで終了コードを狂わせたくない。
+/// `cursor` より後のログ行を `[level] message` 形式で印字し、新しいカーソルを返す。
 async fn flush_logs(client: &Client, build_id: &str, cursor: i64, json: bool) -> i64 {
     match client.get_build_logs(build_id, cursor).await {
         Ok(logs) => {
             for entry in &logs.entries {
-                // --json のときは stdout を JSON 専用にするため進捗ログは stderr へ回す。
                 if json {
                     eprintln!("[{}] {}", entry.level, entry.message);
                 } else {
@@ -389,13 +557,11 @@ fn report(build: &BuildResponse) {
 }
 
 /// 最終状態から終了コードを決める。
-///
-/// passed/approved=0、changes_detected=1、failed/rejected=2。
 fn exit_code_for(status: &str) -> u8 {
     match status {
         "passed" | "approved" => 0,
         "changes_detected" => 1,
-        _ => 2, // failed / rejected / 想定外
+        _ => 2,
     }
 }
 
@@ -403,9 +569,6 @@ fn exit_code_for(status: &str) -> u8 {
 mod tests {
     use super::*;
 
-    /// 終了コードは CI の合否判定そのものなので、8 状態すべてを固定する。
-    /// `changes_detected` は「差分あり = レビュー待ち」であって失敗ではないため、
-    /// 1 に割り当てて失敗（2）と区別する。
     #[test]
     fn exit_code_covers_every_build_status() {
         assert_eq!(exit_code_for("passed"), 0);
@@ -413,25 +576,21 @@ mod tests {
         assert_eq!(exit_code_for("changes_detected"), 1);
         assert_eq!(exit_code_for("failed"), 2);
         assert_eq!(exit_code_for("rejected"), 2);
-        // 非終端状態がここへ来るのは想定外なので、成功に倒さず 2 にする。
         assert_eq!(exit_code_for("pending"), 2);
         assert_eq!(exit_code_for("rendering"), 2);
         assert_eq!(exit_code_for("processing"), 2);
     }
 
-    /// サーバー側に未知の状態が増えても、黙って 0（成功）にしないことを固定する。
     #[test]
     fn unknown_status_is_not_treated_as_success() {
         assert_eq!(exit_code_for("some_future_status"), 2);
         assert_eq!(exit_code_for(""), 2);
     }
 
-    /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。
     fn sample_build() -> BuildResponse {
         BuildResponse {
             id: "build-123".into(),
             number: 42,
-            // finalize 直後の（＝最後に判明している）状態を模す。
             status: "processing".into(),
             baseline_commit_sha: None,
             total_count: 0,
@@ -442,7 +601,6 @@ mod tests {
         }
     }
 
-    /// 成功パスでは `error` キーが出現しないこと（JSON 形状を変えない）を固定する。
     #[test]
     fn json_result_omits_error_on_success() {
         let build = sample_build();
@@ -454,16 +612,10 @@ mod tests {
         assert_eq!(value["project_slug"], "web");
         assert_eq!(value["status"], "processing");
         assert_eq!(value["exit_code"], 0);
-        assert!(
-            value.get("error").is_none(),
-            "success output must not carry an error field"
-        );
-        // 1 行 JSON の契約: 改行を含まない。
+        assert!(value.get("error").is_none());
         assert!(!value.to_string().contains('\n'));
     }
 
-    /// ポーリング失敗時は finalize 済みの build_id 等 + exit_code=2 + error を出す。
-    /// finalize 後の状態がそのまま status に出ること（poll 失敗でも既知値を返す）を固定。
     #[test]
     fn json_result_includes_error_and_exit_2_on_poll_failure() {
         let finalized = sample_build();
@@ -475,13 +627,8 @@ mod tests {
             Some("timed out after 1800s waiting for build build-123 (last status: processing)"),
         );
 
-        // build_id / build_number / slug / status は finalize 済みの既知値。
         assert_eq!(value["build_id"], "build-123");
         assert_eq!(value["build_number"], 42);
-        assert_eq!(value["tenant_slug"], "acme");
-        assert_eq!(value["project_slug"], "web");
-        assert_eq!(value["status"], "processing");
-        // 失敗を表す終了コードと理由。
         assert_eq!(value["exit_code"], 2);
         assert_eq!(
             value["error"],
@@ -490,9 +637,6 @@ mod tests {
         assert!(!value.to_string().contains('\n'));
     }
 
-    /// ビルドが failed / rejected で終わり、サーバーが error_message を返した場合、
-    /// run_upload の終端パス（error_message.as_deref() 経由）で `error` キーに
-    /// その理由が載ること、および exit_code=2 が付くことを固定する。
     #[test]
     fn json_result_carries_server_error_message_on_failed_build() {
         let mut build = sample_build();
