@@ -17,6 +17,7 @@ use common::TestApp;
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -391,6 +392,85 @@ async fn force_does_not_silently_approve_story_removals() {
     assert_eq!(res.status(), StatusCode::OK, "明示確認すれば承認できる");
     let (_, names) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(names, vec!["home".to_string()]);
+}
+
+// 個別レビューで消滅を承認した場合は、force 用フラグなしでも manifest ガードを通る。
+#[tokio::test(flavor = "multi_thread")]
+async fn individually_approved_removal_shrinks_the_baseline_without_bulk_flag() {
+    let fx = setup().await;
+
+    let first = fx
+        .run_build("sha1", &[("home", RED), ("legacy", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    let second = fx.run_build("sha2", &[("home", RED)]).await;
+    let second_id = build_id_of(&second);
+    assert_eq!(second["removed_count"], 1);
+    fx.review(second_id, "legacy", "approve").await;
+
+    let res = fx.approve(second_id, json!({})).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "an individually reviewed removal needs no bulk-approval flag"
+    );
+    let (_, names) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(names, vec!["home".to_string()]);
+}
+
+// 比較失敗は force だけで承認すると、未検証の画像が baseline に焼き付く。
+#[tokio::test(flavor = "multi_thread")]
+async fn force_requires_explicit_acknowledgement_for_failed_comparisons() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+    let (baseline_id, _) = fx.current_baseline().await.expect("baseline exists");
+
+    let second = fx.run_build("sha2", &[("home", BLUE)]).await;
+    let second_id = build_id_of(&second);
+    let comparison = entity::comparisons::Entity::find()
+        .filter(entity::comparisons::Column::BuildId.eq(second_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("load comparison")
+        .expect("comparison exists");
+    let mut active: entity::comparisons::ActiveModel = comparison.into();
+    active.status = Set(entity::comparisons::ComparisonStatus::Failed);
+    active
+        .update(&fx.app.state.db)
+        .await
+        .expect("mark comparison failed");
+
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "force alone must not approve a failed comparison"
+    );
+    let message = error_message(res).await;
+    assert!(
+        message.contains("accept_failures"),
+        "actionable error: {message}"
+    );
+    let (still, _) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(still, baseline_id, "failed image was not promoted");
+
+    let res = fx
+        .approve(second_id, json!({ "force": true, "accept_failures": true }))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a separate explicit acknowledgement permits the exceptional operation"
+    );
 }
 
 // 通常のレビューと承認では baseline が更新されることを検証する。

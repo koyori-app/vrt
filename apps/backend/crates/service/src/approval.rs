@@ -13,12 +13,17 @@ use entity::comparisons::{ComparisonStatus, ReviewStatus};
 /// 承認リクエストのオプション。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ApproveOptions {
-    /// 未レビューの比較をまとめて承認する（`removed` は含めない）。
+    /// 未レビューの比較をまとめて承認する（`removed` と `failed` は含めない）。
     pub force: bool,
     /// `removed`（baseline から story が消える）を承認対象に含める。
     ///
     /// story の消滅は不可逆なので [`force`](Self::force) とは別の明示フラグにしてある。
     pub accept_removals: bool,
+    /// `failed`（画像の破損などで比較できなかった結果）を承認対象に含める。
+    ///
+    /// 比較できていない画像を baseline に焼き付けないよう、`force` とは別の
+    /// 明示フラグにしてある。
+    pub accept_failures: bool,
 }
 
 impl ApproveOptions {
@@ -26,6 +31,7 @@ impl ApproveOptions {
         Self {
             force: true,
             accept_removals: false,
+            accept_failures: false,
         }
     }
 }
@@ -119,8 +125,8 @@ pub fn approved_removal_names(comparisons: &[ComparisonFacts]) -> HashSet<String
 /// 未レビューのまま残り、承認を止めるべき比較の名前（名前順）。
 ///
 /// - `force == false`: 人手判断が要る未レビューはすべてブロックする（従来どおり）
-/// - `force == true`: 一括承認は `removed` を巻き込まない。`removed` の未レビューは
-///   `accept_removals` を明示したときだけ通す
+/// - `force == true`: 一括承認は `removed` と `failed` を巻き込まない。それぞれ
+///   `accept_removals` / `accept_failures` を明示したときだけ通す
 pub fn blocking_pending_names(
     comparisons: &[ComparisonFacts],
     options: ApproveOptions,
@@ -138,13 +144,18 @@ pub fn blocking_pending_names(
 
 /// `force` の一括承認が触ってよい比較か。
 ///
-/// `removed` は「story を baseline から消す」不可逆操作なので、まとめ承認には含めない。
-/// `accept_removals` を明示したときだけ対象に加える。
+/// `removed` は story を baseline から消し、`failed` は比較できなかった画像を
+/// baseline にする危険があるため、まとめ承認には含めない。それぞれ専用の
+/// 明示フラグを指定したときだけ対象に加える。
 pub fn is_bulk_approvable(status: ComparisonStatus, options: ApproveOptions) -> bool {
     if !options.force || !status.needs_review() {
         return false;
     }
-    status != ComparisonStatus::Removed || options.accept_removals
+    match status {
+        ComparisonStatus::Removed => options.accept_removals,
+        ComparisonStatus::Failed => options.accept_failures,
+        _ => true,
+    }
 }
 
 /// 承認しようとしているビルドが、現行 baseline の生成元より古いか。
@@ -260,10 +271,19 @@ mod tests {
         let opts = ApproveOptions::force();
         assert!(is_bulk_approvable(ComparisonStatus::Changed, opts));
         assert!(is_bulk_approvable(ComparisonStatus::Added, opts));
-        assert!(is_bulk_approvable(ComparisonStatus::Failed, opts));
+        assert!(!is_bulk_approvable(ComparisonStatus::Failed, opts));
         assert!(
             !is_bulk_approvable(ComparisonStatus::Removed, opts),
             "removed は force だけでは承認できない"
+        );
+    }
+
+    #[test]
+    fn force_does_not_bulk_approve_failed_comparisons() {
+        let opts = ApproveOptions::force();
+        assert!(
+            !is_bulk_approvable(ComparisonStatus::Failed, opts),
+            "failed comparisons must require a separate explicit acknowledgement"
         );
     }
 
@@ -272,6 +292,7 @@ mod tests {
         let opts = ApproveOptions {
             force: true,
             accept_removals: true,
+            accept_failures: false,
         };
         assert!(is_bulk_approvable(ComparisonStatus::Removed, opts));
     }
@@ -293,6 +314,7 @@ mod tests {
                 ApproveOptions {
                     force: true,
                     accept_removals: true,
+                    accept_failures: false,
                 }
             )
             .is_empty()

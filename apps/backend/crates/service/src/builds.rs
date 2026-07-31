@@ -306,6 +306,11 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 /// 3. **消滅の一括承認防止**: `force` は `removed` を巻き込まない。story の消滅は
 ///    `accept_removals` を明示したときだけ通し、さらに現行 baseline の
 ///    manifest と今回のスクリーンショットを突き合わせて、説明のつかない欠落を止める
+/// 4. **比較失敗の焼き付き防止**: `force` は `failed` を巻き込まない。画像破損などで
+///    比較できなかった結果は `accept_failures` を明示したときだけ通す
+///
+/// 現在は承認済み baseline を過去の版へ戻す運用を提供しない。将来 revert が必要に
+/// なった場合は通常承認のガードを流用せず、意図を示す専用フラグを追加すること。
 ///
 /// `options.force` が無いときは、レビュー待ちの比較が残っているだけで 409。
 ///
@@ -353,13 +358,15 @@ pub async fn approve_build(
                     Err(AppError::NotFound) => None,
                     Err(error) => return Err(error),
                 };
-                if approval::is_older_than_baseline_source(build.number, source_number) {
+                if let Some(source_number) = source_number
+                    && approval::is_older_than_baseline_source(build.number, Some(source_number))
+                {
                     return Err(AppError::ConflictDetail(format!(
                         "cannot approve: build #{} is older than the current baseline \
                          (created from build #{}). approving it would roll the baseline back. \
                          re-run the build against the current baseline instead.",
                         build.number,
-                        source_number.unwrap_or_default()
+                        source_number
                     )));
                 }
             }
@@ -385,11 +392,11 @@ pub async fn approve_build(
                 )));
             }
 
-            // 未レビューの削除を一括承認の対象から除く。
+            // 未レビューの削除・比較失敗を一括承認の対象から除く。
             let blocking = approval::blocking_pending_names(&facts, options);
             if !blocking.is_empty() {
                 let hint = if options.force {
-                    " these are story removals; set accept_removals to confirm them."
+                    " story removals require accept_removals; failed comparisons require accept_failures."
                 } else {
                     " review them, or set force to bulk-approve."
                 };
@@ -494,8 +501,7 @@ async fn load_comparison_facts<C: ConnectionTrait>(
 
 /// 未レビューの比較をまとめて approved にする（一括承認）。
 ///
-/// `removed` は [`ApproveOptions::accept_removals`] を明示したときだけ対象に含める。
-/// story の消滅は baseline から実体が消える不可逆操作なので、`force` だけでは通さない。
+/// `removed` / `failed` は各専用フラグを明示したときだけ対象に含める。
 async fn approve_all_pending<C: ConnectionTrait>(
     db: &C,
     build_id: Uuid,

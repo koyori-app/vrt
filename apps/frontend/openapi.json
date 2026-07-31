@@ -638,7 +638,7 @@
           "Builds"
         ],
         "summary": "ビルドを承認して baseline に昇格",
-        "description": "admin 以上が必要。承認するとこのビルドの全スクリーンショットが `(project, branch)` の新しい baseline になる。未レビューの比較が残っている場合は 409。`force: true` で一括承認できる （`removed` は含まない。story の消滅は `accept_removals: true` で明示する）。却下された比較が残っている場合、比較後に baseline が進んでいる場合、承認されていない story の欠落がある場合も 409。",
+        "description": "admin 以上が必要。承認するとこのビルドの全スクリーンショットが `(project, branch)` の新しい baseline になる。未レビューの比較が残っている場合は 409。`force: true` で一括承認できる （`removed` と `failed` は含まない。各専用フラグで明示する）。却下された比較が残っている場合、比較後に baseline が進んでいる場合、承認されていない story の欠落がある場合も 409。",
         "operationId": "approve_build",
         "parameters": [
           {
@@ -5556,13 +5556,17 @@
         "type": "object",
         "description": "ビルド承認リクエスト。",
         "properties": {
+          "accept_failures": {
+            "type": "boolean",
+            "description": "`true` にすると比較に失敗した結果（`failed`）も承認対象に含める。\n\n破損画像などを baseline に焼き付ける危険があるため `force` とは別のフラグ。\nこのフラグは `force: true` と併用した場合だけ効果があり、単独指定は no-op。"
+          },
           "accept_removals": {
             "type": "boolean",
-            "description": "`true` にすると story の消滅（`removed`）も承認対象に含める。\n\nbaseline から実体が消える不可逆操作なので `force` とは別のフラグにしてある。"
+            "description": "`true` にすると story の消滅（`removed`）も承認対象に含める。\n\nbaseline から実体が消える不可逆操作なので `force` とは別のフラグにしてある。\nこのフラグは `force: true` と併用した場合だけ効果があり、単独指定は no-op。"
           },
           "force": {
             "type": "boolean",
-            "description": "`true` にすると未レビューの比較もまとめて承認する（一括承認）。\n\n`removed`（story の消滅）は含まない。消滅は\n[`accept_removals`](Self::accept_removals) を別途明示したときだけ承認される。"
+            "description": "`true` にすると未レビューの比較もまとめて承認する（一括承認）。\n\n`removed`（story の消滅）と `failed`（比較失敗）は含まない。各専用フラグを\n別途明示したときだけ承認される。"
           }
         }
       },

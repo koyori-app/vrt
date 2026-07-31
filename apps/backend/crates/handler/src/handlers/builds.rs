@@ -298,7 +298,7 @@ pub async fn list_comparisons(
     description = "admin 以上が必要。承認するとこのビルドの全スクリーンショットが \
                    `(project, branch)` の新しい baseline になる。\
                    未レビューの比較が残っている場合は 409。`force: true` で一括承認できる \
-                   （`removed` は含まない。story の消滅は `accept_removals: true` で明示する）。\
+                   （`removed` と `failed` は含まない。各専用フラグで明示する）。\
                    却下された比較が残っている場合、比較後に baseline が進んでいる場合、\
                    承認されていない story の欠落がある場合も 409。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
@@ -323,6 +323,7 @@ pub async fn approve_build(
         .map(|Json(b)| ApproveOptions {
             force: b.force,
             accept_removals: b.accept_removals,
+            accept_failures: b.accept_failures,
         })
         .unwrap_or_default();
     let approved = build_service::approve_build(&state.db, build, auth.user_id, options).await?;
