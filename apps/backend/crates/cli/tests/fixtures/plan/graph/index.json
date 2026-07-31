@@ -1,0 +1,9 @@
+{
+  "v": 5,
+  "entries": {
+    "a--one": { "id": "a--one", "type": "story", "importPath": "./src/A.stories.tsx" },
+    "a--two": { "id": "a--two", "type": "story", "importPath": "./src/A.stories.tsx" },
+    "b--one": { "id": "b--one", "type": "story", "importPath": "./src/B.stories.tsx" },
+    "intro--docs": { "id": "intro--docs", "type": "docs", "importPath": "./src/Intro.mdx" }
+  }
+}

@@ -6,4 +6,5 @@
 pub mod api;
 pub mod bundle;
 pub mod git;
+pub mod plan;
 pub mod turbosnap;

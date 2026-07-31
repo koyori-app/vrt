@@ -26,6 +26,20 @@ struct CreateBuildBody<'a> {
     mode: &'a str,
 }
 
+/// 作成するビルドの座標。
+///
+/// `mode` はサーバー側 `BuildMode` の serde 表現（`screenshots` / `storybook`）。
+/// `storybook` はサーバーがレンダリングし、`screenshots` は CI が PNG を送る。
+pub struct NewBuild<'a> {
+    pub tenant_slug: &'a str,
+    pub project_slug: &'a str,
+    pub branch: &'a str,
+    pub commit_sha: &'a str,
+    pub commit_message: Option<&'a str>,
+    pub pull_request_number: Option<i32>,
+    pub mode: &'a str,
+}
+
 /// finalize のリクエストボディ（payload::builds::FinalizeBuildRequest に一致）。
 #[derive(Debug, Serialize)]
 struct FinalizeBody {
@@ -101,26 +115,21 @@ impl Client {
         serde_json::from_str(&body).with_context(|| format!("{ctx}: could not parse response body"))
     }
 
-    /// ビルドを作成する（mode=storybook）。
-    pub async fn create_build(
-        &self,
-        tenant_slug: &str,
-        project_slug: &str,
-        branch: &str,
-        commit_sha: &str,
-        commit_message: Option<&str>,
-        pull_request_number: Option<i32>,
-    ) -> Result<BuildResponse> {
+    /// ビルドを作成する。
+    ///
+    /// レスポンスの `baseline_commit_sha` は作成時にだけ載る。`screenshots` モードで
+    /// 撮影前に差分の起点を知りたいときも、この経路で受け取る。
+    pub async fn create_build(&self, new: &NewBuild<'_>) -> Result<BuildResponse> {
         let url = format!(
             "{}/v1/ci/projects/{}/{}/builds",
-            self.base_url, tenant_slug, project_slug
+            self.base_url, new.tenant_slug, new.project_slug
         );
         let body = CreateBuildBody {
-            branch,
-            commit_sha,
-            commit_message,
-            pull_request_number,
-            mode: "storybook",
+            branch: new.branch,
+            commit_sha: new.commit_sha,
+            commit_message: new.commit_message,
+            pull_request_number: new.pull_request_number,
+            mode: new.mode,
         };
         let resp = self
             .bearer(self.http.post(&url))

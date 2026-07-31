@@ -1,0 +1,6 @@
+{
+  "modules": [
+    { "name": "./src/A.tsx", "reasons": [ { "moduleName": "./src/A.stories.tsx" } ] },
+    { "name": "./src/A.stories.tsx", "reasons": [] }
+  ]
+}

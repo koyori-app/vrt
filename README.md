@@ -151,6 +151,65 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 `status` を見て終了コードを決める。同じスニペットはプロジェクト画面の
 **CI usage** タブにもテナント / プロジェクトの slug 入りで出る。
 
+#### 撮る story を絞る（`vrt plan`）
+
+`screenshots` モードでは撮影そのものが CI のテストランナーの仕事であり、VRT は
+レンダリングしない。
+そのため CLI は撮影を代行せず、`vrt plan` で「撮るべき story の集合」だけを
+JSON で出力する。
+選択の中身は `storybook` モードの `--only-changed` と同じ依存グラフ解析
+（TurboSnap 相当）を使う。
+
+```bash
+export VRT_URL=https://vrt.example.com
+export VRT_TOKEN=...                              # write:build
+export VRT_PROJECT=<tenant-slug>/<project-slug>
+
+pnpm build-storybook --stats-json                 # preview-stats.json と index.json を出す
+vrt plan --dir ./storybook-static --output plan.json
+
+BUILD=$(jq -r '.build_id' plan.json)              # この計画のために作られた screenshots ビルド
+case "$(jq -r '.plan' plan.json)" in
+  only)        jq -r '.story_ids[]' plan.json > stories.txt ;;  # 空なら撮る story 無し
+  capture_all) : > stories.txt ;;                               # 全 story を撮る
+  *)           : > stories.txt ;;                               # 未知の値も全撮影へ倒す
+esac
+```
+
+計画は stdout にも必ず出るので、`--output` を使わずパイプで受けてもよい。
+ログは stderr へ出すため、stdout は JSON だけになる。
+
+出力の契約は次のとおり。
+
+| フィールド | 意味 |
+| --- | --- |
+| `version` | 契約 version。未知の値なら計画を捨てて全撮影へ倒す |
+| `plan` | `only`（列挙した story だけ撮る）か `capture_all`（全 story を撮る） |
+| `story_ids` | 撮る story ID。`plan` が `only` のときだけ載る |
+| `reason` | 全撮影へ倒した理由。`plan` が `only` なら `null` |
+| `baseline_commit_sha` / `head_commit_sha` | 計画が前提とした差分の起点と終点 |
+| `build_id` | 計画のために作成した `screenshots` ビルド。撮影結果はこのビルドへ送る |
+| `notes` | 判断の補足（レンダリングに無関係として無視したファイルなど） |
+
+`story_ids` が空配列であることと `plan` が `capture_all` であることは別物である。
+前者は「影響のある既存 story は無い」という選択結果、後者は「選択を諦めた」である。
+撮らなかった story を差分なしとして扱ってはならない。
+
+`baseline_commit_sha` と `head_commit_sha` は計画に焼き付けてある。
+計画を作ってから撮るまでにどちらかが変わった場合は、計画を捨てて全 story を撮る。
+
+`plan` が `capture_all` に倒れる条件は `--only-changed` と同じで、次を含む。
+
+- baseline がまだ無い（初回や新規ブランチ）
+- baseline コミットが手元に無く `git diff` が取れない（`fetch-depth: 0` で clone する）
+- `preview-stats.json` が無い、または壊れている
+- `index.json` が壊れている
+- `package.json` や lockfile、`.storybook/` 配下の変更
+- 依存グラフに載っていない変更ファイル
+
+baseline を自分で決めている場合は `--baseline-commit <sha>` を渡せる。
+その場合はビルドを作らないので、ネットワークにも触らず `build_id` も `null` になる。
+
 ### storybook モード（サーバーサイドレンダリング）
 
 CI 側にブラウザを用意せず、**ビルド済み Storybook の zip を投げるだけ**にする形。

@@ -1,0 +1,13 @@
+{
+  "modules": [
+    { "name": "./src/util/format.ts", "reasons": [
+        { "moduleName": "./src/A.tsx" },
+        { "moduleName": "./src/B.tsx" }
+    ]},
+    { "name": "./src/A.tsx", "reasons": [ { "moduleName": "./src/A.stories.tsx" } ] },
+    { "name": "./src/B.tsx", "reasons": [ { "moduleName": "./src/B.stories.tsx" } ] },
+    { "name": "./src/A.stories.tsx", "reasons": [] },
+    { "name": "./src/B.stories.tsx", "reasons": [] },
+    { "name": "./src/orphan/Helper.ts", "reasons": [] }
+  ]
+}
