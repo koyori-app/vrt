@@ -16,6 +16,7 @@ pub mod oauth;
 pub mod oauth_state;
 pub mod projects;
 pub mod render;
+pub mod review_lock;
 pub mod screenshots;
 pub mod storage;
 pub mod tenants;

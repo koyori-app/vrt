@@ -329,18 +329,14 @@ pub async fn approve_build(
 
     with_transaction(db, move |txn| {
         Box::pin(async move {
-            // プロジェクト行ロックで並行承認を直列化する。
-            let project = projects::Entity::find_by_id(build.project_id)
-                .lock_exclusive()
-                .one(txn)
-                .await?
-                .ok_or(AppError::NotFound)?;
-
-            // ロック取得までに他の承認が走っている可能性があるため状態を読み直す。
-            let build = get_build(txn, build.id).await?;
+            // 三つのレビュー判断経路で共通の順序（build -> project）を使う。
+            // build は同一 build の比較レビュー/承認/却下を直列化し、project は異なる
+            // build の baseline 昇格だけを直列化する。規約は review_lock に集約してある。
+            let build = crate::review_lock::build(txn, build.id).await?;
             if !build.status.can_transition_to(BuildStatus::Approved) {
                 return Err(AppError::Conflict);
             }
+            let project = crate::review_lock::project(txn, build.project_id).await?;
 
             // 現行 baseline より古いビルドの承認を拒否する。
             // 比較ジョブが使ったのと同じ解決規則（同一ブランチ → デフォルトブランチ）で
@@ -548,51 +544,62 @@ async fn approve_all_pending<C: ConnectionTrait>(
 }
 
 /// ビルドを却下する（baseline は更新しない）。
-pub async fn reject_build<C: ConnectionTrait>(
-    db: &C,
+pub async fn reject_build(
+    db: &DatabaseConnection,
     build: builds::Model,
     reviewer_id: Uuid,
 ) -> Result<builds::Model, AppError> {
     if !build.status.can_transition_to(BuildStatus::Rejected) {
         return Err(AppError::Conflict);
     }
-    let now = Utc::now().fixed_offset();
-    let build_id = build.id;
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // comparison review / approve と同じ build 行を最初にロックし、状態を読み直す。
+            let build = crate::review_lock::build(txn, build.id).await?;
+            if !build.status.can_transition_to(BuildStatus::Rejected) {
+                return Err(AppError::Conflict);
+            }
 
-    // 却下は比較フェーズの完了時刻を動かさない（承認と同じ方針）。
-    // 却下の時刻は比較ごとの `reviewed_at` に残る。
-    let backfill = build.completed_at.is_none();
-    let mut active: builds::ActiveModel = build.into();
-    active.status = Set(BuildStatus::Rejected);
-    if backfill {
-        active.completed_at = Set(Some(now));
-    }
-    let updated = active.update(db).await?;
+            let now = Utc::now().fixed_offset();
+            let build_id = build.id;
 
-    // 未レビューの比較は rejected に倒す。
-    comparisons::Entity::update_many()
-        .col_expr(
-            comparisons::Column::ReviewStatus,
-            sea_orm::sea_query::Expr::value(ReviewStatus::Rejected),
-        )
-        .col_expr(
-            comparisons::Column::ReviewedBy,
-            sea_orm::sea_query::Expr::value(reviewer_id),
-        )
-        .col_expr(
-            comparisons::Column::ReviewedAt,
-            sea_orm::sea_query::Expr::value(now),
-        )
-        .col_expr(
-            comparisons::Column::UpdatedAt,
-            sea_orm::sea_query::Expr::value(now),
-        )
-        .filter(comparisons::Column::BuildId.eq(build_id))
-        .filter(comparisons::Column::ReviewStatus.eq(ReviewStatus::Pending))
-        .exec(db)
-        .await?;
+            // 却下は比較フェーズの完了時刻を動かさない（承認と同じ方針）。
+            // 却下の時刻は比較ごとの `reviewed_at` に残る。
+            let backfill = build.completed_at.is_none();
+            let mut active: builds::ActiveModel = build.into();
+            active.status = Set(BuildStatus::Rejected);
+            if backfill {
+                active.completed_at = Set(Some(now));
+            }
+            let updated = active.update(txn).await?;
 
-    Ok(updated)
+            // 未レビューの比較は同じ transaction 内で rejected に倒す。
+            comparisons::Entity::update_many()
+                .col_expr(
+                    comparisons::Column::ReviewStatus,
+                    sea_orm::sea_query::Expr::value(ReviewStatus::Rejected),
+                )
+                .col_expr(
+                    comparisons::Column::ReviewedBy,
+                    sea_orm::sea_query::Expr::value(reviewer_id),
+                )
+                .col_expr(
+                    comparisons::Column::ReviewedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .col_expr(
+                    comparisons::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .filter(comparisons::Column::BuildId.eq(build_id))
+                .filter(comparisons::Column::ReviewStatus.eq(ReviewStatus::Pending))
+                .exec(txn)
+                .await?;
+
+            Ok(updated)
+        })
+    })
+    .await
 }
 
 /// 保持数の設定に従って古い完了ビルドを掃除する（ベストエフォート）。

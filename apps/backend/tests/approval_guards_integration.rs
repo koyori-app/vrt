@@ -571,6 +571,48 @@ async fn force_does_not_silently_approve_story_removals() {
     assert_eq!(names, vec!["home".to_string()]);
 }
 
+// 承認後段の manifest ガードで止まった場合、一括レビュー更新も rollback される。
+#[tokio::test(flavor = "multi_thread")]
+async fn manifest_guard_rolls_back_bulk_review_updates() {
+    let fx = setup().await;
+
+    let first = fx
+        .run_build("sha-rollback-1", &[("home", RED), ("legacy", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let second = fx.run_build("sha-rollback-2", &[("home", BLUE)]).await;
+    let second_id = build_id_of(&second);
+    entity::comparisons::Entity::delete_many()
+        .filter(entity::comparisons::Column::BuildId.eq(second_id))
+        .filter(entity::comparisons::Column::Name.eq("legacy"))
+        .exec(&fx.app.state.db)
+        .await
+        .expect("remove comparison to model an unexplained capture gap");
+
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert!(error_message(res).await.contains("legacy"));
+
+    let home = entity::comparisons::Entity::find()
+        .filter(entity::comparisons::Column::BuildId.eq(second_id))
+        .filter(entity::comparisons::Column::Name.eq("home"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("load home comparison")
+        .expect("home comparison exists");
+    assert_eq!(
+        home.review_status,
+        entity::comparisons::ReviewStatus::Pending,
+        "bulk approval before the manifest guard must be rolled back"
+    );
+    assert!(fx.current_baseline().await.is_some());
+    assert_eq!(fx.build_status(second_id).await, "changes_detected");
+}
+
 // 個別レビューで消滅を承認した場合は、force 用フラグなしでも manifest ガードを通る。
 #[tokio::test(flavor = "multi_thread")]
 async fn individually_approved_removal_shrinks_the_baseline_without_bulk_flag() {
