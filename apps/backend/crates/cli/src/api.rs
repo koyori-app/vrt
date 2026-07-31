@@ -53,7 +53,6 @@ pub struct BuildResponse {
     pub removed_count: i32,
     #[serde(default)]
     pub error_message: Option<String>,
-    pub approval_evidence: Option<serde_json::Value>,
 }
 
 /// ビルド進捗ログの 1 行（payload::builds::BuildLogEntry に一致）。
