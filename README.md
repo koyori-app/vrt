@@ -165,9 +165,34 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 zip 化 → アップロード → finalize までを 1 コマンドで済ませられる。branch / commit
 は git から自動で拾う。
 
-```bash
-cargo build --release -p vrt-cli   # target/release/vrt が生成される
+CLI の入手方法は 2 つ。**リリース版のバイナリを落とすのが速い**（ソースビルドは
+初回 15〜20 分かかる）。
 
+```bash
+# リリースからバイナリを取得（推奨）。cli-v* タグごとに配布している。
+VRT_CLI_VERSION=cli-v0.1.0
+VRT_CLI_TARGET=x86_64-unknown-linux-gnu
+BASE="https://github.com/koyori-app/vrt/releases/download/${VRT_CLI_VERSION}"
+
+# チェックサムはアーカイブ名込みで記録してあるので、配布時のファイル名のまま落とす。
+curl -fsSL -O "${BASE}/vrt-${VRT_CLI_TARGET}.tar.gz"
+curl -fsSL -O "${BASE}/vrt-${VRT_CLI_TARGET}.tar.gz.sha256"
+
+# 検証してから展開する（macOS は shasum、Linux は sha256sum -c でも同じ）
+shasum -a 256 -c "vrt-${VRT_CLI_TARGET}.tar.gz.sha256"
+
+tar xzf "vrt-${VRT_CLI_TARGET}.tar.gz" && chmod +x vrt
+```
+
+配布ターゲットは `x86_64` / `aarch64` の Linux（`-unknown-linux-gnu`）と macOS
+（`-apple-darwin`）。
+
+```bash
+# ソースからビルドする場合（Cargo ワークスペースは apps/backend、Linux は mold が要る）
+cargo build --release -p vrt-cli   # target/release/vrt が生成される
+```
+
+```bash
 export VRT_URL=https://vrt.example.com
 export VRT_TOKEN=...                # write:build（--wait を使うなら read:build も）
 export VRT_PROJECT=<tenant-slug>/<project-slug>   # CI usage タブに出る値
@@ -185,6 +210,32 @@ vrt upload --dir ./storybook-static --only-changed --wait
 （`passed`=0 / `changes_detected`=1 / `failed`=2）。CI のジョブをそのまま
 落とせる。`--url` / `--token` / `--project` はフラグでも環境変数
 （`VRT_URL` / `VRT_TOKEN` / `VRT_PROJECT`）でも渡せる。トークンはログに出さない。
+
+`--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
+stdout へ JSON で 1 行だけ出す（例
+`{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
+GitHub Action など呼び出し元がパースしやすいよう、このときログはすべて stderr に回る。
+
+ただし **JSON が出るのはビルドを作成して finalize まで到達した場合だけ**。それ以前の
+失敗（設定不備、ネットワークエラー、stats JSON の解析失敗など）では stdout は空のまま
+stderr にエラーを出して終了コード 2 で終わる。呼び出し元は「stdout が空で非ゼロ終了」を
+必ず処理すること。
+
+`--wait` 併用時、finalize には成功したがその後のポーリングが一時的な通信失敗や
+タイムアウト（既定 30 分）で失敗した場合も **JSON は 1 行出る**。このときの JSON は
+finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
+`project_slug` / finalize 直後の `status`）に `exit_code: 2` と失敗理由の `error`
+フィールド（例
+`{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"processing","exit_code":2,"error":"timed out after 1800s …"}`）
+を添えて出す。`error` は失敗時のみ現れ、成功時の JSON 形状は変わらない。これにより
+呼び出し元は少なくとも `build_id` を取り出して後続処理（結果 URL の組み立てや
+再ポーリング）に使える。
+
+`error` が現れるのはポーリング失敗時だけではない。`--wait` でポーリングが終端まで
+到達し、ビルド自体が `failed` / `rejected` で終わってサーバーが失敗理由
+（`error_message`）を返した場合も、その理由が `exit_code: 2` とともに `error` に載る
+（どのストーリーで落ちたか等）。この場合も成功時（`error_message` が無いとき）は
+`error` キーが出ない契約は変わらない。
 
 `--only-changed` の前提:
 

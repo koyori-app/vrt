@@ -38,6 +38,8 @@ struct FinalizeBody {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuildResponse {
     pub id: String,
+    /// プロジェクト内で連番のビルド番号（`--json` 出力の build_number）。
+    pub number: i64,
     pub status: String,
     #[serde(default)]
     pub baseline_commit_sha: Option<String>,

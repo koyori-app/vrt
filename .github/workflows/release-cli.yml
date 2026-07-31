@@ -1,0 +1,117 @@
+name: Release CLI
+
+# `vrt` CLI（apps/backend/crates/cli、バイナリ名 vrt）のリリースバイナリを配布する。
+# バックエンド本体のリリースと分けるため、タグは `cli-v*`（例 cli-v0.1.0）だけを対象にする。
+on:
+  push:
+    tags:
+      - 'cli-v*'
+  # ビルドの素振り用。Release は作らず（下の release ジョブの if を参照）、
+  # 4 ターゲットがビルドとパッケージングを通ることだけを確認できる。
+  workflow_dispatch:
+
+# リリース（と成果物アップロード）にだけ書き込みが要る。それ以外は付けない。
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          # macOS のランナーラベルは明示的に固定する。`macos-latest` は 1〜2 か月
+          # かけて新しい OS へ移行するため、リリースの再現性が保てない。
+          # 提供中のイメージは macOS 15 / 26 系（14 は deprecated、13 は提供終了）。
+          # Intel 版は `-intel` サフィックス。`-large` / `-xlarge` は larger runner
+          # （public リポジトリでも課金対象）なので使わない。
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # ここで入れるバージョンはリポジトリ直下の rust-toolchain.toml（channel = 1.95.0）と
+      # 揃えること。action は rust-toolchain.toml を読まないため明示が要る。
+      # （明示しないと stable と 1.95.0 の 2 本をダウンロードする）
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # toolchain pin
+        with:
+          toolchain: 1.95.0
+
+      # apps/backend/.cargo/config.toml が Linux ターゲットで -fuse-ld=mold を強制する。
+      # macOS では設定が効かず不要なので Linux ランナーだけに入れる。
+      - name: Install mold
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      # リリース成果物はクリーンビルドにする。キャッシュはサプライチェーン混入
+      # （default ブランチから読める細工済みエントリ）と再現性の懸念があるため使わない。
+      # ネイティブランナーでビルドする（クロスコンパイルは mold と相性が悪いので避ける）。
+      - name: Build release binary
+        run: cargo build --release -p vrt-cli
+        working-directory: apps/backend
+
+      # コンパイル成功だけを根拠に配布しない。起動時に落ちる類の破損
+      # （動的リンク先の欠落など）をパッケージ前にその場で捕まえる。
+      - name: Smoke test binary
+        run: ./target/release/vrt --version
+        working-directory: apps/backend
+
+      # 中身はバイナリ vrt 1 つだけ（ディレクトリで包まない）。
+      # 併せて sha256sum 形式のチェックサムを出す。
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          archive="vrt-${{ matrix.target }}.tar.gz"
+          tar -czf "$archive" -C "apps/backend/target/release" vrt
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vrt-${{ matrix.target }}
+          path: |
+            vrt-${{ matrix.target }}.tar.gz
+            vrt-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # タグ push のときだけ Release を作る。
+  # workflow_dispatch はブランチから手動で回してビルドの素振りをするための入口で、
+  # そのとき GITHUB_REF はタグではない。action-gh-release は tag_name 未指定だと
+  # GITHUB_REF をタグとして扱うため、この if が無いと手動実行が必ず失敗する。
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/cli-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@6da8fa9354ddfdc4aeace5fc48d7f679b5214090 # v2.4.1
+        with:
+          files: |
+            dist/vrt-*.tar.gz
+            dist/vrt-*.tar.gz.sha256
+          fail_on_unmatched_files: true

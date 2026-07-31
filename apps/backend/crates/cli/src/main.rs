@@ -66,17 +66,24 @@ struct UploadArgs {
     /// ビルドが終端状態になるまでポーリングして待つ。
     #[arg(long)]
     wait: bool,
+
+    /// 機械可読な結果を stdout へ JSON で 1 行出力する。
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     // RUST_LOG で調整可能。既定は info。トークンはどのログにも載せない。
+    // ログは常に stderr へ出す。stdout は結果（`--json` の 1 行 JSON など）専用に
+    // 空けておき、呼び出し元がログと混ざらずに機械可読出力だけをパースできるようにする。
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -139,17 +146,100 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     }
     let finalized = client.finalize(&build.id, only_story_ids).await?;
 
-    // 6. 結果を stdout に出す。
-    println!("build_id={}", finalized.id);
-    println!("status={}", finalized.status);
+    // 6. 結果を出す。--json のときは stdout を JSON 1 行専用にするため、
+    //    人間向けの `key=value` サマリは出さない（ログは既に stderr）。
+    if !args.json {
+        println!("build_id={}", finalized.id);
+        println!("status={}", finalized.status);
+    }
 
     if !args.wait {
+        // --wait 無し: finalize 直後の状態を返し、終了コードは常に 0（既存挙動）。
+        if args.json {
+            print_json_result(&finalized, tenant_slug, project_slug, 0, None);
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     // --wait: 終端になるまでポーリングして終了コードに反映する。
-    let final_build = poll_until_terminal(&client, &finalized.id).await?;
-    report_and_exit(&final_build)
+    let final_build = match poll_until_terminal(&client, &finalized.id, args.json).await {
+        Ok(build) => build,
+        Err(e) => {
+            // finalize は成功済み。`--json` の契約は「finalize まで到達すれば JSON が
+            // 1 行出る」なので、ここでポーリングが一時的な通信失敗やタイムアウトで
+            // Err になっても、`?` で早期リターンして stdout を空にしてはいけない。
+            // 呼び出し元が build_id すら取れなくなるため、既知の finalize 済み情報
+            // （build_id / build_number / slug / finalize 直後の status）に exit_code=2
+            // と失敗理由 `error` を添えて 1 行だけ出す。
+            if args.json {
+                print_json_result(
+                    &finalized,
+                    tenant_slug,
+                    project_slug,
+                    2,
+                    Some(&format!("{e:#}")),
+                );
+                // ログは従来どおり stderr へも残す（main のハンドラは通らないため自前で）。
+                tracing::error!("{e:#}");
+                return Ok(ExitCode::from(2));
+            }
+            // `--json` でないときは従来どおり伝播し、main 側で error ログ + exit 2。
+            return Err(e);
+        }
+    };
+    let code = exit_code_for(&final_build.status);
+    if !args.json {
+        report(&final_build);
+    } else {
+        // ビルドが failed / rejected で終わったら、人間向け report() と同じく
+        // サーバーが返した失敗理由（error_message）を JSON の `error` にも載せる。
+        // 成功時は error_message が None なので `error` キーは出ない契約を保つ。
+        print_json_result(
+            &final_build,
+            tenant_slug,
+            project_slug,
+            code,
+            final_build.error_message.as_deref(),
+        );
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// 機械可読な結果を stdout へ JSON で 1 行出力する。
+fn print_json_result(
+    build: &BuildResponse,
+    tenant_slug: &str,
+    project_slug: &str,
+    exit_code: u8,
+    error: Option<&str>,
+) {
+    let out = json_result_value(build, tenant_slug, project_slug, exit_code, error);
+    println!("{out}");
+}
+
+/// `--json` の 1 行 JSON の値を組み立てる純関数。
+///
+/// `error` は失敗時のみ `Some` を渡す。`None` のときは成功パスと同じ形状
+/// （`error` キーは出現しない）を保つ。
+fn json_result_value(
+    build: &BuildResponse,
+    tenant_slug: &str,
+    project_slug: &str,
+    exit_code: u8,
+    error: Option<&str>,
+) -> serde_json::Value {
+    let mut out = serde_json::json!({
+        "build_id": build.id,
+        "build_number": build.number,
+        "tenant_slug": tenant_slug,
+        "project_slug": project_slug,
+        "status": build.status,
+        "exit_code": exit_code,
+    });
+    if let Some(message) = error {
+        out["error"] = serde_json::Value::String(message.to_string());
+    }
+    out
 }
 
 /// `--only-changed` の影響ストーリーを算出する。
@@ -220,9 +310,10 @@ fn resolve_only_story_ids(
 
 /// ビルドが終端（またはレビュー待ちの changes_detected）になるまでポーリングする。
 ///
-/// 状態取得のたびに進捗ログも増分取得して stdout に流す。終端後にも 1 回引いて、
+/// 状態取得のたびに進捗ログも増分取得して流す（出力先は通常 stdout、`--json` の
+/// ときは stdout を JSON 1 行専用に空けるため stderr）。終端後にも 1 回引いて、
 /// 最後の状態遷移と同時に書かれた行を取りこぼさないようにする。
-async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildResponse> {
+async fn poll_until_terminal(client: &Client, build_id: &str, json: bool) -> Result<BuildResponse> {
     const INTERVAL: Duration = Duration::from_secs(3);
     // ジョブが詰まったまま無限待機しないよう上限を設ける。
     const TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -231,12 +322,12 @@ async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildRes
     // 追尾済みログの末尾 id。ここより後の行だけを毎回引く。
     let mut log_cursor: i64 = 0;
     loop {
-        log_cursor = flush_logs(client, build_id, log_cursor).await;
+        log_cursor = flush_logs(client, build_id, log_cursor, json).await;
 
         let build = client.get_build(build_id).await?;
         if is_settled(&build.status) {
             // 終端遷移と同時に書かれた行（完了サマリ・失敗理由）を最後に流し切る。
-            flush_logs(client, build_id, log_cursor).await;
+            flush_logs(client, build_id, log_cursor, json).await;
             return Ok(build);
         }
         if start.elapsed() >= TIMEOUT {
@@ -254,11 +345,16 @@ async fn poll_until_terminal(client: &Client, build_id: &str) -> Result<BuildRes
 ///
 /// ログ取得の失敗はビルド待機の失敗にはしない（警告だけ出して次に進む）。
 /// 進捗ログは補助情報であり、これで終了コードを狂わせたくない。
-async fn flush_logs(client: &Client, build_id: &str, cursor: i64) -> i64 {
+async fn flush_logs(client: &Client, build_id: &str, cursor: i64, json: bool) -> i64 {
     match client.get_build_logs(build_id, cursor).await {
         Ok(logs) => {
             for entry in &logs.entries {
-                println!("[{}] {}", entry.level, entry.message);
+                // --json のときは stdout を JSON 専用にするため進捗ログは stderr へ回す。
+                if json {
+                    eprintln!("[{}] {}", entry.level, entry.message);
+                } else {
+                    println!("[{}] {}", entry.level, entry.message);
+                }
             }
             logs.last_id
         }
@@ -280,10 +376,8 @@ fn is_settled(status: &str) -> bool {
     )
 }
 
-/// 最終状態を stdout に出し、終了コードを決める。
-///
-/// passed/approved=0、changes_detected=1、failed/rejected=2。
-fn report_and_exit(build: &BuildResponse) -> Result<ExitCode> {
+/// 最終状態を人間向けに stdout へ出す。
+fn report(build: &BuildResponse) {
     println!("final_status={}", build.status);
     println!(
         "counts total={} changed={} added={} removed={}",
@@ -292,10 +386,141 @@ fn report_and_exit(build: &BuildResponse) -> Result<ExitCode> {
     if let Some(msg) = &build.error_message {
         println!("error_message={msg}");
     }
-    let code = match build.status.as_str() {
+}
+
+/// 最終状態から終了コードを決める。
+///
+/// passed/approved=0、changes_detected=1、failed/rejected=2。
+fn exit_code_for(status: &str) -> u8 {
+    match status {
         "passed" | "approved" => 0,
         "changes_detected" => 1,
         _ => 2, // failed / rejected / 想定外
-    };
-    Ok(ExitCode::from(code))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 終了コードは CI の合否判定そのものなので、8 状態すべてを固定する。
+    /// `changes_detected` は「差分あり = レビュー待ち」であって失敗ではないため、
+    /// 1 に割り当てて失敗（2）と区別する。
+    #[test]
+    fn exit_code_covers_every_build_status() {
+        assert_eq!(exit_code_for("passed"), 0);
+        assert_eq!(exit_code_for("approved"), 0);
+        assert_eq!(exit_code_for("changes_detected"), 1);
+        assert_eq!(exit_code_for("failed"), 2);
+        assert_eq!(exit_code_for("rejected"), 2);
+        // 非終端状態がここへ来るのは想定外なので、成功に倒さず 2 にする。
+        assert_eq!(exit_code_for("pending"), 2);
+        assert_eq!(exit_code_for("rendering"), 2);
+        assert_eq!(exit_code_for("processing"), 2);
+    }
+
+    /// サーバー側に未知の状態が増えても、黙って 0（成功）にしないことを固定する。
+    #[test]
+    fn unknown_status_is_not_treated_as_success() {
+        assert_eq!(exit_code_for("some_future_status"), 2);
+        assert_eq!(exit_code_for(""), 2);
+    }
+
+    /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。
+    fn sample_build() -> BuildResponse {
+        BuildResponse {
+            id: "build-123".into(),
+            number: 42,
+            // finalize 直後の（＝最後に判明している）状態を模す。
+            status: "processing".into(),
+            baseline_commit_sha: None,
+            total_count: 0,
+            changed_count: 0,
+            added_count: 0,
+            removed_count: 0,
+            error_message: None,
+        }
+    }
+
+    /// 成功パスでは `error` キーが出現しないこと（JSON 形状を変えない）を固定する。
+    #[test]
+    fn json_result_omits_error_on_success() {
+        let build = sample_build();
+        let value = json_result_value(&build, "acme", "web", 0, None);
+
+        assert_eq!(value["build_id"], "build-123");
+        assert_eq!(value["build_number"], 42);
+        assert_eq!(value["tenant_slug"], "acme");
+        assert_eq!(value["project_slug"], "web");
+        assert_eq!(value["status"], "processing");
+        assert_eq!(value["exit_code"], 0);
+        assert!(
+            value.get("error").is_none(),
+            "success output must not carry an error field"
+        );
+        // 1 行 JSON の契約: 改行を含まない。
+        assert!(!value.to_string().contains('\n'));
+    }
+
+    /// ポーリング失敗時は finalize 済みの build_id 等 + exit_code=2 + error を出す。
+    /// finalize 後の状態がそのまま status に出ること（poll 失敗でも既知値を返す）を固定。
+    #[test]
+    fn json_result_includes_error_and_exit_2_on_poll_failure() {
+        let finalized = sample_build();
+        let value = json_result_value(
+            &finalized,
+            "acme",
+            "web",
+            2,
+            Some("timed out after 1800s waiting for build build-123 (last status: processing)"),
+        );
+
+        // build_id / build_number / slug / status は finalize 済みの既知値。
+        assert_eq!(value["build_id"], "build-123");
+        assert_eq!(value["build_number"], 42);
+        assert_eq!(value["tenant_slug"], "acme");
+        assert_eq!(value["project_slug"], "web");
+        assert_eq!(value["status"], "processing");
+        // 失敗を表す終了コードと理由。
+        assert_eq!(value["exit_code"], 2);
+        assert_eq!(
+            value["error"],
+            "timed out after 1800s waiting for build build-123 (last status: processing)"
+        );
+        assert!(!value.to_string().contains('\n'));
+    }
+
+    /// ビルドが failed / rejected で終わり、サーバーが error_message を返した場合、
+    /// run_upload の終端パス（error_message.as_deref() 経由）で `error` キーに
+    /// その理由が載ること、および exit_code=2 が付くことを固定する。
+    #[test]
+    fn json_result_carries_server_error_message_on_failed_build() {
+        let mut build = sample_build();
+        build.status = "failed".into();
+        build.error_message = Some("render worker crashed for 3 stories".into());
+
+        let code = exit_code_for(&build.status);
+        let value = json_result_value(&build, "acme", "web", code, build.error_message.as_deref());
+
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["exit_code"], 2);
+        assert_eq!(value["error"], "render worker crashed for 3 stories");
+        assert!(!value.to_string().contains('\n'));
+    }
+
+    #[test]
+    fn settled_statuses_stop_the_poll_loop() {
+        for s in [
+            "passed",
+            "changes_detected",
+            "failed",
+            "approved",
+            "rejected",
+        ] {
+            assert!(is_settled(s), "{s} should be terminal");
+        }
+        for s in ["pending", "rendering", "processing"] {
+            assert!(!is_settled(s), "{s} should not be terminal");
+        }
+    }
 }
