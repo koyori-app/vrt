@@ -161,6 +161,7 @@ JSON で出力する。
 （TurboSnap 相当）を使う。
 
 ```bash
+set -euo pipefail
 export VRT_URL=https://vrt.example.com
 export VRT_TOKEN=...                              # write:build
 export VRT_PROJECT=<tenant-slug>/<project-slug>
@@ -175,6 +176,10 @@ case "$(jq -r '.plan' plan.json)" in
   *)           : > stories.txt ;;                               # 未知の値も全撮影へ倒す
 esac
 ```
+
+`vrt plan` は環境の不備では計画を出さず、終了コード 2 で落ちる。
+全撮影へは倒さないので、呼び出し側で必ず失敗として扱うこと。
+黙って全撮影に読み替えると、設定ミスに気づけなくなる。
 
 計画は stdout にも必ず出るので、`--output` を使わずパイプで受けてもよい。
 ログは stderr へ出すため、stdout は JSON だけになる。
