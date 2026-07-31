@@ -270,6 +270,16 @@ fn capture_all_without_baseline_records_the_missing_baseline() {
 }
 
 #[test]
+fn explicit_missing_baseline_commit_is_not_capture_all() {
+    let err = vrt_cli::git::commit_exists("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+        .expect_err("missing SHA must error");
+    assert!(
+        err.to_string().contains("not present locally"),
+        "err={err:#}"
+    );
+}
+
+#[test]
 fn notes_survive_into_the_plan() {
     // グラフ外でも .md は無視される。その判断は notes に残す。
     let selection = plan_selection("graph", &["README.md", "apps/frontend/src/A.tsx"]);
