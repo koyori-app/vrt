@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 /// `git <args>` を実行し、成功なら stdout を trim して返す。
 fn git(args: &[&str]) -> Result<String> {
-    let output = Command::new("/usr/bin/git")
+    let output = Command::new("git")
         .args(args)
         .output()
         .with_context(|| format!("failed to spawn `git {}`", args.join(" ")))?;

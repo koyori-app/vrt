@@ -25,7 +25,7 @@ fn git_rev_parse(repo: &Path, rev: &str) -> String {
 }
 
 fn git_rev_parse_opt(repo: &Path, rev: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/git")
+    let output = Command::new("git")
         .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
         .current_dir(repo)
         .output()
