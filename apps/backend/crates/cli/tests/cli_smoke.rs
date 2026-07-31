@@ -17,8 +17,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn graph_fixture() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/plan/graph")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph")
 }
 
 #[test]
@@ -33,7 +32,7 @@ fn plan_without_credentials_exits_2() {
             "--commit",
             "head222",
         ])
-        .current_dir(&repo_root())
+        .current_dir(repo_root())
         .output()
         .expect("spawn vrt");
 
@@ -53,7 +52,7 @@ fn plan_without_credentials_exits_2() {
 fn plan_with_baseline_commit_writes_json_to_stdout() {
     let baseline = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(&repo_root())
+        .current_dir(repo_root())
         .output()
         .expect("git rev-parse");
     assert!(baseline.status.success());
@@ -71,7 +70,7 @@ fn plan_with_baseline_commit_writes_json_to_stdout() {
             "--commit",
             "head222",
         ])
-        .current_dir(&repo_root())
+        .current_dir(repo_root())
         .output()
         .expect("spawn vrt");
 
@@ -102,7 +101,7 @@ fn plan_with_missing_baseline_commit_exits_2() {
             "--commit",
             "head222",
         ])
-        .current_dir(&repo_root())
+        .current_dir(repo_root())
         .output()
         .expect("spawn vrt");
 
