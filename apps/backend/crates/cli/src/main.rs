@@ -41,9 +41,10 @@ enum Command {
     /// storybook build を実行し、成果物に生成元コミットの provenance を書き込む。
     ///
     /// `vrt stamp -- <build command...>` の形で build コマンドを渡す。vrt が
-    /// build 開始前に HEAD と worktree の clean を観測し、build を実行し、
-    /// 成功後に同一 HEAD・clean を再観測してから stamp する——「build がその
-    /// commit で走った」ことを vrt 自身の計器で証明するためである。
+    /// build 開始前に HEAD と worktree の clean を観測して**旧 provenance と
+    /// stats / index を削除**し、build を実行し、成功後に同一 HEAD・clean を
+    /// 再観測してから stamp する——「build がその commit で走り、成果物を
+    /// 再生成した」ことを vrt 自身の計器で証明するためである。
     /// `vrt plan` / `vrt upload --only-changed` は絞り込みの前にこれを検証し、
     /// 別コミットで生成された成果物（古いキャッシュ等）での絞り込みを拒否する。
     Stamp(StampArgs),
@@ -193,15 +194,21 @@ async fn main() -> ExitCode {
 /// `vrt stamp -- <build command>`: build を実行し、成果物へ provenance を書き込む。
 ///
 /// 「stamp 時点の HEAD」ではなく「build がその HEAD で走った」ことを証明する
-/// ため、観測は build を挟んで二度行う。
+/// ため、観測は build を挟んで二度行う。さらに「コマンドが成功した」ことと
+/// 「成果物がその build で生成された」ことは別なので、build 前に旧成果物を
+/// 無効化し、build 後の存在をもって再生成を証明する。
 ///
 /// 1. build 開始前: HEAD を解決し、worktree が clean（追跡ファイルに
 ///    未コミット変更なし）であることを検査する
-/// 2. build コマンドを実行する（失敗したら stamp しない）
-/// 3. build 成功後: HEAD が開始前と同一のまま動いていないこと、worktree が
+/// 2. 旧成果物の無効化: 旧 provenance と stats / index を削除する。何も
+///    生成しない命令が build 前の成果物をそのまま stamp する経路を断ち、
+///    build が失敗しても古い証明が残らないようにする
+/// 3. build コマンドを実行する（失敗したら stamp しない）
+/// 4. build 成功後: HEAD が開始前と同一のまま動いていないこと、worktree が
 ///    依然 clean であることを再検査する（build 中の checkout / commit /
 ///    追跡ファイル書き換えはここで検出され、stamp は行われない）
-/// 4. その HEAD で provenance を書く
+/// 5. その HEAD で provenance を書く。stats / index は手順 2 で消されている
+///    ため、ここで存在する＝build の実行中に生成されたものである
 fn run_stamp(args: StampArgs) -> Result<ExitCode> {
     // 1. build 開始前の観測。
     let head_before =
@@ -209,7 +216,22 @@ fn run_stamp(args: StampArgs) -> Result<ExitCode> {
     git::verify_worktree_matches(&head_before)
         .context("the worktree must be clean before the build so the stamp can prove it")?;
 
-    // 2. build 実行。argv をそのまま起動する（シェルを介さない）。
+    // 2. 旧成果物の無効化。storybook には HEAD に束縛された信頼できる
+    //    build-time marker が無いため、cache-hit を証明で受け入れる形は取らず、
+    //    実入力 2 ファイルの再生成を build に強制する（実際の storybook build は
+    //    常に両ファイルを書くので、失敗するのは生成しない命令だけである）。
+    let paths = ArtifactPaths {
+        dir: &args.dir,
+        stats_json: args.stats_json.as_deref(),
+        index_json: args.index_json.as_deref(),
+    };
+    provenance::invalidate(&paths)?;
+    tracing::info!(
+        dir = %args.dir.display(),
+        "invalidated the previous provenance and artifacts; the build must regenerate them"
+    );
+
+    // 3. build 実行。argv をそのまま起動する（シェルを介さない）。
     let (program, rest) = args
         .build_command
         .split_first()
@@ -226,7 +248,7 @@ fn run_stamp(args: StampArgs) -> Result<ExitCode> {
         );
     }
 
-    // 3. build 成功後の再観測。HEAD が動いた・worktree が汚れた build は
+    // 4. build 成功後の再観測。HEAD が動いた・worktree が汚れた build は
     //    「head_before でビルドした」証明にならないので stamp しない。
     let head_after = git::head_commit().context("failed to re-resolve HEAD after the build")?;
     if head_after != head_before {
@@ -239,12 +261,8 @@ fn run_stamp(args: StampArgs) -> Result<ExitCode> {
         "the build left the worktree dirty, so the artifact cannot be attributed to HEAD",
     )?;
 
-    // 4. stamp。
-    let paths = ArtifactPaths {
-        dir: &args.dir,
-        stats_json: args.stats_json.as_deref(),
-        index_json: args.index_json.as_deref(),
-    };
+    // 5. stamp。stats / index は手順 2 で消してあるので、stamp が要求する
+    //    存在検査を通る＝この build の実行中に再生成されたことの証明になる。
     let out = provenance::stamp(&paths, &head_after, &args.build_command)?;
     tracing::info!(commit = %head_after, path = %out.display(), "stamped artifact provenance");
     Ok(ExitCode::SUCCESS)
@@ -1193,6 +1211,110 @@ mod tests {
         assert!(
             only.is_none(),
             "a v1 stamp proves nothing about build time and must fall back to full capture"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// commit A の成果物を保持したまま commit B で `vrt stamp -- true`
+    /// （何も生成しない命令）を走らせても stamp されない。vrt が build 前に
+    /// stats / index と旧 provenance を無効化し、no-op build では再生成
+    /// されないためである。
+    /// positive control: 無効化の無い修正前の実装では、build「成功」後も
+    /// A の成果物がそのまま残っているため stamp が成功し（exit 0・B の v2
+    /// provenance が A の成果物に付く）、このテストは落ちる。
+    #[test]
+    fn stamp_with_a_noop_build_does_not_bless_stale_artifacts() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        // 成果物は commit A(=c2) でビルド・stamp された体（古いキャッシュの再現）。
+        let artifact = stamped_graph_artifact(&c2);
+        // repo は commit B(=c3, HEAD) の clean な checkout。
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let err = run_stamp(StampArgs {
+            dir: artifact.path().to_path_buf(),
+            stats_json: None,
+            index_json: None,
+            build_command: vec!["true".to_string()],
+        })
+        .expect_err("a no-op build must not stamp artifacts it did not generate");
+        assert!(format!("{err:#}").contains("--stats-json"), "err={err:#}");
+        // 旧 provenance も残らない（build 前に無効化済み）。
+        assert!(
+            !artifact
+                .path()
+                .join(vrt_cli::provenance::PROVENANCE_FILE)
+                .is_file(),
+            "the stale provenance must have been invalidated"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// build コマンドが実際に stats / index を生成すれば stamp は成立し、
+    /// provenance は build 後の HEAD と再生成された内容に束縛される
+    /// （無効化による過剰ブロックの回帰防止）。
+    #[test]
+    fn stamp_succeeds_when_the_build_regenerates_the_artifacts() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, c2, c3, frontend_cwd) = init_story_diff_repo();
+        // 別コミット由来の古い成果物が転がっていても、build が再生成した
+        // 内容だけが stamp される。
+        let artifact = stamped_graph_artifact(&c2);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let script = format!(
+            "printf '{{\"modules\":[]}}' > '{dir}/preview-stats.json' && \
+             printf '{{\"v\":5,\"entries\":{{}}}}' > '{dir}/index.json'",
+            dir = artifact.path().display()
+        );
+        run_stamp(StampArgs {
+            dir: artifact.path().to_path_buf(),
+            stats_json: None,
+            index_json: None,
+            build_command: vec!["sh".to_string(), "-c".to_string(), script],
+        })
+        .expect("a build that regenerates the artifacts must stamp");
+
+        // 新しい provenance は HEAD(c3) と再生成された内容に一致する。
+        let verification = vrt_cli::provenance::verify(
+            &ArtifactPaths {
+                dir: artifact.path(),
+                stats_json: None,
+                index_json: None,
+            },
+            &c3,
+        )
+        .expect("verify the fresh stamp");
+        assert_eq!(verification, Verification::Verified);
+
+        let _keep_tmp = tmp;
+    }
+
+    /// build が失敗した stamp は旧 provenance を残さない。失敗後に別コミットの
+    /// 証明が生き残ると、plan / upload がその旧成果物で絞り込めてしまうためである。
+    #[test]
+    fn a_failed_build_leaves_no_stale_provenance() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        let artifact = stamped_graph_artifact(&c2);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let err = run_stamp(StampArgs {
+            dir: artifact.path().to_path_buf(),
+            stats_json: None,
+            index_json: None,
+            build_command: vec!["false".to_string()],
+        })
+        .expect_err("a failing build must not stamp");
+        assert!(format!("{err:#}").contains("failed"), "err={err:#}");
+        assert!(
+            !artifact
+                .path()
+                .join(vrt_cli::provenance::PROVENANCE_FILE)
+                .is_file(),
+            "a failed stamp must not leave the previous provenance behind"
         );
 
         let _keep_tmp = tmp;

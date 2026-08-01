@@ -120,6 +120,40 @@ fn sha256_hex(path: &Path) -> Result<String> {
     Ok(out)
 }
 
+/// build 開始前に旧 provenance と絞り込み入力（stats / index）を削除する。
+///
+/// 「build コマンドが成功した」ことと「成果物がその build で生成された」ことは
+/// 別である——何も生成しない命令（no-op）でも成功はするので、build 前に残って
+/// いた別コミットの成果物がそのまま stamp されてしまう。そこで build 前に
+/// 実入力の 2 ファイルと旧 provenance を消す。削除後に [`stamp`] が stats /
+/// index の存在を要求するため、build 成功後にそれらが存在すること自体が
+/// 「build の実行中に生成された」証明になる。
+///
+/// 副次効果として、build が失敗した stamp も旧 provenance を残さない。
+/// 失敗した stamp の後に古い証明が生き残って再利用される経路はここで断たれる。
+///
+/// stats / index が git 追跡下にある場合、この削除は worktree を汚し
+/// build 後の clean 再検査で stamp が拒否される。build 出力を追跡する構成は
+/// そもそも「build がその commit で走った」証明と両立しないため、fail-closed
+/// のままにしてある。
+pub fn invalidate(paths: &ArtifactPaths<'_>) -> Result<()> {
+    for path in [
+        paths.provenance_path(),
+        paths.stats_path(),
+        paths.index_path(),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to remove stale {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// provenance を書き込む（`vrt stamp` の本体）。
 ///
 /// stats / index の両方が build 後に存在しなければエラー。stamp の目的は
@@ -429,6 +463,28 @@ mod tests {
             format!("{err:#}").contains("build ownership"),
             "err={err:#}"
         );
+    }
+
+    /// invalidate は provenance / stats / index の 3 点をすべて消す。
+    /// 消し残しがあると no-op build が旧成果物を stamp できてしまう。
+    #[test]
+    fn invalidate_removes_provenance_stats_and_index() {
+        let tmp = artifact_dir();
+        stamp(&paths(tmp.path()), HEAD, &build_command()).expect("stamp");
+        invalidate(&paths(tmp.path())).expect("invalidate");
+        assert!(!tmp.path().join(PROVENANCE_FILE).is_file());
+        assert!(!tmp.path().join("preview-stats.json").is_file());
+        assert!(!tmp.path().join("index.json").is_file());
+        // 無効化後の成果物では stamp できない（build による再生成が必須）。
+        let err = stamp(&paths(tmp.path()), HEAD, &build_command()).expect_err("no stats");
+        assert!(format!("{err:#}").contains("--stats-json"), "err={err:#}");
+    }
+
+    /// 消す対象が最初から無くても invalidate は成功する（初回 build の経路）。
+    #[test]
+    fn invalidate_tolerates_absent_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        invalidate(&paths(tmp.path())).expect("invalidate on empty dir");
     }
 
     #[test]

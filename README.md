@@ -236,11 +236,26 @@ vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
 
 1. build 開始前に HEAD を解決し、worktree が clean（追跡ファイルに未コミット
    変更なし）であることを検査する
-2. build コマンドを実行する。失敗したら何も stamp しない
-3. build 成功後、HEAD が動いていないこと・worktree が依然 clean であることを
+2. **旧成果物を無効化する**——`<dir>/vrt-provenance.json` と stats / index を
+   削除する。「コマンドが成功した」ことと「成果物がその build で生成された」
+   ことは別であり（何も生成しない命令でも成功はする）、build 前の成果物が
+   build を経ずに生き残る経路をここで断つ
+3. build コマンドを実行する。失敗したら何も stamp しない。旧 provenance は
+   手順 2 で既に消えているため、**失敗した stamp が古い証明を残すこともない**
+4. build 成功後、HEAD が動いていないこと・worktree が依然 clean であることを
    再検査する。build 中の checkout / commit / 追跡ファイル書き換えはここで
    検出され、stamp は行われない
-4. その HEAD で `<dir>/vrt-provenance.json` を書く
+5. stats / index が存在することを確認し、その HEAD で
+   `<dir>/vrt-provenance.json` を書く。両ファイルは手順 2 で削除済みなので、
+   ここで存在する＝**build の実行中に再生成された**ことの証明になる。
+   no-op な命令を渡すと stats 不在でここが失敗する
+
+storybook には HEAD に束縛された信頼できる build-time marker が無いため、
+「キャッシュ命中で成果物を書き直さない build」を証明付きで受け入れる形は
+取らず、実入力 2 ファイルの再生成を build に強制する。実際の storybook build
+は常に stats / index を書き出すので、この強制で失敗するのは生成しない命令だけ
+である。なお stats / index を git 追跡下に置く構成では手順 2 の削除が worktree
+を汚し手順 4 で拒否されるが、build 出力の追跡はそもそも本証明と両立しない。
 
 記録されるのは次の 3 つである。
 
@@ -276,21 +291,28 @@ build 後の後追い stamp（build コマンド無しの形）は提供しな�
 
 保証するのは次の範囲である。
 
-- stats / index のバイト列が、**vrt が実行して成功した build** の直後に
-  成果物ディレクトリへ存在した内容と一致していること
+- stats / index が **vrt が実行して成功した build の実行中に生成された**こと
+  （build 開始前に両ファイルと旧 provenance は削除されるため、成功後に存在する
+  こと自体が再生成の証明になる。build 前から残っていた別ビルドの成果物に
+  provenance が付くことはない）
+- stats / index のバイト列が、その build の直後に成果物ディレクトリへ
+  存在した内容と一致していること
 - その build の開始前と成功後の両方で、worktree が同一 HEAD の clean な
   checkout だったこと
+- build が失敗した stamp は何も stamp せず、**古い provenance も残さない**こと
+  （失敗後の成果物ディレクトリは provenance 不在＝全撮影へ倒れる状態になる）
 - 別コミットの成果物（キャッシュ復元・rebase 前のビルド）での絞り込みが
   エラーか全撮影へ倒れること
 
 次は**保証しない**。運用側の緩和策とあわせて明記する。
 
 - **build コマンドの意味論**: vrt が証明するのは「渡された argv が clean な
-  HEAD で走って成功し、直後の stats / index がこのバイト列だった」ことまで。
-  argv 自体が古い成果物のコピーのような「ビルドしない命令」でも形式上は有効な
-  provenance ができる。緩和として実行コマンドを provenance に記録し監査可能に
-  してあるが、命令の中身までは検証しない——build コマンドには実際に
-  storybook build を行うものを渡すこと
+  HEAD で走って成功し、stats / index をその実行中に書いた」ことまで。argv が
+  本物の storybook build であるかは検証しない——build 前の無効化により
+  「何も生成しない命令」は失敗するようになったが、**命令自身が古い内容を
+  書き戻す**（退避先からのコピー等）場合は、形式上有効な provenance ができて
+  しまう。緩和として実行コマンドを provenance に記録し監査可能にしてある。
+  build コマンドには実際に storybook build を行うものを渡すこと
 - **build プロセス内部の忠実性**: storybook / webpack の incremental cache が
   古い内容の stats を出せば、正しい worktree でビルドしても stats の中身が
   古いことはありうる。絞り込みを使う CI job では storybook のキャッシュを
