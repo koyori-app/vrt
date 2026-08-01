@@ -228,7 +228,16 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     } else {
         tracing::info!("finalizing with a full capture");
     }
-    let finalized = client.finalize(&build.id, only_story_ids).await?;
+    // 差分撮影のときだけ、計画の起点にした baseline をサーバーの固定値と照合させる。
+    // 全撮影は baseline がどれでも結果が変わらないため添えない。
+    let expected_baseline = if only_story_ids.is_some() {
+        build.baseline_commit_sha.as_deref()
+    } else {
+        None
+    };
+    let finalized = client
+        .finalize(&build.id, only_story_ids, expected_baseline)
+        .await?;
 
     // 6. 結果を出す。--json のときは stdout を JSON 1 行専用にするため、
     //    人間向けの `key=value` サマリは出さない（ログは既に stderr）。
@@ -355,6 +364,11 @@ fn resolve_only_story_ids(
     };
     tracing::info!(count = changed_files.len(), "changed files since baseline");
 
+    // 絞り込みの入力（stats / index）は worktree のファイル。worktree が
+    // 記録した commit と一致していなければ、選別は別コミットの内容を見てしまう。
+    // ここは全撮影へ倒さずエラーにする（設定ミスを黙って読み替えない）。
+    git::verify_worktree_matches(commit)?;
+
     let repo_root = git::repo_root()?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
 
@@ -468,6 +482,10 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
             ),
             Ok(changed_files) => {
                 tracing::info!(count = changed_files.len(), "changed files since baseline");
+                // 選別の入力（stats / index）は worktree 由来。worktree が計画の
+                // 終点 commit と一致しない・追跡ファイルが汚れている状態で
+                // 絞り込むと、別内容に対する計画になる。エラーで止める。
+                git::verify_worktree_matches(&head_for_diff)?;
                 let repo_root = git::repo_root()?;
                 let cwd = std::env::current_dir().context("failed to read current directory")?;
                 let selection = plan::select_stories(
@@ -801,25 +819,53 @@ mod tests {
         (tmp, c1, c2, c3, frontend)
     }
 
-    /// `--only-changed` は build 記録の `--commit` 終点を使い、worktree HEAD を使わない。
+    fn pending_build(baseline: String) -> BuildResponse {
+        BuildResponse {
+            id: "build-test".into(),
+            number: 1,
+            status: "pending".into(),
+            baseline_commit_sha: Some(baseline),
+            total_count: 0,
+            changed_count: 0,
+            added_count: 0,
+            removed_count: 0,
+            error_message: None,
+        }
+    }
+
+    /// `--only-changed` の絞り込みは、worktree が記録した `--commit` と一致して
+    /// いなければエラーにする。stats / index は worktree から読むため、終点だけを
+    /// `--commit` に固定しても worktree が別コミットなら別内容に対する選別になる。
+    /// positive control: 終点固定だけで成功していた旧実装ではここが Ok になり、このテストは落ちる。
     #[test]
     fn only_changed_uses_explicit_commit_not_worktree_head() {
         let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
         let (tmp, c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
         let _guard = ChdirGuard::change_to(&frontend_cwd);
 
-        let build = BuildResponse {
-            id: "build-test".into(),
-            number: 1,
-            status: "pending".into(),
-            baseline_commit_sha: Some(c1),
-            total_count: 0,
-            changed_count: 0,
-            added_count: 0,
-            removed_count: 0,
-            error_message: None,
-        };
+        let build = pending_build(c1);
+        let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
 
+        // worktree は c3 のまま --commit c2 → 前提不一致でエラー。
+        let err = resolve_only_story_ids(&graph_fixture, None, &build, &c2)
+            .expect_err("worktree/commit mismatch must not narrow silently");
+        assert!(
+            format!("{err:#}").contains("does not match the recorded commit"),
+            "err={err:#}"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// worktree を `--commit` に合わせてあれば絞り込みが成立する（過剰ブロックの回帰防止）。
+    #[test]
+    fn only_changed_narrows_when_worktree_matches_the_recorded_commit() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        git_in(tmp.path(), &["checkout", "--detach", &c2]);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let build = pending_build(c1);
         let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
 
         let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
@@ -827,10 +873,9 @@ mod tests {
         assert_eq!(
             ids,
             vec!["a--one".to_string(), "a--two".to_string()],
-            "diff end must be --commit (c2: A.tsx only), not worktree HEAD (c3: B.tsx too)"
+            "diff end is --commit (c2: A.tsx only), so only A stories are selected"
         );
 
-        // worktree はまだ c3。壊れた実装（HEAD 差分）なら B の story も混ざる。
         let _keep_tmp = tmp;
     }
 }
