@@ -210,8 +210,8 @@ async fn run(
     .await?;
 
     // `only_story_ids` が来ているときだけ baseline から name→entry の流用テーブルを作る。
-    // baseline はビルド作成時に固定されたもの（`builds.baseline_id`）を使う。
-    // ここで最新を引き直すと、作成〜レンダリングの間に別ビルドが承認された場合に
+    // baseline は finalize が照合のうえ固定したもの（`builds.baseline_id`）を使う。
+    // ここで最新を引き直すと、finalize〜レンダリングの間に別ビルドが承認された場合に
     // クライアントが差分計画の起点にした baseline と違うものを流用してしまう
     // （compare_build と同じ理由）。固定が無ければ空になり、結果的に全撮影になる。
     let baseline_entries: HashMap<String, baseline_entries::Model> = match &only_story_ids {

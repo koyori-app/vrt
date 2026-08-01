@@ -390,7 +390,9 @@ fn resolve_only_story_ids(
             tracing::warn!("{reason}; capturing all stories");
             Ok(None)
         }
-        Selection::Only { story_ids, notes } => {
+        Selection::Only {
+            story_ids, notes, ..
+        } => {
             warn_notes(&notes);
             Ok(Some(story_ids))
         }
@@ -421,7 +423,9 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
 
     // baseline の入手経路。明示指定が優先。無ければ screenshots ビルドを作り、
     // その作成レスポンスから受け取る（撮影前に起点を知れる唯一の経路）。
+    // サーバー経路では選択計画をビルドへ固定するためクライアントを持ち回る。
     let explicit_baseline = args.baseline_commit.clone();
+    let mut client: Option<Client> = None;
     let (baseline_commit_sha, build_id) = match args.baseline_commit {
         Some(sha) => {
             let oid = git::resolve_commit(&sha)
@@ -437,8 +441,8 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                 );
             };
             let (tenant_slug, project_slug) = split_project(&project)?;
-            let client = Client::new(url, token)?;
-            let build = client
+            let c = Client::new(url, token)?;
+            let build = c
                 .create_build(&NewBuild {
                     tenant_slug,
                     project_slug,
@@ -450,6 +454,7 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                 })
                 .await?;
             tracing::info!(build_id = %build.id, "created screenshots build");
+            client = Some(c);
             (build.baseline_commit_sha, Some(build.id))
         }
     };
@@ -461,6 +466,10 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
         head_commit_sha,
         build_id,
     };
+
+    // `plan = "only"` のときの母集合（現行 index の全 story ID）。
+    // サーバーへ計画を固定するときの manifest_names に使う。
+    let mut manifest_story_ids: Option<Vec<String>> = None;
 
     let document = match &baseline_commit_sha {
         // baseline が無ければ差分の起点が無い → 全撮影。
@@ -499,6 +508,13 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                     },
                     CorruptInput::FailClosed,
                 )?;
+                if let Selection::Only {
+                    manifest_story_ids: manifest,
+                    ..
+                } = &selection
+                {
+                    manifest_story_ids = Some(manifest.clone());
+                }
                 PlanDocument::from_selection(coords, selection)
             }
         },
@@ -509,6 +525,32 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
         tracing::warn!("{reason}; capturing all stories");
     } else if let Some(ids) = &document.story_ids {
         tracing::info!(count = ids.len(), "planned story set");
+    }
+
+    // `plan = "only"` かつサーバー経路（ビルドを作った）なら、CI が撮影を始める前に
+    // 選択計画をビルドへ固定する。finalize と比較はこの保存値と実アップロードを
+    // 突き合わせるので、撮影が全滅しても「空の申告 == 空のアップロード」の
+    // 循環一致で通り抜けることはない。固定に失敗したら計画は出力しない
+    // （束縛の無い部分撮影を CI に始めさせない）。
+    if let (Some(build_id), Some(story_ids), Some(manifest), Some(baseline)) = (
+        &document.build_id,
+        &document.story_ids,
+        &manifest_story_ids,
+        &document.baseline_commit_sha,
+    ) {
+        let client = client
+            .as_ref()
+            .expect("a server-created build implies an API client");
+        client
+            .attach_plan(build_id, story_ids, manifest, baseline)
+            .await
+            .context("failed to pin the capture plan to the build")?;
+        tracing::info!(
+            build_id = %build_id,
+            selected = story_ids.len(),
+            manifest = manifest.len(),
+            "capture plan pinned to the build"
+        );
     }
 
     let json = document.to_json()?;

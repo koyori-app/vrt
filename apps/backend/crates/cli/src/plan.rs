@@ -50,6 +50,12 @@ pub enum Selection {
     /// 列挙した story だけ撮る。空 Vec は「撮るべき既存 story 無し」。
     Only {
         story_ids: Vec<String>,
+        /// 現行 index に存在する全 story ID（選択の母集合）。
+        ///
+        /// サーバーへ計画を固定するとき（`POST /v1/ci/builds/{id}/plan`）の
+        /// `manifest_names` になる。baseline にあってここに無い名前は
+        /// 「story が消えた」としてサーバーが `removed` を報告する。
+        manifest_story_ids: Vec<String>,
         notes: Vec<String>,
     },
 }
@@ -123,6 +129,8 @@ pub fn select_stories(inputs: &SelectionInputs<'_>, on_corrupt: CorruptInput) ->
         Err(e) => return on_corrupt_input(on_corrupt, e, notes),
     };
 
+    let manifest_story_ids: Vec<String> = stories.iter().map(|s| s.id.clone()).collect();
+
     let outcome = turbosnap::compute_affected_stories(
         inputs.repo_root,
         inputs.cwd,
@@ -133,7 +141,11 @@ pub fn select_stories(inputs: &SelectionInputs<'_>, on_corrupt: CorruptInput) ->
     notes.extend(outcome.notes);
     Ok(match outcome.plan {
         Plan::CaptureAll(reason) => Selection::CaptureAll { reason, notes },
-        Plan::Only(story_ids) => Selection::Only { story_ids, notes },
+        Plan::Only(story_ids) => Selection::Only {
+            story_ids,
+            manifest_story_ids,
+            notes,
+        },
     })
 }
 
@@ -220,7 +232,9 @@ impl PlanDocument {
     pub fn from_selection(coords: PlanCoordinates, selection: Selection) -> Self {
         match selection {
             Selection::CaptureAll { reason, notes } => Self::capture_all(coords, reason, notes),
-            Selection::Only { story_ids, notes } => Self {
+            Selection::Only {
+                story_ids, notes, ..
+            } => Self {
                 version: PLAN_VERSION,
                 plan: PlanKind::Only,
                 branch: coords.branch,

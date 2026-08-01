@@ -1,13 +1,18 @@
-//! screenshots モードの部分アップロード（carry-forward）と baseline 固定の統合テスト。
+//! screenshots モードの部分アップロード（capture plan / carry-forward）の統合テスト。
 //!
 //! 検証する契約:
 //!
-//! 1. finalize で `captured_names` を宣言した部分アップロードでは、宣言外の
-//!    baseline エントリが `removed` ではなく前回 baseline の流用（unchanged）になり、
+//! 1. 撮影前に `POST /v1/ci/builds/{id}/plan` で固定した計画の選択外 baseline
+//!    エントリは `removed` ではなく前回 baseline の流用（unchanged）になり、
 //!    承認しても baseline から消えない
-//! 2. 「宣言 == 実際のアップロード」が成立しない finalize は 400 で拒否される
-//! 3. 比較に使う baseline はビルド作成時に固定され、作成後に別ビルドが承認されて
-//!    最新 baseline が動いても比較対象はずれない（`expected_baseline_commit_sha` 照合含む）
+//! 2. 計画の manifest（現行 index）から消えた名前は流用されず `removed` になる
+//!    （story の削除が carry-forward で隠れない）
+//! 3. 「今回撮る集合」の出所は保存済み計画であり、finalize の自己申告ではない。
+//!    計画なしのビルドへの `captured_names` は拒否され、計画ありのビルドは
+//!    アップロード実績が計画と一致しない限り finalize できない
+//!    （撮影が全滅して空アップロードになっても偽 PASS しない）
+//! 4. 比較 baseline は計画添付時に照合のうえ固定され、その後最新 baseline が
+//!    動いても比較対象はずれない。計画の起点が古ければ添付自体が 409
 
 mod common;
 
@@ -30,6 +35,9 @@ fn png(width: u32, height: u32, color: [u8; 4]) -> Vec<u8> {
         .expect("encode png");
     buf.into_inner()
 }
+
+/// 全撮影ビルドで使う 3 ページの現行 manifest。
+const FULL_MANIFEST: [&str; 3] = ["about", "home", "pricing"];
 
 struct Fixture {
     app: TestApp,
@@ -95,6 +103,39 @@ impl Fixture {
             .await;
         assert_eq!(res.status(), StatusCode::CREATED, "create build");
         res.json().await.expect("build json")
+    }
+
+    async fn attach_plan(
+        &self,
+        build_id: Uuid,
+        selected: &[&str],
+        manifest: &[&str],
+        baseline_commit_sha: &str,
+    ) -> reqwest::Response {
+        self.app
+            .post_json_with_bearer(
+                &format!("/v1/ci/builds/{build_id}/plan"),
+                &self.token,
+                json!({
+                    "selected_names": selected,
+                    "manifest_names": manifest,
+                    "baseline_commit_sha": baseline_commit_sha,
+                }),
+            )
+            .await
+    }
+
+    async fn attach_plan_ok(
+        &self,
+        build_id: Uuid,
+        selected: &[&str],
+        manifest: &[&str],
+        baseline_commit_sha: &str,
+    ) {
+        let res = self
+            .attach_plan(build_id, selected, manifest, baseline_commit_sha)
+            .await;
+        assert_eq!(res.status(), StatusCode::OK, "attach capture plan");
     }
 
     async fn upload(&self, build_id: Uuid, name: &str, png: Vec<u8>) {
@@ -222,10 +263,10 @@ fn find_comparison<'a>(list: &'a [Value], name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("comparison {name} not found"))
 }
 
-/// 部分アップロード: 宣言外の baseline エントリは removed にならず流用され、
-/// 承認後の baseline からも消えない。
+/// 部分アップロード: 計画の選択外（かつ manifest 内）の baseline エントリは
+/// removed にならず流用され、承認後の baseline からも消えない。
 ///
-/// positive control: carry-forward の無い旧実装では about / pricing が `removed`
+/// positive control: carry-forward の無い実装では about / pricing が `removed`
 /// になり（removed_count = 2）、承認で baseline が 1 件に縮む → このテストは落ちる。
 #[tokio::test(flavor = "multi_thread")]
 async fn subset_upload_carries_forward_unselected_baseline_entries() {
@@ -233,14 +274,19 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
     let home_v1 = png(40, 30, [255, 255, 255, 255]);
     fx.establish_baseline("base0001", home_v1).await;
 
-    // home だけ撮り直す部分アップロード（内容も変える）。
+    // home だけ撮り直す計画を撮影前に固定してから、home をアップロードする。
     let build = fx.create_build("subset01").await;
     let build_id = build_id_of(&build);
+    assert_eq!(
+        build["baseline_commit_sha"].as_str(),
+        Some("base0001"),
+        "creation reports the current baseline as the planning basis"
+    );
+    fx.attach_plan_ok(build_id, &["home"], &FULL_MANIFEST, "base0001")
+        .await;
     fx.upload(build_id, "home", png(40, 30, [255, 0, 0, 255]))
         .await;
-    let res = fx
-        .finalize(build_id, Some(json!({ "captured_names": ["home"] })))
-        .await;
+    let res = fx.finalize(build_id, None).await;
     assert_eq!(res.status(), StatusCode::OK, "subset finalize");
 
     let build = fx.wait_for_terminal(build_id).await;
@@ -265,7 +311,7 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
         );
     }
 
-    // 承認しても宣言外のエントリは baseline に残る（消滅しない）。
+    // 承認しても選択外のエントリは baseline に残る（消滅しない）。
     fx.approve_force(build_id).await;
     let (_, names) = fx.latest_baseline().await;
     assert_eq!(
@@ -275,19 +321,63 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
     );
 }
 
-/// 何も撮らない部分アップロード（`captured_names: []`）は全エントリ流用で passed になる。
+/// 削除された story は carry-forward で隠れない: 計画の manifest から消えた
+/// baseline エントリは流用されず `removed` として報告される。
+///
+/// positive control: manifest を見ず選択外を無差別に流用する実装では pricing が
+/// unchanged に化けて removed_count = 0 になり、このテストは落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn empty_captured_set_reuses_the_whole_baseline() {
+async fn vanished_story_is_reported_as_removed_not_carried_forward() {
+    let fx = setup().await;
+    fx.establish_baseline("base0006", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    // 現行 index から pricing が消えた状態で home だけ撮り直す計画。
+    let build = fx.create_build("vanish01").await;
+    let build_id = build_id_of(&build);
+    fx.attach_plan_ok(build_id, &["home"], &["about", "home"], "base0006")
+        .await;
+    fx.upload(build_id, "home", png(40, 30, [255, 255, 255, 255]))
+        .await;
+    assert_eq!(fx.finalize(build_id, None).await.status(), StatusCode::OK);
+
+    let build = fx.wait_for_terminal(build_id).await;
+    assert_eq!(build["status"].as_str(), Some("changes_detected"));
+    assert_eq!(build["total_count"].as_i64(), Some(3));
+    assert_eq!(
+        build["removed_count"].as_i64(),
+        Some(1),
+        "a story missing from the manifest must surface as removed"
+    );
+    assert_eq!(
+        build["unchanged_count"].as_i64(),
+        Some(2),
+        "home (re-captured, identical) and about (carried forward)"
+    );
+
+    let cmps = fx.comparisons(build_id).await;
+    assert_eq!(
+        find_comparison(&cmps, "pricing")["status"],
+        "removed",
+        "the vanished story is visible for review instead of being silently reused"
+    );
+    assert_eq!(find_comparison(&cmps, "about")["status"], "unchanged");
+}
+
+/// 何も撮らない計画（selected が空）は全エントリ流用で passed になる。
+/// 撮影前に固定された計画が「変更なし」を宣言しているので、これは偽 PASS ではない。
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_selection_plan_reuses_the_whole_baseline() {
     let fx = setup().await;
     fx.establish_baseline("base0002", png(40, 30, [255, 255, 255, 255]))
         .await;
 
     let build = fx.create_build("subset02").await;
     let build_id = build_id_of(&build);
-    let res = fx
-        .finalize(build_id, Some(json!({ "captured_names": [] })))
+    fx.attach_plan_ok(build_id, &[], &FULL_MANIFEST, "base0002")
         .await;
-    assert_eq!(res.status(), StatusCode::OK, "empty subset finalize");
+    let res = fx.finalize(build_id, None).await;
+    assert_eq!(res.status(), StatusCode::OK, "empty selection finalize");
 
     let build = fx.wait_for_terminal(build_id).await;
     assert_eq!(build["status"].as_str(), Some("passed"));
@@ -296,40 +386,82 @@ async fn empty_captured_set_reuses_the_whole_baseline() {
     assert_eq!(build["removed_count"].as_i64(), Some(0));
 }
 
-/// 宣言とアップロードの不一致（欠落・過剰）は finalize が 400 で拒否する。
+/// 「撮る集合」は保存済み計画からのみ来る。
+///
+/// - 計画なしのビルドへの `captured_names` は 400（自己申告だけの部分アップロードは
+///   撮影全滅時に「空の申告 == 空のアップロード」で偽 PASS するため受け付けない）
+/// - 計画ありでもアップロードが計画に満たなければ finalize は 400
+/// - 計画に無い名前のアップロードは upload 時点で 400
+///
+/// positive control: 申告を出所にする実装では最初の finalize
+/// （宣言 [] == アップロード 0 枚）が 200 で通ってしまい、このテストは落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn mismatched_captured_names_are_rejected() {
+async fn selection_comes_from_the_stored_plan_not_the_callers_declaration() {
     let fx = setup().await;
     fx.establish_baseline("base0003", png(40, 30, [255, 255, 255, 255]))
         .await;
 
-    // 宣言したのにアップロードが欠けている → 撮影失敗が流用に化けるので拒否。
-    let build = fx.create_build("subset03").await;
-    let build_id = build_id_of(&build);
-    fx.upload(build_id, "home", png(40, 30, [1, 2, 3, 255]))
-        .await;
+    // 計画なし + captured_names（空 = 全流用の主張）→ 400。
+    let unplanned = fx.create_build("noplan01").await;
+    let unplanned_id = build_id_of(&unplanned);
     let res = fx
-        .finalize(
-            build_id,
-            Some(json!({ "captured_names": ["home", "about"] })),
-        )
+        .finalize(unplanned_id, Some(json!({ "captured_names": [] })))
         .await;
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "missing upload");
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "captured_names without a pre-capture plan must be rejected"
+    );
+    let body = res.text().await.expect("body");
+    assert!(
+        body.contains("capture plan"),
+        "the error should point the caller at the plan endpoint: {body}"
+    );
 
-    // アップロードしたのに宣言に無い → 計画と実撮影のずれなので拒否。
-    let res = fx
-        .finalize(build_id, Some(json!({ "captured_names": [] })))
+    // 計画あり（home を撮るはず）なのに 1 枚もアップロードせず finalize → 400。
+    // 撮影が全滅したケース。ここが通ると全 baseline 流用の偽 PASS になる。
+    let planned = fx.create_build("plan0001").await;
+    let planned_id = build_id_of(&planned);
+    fx.attach_plan_ok(planned_id, &["home"], &FULL_MANIFEST, "base0003")
         .await;
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "undeclared upload");
+    let res = fx.finalize(planned_id, None).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-empty plan with zero uploads must not finalize"
+    );
 
-    // 一致させれば通る。
+    // 申告で計画を上書きすることもできない（申告 [] は計画と不一致で 400）。
     let res = fx
-        .finalize(build_id, Some(json!({ "captured_names": ["home"] })))
+        .finalize(planned_id, Some(json!({ "captured_names": [] })))
         .await;
-    assert_eq!(res.status(), StatusCode::OK, "matching declaration");
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "an empty declaration cannot override the stored plan"
+    );
+
+    // 計画に無い名前のアップロードは upload 時点で拒否される。
+    let res = fx
+        .app
+        .upload_screenshot(planned_id, &fx.token, "about", png(8, 8, [1, 2, 3, 255]))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "uploads outside the planned selection are rejected eagerly"
+    );
+
+    // 計画どおりアップロードすれば通る（captured_names のクロスチェックも一致）。
+    fx.upload(planned_id, "home", png(40, 30, [9, 9, 9, 255]))
+        .await;
+    let res = fx
+        .finalize(planned_id, Some(json!({ "captured_names": ["home"] })))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "plan fulfilled");
 }
 
-/// screenshots モードの only_story_ids は引き続き 400（名前ベースの captured_names を使う）。
+/// screenshots モードの only_story_ids は引き続き 400（capture plan を使う）。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_story_ids_is_still_rejected_for_screenshots_mode() {
     let fx = setup().await;
@@ -343,35 +475,34 @@ async fn only_story_ids_is_still_rejected_for_screenshots_mode() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let body = res.text().await.expect("body");
     assert!(
-        body.contains("captured_names"),
-        "the error should point the caller at captured_names: {body}"
+        body.contains("capture plan"),
+        "the error should point the caller at the plan endpoint: {body}"
     );
 }
 
-/// 比較に使う baseline はビルド作成時に固定される。
+/// 比較 baseline は計画添付時に固定される。
 ///
-/// 作成後に別ビルドの承認で最新 baseline が動いても、比較は固定した baseline に
+/// 添付後に別ビルドの承認で最新 baseline が動いても、比較は固定した baseline に
 /// 対して行われる（クライアントが計画に使った起点とずれない）。
 ///
-/// positive control: 比較時に最新 baseline を引き直す旧実装では、このビルドは
+/// positive control: 比較時に最新 baseline を引き直す実装では、このビルドは
 /// 新 baseline（home v2）と比較されて changes_detected になり、このテストは落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn comparison_uses_the_baseline_pinned_at_build_creation() {
+async fn comparison_uses_the_baseline_pinned_when_the_plan_was_attached() {
     let fx = setup().await;
     let home_v1 = png(40, 30, [255, 255, 255, 255]);
-    let first_build_id = fx.establish_baseline("base0004", home_v1.clone()).await;
+    fx.establish_baseline("base0004", home_v1.clone()).await;
     let (pinned_baseline_id, _) = fx.latest_baseline().await;
 
-    // このビルドは作成時点の baseline（home v1）に固定される。
-    // 作成レスポンスの baseline_commit_sha も固定値を指す。
+    // 計画添付でこのビルドは作成時点の baseline（home v1）に固定される。
     let pinned_build = fx.create_build("pinned01").await;
     let pinned_build_id = build_id_of(&pinned_build);
     assert_eq!(
         pinned_build["baseline_commit_sha"].as_str(),
-        Some("base0004"),
-        "creation response reports the pinned baseline's source commit"
+        Some("base0004")
     );
-    let _ = first_build_id;
+    fx.attach_plan_ok(pinned_build_id, &["home"], &FULL_MANIFEST, "base0004")
+        .await;
 
     // 別ビルドが home v2 で承認され、最新 baseline が入れ替わる。
     fx.establish_baseline("moved001", png(40, 30, [0, 0, 255, 255]))
@@ -379,13 +510,8 @@ async fn comparison_uses_the_baseline_pinned_at_build_creation() {
     let (latest_baseline_id, _) = fx.latest_baseline().await;
     assert_ne!(pinned_baseline_id, latest_baseline_id, "baseline moved");
 
-    // 固定済みビルドへ v1 と同一の home をアップロード → 固定 baseline と比較して passed。
+    // v1 と同一の home をアップロード → 固定 baseline と比較して passed。
     fx.upload(pinned_build_id, "home", home_v1).await;
-    fx.upload(pinned_build_id, "about", png(30, 30, [200, 200, 200, 255]))
-        .await;
-    fx.upload(pinned_build_id, "pricing", png(20, 20, [10, 200, 10, 255]))
-        .await;
-    // 計画の起点（作成時に受け取った baseline）を照合させて finalize する。
     let res = fx
         .finalize(
             pinned_build_id,
@@ -407,21 +533,33 @@ async fn comparison_uses_the_baseline_pinned_at_build_creation() {
     );
 }
 
-/// 計画の起点とビルドの固定 baseline がずれた finalize は 400 で拒否される。
+/// 計画の起点が古い（添付前に baseline が動いた）場合、添付は 409 で拒否される。
+/// 固定なしビルドへの expected_baseline_commit_sha も 400 で拒否される。
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_expected_baseline_is_rejected_at_finalize() {
+async fn stale_plan_basis_is_rejected() {
     let fx = setup().await;
     fx.establish_baseline("base0005", png(40, 30, [255, 255, 255, 255]))
         .await;
 
-    // baseline が動いた後に作られたビルドは新 baseline に固定される。
-    fx.establish_baseline("moved002", png(40, 30, [0, 255, 0, 255]))
-        .await;
+    // ビルド作成の後、添付の前に baseline が動く。
     let build = fx.create_build("stale001").await;
     let build_id = build_id_of(&build);
-    fx.upload(build_id, "home", png(8, 8, [1, 2, 3, 255])).await;
+    fx.establish_baseline("moved002", png(40, 30, [0, 255, 0, 255]))
+        .await;
 
-    // 旧 baseline を起点に計画したと主張する finalize → 固定値と不一致で 400。
+    // 旧 baseline を起点にした計画の添付 → 409（再計画が必要）。
+    let res = fx
+        .attach_plan(build_id, &["home"], &FULL_MANIFEST, "base0005")
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "stale plan basis");
+    let body = res.text().await.expect("body");
+    assert!(
+        body.contains("baseline moved"),
+        "error should say the baseline moved: {body}"
+    );
+
+    // 計画（= 固定 baseline）なしのビルドに expected を渡しても照合対象が無い → 400。
+    fx.upload(build_id, "home", png(8, 8, [1, 2, 3, 255])).await;
     let res = fx
         .finalize(
             build_id,
@@ -431,7 +569,45 @@ async fn stale_expected_baseline_is_rejected_at_finalize() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let body = res.text().await.expect("body");
     assert!(
-        body.contains("expected_baseline_commit_sha"),
-        "error should name the mismatched field: {body}"
+        body.contains("capture plan"),
+        "error should explain that verification needs a plan: {body}"
     );
+}
+
+/// 計画はアップロード開始前にしか添付できない（撮影結果からの逆算を断つ）。
+/// selected が manifest の部分集合でない計画・二重添付も拒否される。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_attachment_guards() {
+    let fx = setup().await;
+    fx.establish_baseline("base0007", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    // アップロード後の添付は 409。
+    let build = fx.create_build("guard001").await;
+    let build_id = build_id_of(&build);
+    fx.upload(build_id, "home", png(8, 8, [1, 2, 3, 255])).await;
+    let res = fx
+        .attach_plan(build_id, &["home"], &FULL_MANIFEST, "base0007")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "a plan attached after uploads could be derived from what happened to be captured"
+    );
+
+    // selected ⊄ manifest は 400。
+    let build = fx.create_build("guard002").await;
+    let build_id = build_id_of(&build);
+    let res = fx
+        .attach_plan(build_id, &["home", "ghost"], &FULL_MANIFEST, "base0007")
+        .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "selected ⊄ manifest");
+
+    // 正常添付ののち、二重添付は 409。
+    fx.attach_plan_ok(build_id, &["home"], &FULL_MANIFEST, "base0007")
+        .await;
+    let res = fx
+        .attach_plan(build_id, &["home"], &FULL_MANIFEST, "base0007")
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT, "double attach");
 }

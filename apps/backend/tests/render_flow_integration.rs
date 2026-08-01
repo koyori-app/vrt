@@ -345,16 +345,24 @@ impl Fixture {
     }
 
     /// `only_story_ids` を添えて finalize する（撮影対象を絞る）。
+    ///
+    /// 部分レンダリングは計画の起点 baseline の照合が必須になったため、
+    /// `expected_baseline_commit_sha`（= 差分計画の起点にした baseline の
+    /// 昇格元コミット）を常に添える。
     async fn finalize_with_only(
         &self,
         build_id: Uuid,
         only_story_ids: &[&str],
+        expected_baseline_commit_sha: &str,
     ) -> reqwest::Response {
         self.app
             .post_json_with_bearer(
                 &format!("/v1/ci/builds/{build_id}/finalize"),
                 &self.token,
-                json!({ "only_story_ids": only_story_ids }),
+                json!({
+                    "only_story_ids": only_story_ids,
+                    "expected_baseline_commit_sha": expected_baseline_commit_sha,
+                }),
             )
             .await
     }
@@ -698,7 +706,10 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
             .status(),
         StatusCode::CREATED
     );
-    let res = fx.finalize_with_only(build_b_id, &["demo-box--red"]).await;
+    // 計画の起点 = build A から昇格した baseline（コミット only001）。
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--red"], "only001")
+        .await;
     assert_eq!(res.status(), StatusCode::OK, "finalize with only_story_ids");
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
@@ -775,8 +786,9 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
         StatusCode::CREATED
     );
     // Red だけ指定。Green は指定に入れない（新規なので撮影されるはず）。
+    // 直前に build B（コミット only002）が承認されて baseline が進んでいる。
     assert_eq!(
-        fx.finalize_with_only(build_c_id, &["demo-box--red"])
+        fx.finalize_with_only(build_c_id, &["demo-box--red"], "only002")
             .await
             .status(),
         StatusCode::OK
@@ -818,17 +830,19 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
     assert_eq!(added, vec!["Demo/Box/Green"], "only the new story is added");
 }
 
-/// storybook の流用（`only_story_ids`）もビルド作成時に固定した baseline を使う。
+/// storybook の流用（`only_story_ids`）は、finalize が照合のうえ固定した baseline を使う。
 ///
-/// 作成後に別ビルドが承認されて最新 baseline が入れ替わっても、流用画像と比較対象は
-/// 固定した baseline から引く（クライアントが差分計画の起点にしたものとずれない）。
+/// 作成〜finalize の間に別ビルドが承認されて最新 baseline が入れ替わった場合、
+/// 古い起点のままの finalize は 400 で拒否される（流用画像と比較対象が計画と
+/// 別物になる前に断つ）。現在の baseline へ再計画すれば、その baseline が固定され、
+/// 流用画像・比較対象・`baseline_id` のすべてが一致する。
 ///
-/// positive control: 流用・比較時に最新 baseline を引き直す旧実装では、流用画像が
-/// 入れ替わり後の baseline（暗い赤）になり、`baseline_id` も新 baseline を指すため、
-/// このテストのバイト列比較と `baseline_id` の両方が落ちる。
+/// positive control: 起点の照合をせず finalize 時の最新へ黙って倒す実装では、
+/// 古い起点（pin0001）の finalize が 200 で通ってしまい、最初のアサートで落ちる。
 #[tokio::test(flavor = "multi_thread")]
-async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
-    if !chromium_or_skip("reuse_pulls_from_the_baseline_pinned_at_build_creation") {
+async fn stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baseline() {
+    if !chromium_or_skip("stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baseline")
+    {
         return;
     }
     let fx = setup().await;
@@ -852,9 +866,9 @@ async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "approve build A");
-    let (pinned_baseline_id, red_v1_key) = fx.latest_baseline_red_entry().await;
+    let (old_baseline_id, red_v1_key) = fx.latest_baseline_red_entry().await;
 
-    // ── ビルド B: この時点で作成 → baseline B1 に固定される ────────────────
+    // ── ビルド B: この時点で作成（差分計画の起点は B1 のつもり）─────────────
     let build_b = fx.create_storybook_build("pin0002").await;
     let build_b_id = build_id_of(&build_b);
     assert_eq!(
@@ -884,11 +898,21 @@ async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
         .await;
     assert_eq!(res.status(), StatusCode::OK, "approve build C");
     let (moved_baseline_id, red_v2_key) = fx.latest_baseline_red_entry().await;
-    assert_ne!(pinned_baseline_id, moved_baseline_id, "baseline moved");
+    assert_ne!(old_baseline_id, moved_baseline_id, "baseline moved");
 
-    // ── ビルド B を Blue だけ絞って finalize → Red は流用される ───────────
+    // ── 古い起点（B1 = pin0001）のままの部分 finalize は 400 ───────────────
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--blue"], "pin0001")
+        .await;
     assert_eq!(
-        fx.finalize_with_only(build_b_id, &["demo-box--blue"])
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a partial render planned against a baseline that has since moved must be rejected"
+    );
+
+    // ── 現在の baseline（B2 = pin0003）へ再計画すれば通り、B2 が固定される ──
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--blue"], "pin0003")
             .await
             .status(),
         StatusCode::OK
@@ -896,12 +920,12 @@ async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
     let build_b = fx.wait_for_terminal(build_b_id).await;
     assert_eq!(
         build_b["baseline_id"].as_str().map(|s| s.parse().unwrap()),
-        Some(pinned_baseline_id),
-        "the build must record the baseline pinned at creation, not the moved one"
+        Some(moved_baseline_id),
+        "the build must record the baseline verified and pinned at finalize"
     );
 
-    // 流用された Red のバイト列は固定 baseline（明るい赤）と一致し、
-    // 入れ替わり後の baseline（暗い赤）とは一致しない。
+    // 流用された Red のバイト列は固定した現行 baseline（暗い赤）と一致し、
+    // 旧 baseline（明るい赤）とは一致しない——流用元と照合済みの起点が同一。
     let shots = fx.screenshots(build_b_id).await;
     let red_shot = shots
         .iter()
@@ -912,17 +936,17 @@ async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
         .expect("read reused bytes");
     let v1 = service::screenshots::read_all(&fx.app.state.storage, &red_v1_key)
         .await
-        .expect("read pinned baseline bytes");
+        .expect("read old baseline bytes");
     let v2 = service::screenshots::read_all(&fx.app.state.storage, &red_v2_key)
         .await
-        .expect("read moved baseline bytes");
+        .expect("read current baseline bytes");
     assert_eq!(
-        reused, v1,
-        "reuse must copy from the pinned baseline (bright red)"
+        reused, v2,
+        "reuse must copy from the baseline pinned at finalize (dark red)"
     );
     assert_ne!(
-        reused, v2,
-        "reuse must not follow the baseline that moved after build creation"
+        reused, v1,
+        "reuse must not silently keep a stale planning basis"
     );
 }
 
@@ -936,7 +960,9 @@ async fn only_story_ids_is_rejected_for_screenshot_mode() {
     let build: Value = res.json().await.expect("build json");
     let build_id = build_id_of(&build);
 
-    let res = fx.finalize_with_only(build_id, &["button--primary"]).await;
+    let res = fx
+        .finalize_with_only(build_id, &["button--primary"], "whatever")
+        .await;
     assert_eq!(
         res.status(),
         StatusCode::BAD_REQUEST,
@@ -1145,7 +1171,7 @@ async fn build_logs_capture_render_and_compare_progress() {
         StatusCode::CREATED
     );
     assert_eq!(
-        fx.finalize_with_only(build_b_id, &["demo-box--red"])
+        fx.finalize_with_only(build_b_id, &["demo-box--red"], "log0001")
             .await
             .status(),
         StatusCode::OK

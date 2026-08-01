@@ -4,7 +4,8 @@
 //!
 //! 処理の流れ:
 //!
-//! 1. build / project をロードし、[`service::baselines::latest_for`] で baseline を解決
+//! 1. build / project をロードし、baseline を解決する（部分撮影が固定した
+//!    `builds.baseline_id` があればそれ、無ければ [`service::baselines::latest_for`]）
 //! 2. スクリーンショットと baseline エントリを **name で完全外部結合**し、
 //!    片側だけに存在するものを `added` / `removed` にする
 //! 3. 両側に存在するペアは PNG をストレージから読み、[`service::diff::diff_images`] を実行。
@@ -190,12 +191,16 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
     service::comparisons::delete_for_build(db, build_id).await?;
 
-    // baseline はビルド作成時に固定されたもの（`builds.baseline_id`）を使う。
-    // ここで最新を引き直すと、作成〜比較の間に別ビルドが承認された場合に
-    // クライアントが計画した baseline と違うものと比較してしまう。
+    // baseline の解決は 2 系統ある。
+    //
+    // - 部分撮影（capture plan / only_story_ids）が固定した `builds.baseline_id` が
+    //   あればそれを使う。ここで最新を引き直すと、計画〜比較の間に別ビルドが
+    //   承認された場合にクライアントが計画した baseline と違うものと比較してしまう。
+    // - 固定が無ければ従来どおり比較時点の最新を解決する（全撮影ビルド。
+    //   作成が古くても最新 baseline と比較できる——他ブランチの fallback を含む）。
     let baseline = match build.baseline_id {
         Some(id) => Some(service::baselines::get_baseline(db, id).await?),
-        None => None,
+        None => service::baselines::latest_for(db, &project, &build.branch).await?,
     };
     let baseline_entries = match &baseline {
         Some(b) => service::baselines::entries(db, b.id).await?,
@@ -203,14 +208,18 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     };
     let shots = service::screenshots::list_for_build(db, build_id).await?;
 
-    // screenshots モードの部分アップロード: 宣言集合の外にある baseline エントリは
-    // 「今回撮らなかった」だけで削除ではない。baseline の PNG をこのビルドの
-    // スクリーンショットとして複製してから通常の比較に入れる（unchanged になり、
-    // 承認時も全スクリーンショット昇格の経路がそのまま新 baseline へ引き継ぐ。
-    // storybook モードの only_story_ids 流用と同じ帰結）。
-    let shots = match captured_name_set(&build)? {
-        Some(selected) => {
-            materialize_carry_forward(state, &project, &build, &baseline_entries, &selected, shots)
+    // screenshots モードの部分アップロード: 撮影前に保存された capture plan の
+    // 選択集合の外にある baseline エントリは「今回撮らなかった」だけで削除ではない。
+    // baseline の PNG をこのビルドのスクリーンショットとして複製してから通常の
+    // 比較に入れる（unchanged になり、承認時も全スクリーンショット昇格の経路が
+    // そのまま新 baseline へ引き継ぐ。storybook モードの only_story_ids 流用と
+    // 同じ帰結）。ただし plan の manifest（現行 index）から消えた名前は複製せず、
+    // 完全外部結合で `removed` として報告させる——流用で削除を隠さない。
+    let shots = match service::builds::capture_plan(&build)
+        .map_err(|e| anyhow::anyhow!("read capture plan: {e}"))?
+    {
+        Some(plan) => {
+            materialize_carry_forward(state, &project, &build, &baseline_entries, &plan, shots)
                 .await?
         }
         None => shots,
@@ -354,24 +363,6 @@ impl Outcome {
     }
 }
 
-/// ビルドに宣言された「今回撮影した名前」の集合を取り出す。
-///
-/// `None` は全撮影（従来どおり）。宣言はサーバー自身が finalize で書いた値なので
-/// 配列以外の形は想定外＝壊れたデータとして即エラーにする（黙って全撮影として
-/// 読み替えると、宣言外の baseline エントリが removed になり誤承認で消える）。
-fn captured_name_set(build: &builds::Model) -> Result<Option<HashSet<String>>, anyhow::Error> {
-    let Some(value) = &build.captured_names else {
-        return Ok(None);
-    };
-    let names: Vec<String> = serde_json::from_value(value.clone()).map_err(|e| {
-        anyhow::anyhow!(
-            "build {} has malformed captured_names ({e}); refusing to compare",
-            build.id
-        )
-    })?;
-    Ok(Some(names.into_iter().collect()))
-}
-
 /// スクリーンショットが baseline 流用の複製（`metadata.reused == true`）か。
 fn is_reused(shot: &screenshots::Model) -> bool {
     shot.metadata
@@ -381,11 +372,16 @@ fn is_reused(shot: &screenshots::Model) -> bool {
         .unwrap_or(false)
 }
 
-/// 宣言集合の外にある baseline エントリを、このビルドのスクリーンショットとして複製する。
+/// 計画の選択集合の外にある baseline エントリを、このビルドのスクリーンショットとして複製する。
 ///
-/// finalize 時点の「宣言 == アップロード」検証をここでも再確認する。finalize の
-/// 検証と遷移の間に紛れ込んだアップロードや、宣言に無い名前の混入を、比較を
+/// finalize 時点の「計画 == アップロード」検証をここでも再確認する。finalize の
+/// 検証と遷移の間に紛れ込んだアップロードや、計画に無い名前の混入を、比較を
 /// 始める前に落とすための多重防御（流用の複製は `reused` メタデータで除外して数える）。
+///
+/// 複製するのは「選択外かつ現行 manifest に残っている」名前だけ。manifest から
+/// 消えた名前（story の削除）は複製せず、完全外部結合が `removed` として報告する。
+/// ここで無差別に複製すると、削除された story が unchanged に化けて永久に
+/// baseline へ残り続ける。
 ///
 /// リトライ安全性: 複製済みの名前はスキップするので、途中で落ちて再実行されても
 /// `(build_id, name)` の UNIQUE 制約にぶつからない。
@@ -394,32 +390,40 @@ async fn materialize_carry_forward(
     project: &projects::Model,
     build: &builds::Model,
     baseline_entries: &[baseline_entries::Model],
-    selected: &HashSet<String>,
+    plan: &service::builds::CapturePlan,
     shots: Vec<screenshots::Model>,
 ) -> Result<Vec<screenshots::Model>, anyhow::Error> {
     let db = &state.db;
+
+    let selected = plan.selected_set();
+    let manifest = plan.manifest_set();
 
     let uploaded: HashSet<&str> = shots
         .iter()
         .filter(|s| !is_reused(s))
         .map(|s| s.name.as_str())
         .collect();
-    let declared: HashSet<&str> = selected.iter().map(String::as_str).collect();
-    if uploaded != declared {
-        let mut missing: Vec<&&str> = declared.difference(&uploaded).collect();
-        let mut extra: Vec<&&str> = uploaded.difference(&declared).collect();
+    if uploaded != selected {
+        let mut missing: Vec<&&str> = selected.difference(&uploaded).collect();
+        let mut extra: Vec<&&str> = uploaded.difference(&selected).collect();
         missing.sort();
         extra.sort();
         anyhow::bail!(
-            "captured_names does not match the uploaded screenshots \
-             (declared but not uploaded: {missing:?}; uploaded but not declared: {extra:?})"
+            "the uploaded screenshots do not match the capture plan \
+             (planned but not uploaded: {missing:?}; uploaded but not planned: {extra:?})"
         );
     }
 
     let existing: HashSet<String> = shots.iter().map(|s| s.name.clone()).collect();
     let mut carried = 0usize;
+    let mut vanished = 0usize;
     for entry in baseline_entries {
-        if selected.contains(&entry.name) || existing.contains(&entry.name) {
+        if selected.contains(entry.name.as_str()) || existing.contains(&entry.name) {
+            continue;
+        }
+        if !manifest.contains(entry.name.as_str()) {
+            // 現行 index に存在しない = story が消えた。流用せず removed に倒す。
+            vanished += 1;
             continue;
         }
         // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
@@ -448,7 +452,19 @@ async fn materialize_carry_forward(
             db,
             build.id,
             LogLevel::Info,
-            format!("carried forward {carried} baseline screenshots outside the captured set"),
+            format!("carried forward {carried} baseline screenshots outside the planned set"),
+        )
+        .await?;
+    }
+    if vanished > 0 {
+        service::build_logs::append(
+            db,
+            build.id,
+            LogLevel::Info,
+            format!(
+                "{vanished} baseline entr{} no longer in the story manifest; reporting as removed",
+                if vanished == 1 { "y is" } else { "ies are" }
+            ),
         )
         .await?;
     }

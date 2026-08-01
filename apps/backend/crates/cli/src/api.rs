@@ -50,6 +50,14 @@ struct FinalizeBody<'a> {
     expected_baseline_commit_sha: Option<&'a str>,
 }
 
+/// capture plan 添付のリクエストボディ（payload::builds::AttachCapturePlanRequest に一致）。
+#[derive(Debug, Serialize)]
+struct AttachPlanBody<'a> {
+    selected_names: &'a [String],
+    manifest_names: &'a [String],
+    baseline_commit_sha: &'a str,
+}
+
 /// BuildResponse のうち CLI が使うフィールドだけ受ける。
 ///
 /// `status` はサーバー側 enum に密結合しないよう文字列で受ける。
@@ -142,6 +150,32 @@ impl Client {
             .await
             .context("create build request failed")?;
         Self::read_json(resp, "create build").await
+    }
+
+    /// 部分アップロード計画（capture plan）をビルドへ固定する。
+    ///
+    /// 撮影を始める前に呼ぶこと。サーバーは計画の起点 `baseline_commit_sha` が
+    /// いまも最新の baseline であることを確認してから比較対象を固定する。
+    /// baseline が動いていた場合は 409 が返るので、計画を作り直す。
+    pub async fn attach_plan(
+        &self,
+        build_id: &str,
+        selected_names: &[String],
+        manifest_names: &[String],
+        baseline_commit_sha: &str,
+    ) -> Result<BuildResponse> {
+        let url = format!("{}/v1/ci/builds/{}/plan", self.base_url, build_id);
+        let resp = self
+            .bearer(self.http.post(&url))
+            .json(&AttachPlanBody {
+                selected_names,
+                manifest_names,
+                baseline_commit_sha,
+            })
+            .send()
+            .await
+            .context("attach capture plan request failed")?;
+        Self::read_json(resp, "attach capture plan").await
     }
 
     /// Storybook バンドル（zip）を multipart でアップロードする。
