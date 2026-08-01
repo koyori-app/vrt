@@ -198,11 +198,7 @@ mod tests {
         git_in(root, &["update-ref", "refs/heads/-hyphen-branch", &c3]);
 
         let without_eoo = Command::new("git")
-            .args([
-                "rev-parse",
-                "--verify",
-                "-hyphen-branch^{commit}",
-            ])
+            .args(["rev-parse", "--verify", "-hyphen-branch^{commit}"])
             .current_dir(root)
             .output()
             .expect("spawn git");
