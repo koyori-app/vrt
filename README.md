@@ -224,8 +224,8 @@ esac
 
 `plan` が `capture_all` に倒れる条件は `--only-changed` と同じで、次を含む。
 
-- baseline がまだ無い（初回や新規ブランチ）
-- baseline コミットが手元に無く `git diff` が取れない（`fetch-depth: 0` で clone する）
+- サーバー解決経路で baseline がまだ無い（初回や新規ブランチ）
+- サーバー解決経路で baseline コミットが手元に無く `git diff` が取れない（`fetch-depth: 0` で clone する）
 - `preview-stats.json` が無い、または壊れている
 - `index.json` が壊れている
 - `package.json` や lockfile、`.storybook/` 配下の変更
@@ -233,6 +233,9 @@ esac
 
 baseline を自分で決めている場合は `--baseline-commit <sha>` を渡せる。
 その場合はビルドを作らないので、ネットワークにも触らず `build_id` キーも省略される。
+**`--baseline-commit` を明示した経路では**、指定した rev が手元に無い・解決できない・
+`git diff` が取れないときは `capture_all` へ倒さず **終了コード 2** で落ちる
+（設定ミスを黙って全撮影に読み替えない）。
 
 `--baseline-commit` を渡さずサーバーから baseline を解決する経路では、計画用の
 `screenshots` ビルドが作成される。撮影結果をその `build_id` に送らず放置すると
@@ -332,13 +335,16 @@ finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
   を出す（既定の探索先は `<dir>/preview-stats.json`、`--stats-json` で変更可）。
   無い場合は警告して全撮影にフォールバックする
 - **git 履歴が baseline コミットまで必要**: 差分は
-  `git diff <baseline> HEAD` で取る。shallow clone で baseline が手元に無いと
+  `git diff <baseline> <commit>` で取る（`<commit>` は `--commit` 解決値、
+  未指定なら worktree の `HEAD`）。shallow clone で baseline が手元に無いと
   全撮影に倒れる。CI では `fetch-depth: 0`（または baseline に届く深さ）で clone する
-- **自動で全撮影に倒れるケース**: baseline がまだ無い（初回・新規ブランチ）、
+- **自動で全撮影に倒れるケース**: サーバーから返った baseline がまだ無い（初回・新規ブランチ）、
   `package.json` / lockfile（`pnpm-lock.yaml` / `yarn.lock` / `package-lock.json`）
   の変更、`.storybook/` 配下の変更、依存グラフに載っていない変更ファイル
   （拾い漏れを避けるため安全側に倒す）。`*.md` などレンダリングに無関係な
   グラフ外ファイルは無視する
+- **`--commit`**: ビルド記録と差分終点の両方に使う。worktree の `HEAD` と異なる
+  SHA を渡したとき、選別はその明示 SHA までの差分だけを見る（`HEAD` には追従しない）
 
 #### 低レベル API（curl で直接叩く）
 

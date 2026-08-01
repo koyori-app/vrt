@@ -41,8 +41,13 @@ pub fn current_branch() -> Result<String> {
 ///
 /// 存在確認も兼ねる。`main` や `HEAD~1` などの ref 名も受け付ける。
 pub fn resolve_commit(rev: &str) -> Result<String> {
-    git(&["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
-        .with_context(|| format!("could not resolve commit {rev}"))
+    git(&[
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        &format!("{rev}^{{commit}}"),
+    ])
+    .with_context(|| format!("could not resolve commit {rev}"))
 }
 
 /// 現在の commit SHA（`git rev-parse HEAD`）。
@@ -181,5 +186,42 @@ mod tests {
         let _guard = ChdirGuard::change_to(tmp.path());
         let files = changed_files(&c1, &c2).expect("diff");
         assert_eq!(files, vec!["a.txt".to_string()]);
+    }
+
+    /// ハイフン始まりの ref は `--end-of-options` 無しだと git がオプション解釈する。
+    /// 修正前の `resolve_commit` はここで失敗する positive control。
+    #[test]
+    fn resolve_commit_accepts_hyphen_prefixed_ref() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, _c2, c3) = init_linear_repo();
+        let root = tmp.path();
+        git_in(
+            root,
+            &[
+                "update-ref",
+                "refs/heads/-hyphen-branch",
+                &c3,
+            ],
+        );
+
+        let without_eoo = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                &format!("-hyphen-branch^{{commit}}"),
+            ])
+            .current_dir(root)
+            .output()
+            .expect("spawn git");
+        assert!(
+            !without_eoo.status.success(),
+            "without --end-of-options, hyphen-prefixed rev must not resolve; stderr={}",
+            String::from_utf8_lossy(&without_eoo.stderr)
+        );
+
+        let _guard = ChdirGuard::change_to(root);
+        let oid = resolve_commit("-hyphen-branch").expect("hyphen-prefixed ref");
+        assert_eq!(oid, c3);
+        assert_eq!(oid.len(), 40);
     }
 }
