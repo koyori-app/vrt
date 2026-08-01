@@ -16,12 +16,16 @@ use bytes::Bytes;
 use chrono::Utc;
 use image::{ImageFormat, RgbaImage};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, prelude::Uuid,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
+    EntityTrait, QueryFilter, QueryOrder, prelude::Uuid,
 };
 
+use common::db::with_transaction;
 use common::error::AppError;
-use entity::screenshots;
+use entity::{
+    builds::{BuildMode, BuildStatus},
+    screenshots,
+};
 
 use crate::storage::{ByteStream, StorageBackend, StorageError};
 
@@ -210,6 +214,111 @@ pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
     }
     .insert(db)
     .await?)
+}
+
+/// CI からの直アップロード（`POST /v1/ci/builds/{id}/screenshots`）用の保存経路。
+///
+/// [`store_screenshot`] と違い、ビルド状態の検査（pending / screenshots モード /
+/// capture plan の選択内 / 同名重複）を **build 行ロックの中で** DB 挿入と
+/// 同時に行う。ハンドラの事前検査だけでは、計画添付（`attach_capture_plan`）と
+/// 並行したアップロードが「添付前の検査を通った計画外ショット」として
+/// 紛れ込みうる——添付側の「アップロード済みなら 409」という逆算防止も
+/// 素通りする（直列化の規約は [`crate::review_lock`]）。
+///
+/// ストレージ保存は行ロックの**前**に行い、検査に落ちたら保存済みオブジェクトを
+/// 補償削除する。ロックを保持したままストレージ IO を待つと、計画添付や
+/// finalize まで巻き添えでブロックされるためである。キーは新規 UUID を含むので、
+/// 先行保存が既存オブジェクトと衝突することはない。
+pub async fn store_ci_screenshot(
+    db: &DatabaseConnection,
+    storage: &Arc<dyn StorageBackend>,
+    tenant_id: Uuid,
+    project_id: Uuid,
+    build_id: Uuid,
+    name: String,
+    bytes: Bytes,
+) -> Result<screenshots::Model, AppError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(AppError::BadRequestDetail("name is required".into()));
+    }
+    if name.len() > 255 {
+        return Err(AppError::BadRequestDetail(
+            "name must be 255 characters or fewer".into(),
+        ));
+    }
+    let (width, height) = validate_png(&bytes)?;
+
+    let screenshot_id = Uuid::new_v4();
+    let key = screenshot_key(tenant_id, project_id, build_id, screenshot_id);
+    upload_png(storage, &key, bytes)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("upload screenshot: {e}")))?;
+
+    let stored_key = key.clone();
+    let inserted: Result<screenshots::Model, AppError> = with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // ロック順 1（build のみ）。状態・計画はこの取り直した行を正とする。
+            let build = crate::review_lock::build(txn, build_id).await?;
+            if build.status != BuildStatus::Pending {
+                return Err(AppError::Conflict);
+            }
+            if build.mode != BuildMode::Screenshots {
+                return Err(AppError::Conflict);
+            }
+            // capture plan が固定されたビルドは、計画で選択された名前しか受け付けない。
+            // 計画外の名前を黙って受けると、finalize の「計画 == アップロード」検証が
+            // そこで初めて落ちるまで撮影のずれに気づけない。
+            if let Some(plan) = crate::builds::capture_plan(&build)?
+                && !plan.selected_names.iter().any(|n| n == &name)
+            {
+                return Err(AppError::BadRequestDetail(format!(
+                    "screenshot `{name}` is not in the capture plan attached to this build; \
+                     only planned names can be uploaded (re-run the plan if the selection changed)"
+                )));
+            }
+
+            let duplicate = screenshots::Entity::find()
+                .filter(screenshots::Column::BuildId.eq(build_id))
+                .filter(screenshots::Column::Name.eq(name.clone()))
+                .one(txn)
+                .await?;
+            if duplicate.is_some() {
+                return Err(AppError::Conflict);
+            }
+
+            Ok(screenshots::ActiveModel {
+                id: Set(screenshot_id),
+                build_id: Set(build_id),
+                name: Set(name),
+                storage_key: Set(stored_key),
+                width: Set(width as i32),
+                height: Set(height as i32),
+                metadata: Set(None),
+                created_at: Set(Utc::now().fixed_offset()),
+            }
+            .insert(txn)
+            .await?)
+        })
+    })
+    .await;
+
+    match inserted {
+        Ok(model) => Ok(model),
+        Err(err) => {
+            // 検査に落ちた・挿入できなかったオブジェクトを補償削除する（ベストエフォート）。
+            // 失敗しても行が無い以上どこからも参照されず、実害はゴミオブジェクトのみ。
+            if let Err(delete_err) = storage.delete(&key).await {
+                tracing::warn!(
+                    %build_id,
+                    key = %key,
+                    error = %delete_err,
+                    "failed to delete the storage object of a rejected screenshot upload"
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 /// ビルドのスクリーンショット一覧（名前順）。

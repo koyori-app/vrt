@@ -225,6 +225,8 @@ pub async fn upload_screenshot(
     let (build, project) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
+    // 事前検査（バイト列を読む前の速い失敗）。正とするのは store_ci_screenshot が
+    // build 行ロックの中で行う再検査で、ここは並行変更に対して権威を持たない。
     // finalize 後のアップロードは受け付けない。
     if build.status != BuildStatus::Pending {
         return Err(AppError::Conflict);
@@ -272,19 +274,10 @@ pub async fn upload_screenshot(
     let name = name.ok_or_else(|| AppError::BadRequestDetail("name field is required".into()))?;
     let file = file.ok_or_else(|| AppError::BadRequestDetail("file field is required".into()))?;
 
-    // capture plan が固定されたビルドは、計画で選択された名前しか受け付けない。
-    // 計画外の名前を黙って受けると、finalize の「計画 == アップロード」検証が
-    // そこで初めて落ちるまで撮影のずれに気づけない。
-    if let Some(plan) = build_service::capture_plan(&build)?
-        && !plan.selected_names.iter().any(|n| n == &name)
-    {
-        return Err(AppError::BadRequestDetail(format!(
-            "screenshot `{name}` is not in the capture plan attached to this build; \
-             only planned names can be uploaded (re-run the plan if the selection changed)"
-        )));
-    }
-
-    let screenshot = screenshot_service::store_screenshot(
+    // 状態・モード・capture plan（計画外の名前は 400）・重複の権威ある検査は、
+    // build 行ロックの中で DB 挿入と同時に行う。計画添付との並行競合で
+    // 「添付前の検査を通った計画外ショット」が紛れ込むのを防ぐ。
+    let screenshot = screenshot_service::store_ci_screenshot(
         &state.db,
         &state.storage,
         project.tenant_id,

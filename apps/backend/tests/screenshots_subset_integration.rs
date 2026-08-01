@@ -574,6 +574,94 @@ async fn stale_plan_basis_is_rejected() {
     );
 }
 
+/// plan 添付と upload は build 行ロック（review_lock::build）で直列化される。
+///
+/// 添付処理が build 行をロックしている間に届いたアップロードは、添付の commit
+/// までブロックされ、commit 後に保存済み計画で検証される。ここでは「計画外の
+/// 名前」を送るので 400 になり、DB 行も残らない（ストレージは補償削除）。
+///
+/// positive control: ロックの無い実装（build 行ロックを取らずに挿入する旧経路）
+/// では、アップロードは添付中でも待たされず即 201 で通り、
+/// `!handle.is_finished()` と最終ステータス 400 の両方が落ちる。
+/// これは「計画添付前の検査をすり抜けた計画外ショット」そのものであり、
+/// アップロード実績から計画を逆算する偽 PASS 経路（添付時の
+/// 「アップロード済みなら 409」検査の素通り）と同型である。
+#[tokio::test(flavor = "multi_thread")]
+async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
+    use sea_orm::{
+        ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
+        TransactionTrait,
+    };
+
+    let fx = setup().await;
+    fx.establish_baseline("base0008", png(40, 30, [255, 255, 255, 255]))
+        .await;
+    let build = fx.create_build("serial01").await;
+    let build_id = build_id_of(&build);
+    let (baseline_id, _) = fx.latest_baseline().await;
+
+    // 添付処理の途中を再現する: build 行ロックを保持したまま止まっている
+    // トランザクション（attach_capture_plan がロック直後で停止している状態）。
+    let txn = fx.app.state.db.begin().await.expect("begin");
+    let locked = service::review_lock::build(&txn, build_id)
+        .await
+        .expect("lock build row");
+
+    // その間に届いた「計画外の名前」のアップロード（home だけ撮る計画になる）。
+    let base_url = fx.app.base_url().to_string();
+    let token = fx.token.clone();
+    let handle = tokio::spawn(async move {
+        let part = reqwest::multipart::Part::bytes(png(8, 8, [1, 2, 3, 255]))
+            .file_name("pricing.png")
+            .mime_str("image/png")
+            .expect("png mime");
+        let form = reqwest::multipart::Form::new()
+            .text("name", "pricing")
+            .part("file", part);
+        reqwest::Client::new()
+            .post(format!("{base_url}/v1/ci/builds/{build_id}/screenshots"))
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await
+            .expect("multipart upload")
+            .status()
+    });
+
+    // ロックが効いていればアップロードは commit まで完了できない。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !handle.is_finished(),
+        "the upload must block on the build row lock while a plan attachment is in flight"
+    );
+
+    // ロックを保持したまま計画を添付して commit（home のみ選択）。
+    let mut active: entity::builds::ActiveModel = locked.into();
+    active.capture_plan = Set(Some(serde_json::json!({
+        "selected_names": ["home"],
+        "manifest_names": FULL_MANIFEST,
+    })));
+    active.baseline_id = Set(Some(baseline_id));
+    active.update(&txn).await.expect("attach plan under the lock");
+    txn.commit().await.expect("commit");
+
+    // commit 後、アップロードは保存済み計画で検証されて 400 で落ちる。
+    let status = handle.await.expect("join upload");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an out-of-plan upload that raced the attachment must be rejected, not inserted"
+    );
+
+    // DB 行は残らない（補償が効いている）。
+    let rows = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .count(&fx.app.state.db)
+        .await
+        .expect("count screenshots");
+    assert_eq!(rows, 0, "the rejected upload must not leave a screenshot row");
+}
+
 /// 計画はアップロード開始前にしか添付できない（撮影結果からの逆算を断つ）。
 /// selected が manifest の部分集合でない計画・二重添付も拒否される。
 #[tokio::test(flavor = "multi_thread")]
