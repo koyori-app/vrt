@@ -228,10 +228,7 @@ fn plan_normalizes_baseline_ref_to_full_oid() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
-    assert_eq!(
-        value["baseline_commit_sha"].as_str().expect("baseline"),
-        c2
-    );
+    assert_eq!(value["baseline_commit_sha"].as_str().expect("baseline"), c2);
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), head);
 }
 
@@ -264,10 +261,7 @@ fn plan_diff_uses_explicit_commit_not_worktree_head() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
-    assert_eq!(
-        value["baseline_commit_sha"].as_str().expect("baseline"),
-        c1
-    );
+    assert_eq!(value["baseline_commit_sha"].as_str().expect("baseline"), c1);
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), c2);
     assert_ne!(
         value["head_commit_sha"].as_str().expect("head"),
