@@ -311,6 +311,27 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
         );
     }
 
+    // carry-forward 複製は (build_id, name) から導出した決定的 ID を使う。
+    // ジョブのリトライ・再実行が同じストレージキーへ収束し、upload と insert の
+    // 間で落ちた孤児オブジェクトが再実行で回収される前提を固定する。
+    {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        for name in ["about", "pricing"] {
+            let row = entity::screenshots::Entity::find()
+                .filter(entity::screenshots::Column::BuildId.eq(build_id))
+                .filter(entity::screenshots::Column::Name.eq(name))
+                .one(&fx.app.state.db)
+                .await
+                .expect("query carried shot")
+                .expect("carried shot exists");
+            assert_eq!(
+                row.id,
+                service::screenshots::carry_forward_screenshot_id(build_id, name),
+                "carried-forward `{name}` must use the deterministic id so retries converge"
+            );
+        }
+    }
+
     // 承認しても選択外のエントリは baseline に残る（消滅しない）。
     fx.approve_force(build_id).await;
     let (_, names) = fx.latest_baseline().await;
@@ -642,7 +663,10 @@ async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
         "manifest_names": FULL_MANIFEST,
     })));
     active.baseline_id = Set(Some(baseline_id));
-    active.update(&txn).await.expect("attach plan under the lock");
+    active
+        .update(&txn)
+        .await
+        .expect("attach plan under the lock");
     txn.commit().await.expect("commit");
 
     // commit 後、アップロードは保存済み計画で検証されて 400 で落ちる。
@@ -659,7 +683,10 @@ async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
         .count(&fx.app.state.db)
         .await
         .expect("count screenshots");
-    assert_eq!(rows, 0, "the rejected upload must not leave a screenshot row");
+    assert_eq!(
+        rows, 0,
+        "the rejected upload must not leave a screenshot row"
+    );
 }
 
 /// 計画はアップロード開始前にしか添付できない（撮影結果からの逆算を断つ）。

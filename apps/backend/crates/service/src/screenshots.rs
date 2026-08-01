@@ -53,6 +53,22 @@ pub fn diff_key(tenant_id: Uuid, project_id: Uuid, build_id: Uuid, comparison_id
     format!("tenants/{tenant_id}/projects/{project_id}/builds/{build_id}/diffs/{comparison_id}.png")
 }
 
+/// carry-forward 複製（baseline 流用ショット）の決定的なスクリーンショット ID。
+///
+/// `(build_id, name)` から UUIDv5 で導出するため、比較ジョブのリトライ・再実行が
+/// 何度走っても同じ ID・同じストレージキーに収束する。
+///
+/// - 前回の実行が「ストレージへ保存 → DB 挿入」の間で落ちても、再実行は同じ
+///   キーへ上書き保存して行を挿入するので、孤児オブジェクトが自然に回収される
+/// - 並行二重実行でも同じキーへの上書き PUT と `(build_id, name)` UNIQUE への
+///   upsert に収束し、重複行・重複オブジェクトが生じない
+pub fn carry_forward_screenshot_id(build_id: Uuid, name: &str) -> Uuid {
+    // 固定文字列から導出した専用名前空間。通常アップロード（ランダム v4）と
+    // 衝突しないよう、v5 の決定的空間に閉じ込める。
+    let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, b"vrt:carry-forward");
+    Uuid::new_v5(&namespace, format!("{build_id}/{name}").as_bytes())
+}
+
 /// PNG のマジックバイトと寸法を検証する。デコードできない画像はここで弾く。
 pub fn validate_png(bytes: &[u8]) -> Result<(u32, u32), AppError> {
     if bytes.len() > MAX_UPLOAD_BYTES {
@@ -420,6 +436,27 @@ mod tests {
         // ローカルバックエンドのキー検証を通ること（パストラバーサル無し）。
         assert!(!shot_key.contains(".."));
         assert!(!shot_key.starts_with('/'));
+    }
+
+    #[test]
+    fn carry_forward_id_is_deterministic_per_build_and_name() {
+        let build_a = Uuid::new_v4();
+        let build_b = Uuid::new_v4();
+
+        // 同じ (build, name) は常に同じ ID（リトライが同じキーへ収束する根拠）。
+        assert_eq!(
+            carry_forward_screenshot_id(build_a, "home"),
+            carry_forward_screenshot_id(build_a, "home"),
+        );
+        // build か name が違えば別 ID。
+        assert_ne!(
+            carry_forward_screenshot_id(build_a, "home"),
+            carry_forward_screenshot_id(build_a, "about"),
+        );
+        assert_ne!(
+            carry_forward_screenshot_id(build_a, "home"),
+            carry_forward_screenshot_id(build_b, "home"),
+        );
     }
 
     #[test]

@@ -372,6 +372,38 @@ fn is_reused(shot: &screenshots::Model) -> bool {
         .unwrap_or(false)
 }
 
+/// 一時的でありうる失敗（ストレージ IO 等）を短いバックオフ付きでやり直す。
+///
+/// carry-forward は 1 エントリごとに download → upload → insert の 3 段で、
+/// どの段の一時失敗も従来はそのままビルドの failed 直行だった（[`process`] は
+/// `run` の Err を mark_failed に落とす）。ジョブ全体を apalis のリトライへ
+/// 返す設計にすると、リトライ枯渇時に mark_failed を通らずビルドが
+/// processing のまま宙吊りになるため、リトライは**ジョブ内**で行い、
+/// 使い切ったときだけ従来どおり failed へ落とす。
+async fn with_transient_retries<T, F, Fut>(what: &str, mut f: F) -> Result<T, anyhow::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    const ATTEMPTS: u64 = 3;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=ATTEMPTS {
+        match f().await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if attempt < ATTEMPTS {
+                    tracing::warn!(attempt, what, error = %e, "carry-forward step failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(200 * attempt)).await;
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last
+        .expect("at least one attempt ran")
+        .context(format!("{what} (after {ATTEMPTS} attempts)")))
+}
+
 /// 計画の選択集合の外にある baseline エントリを、このビルドのスクリーンショットとして複製する。
 ///
 /// finalize 時点の「計画 == アップロード」検証をここでも再確認する。finalize の
@@ -383,8 +415,33 @@ fn is_reused(shot: &screenshots::Model) -> bool {
 /// ここで無差別に複製すると、削除された story が unchanged に化けて永久に
 /// baseline へ残り続ける。
 ///
-/// リトライ安全性: 複製済みの名前はスキップするので、途中で落ちて再実行されても
-/// `(build_id, name)` の UNIQUE 制約にぶつからない。
+/// ## 物理複製を選ぶ理由（baseline 参照の流用にしない）
+///
+/// baseline エントリの `storage_key` を今回のショット行から直接参照すれば
+/// DB トランザクションだけで完結するが、それは**ビルドをまたいだキー共有**を
+/// 新設することになる。`prune_old_builds` は「ビルドのオブジェクトはビルドと
+/// 共に死ぬ」を前提に、baseline の参照元ビルドだけを保護してストレージを
+/// 削除する——古い参照元ビルドが保護から外れた時点で、それを参照し続ける
+/// 新しいビルドのショット（と、その承認で昇格した新 baseline のエントリ）が
+/// ぶら下がりになる。参照方式には参照カウント相当の寿命管理の作り直しが要り、
+/// 本 PR の範囲を超えるため、複製で「キーはビルド内に閉じる」性質を保つ。
+///
+/// ## 非原子性への対処（決定的キー + upsert + リトライ + 補償削除）
+///
+/// download → upload → insert は原子的にできない（ストレージは DB
+/// トランザクションに参加しない）。代わりに:
+///
+/// - スクリーンショット ID を `(build_id, name)` から決定的に導出する
+///   （[`service::screenshots::carry_forward_screenshot_id`]）。upload と insert の
+///   間で落ちても、再実行が**同じキー**へ上書き保存して行を挿すため、
+///   孤児オブジェクトは再実行で自然に回収される
+/// - insert は `(build_id, name)` UNIQUE への `ON CONFLICT DO NOTHING`。
+///   再実行・並行実行が重複行エラーで落ちない
+/// - 各段は [`with_transient_retries`] で短いリトライを持ち、一時的な
+///   ストレージ/DB の失敗が即ビルド failed に直行しない
+/// - insert がリトライ後も失敗し、かつ行が存在しないと確認できた場合だけ、
+///   アップロード済みオブジェクトを補償削除する（行が確認できないときは
+///   消さない——既存行が参照するオブジェクトを壊さない側に倒す）
 async fn materialize_carry_forward(
     state: &JobState,
     project: &projects::Model,
@@ -393,6 +450,9 @@ async fn materialize_carry_forward(
     plan: &service::builds::CapturePlan,
     shots: Vec<screenshots::Model>,
 ) -> Result<Vec<screenshots::Model>, anyhow::Error> {
+    use sea_orm::sea_query::OnConflict;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
     let db = &state.db;
 
     let selected = plan.selected_set();
@@ -426,24 +486,90 @@ async fn materialize_carry_forward(
             vanished += 1;
             continue;
         }
+
         // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
         // バイト列が同一なので、後段の比較が unchanged と判定する
-        // （render_build.rs の Reuse 経路と同じ手口）。
-        let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("download baseline for `{}`: {e}", entry.name))?;
-        service::screenshots::store_screenshot_with_metadata(
-            db,
-            &state.storage,
+        // （render_build.rs の Reuse 経路と同じ手口）。寸法は baseline エントリの
+        // 記録値を引き継ぐ（バイト列同一なので再デコード検証は不要）。
+        let screenshot_id =
+            service::screenshots::carry_forward_screenshot_id(build.id, &entry.name);
+        let key = service::screenshots::screenshot_key(
             project.tenant_id,
             project.id,
             build.id,
-            entry.name.clone(),
-            bytes::Bytes::from(png),
-            Some(serde_json::json!({ "reused": true })),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("store carried-forward screenshot `{}`: {e}", entry.name))?;
+            screenshot_id,
+        );
+
+        let png = with_transient_retries("download baseline PNG", || async {
+            service::screenshots::read_all(&state.storage, &entry.storage_key)
+                .await
+                .map_err(|e| anyhow::anyhow!("download baseline for `{}`: {e}", entry.name))
+        })
+        .await?;
+        let png = bytes::Bytes::from(png);
+
+        with_transient_retries("upload carried-forward copy", || {
+            let png = png.clone();
+            let key = key.clone();
+            async move {
+                service::screenshots::upload_png(&state.storage, &key, png)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("upload carried-forward `{}`: {e}", entry.name))
+            }
+        })
+        .await?;
+
+        let active = screenshots::ActiveModel {
+            id: sea_orm::ActiveValue::Set(screenshot_id),
+            build_id: sea_orm::ActiveValue::Set(build.id),
+            name: sea_orm::ActiveValue::Set(entry.name.clone()),
+            storage_key: sea_orm::ActiveValue::Set(key.clone()),
+            width: sea_orm::ActiveValue::Set(entry.width),
+            height: sea_orm::ActiveValue::Set(entry.height),
+            metadata: sea_orm::ActiveValue::Set(Some(serde_json::json!({ "reused": true }))),
+            created_at: sea_orm::ActiveValue::Set(Utc::now().fixed_offset()),
+        };
+        let inserted = with_transient_retries("insert carried-forward row", || {
+            let active = active.clone();
+            async move {
+                screenshots::Entity::insert(active)
+                    .on_conflict(
+                        OnConflict::columns([
+                            screenshots::Column::BuildId,
+                            screenshots::Column::Name,
+                        ])
+                        .do_nothing()
+                        .to_owned(),
+                    )
+                    .exec_without_returning(db)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("store carried-forward screenshot `{}`: {e}", entry.name)
+                    })
+            }
+        })
+        .await;
+
+        if let Err(insert_err) = inserted {
+            // 行が確実に存在しない場合だけ、アップロード済みオブジェクトを補償削除する。
+            // 存在確認自体に失敗したら消さない（既存行の実体を壊す方が高くつく）。
+            let row_absent = screenshots::Entity::find()
+                .filter(screenshots::Column::BuildId.eq(build.id))
+                .filter(screenshots::Column::Name.eq(entry.name.clone()))
+                .one(db)
+                .await
+                .map(|row| row.is_none())
+                .unwrap_or(false);
+            if row_absent && let Err(delete_err) = state.storage.delete(&key).await {
+                tracing::warn!(
+                    build_id = %build.id,
+                    key = %key,
+                    error = %delete_err,
+                    "failed to delete an orphaned carried-forward object"
+                );
+            }
+            return Err(insert_err);
+        }
         carried += 1;
     }
 
