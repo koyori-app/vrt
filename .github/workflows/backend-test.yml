@@ -2,7 +2,9 @@ name: Backend Test
 
 on:
   push:
-    branches: [main]
+    # pc/**: 使い捨ての positive-control 枝で CI 証拠を採るための一時トリガー
+    # （枝ごと削除される。main には入らない）
+    branches: [main, 'pc/**']
     paths:
       - 'apps/backend/**'
       - 'rust-toolchain.toml'

@@ -1217,4 +1217,51 @@ mod tests {
 
         let _keep_tmp = tmp;
     }
+
+    /// 【positive control・使い捨て枝】修正前 head (9c07964) の欠陥の存在証明。
+    ///
+    /// commit A(=c2) でビルド・stamp された成果物を保持したまま、
+    /// commit B(=c3, HEAD) で `vrt stamp -- true`（何も生成しない no-op 命令）を
+    /// 走らせると、build 前の無効化が無いため「build 成功」後も A の成果物が
+    /// そのまま残り、stamp は exit 0 で成功して **A の成果物に B の v2
+    /// provenance が付く**。その成果物は B に対する検証（verify）まで通る。
+    ///
+    /// このテストが**緑**であること自体が欠陥の存在証拠である。修正後
+    /// （build 前に provenance / stats / index を無効化する head）では
+    /// run_stamp が stats 不在で失敗し、このテストは構造的に成立しない。
+    #[test]
+    fn pc_noop_build_blesses_stale_artifacts_before_the_fix() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, c2, c3, frontend_cwd) = init_story_diff_repo();
+        // 成果物は commit A(=c2) でビルドされた体（古いキャッシュの再現）。
+        let artifact = stamped_graph_artifact(&c2);
+        // repo は commit B(=c3, HEAD) の clean な checkout。
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        run_stamp(StampArgs {
+            dir: artifact.path().to_path_buf(),
+            stats_json: None,
+            index_json: None,
+            build_command: vec!["true".to_string()],
+        })
+        .expect("BEFORE THE FIX: a no-op build stamps stale artifacts with exit 0");
+
+        // A の成果物なのに B の provenance が付き、B に対する検証まで通る。
+        let verification = vrt_cli::provenance::verify(
+            &ArtifactPaths {
+                dir: artifact.path(),
+                stats_json: None,
+                index_json: None,
+            },
+            &c3,
+        )
+        .expect("verify");
+        assert_eq!(
+            verification,
+            Verification::Verified,
+            "BEFORE THE FIX: commit A's artifacts pass verification against commit B"
+        );
+
+        let _keep_tmp = tmp;
+    }
 }
