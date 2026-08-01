@@ -195,14 +195,7 @@ mod tests {
         let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
         let (tmp, _c1, _c2, c3) = init_linear_repo();
         let root = tmp.path();
-        git_in(
-            root,
-            &[
-                "update-ref",
-                "refs/heads/-hyphen-branch",
-                &c3,
-            ],
-        );
+        git_in(root, &["update-ref", "refs/heads/-hyphen-branch", &c3]);
 
         let without_eoo = Command::new("git")
             .args([
