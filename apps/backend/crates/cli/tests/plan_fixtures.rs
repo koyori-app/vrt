@@ -151,6 +151,35 @@ fn empty_index_container_falls_back_to_capture_all() {
     assert!(matches!(selection, Selection::CaptureAll { .. }));
 }
 
+/// 有効な story が混ざっていても、`importPath` 欠落が 1 件でもあれば index 全体を
+/// 壊れ扱いにして全撮影へ倒す。欠落 story を黙って捨てると、そのファイルの変更が
+/// 選別から漏れて `plan:"only"` の空振りになる。
+/// positive control: 欠落を黙って捨てる旧実装では `Only(["a--one"])` が返り、このテストは落ちる。
+#[test]
+fn partially_missing_import_path_falls_back_to_capture_all() {
+    let selection = plan_selection("partial-import-path", &["apps/frontend/src/A.tsx"]);
+    match selection {
+        Selection::CaptureAll { reason, .. } => {
+            assert!(reason.contains("importPath"), "reason: {reason}");
+        }
+        Selection::Only { story_ids, .. } => {
+            panic!("partially broken index must not yield a story set: {story_ids:?}")
+        }
+    }
+}
+
+/// storybook モード（`CorruptInput::Error`）でも部分欠落はエラーのまま。
+#[test]
+fn storybook_mode_errors_on_partially_missing_import_path() {
+    let err = select(
+        "partial-import-path",
+        &["apps/frontend/src/A.tsx"],
+        CorruptInput::Error,
+    )
+    .expect_err("partially broken index must stay an error in storybook mode");
+    assert!(format!("{err:#}").contains("importPath"), "err={err:#}");
+}
+
 #[test]
 fn index_without_import_paths_falls_back_to_capture_all() {
     let selection = plan_selection("no-import-path", &["apps/frontend/src/A.tsx"]);

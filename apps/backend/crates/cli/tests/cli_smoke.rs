@@ -129,9 +129,11 @@ fn plan_without_credentials_exits_2() {
 
 #[test]
 fn plan_with_baseline_commit_writes_json_to_stdout() {
-    let repo = repo_root();
-    let baseline = git_rev_parse(&repo, "HEAD");
-    let head = baseline.clone();
+    // 開発中の実リポジトリは worktree が汚れていることがあるので、
+    // クリーンな一時リポジトリで回す（絞り込み時は clean worktree が前提条件）。
+    let (tmp, _c1, _c2, head) = init_linear_repo();
+    let repo = tmp.path().to_path_buf();
+    let baseline = head.clone();
 
     let output = vrt()
         .args([
@@ -232,12 +234,60 @@ fn plan_normalizes_baseline_ref_to_full_oid() {
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), head);
 }
 
+/// 絞り込み時、worktree は `--commit` の内容と一致していなければならない。
+///
+/// 選別の入力（stats / index）は worktree のファイルから読むため、diff の終点だけを
+/// `--commit` に固定しても、worktree が別コミットなら「別内容に対する計画」になる。
+/// この不一致は全撮影へ倒さず終了コード 2 のエラーにする（設定ミスを黙って読み替えない）。
+///
+/// positive control: 終点だけ固定して成功していた旧実装ではこの状況で exit 0 になり、
+/// このテストは落ちる。
 #[test]
 fn plan_diff_uses_explicit_commit_not_worktree_head() {
-    let (tmp, c1, c2, head) = init_linear_repo();
+    let (tmp, c1, c2, _head) = init_linear_repo();
     let repo = tmp.path();
 
-    // worktree は c3（head）だが、--commit は c2。diff 終点は c2 で固定される。
+    // worktree は c3（head）のまま、--commit は c2 → 前提不一致でエラー。
+    let output = vrt()
+        .args([
+            "plan",
+            "--baseline-commit",
+            &c1,
+            "--dir",
+            graph_fixture().to_str().expect("utf8"),
+            "--branch",
+            "feat/test",
+            "--commit",
+            &c2,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "worktree/commit mismatch must fail, not narrow against the wrong content; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "no plan may be emitted on a precondition failure"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not match the recorded commit"),
+        "stderr={stderr}"
+    );
+}
+
+/// worktree を `--commit` に合わせてあれば絞り込みは成立する（過剰ブロックの回帰防止）。
+#[test]
+fn plan_narrows_when_worktree_matches_the_recorded_commit() {
+    let (tmp, c1, c2, _head) = init_linear_repo();
+    let repo = tmp.path();
+    git_in(repo, &["checkout", "--detach", &c2]);
+
     let output = vrt()
         .args([
             "plan",
@@ -263,9 +313,37 @@ fn plan_diff_uses_explicit_commit_not_worktree_head() {
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
     assert_eq!(value["baseline_commit_sha"].as_str().expect("baseline"), c1);
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), c2);
-    assert_ne!(
-        value["head_commit_sha"].as_str().expect("head"),
-        head,
-        "explicit --commit must not follow worktree HEAD"
+}
+
+/// 追跡ファイルが汚れた worktree での絞り込みもエラー（stats/index が commit と別内容になりうる）。
+#[test]
+fn plan_rejects_a_dirty_tracked_worktree() {
+    let (tmp, c1, _c2, head) = init_linear_repo();
+    let repo = tmp.path();
+    fs::write(repo.join("README.md"), "dirty\n").expect("dirty tracked file");
+
+    let output = vrt()
+        .args([
+            "plan",
+            "--baseline-commit",
+            &c1,
+            "--dir",
+            graph_fixture().to_str().expect("utf8"),
+            "--branch",
+            "feat/test",
+            "--commit",
+            &head,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("uncommitted changes"), "stderr={stderr}");
 }

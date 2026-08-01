@@ -42,8 +42,12 @@ pub struct NewBuild<'a> {
 
 /// finalize のリクエストボディ（payload::builds::FinalizeBuildRequest に一致）。
 #[derive(Debug, Serialize)]
-struct FinalizeBody {
+struct FinalizeBody<'a> {
     only_story_ids: Vec<String>,
+    /// 差分計画の起点にした baseline のコミット SHA。サーバーはビルドに
+    /// 固定された baseline と照合し、ずれていれば finalize を拒否する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_baseline_commit_sha: Option<&'a str>,
 }
 
 /// BuildResponse のうち CLI が使うフィールドだけ受ける。
@@ -165,16 +169,20 @@ impl Client {
     /// finalize する。`only_story_ids` が `Some` なら差分撮影、`None` なら全撮影。
     ///
     /// 全撮影はボディ無しの POST（ci.rs は空ボディを全撮影として扱う）。
+    /// 差分撮影のときは、計画の起点にした baseline のコミット SHA を
+    /// `expected_baseline_commit_sha` として添え、サーバー側の固定値と照合させる。
     pub async fn finalize(
         &self,
         build_id: &str,
         only_story_ids: Option<Vec<String>>,
+        expected_baseline_commit_sha: Option<&str>,
     ) -> Result<BuildResponse> {
         let url = format!("{}/v1/ci/builds/{}/finalize", self.base_url, build_id);
         let mut req = self.bearer(self.http.post(&url));
         if let Some(ids) = only_story_ids {
             req = req.json(&FinalizeBody {
                 only_story_ids: ids,
+                expected_baseline_commit_sha,
             });
         }
         let resp = req.send().await.context("finalize request failed")?;

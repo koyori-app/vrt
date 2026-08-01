@@ -55,6 +55,35 @@ pub fn head_commit() -> Result<String> {
     resolve_commit("HEAD")
 }
 
+/// 絞り込み（差分選別）の前提を検証する。
+///
+/// stats / index は worktree のファイルから読む。選別は「`commit` までの差分」を
+/// 前提に組まれるので、worktree の内容が `commit` と一致していなければ、
+/// 差分の終点と選別の入力（依存グラフ・ストーリー一覧）がずれた計画になる。
+/// 全撮影へ黙って倒すと設定ミス（別コミットの成果物を渡した等）に気づけないため、
+/// 満たさない場合はエラーにする。
+///
+/// - worktree の `HEAD` が `commit` と一致しない → エラー
+/// - 追跡ファイルに未コミットの変更がある（`git status --porcelain -uno`）→ エラー
+///   （未追跡ファイルは stats に現れないため対象外）
+pub fn verify_worktree_matches(commit: &str) -> Result<()> {
+    let head = head_commit()?;
+    if head != commit {
+        bail!(
+            "worktree HEAD ({head}) does not match the recorded commit ({commit}); \
+             check out that exact commit before narrowing the capture set"
+        );
+    }
+    let status = git(&["status", "--porcelain", "--untracked-files=no"])?;
+    if !status.is_empty() {
+        bail!(
+            "tracked files have uncommitted changes, so the stats/index in the worktree \
+             may not correspond to commit {commit}:\n{status}"
+        );
+    }
+    Ok(())
+}
+
 /// `from_commit` から `to_commit` までの変更ファイル一覧（リポジトリルート相対）。
 ///
 /// 両端は [`resolve_commit`] で正規化してから `git diff --name-only` する。

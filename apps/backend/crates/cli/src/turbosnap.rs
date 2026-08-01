@@ -94,10 +94,15 @@ pub struct StoryEntry {
 
 /// index.json の JSON からストーリー一覧を取り出す。
 ///
-/// `type == "story"`（または `type` 欠落）かつ `importPath` を持つものだけ。
-/// `entries` / `stories` が無い、空、または story として有効な `importPath` を
-/// 1 件も抽出できない場合は意味的に壊れているとみなしエラーにする。
-/// 空集合の `plan:"only"` へ黙って落ちる契約違反を防ぐ。
+/// `type == "story"`（または `type` 欠落）のエントリだけを対象にする。
+/// `entries` / `stories` が無い・空、story を 1 件も抽出できない場合は
+/// 意味的に壊れているとみなしエラーにする（空集合の `plan:"only"` へ
+/// 黙って落ちる契約違反を防ぐ）。
+///
+/// story エントリに `importPath` が無い場合は、**1 件でも** index 全体を
+/// エラーにする。欠けた story を黙って捨てると、そのファイルへの変更が
+/// 選別から漏れ、`plan:"only"` が「その story は撮らなくてよい」と主張して
+/// しまう（baseline 流用に化ける）。有効なエントリが他にあっても救済しない。
 pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>> {
     let index: StorybookIndex = serde_json::from_str(json).context("failed to parse index JSON")?;
 
@@ -111,14 +116,15 @@ pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>> {
     }
 
     let mut out = Vec::new();
-    let mut story_without_import = 0usize;
     for (key, entry) in entries {
         if entry.entry_type.as_deref().unwrap_or("story") != "story" {
             continue;
         }
         let Some(import_path) = entry.import_path else {
-            story_without_import += 1;
-            continue;
+            bail!(
+                "story entry `{key}` has no `importPath`; \
+                 refusing to build a story selection from a partially broken index"
+            );
         };
         out.push(StoryEntry {
             id: entry.id.unwrap_or(key),
@@ -127,9 +133,6 @@ pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>> {
     }
 
     if out.is_empty() {
-        if story_without_import > 0 {
-            bail!("index has story entries but none include `importPath`");
-        }
         bail!("index has no extractable story entries");
     }
 
@@ -457,11 +460,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_index_skips_docs_and_missing_import_path() {
+    fn parse_index_skips_docs_entries() {
         let s = stories();
         // docs エントリ intro--docs は除外され、story 3 件だけ残る。
         assert_eq!(s.len(), 3);
         assert!(s.iter().all(|e| e.id != "intro--docs"));
+    }
+
+    /// 有効な story が他にあっても、`importPath` 欠落が 1 件でもあれば index 全体を
+    /// エラーにする。欠落 story を黙って捨てると、そのファイルの変更が選別から漏れ、
+    /// `plan:"only"` が「撮らなくてよい」と誤って主張する。
+    /// positive control: 欠落を黙って捨てる旧実装では有効 1 件の Ok が返り、このテストは落ちる。
+    #[test]
+    fn parse_index_rejects_partially_missing_import_path() {
+        let err = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "a--one": { "id": "a--one", "type": "story", "importPath": "./src/A.stories.tsx" },
+                "b--one": { "id": "b--one", "type": "story" }
+              }
+            }"#,
+        )
+        .expect_err("one story without importPath must poison the whole index");
+        assert!(err.to_string().contains("importPath"), "err={err:#}");
+        assert!(err.to_string().contains("b--one"), "err={err:#}");
     }
 
     #[test]
