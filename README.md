@@ -166,8 +166,9 @@ export VRT_URL=https://vrt.example.com
 export VRT_TOKEN=...                              # write:build
 export VRT_PROJECT=<tenant-slug>/<project-slug>
 
-pnpm build-storybook --stats-json                 # preview-stats.json と index.json を出す
-vrt stamp --dir ./storybook-static                # 成果物を生成元コミットへ束縛する（直後に実行）
+# build は vrt が実行する。前後の HEAD を vrt 自身が観測して成果物を
+# 生成元コミットへ束縛する（stamp 単独の後追い実行は無い）
+vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
 vrt plan --dir ./storybook-static --output plan.json
 
 # build_id はキーがあるときだけ使う（--baseline-commit 経路では省略される）。
@@ -216,7 +217,7 @@ worktree のファイルから読むため、worktree の内容が計画の終�
 - worktree の `HEAD` が `--commit`（省略時は `HEAD` 解決値）と一致していること
 - 追跡ファイルに未コミットの変更が無いこと（未追跡ファイルは対象外）
 
-##### 成果物を生成元コミットへ束縛する（`vrt stamp`）
+##### 成果物を生成元コミットへ束縛する（`vrt stamp -- <build command>`）
 
 上の worktree 検査は**追跡ファイルしか見ない**。ところが絞り込みの実入力である
 `preview-stats.json` / `index.json` は通常 untracked なので、worktree 検査だけでは
@@ -224,29 +225,84 @@ worktree のファイルから読むため、worktree の内容が計画の終�
 掴んだまま絞り込んでしまう。その場合、変更の影響を受けた story が選別から漏れて
 偽 PASS になりうる。
 
-そこで `storybook build` の**直後**、同じ CI ステップで `vrt stamp` を実行する。
-stamp は `<dir>/vrt-provenance.json` に次を記録する。
+そこで storybook build は `vrt stamp` に**実行させる**。
 
-- 生成時の worktree の HEAD commit OID
+```bash
+vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
+```
+
+`--` の後は argv としてそのまま起動される（シェル展開はしない。シェル機能が
+要るなら `sh -c '...'` を渡す）。vrt は次の順で動く。
+
+1. build 開始前に HEAD を解決し、worktree が clean（追跡ファイルに未コミット
+   変更なし）であることを検査する
+2. build コマンドを実行する。失敗したら何も stamp しない
+3. build 成功後、HEAD が動いていないこと・worktree が依然 clean であることを
+   再検査する。build 中の checkout / commit / 追跡ファイル書き換えはここで
+   検出され、stamp は行われない
+4. その HEAD で `<dir>/vrt-provenance.json` を書く
+
+記録されるのは次の 3 つである。
+
+- build の前後で vrt が観測した worktree の HEAD commit OID
 - `preview-stats.json` / `index.json`（`--stats-json` / `--index-json` で
   パスを変えている場合はその解決後ファイル）の SHA-256
+- vrt が実行した build コマンド（argv）
+
+build 後の後追い stamp（build コマンド無しの形）は提供しない。stamp と build の
+間に checkout が挟まると「その commit でビルドした」証明にならないためで、
+証明は生成時点の観測にしか作れない。
 
 `vrt plan` / `vrt upload --only-changed` は絞り込みの前にこれを検証する。
 
 - **provenance が無い** → 絞り込まず**全撮影へ倒す**（理由に stamp の導入手順を残す）。
   stamp 未導入の既存パイプラインはこの移行経路でそのまま動き続ける——絞り込みが
-  効かなくなるだけで、全撮影は撮り逃しを作らないため安全側である。絞り込みを
-  再度有効にするには build 直後に `vrt stamp` を 1 行足す
+  効かなくなるだけで、全撮影は撮り逃しを作らないため安全側である
+- **provenance が version 1（build 所有なしの旧形式）** → 絞り込まず
+  **全撮影へ倒す**。v1 は「stamp 時点の HEAD」しか証明せず、build と stamp の
+  間の checkout を検出できない。コミットとハッシュが一致して正しく見えても
+  採用しない（**移行期の扱い**: 旧 CLI で stamp 済みの CI キャッシュはこの
+  経路で無害化される。絞り込みを取り戻すには build を
+  `vrt stamp -- <build command>` に載せ替えて成果物を作り直す）
 - **provenance があるのにコミットが一致しない／stats・index の内容ハッシュが
-  一致しない／壊れている** → 全撮影へ倒さず**終了コード 2 で落ちる**。
-  別コミットの成果物や stamp 後の差し替えは設定ミスの積極的な証拠であり、
-  黙って全撮影に読み替えると誤設定に永久に気づけない（worktree 不一致を
+  一致しない／壊れている／version 不明** → 全撮影へ倒さず**終了コード 2 で
+  落ちる**。別コミットの成果物や stamp 後の差し替えは設定ミスの積極的な証拠で
+  あり、黙って全撮影に読み替えると誤設定に永久に気づけない（worktree 不一致を
   エラーにするのと同じ方針）
 
 いずれの場合も「生成元を検証できないまま絞り込む」ことはない。
-`vrt stamp` 自体も worktree が clean（追跡ファイルに未コミット変更なし）で
-なければ拒否する——汚れた worktree での stamp は「HEAD でビルドした」証明に
-ならないためである。
+
+##### provenance が保証すること・しないこと
+
+保証するのは次の範囲である。
+
+- stats / index のバイト列が、**vrt が実行して成功した build** の直後に
+  成果物ディレクトリへ存在した内容と一致していること
+- その build の開始前と成功後の両方で、worktree が同一 HEAD の clean な
+  checkout だったこと
+- 別コミットの成果物（キャッシュ復元・rebase 前のビルド）での絞り込みが
+  エラーか全撮影へ倒れること
+
+次は**保証しない**。運用側の緩和策とあわせて明記する。
+
+- **build コマンドの意味論**: vrt が証明するのは「渡された argv が clean な
+  HEAD で走って成功し、直後の stats / index がこのバイト列だった」ことまで。
+  argv 自体が古い成果物のコピーのような「ビルドしない命令」でも形式上は有効な
+  provenance ができる。緩和として実行コマンドを provenance に記録し監査可能に
+  してあるが、命令の中身までは検証しない——build コマンドには実際に
+  storybook build を行うものを渡すこと
+- **build プロセス内部の忠実性**: storybook / webpack の incremental cache が
+  古い内容の stats を出せば、正しい worktree でビルドしても stats の中身が
+  古いことはありうる。絞り込みを使う CI job では storybook のキャッシュを
+  復元しない（キャッシュ無しでビルドする）ことを推奨する
+- **依存の状態**: `node_modules` の中身が lockfile と一致しているかは見ない。
+  同じ job 内で frozen lockfile インストールを行うこと
+- **untracked な build 入力**: clean 検査は追跡ファイルのみ。untracked の
+  ローカルファイルが build に影響しても検出できない（CI の fresh checkout では
+  実害になりにくいが、ローカル実行では注意）
+- **改竄への防御**: provenance は無署名で、手で書けば偽装できる。脅威モデルは
+  「事故（キャッシュ復元・rebase・手順ミス）」であり、悪意ある CI ランナーへの
+  防御ではない
 
 #### 部分アップロードは撮影前に計画を固定する（capture plan）
 
@@ -441,9 +497,10 @@ finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
 - **stats-json が必要**: `storybook build --stats-json` で `preview-stats.json`
   を出す（既定の探索先は `<dir>/preview-stats.json`、`--stats-json` で変更可）。
   無い場合は警告して全撮影にフォールバックする
-- **provenance（`vrt stamp`）が必要**: build 直後に `vrt stamp` で成果物を
-  生成元コミットへ束縛する（詳細は `vrt plan` の節を参照）。無い場合は警告して
-  全撮影にフォールバックする（移行期）。**あるのにコミットや内容ハッシュが
+- **provenance（`vrt stamp -- <build command>`）が必要**: build を vrt に
+  実行させ、成果物を生成元コミットへ束縛する（詳細は `vrt plan` の節を参照）。
+  無い場合と version 1（build 所有なしの旧形式）の場合は警告して全撮影に
+  フォールバックする（移行期）。**あるのにコミットや内容ハッシュが
   合わない場合はエラー（終了コード 2）**——別コミットの成果物での絞り込みは
   偽 PASS を作るため、黙って読み替えない
 - **git 履歴が baseline コミットまで必要**: 差分は
