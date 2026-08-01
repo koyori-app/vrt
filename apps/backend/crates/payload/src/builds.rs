@@ -227,8 +227,23 @@ impl From<screenshots::Model> for ScreenshotResponse {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct ApproveBuildRequest {
     /// `true` にすると未レビューの比較もまとめて承認する（一括承認）。
+    ///
+    /// `removed`（story の消滅）と `failed`（比較失敗）は含まない。各専用フラグを
+    /// 別途明示したときだけ承認される。
     #[serde(default)]
     pub force: bool,
+    /// `true` にすると story の消滅（`removed`）も承認対象に含める。
+    ///
+    /// baseline から実体が消える不可逆操作なので `force` とは別のフラグにしてある。
+    /// このフラグは `force: true` と併用した場合だけ効果があり、単独指定は no-op。
+    #[serde(default)]
+    pub accept_removals: bool,
+    /// `true` にすると比較に失敗した結果（`failed`）も承認対象に含める。
+    ///
+    /// 破損画像などを baseline に焼き付ける危険があるため `force` とは別のフラグ。
+    /// このフラグは `force: true` と併用した場合だけ効果があり、単独指定は no-op。
+    #[serde(default)]
+    pub accept_failures: bool,
 }
 
 /// ビルド一覧のページネーションパラメータ。

@@ -6,10 +6,10 @@ use sea_orm::{
     QueryOrder, prelude::Uuid,
 };
 
+use common::db::with_transaction;
 use common::error::AppError;
 use entity::{
-    builds, builds::BuildStatus, comparisons, comparisons::ComparisonStatus,
-    comparisons::ReviewStatus,
+    builds::BuildStatus, comparisons, comparisons::ComparisonStatus, comparisons::ReviewStatus,
 };
 
 /// レビュー操作。
@@ -55,27 +55,38 @@ pub async fn get_comparison<C: ConnectionTrait>(
 ///
 /// - ビルドが `changes_detected` のときだけ受け付ける（それ以外は [`AppError::Conflict`]）
 /// - `unchanged` の比較はそもそもレビュー不要なので [`AppError::Conflict`]
-pub async fn review<C: ConnectionTrait>(
-    db: &C,
-    build: &builds::Model,
-    comparison: comparisons::Model,
+pub async fn review(
+    db: &sea_orm::DatabaseConnection,
+    build_id: Uuid,
+    comparison_id: Uuid,
     action: ReviewAction,
     reviewer_id: Uuid,
 ) -> Result<comparisons::Model, AppError> {
-    if build.status != BuildStatus::ChangesDetected {
-        return Err(AppError::Conflict);
-    }
-    if !comparison.status.needs_review() {
-        return Err(AppError::Conflict);
-    }
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            let build = crate::review_lock::build(txn, build_id).await?;
+            let comparison = crate::review_lock::comparison(txn, comparison_id).await?;
 
-    let now = Utc::now().fixed_offset();
-    let mut active: comparisons::ActiveModel = comparison.into();
-    active.review_status = Set(action.to_status());
-    active.reviewed_by = Set(Some(reviewer_id));
-    active.reviewed_at = Set(Some(now));
-    active.updated_at = Set(now);
-    Ok(active.update(db).await?)
+            if comparison.build_id != build.id {
+                return Err(AppError::NotFound);
+            }
+            if build.status != BuildStatus::ChangesDetected {
+                return Err(AppError::Conflict);
+            }
+            if !comparison.status.needs_review() {
+                return Err(AppError::Conflict);
+            }
+
+            let now = Utc::now().fixed_offset();
+            let mut active: comparisons::ActiveModel = comparison.into();
+            active.review_status = Set(action.to_status());
+            active.reviewed_by = Set(Some(reviewer_id));
+            active.reviewed_at = Set(Some(now));
+            active.updated_at = Set(now);
+            Ok(active.update(txn).await?)
+        })
+    })
+    .await
 }
 
 /// ビルドに紐づく比較を全削除する（ジョブのリトライ時に呼ぶ）。

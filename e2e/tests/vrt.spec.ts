@@ -11,8 +11,9 @@
  * the PAT and the background worker all line up in one running system.
  */
 import { expect, test } from "@playwright/test";
+import { Client } from "pg";
 
-import { API_URL } from "../env";
+import { API_URL, DATABASE_URL } from "../env";
 import { png, testLogin, unique, waitForTerminalBuild } from "../global-setup";
 
 test("login page renders both OAuth providers", async ({ page }) => {
@@ -150,4 +151,82 @@ test("full VRT flow: tenant, project, PAT, CI upload, review, approve", async ({
   const after = await request.get(`${API_URL}/v1/ci/builds/${build.id}`, { headers: auth });
   expect(after.status()).toBe(200);
   expect((await after.json()).status).toBe("approved");
+
+  // ── failed comparison bulk approval ──────────────────────────────────
+  // Produce another reviewed build, then model the compare worker's failure
+  // state directly. The browser assertion below is intentionally about the UI
+  // contract: acknowledge the baseline consequence, then send the explicit
+  // acceptance bit that the approval API requires.
+  const failedBuildResponse = await request.post(
+    `${API_URL}/v1/ci/projects/${tenantSlug}/${projectSlug}/builds`,
+    {
+      headers: auth,
+      data: { branch: "main", commit_sha: "1123456789abcdef0123456789abcdef01234567" },
+    },
+  );
+  expect(failedBuildResponse.status(), await failedBuildResponse.text()).toBe(201);
+  const failedBuild = await failedBuildResponse.json();
+
+  for (const [name, colour] of [
+    ["home", [20, 200, 80, 255]],
+    ["settings", [40, 80, 220, 255]],
+  ] as const) {
+    const uploaded = await request.post(
+      `${API_URL}/v1/ci/builds/${failedBuild.id}/screenshots`,
+      {
+        headers: auth,
+        multipart: {
+          name,
+          file: {
+            name: `${name}.png`,
+            mimeType: "image/png",
+            buffer: png(64, 48, [...colour]),
+          },
+        },
+      },
+    );
+    expect(uploaded.status(), await uploaded.text()).toBe(201);
+  }
+
+  const failedFinalized = await request.post(
+    `${API_URL}/v1/ci/builds/${failedBuild.id}/finalize`,
+    { headers: auth },
+  );
+  expect(failedFinalized.status(), await failedFinalized.text()).toBe(200);
+  expect((await waitForTerminalBuild(request, failedBuild.id, token)).status).toBe(
+    "changes_detected",
+  );
+
+  const database = new Client({ connectionString: DATABASE_URL });
+  await database.connect();
+  try {
+    const marked = await database.query(
+      "UPDATE comparisons SET status = 'failed', error_message = 'forced e2e comparison failure' WHERE build_id = $1 AND name = 'home'",
+      [failedBuild.id],
+    );
+    expect(marked.rowCount).toBe(1);
+  } finally {
+    await database.end();
+  }
+
+  await page.goto(`/t/${tenantSlug}/p/${projectSlug}/builds/2`);
+  await expect(page.getByText("Failed", { exact: true })).toBeVisible();
+
+  const dialogs: string[] = [];
+  page.on("dialog", async (dialog) => {
+    dialogs.push(dialog.message());
+    await dialog.accept();
+  });
+  const approvalRequestPromise = page.waitForRequest(
+    (candidate) =>
+      candidate.method() === "POST" && candidate.url().endsWith(`/builds/${failedBuild.id}/approve`),
+  );
+  await page.getByRole("button", { name: "Approve build" }).click();
+  const approvalRequest = await approvalRequestPromise;
+
+  await expect.poll(() => dialogs.length).toBe(2);
+  expect(dialogs[1]).toContain("screenshots from these failed comparisons will become the baseline");
+  expect(dialogs[1]).toContain("review each failed comparison individually first");
+  expect(approvalRequest.postDataJSON()).toMatchObject({ force: true, accept_failures: true });
+  await expect(page.getByText("Approved", { exact: true }).first()).toBeVisible();
 });

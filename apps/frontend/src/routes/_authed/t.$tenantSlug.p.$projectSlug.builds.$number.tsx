@@ -222,21 +222,55 @@ function BuildReview({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [comparisons, move, review, selectedId]);
 
-  const pendingReviews = comparisons.filter(
+  const unreviewed = comparisons.filter(
     (comparison) => comparison.review_status === "pending" && comparison.status !== "unchanged",
-  ).length;
+  );
+  const pendingReviews = unreviewed.length;
+  // Removals drop a story out of the baseline for good, so the backend keeps them
+  // out of `force` and wants a separate opt-in.
+  const pendingRemovals = unreviewed.filter((comparison) => comparison.status === "removed");
+  // A failed comparison has no trustworthy diff. Do not let bulk approval turn
+  // its screenshot into the baseline without spelling that consequence out.
+  const pendingFailures = unreviewed.filter((comparison) => comparison.status === "failed");
 
   function onApproveBuild() {
-    if (pendingReviews > 0) {
-      const ok = confirm(
-        `${pendingReviews} comparison(s) are still unreviewed. Approve the whole build anyway?`,
-      );
-      if (!ok) return;
-      // `force` is what lets the backend approve past unreviewed comparisons.
-      approveBuild.mutate({ params: { path: { build_id: buildId } }, body: { force: true } });
+    if (pendingReviews === 0) {
+      approveBuild.mutate({ params: { path: { build_id: buildId } }, body: { force: false } });
       return;
     }
-    approveBuild.mutate({ params: { path: { build_id: buildId } }, body: { force: false } });
+
+    const ok = confirm(
+      `${pendingReviews} comparison(s) are still unreviewed. Approve the whole build anyway?`,
+    );
+    if (!ok) return;
+
+    let acceptRemovals = false;
+    if (pendingRemovals.length > 0) {
+      const names = pendingRemovals.map((comparison) => comparison.name).join(", ");
+      acceptRemovals = confirm(
+        `${pendingRemovals.length} story/stories will be removed from the baseline for good: ${names}. Confirm the removals?`,
+      );
+      if (!acceptRemovals) return;
+    }
+
+    let acceptFailures = false;
+    if (pendingFailures.length > 0) {
+      const names = pendingFailures.map((comparison) => comparison.name).join(", ");
+      acceptFailures = confirm(
+        `${pendingFailures.length} comparison(s) failed, so no trustworthy visual diff is available: ${names}. If you continue, the screenshots from these failed comparisons will become the baseline. Cancel to review each failed comparison individually first. Continue?`,
+      );
+      if (!acceptFailures) return;
+    }
+
+    // `force` is what lets the backend approve past unreviewed comparisons.
+    approveBuild.mutate({
+      params: { path: { build_id: buildId } },
+      body: {
+        force: true,
+        accept_removals: acceptRemovals,
+        accept_failures: acceptFailures,
+      },
+    });
   }
 
   return (

@@ -749,6 +749,18 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
         "every comparison is unchanged, got {cmps:?}"
     );
 
+    // 部分撮影ビルドを承認する。Reuse が参照だけで screenshot 実体を作らなければ、
+    // baseline manifest の Blue / Empty が欠落扱いになり、この承認は 409 で落ちる。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_b_id}/approve"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "reused screenshots are physical build artifacts accepted by the manifest guard"
+    );
+
     // ── ビルド C: 新規ストーリー Green を足す。only_story_ids に入れない ───
     // baseline に Green が無いので、指定外でも撮影されて added になる。
     let build_c = fx.create_storybook_build("only003").await;
