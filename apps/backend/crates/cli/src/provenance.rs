@@ -88,7 +88,8 @@ pub enum Verification {
 }
 
 fn sha256_hex(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let digest = Sha256::digest(&bytes);
     let mut out = String::with_capacity(64);
     for byte in digest {
@@ -178,8 +179,12 @@ pub fn verify(paths: &ArtifactPaths<'_>, expected_head_commit_sha: &str) -> Resu
     }
 
     let stats_path = paths.stats_path();
-    let actual_stats = sha256_hex(&stats_path)
-        .with_context(|| format!("could not hash {} to verify provenance", stats_path.display()))?;
+    let actual_stats = sha256_hex(&stats_path).with_context(|| {
+        format!(
+            "could not hash {} to verify provenance",
+            stats_path.display()
+        )
+    })?;
     if actual_stats != provenance.stats_sha256 {
         bail!(
             "{} does not match the stamped artifact (its content changed after `vrt stamp`); \
@@ -189,8 +194,12 @@ pub fn verify(paths: &ArtifactPaths<'_>, expected_head_commit_sha: &str) -> Resu
     }
 
     let index_path = paths.index_path();
-    let actual_index = sha256_hex(&index_path)
-        .with_context(|| format!("could not hash {} to verify provenance", index_path.display()))?;
+    let actual_index = sha256_hex(&index_path).with_context(|| {
+        format!(
+            "could not hash {} to verify provenance",
+            index_path.display()
+        )
+    })?;
     if actual_index != provenance.index_sha256 {
         bail!(
             "{} does not match the stamped artifact (its content changed after `vrt stamp`); \
@@ -281,8 +290,11 @@ mod tests {
     fn index_swapped_after_stamp_is_rejected() {
         let tmp = artifact_dir();
         stamp(&paths(tmp.path()), HEAD).expect("stamp");
-        fs::write(tmp.path().join("index.json"), r#"{"v":5,"entries":{"x":{}}}"#)
-            .expect("swap index");
+        fs::write(
+            tmp.path().join("index.json"),
+            r#"{"v":5,"entries":{"x":{}}}"#,
+        )
+        .expect("swap index");
         let err = verify(&paths(tmp.path()), HEAD).expect_err("must reject");
         assert!(format!("{err:#}").contains("index.json"), "err={err:#}");
     }
@@ -331,7 +343,10 @@ mod tests {
             index_json: Some(&index),
         };
         stamp(&custom, HEAD).expect("stamp");
-        assert_eq!(verify(&custom, HEAD).expect("verify"), Verification::Verified);
+        assert_eq!(
+            verify(&custom, HEAD).expect("verify"),
+            Verification::Verified
+        );
 
         fs::write(&stats, r#"{"modules":[1]}"#).expect("swap");
         assert!(verify(&custom, HEAD).is_err());

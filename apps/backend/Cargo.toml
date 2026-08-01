@@ -25,7 +25,8 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
 sha2 = "0.11"
-uuid = { version = "1", features = ["serde", "v4"] }
+# v5 は carry-forward 複製の決定的スクリーンショット ID（(build_id, name) から導出）に使う。
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 redis = { version = "1.2.1", features = ["tokio-comp"] }
 redis_pool = "0.10.0"
 regex = "1"
