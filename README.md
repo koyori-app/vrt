@@ -200,6 +200,49 @@ esac
 全撮影へは倒さないので、呼び出し側で必ず失敗として扱うこと。
 黙って全撮影に読み替えると、設定ミスに気づけなくなる。
 
+絞り込み（`plan = "only"` の算出）には前提条件がある。stats / index は
+worktree のファイルから読むため、worktree の内容が計画の終点コミットと
+一致していなければ「別内容に対する計画」ができてしまう。次を満たさない場合、
+`vrt plan` は全撮影へ倒さず終了コード 2 で落ちる。
+
+- worktree の `HEAD` が `--commit`（省略時は `HEAD` 解決値）と一致していること
+- 追跡ファイルに未コミットの変更が無いこと（未追跡ファイルは対象外）
+
+#### 部分アップロードを finalize で宣言する（`captured_names`）
+
+計画に従って一部の story だけを撮った場合、そのままアップロードして finalize
+すると、撮らなかった名前の baseline エントリがすべて `removed` になってしまう。
+サーバーは「アップロードされなかった」と「削除された」を区別できないからである。
+
+そこで部分アップロードでは、finalize のボディで **今回撮った名前の集合** を宣言する。
+
+```bash
+# 撮った screenshots を通常どおりアップロードした後、名前を宣言して finalize する
+curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
+  -H "Authorization: Bearer $VRT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"captured_names": ["home-page", "pricing"]}'
+```
+
+宣言があると、サーバーは次のように振る舞う。
+
+- **宣言 == 実際にアップロードされた名前** を検証し、一致しなければ 400 で拒否する。
+  宣言したのにアップロードが欠けた名前を黙って流用に回すと、撮影の失敗が
+  「差分なし」に化けるためである（逆方向の過剰アップロードも計画とのずれとして拒否）
+- 宣言に無い名前の baseline エントリは `removed` にせず、前回 baseline の画像を
+  このビルドのスクリーンショットとして流用する（比較は `unchanged` になり、
+  承認しても baseline から消えない）。`storybook` モードの `only_story_ids` と
+  同じ帰結になる
+- `captured_names: []`（何も撮らない）は全エントリ流用の宣言として有効
+
+このため部分アップロードでは story の削除は検出されない。story を削除した
+ときは全撮影（宣言なしの finalize）で流し、`removed` をレビューで承認すること。
+
+`expected_baseline_commit_sha` を併せて渡すと、計画の起点にした baseline と
+ビルドに固定された baseline の一致を finalize 時点で検証できる（不一致は 400）。
+baseline はビルド**作成時**に解決して固定され、比較もその固定値に対して走る。
+作成後に別ビルドが承認されて最新 baseline が動いても、このビルドの比較はずれない。
+
 計画は stdout にも必ず出るので、`--output` を使わずパイプで受けてもよい。
 ログは stderr へ出すため、stdout は JSON だけになる。
 
@@ -343,8 +386,10 @@ finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
   の変更、`.storybook/` 配下の変更、依存グラフに載っていない変更ファイル
   （拾い漏れを避けるため安全側に倒す）。`*.md` などレンダリングに無関係な
   グラフ外ファイルは無視する
-- **`--commit`**: ビルド記録と差分終点の両方に使う。worktree の `HEAD` と異なる
-  SHA を渡したとき、選別はその明示 SHA までの差分だけを見る（`HEAD` には追従しない）
+- **`--commit`**: ビルド記録と差分終点の両方に使う。絞り込み時は worktree が
+  この SHA と一致していること（`HEAD` 一致・追跡ファイル clean）が前提条件で、
+  満たさなければ全撮影へ倒さずエラー（終了コード 2）で落ちる。stats / index は
+  worktree から読むため、worktree が別コミットだと選別が別内容に対する計画になる
 
 #### 低レベル API（curl で直接叩く）
 
@@ -380,7 +425,13 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
   そのストーリー ID だけを撮影し、残りは baseline のスクリーンショットを流用する
   （TurboSnap 相当。baseline に無い新規ストーリーは指定に無くても撮影される）。
   ボディ無し・空・`only_story_ids: null` は従来どおり全撮影。`screenshots`
-  モードで渡すと 400。どのストーリーを渡すべきかを決める CLI は後続で用意する
+  モードで渡すと 400（サーバーがレンダリングしないため、ストーリー ID を
+  スクリーンショット名へ写像できない。部分アップロードは名前ベースの
+  `captured_names` を使う）。どのストーリーを渡すべきかは `vrt upload
+  --only-changed` が自動で決める
+- 流用の起点になる baseline はビルド**作成時**に固定される。
+  `{"expected_baseline_commit_sha": "<sha>"}` を finalize に添えると、
+  計画の起点との一致をサーバーが検証する（不一致は 400）
 - `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
   1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
 - finalize 後は `pending → rendering → processing → …` と進む。
