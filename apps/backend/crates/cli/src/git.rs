@@ -201,7 +201,7 @@ mod tests {
             .args([
                 "rev-parse",
                 "--verify",
-                &format!("-hyphen-branch^{{commit}}"),
+                "-hyphen-branch^{commit}",
             ])
             .current_dir(root)
             .output()
