@@ -126,41 +126,70 @@ pub struct FinalizeBuildRequest {
     /// ここに載っていないストーリーは baseline のスクリーンショットを流用する
     /// （baseline に該当が無い新規ストーリーは見逃さないよう撮影する）。
     /// `storybook` モードのビルドでのみ意味を持つ。`screenshots` モードで
-    /// 指定すると 400 になる（サーバーがレンダリングしないため）。
+    /// 指定すると 400 になる（サーバーがレンダリングしないため、ストーリー ID を
+    /// スクリーンショット名へ写像できない。代わりに `captured_names` を使う）。
     #[serde(default)]
     pub only_story_ids: Option<Vec<String>>,
+
+    /// `screenshots` モードの部分アップロードで、今回 CI が撮影して
+    /// アップロードしたスクリーンショット名の集合。
+    ///
+    /// 宣言するとサーバーは「宣言 == 実際にアップロードされた名前」を検証し、
+    /// 一致しなければ 400 で拒否する（撮るつもりだった名前が欠けたまま
+    /// baseline を流用してしまう事故を防ぐ）。宣言に無い baseline エントリは
+    /// removed ではなく前回の baseline を流用（carry-forward）する。
+    /// `null`・省略は全撮影（従来どおり。baseline に無い名前は added、
+    /// アップロードされなかった baseline エントリは removed）。
+    /// `storybook` モードで指定すると 400（サーバーが撮るので宣言が成立しない）。
+    #[serde(default)]
+    pub captured_names: Option<Vec<String>>,
+
+    /// クライアントが撮影計画の起点にした baseline のコミット SHA。
+    ///
+    /// 渡すとサーバーは「このビルドに固定された baseline の昇格元コミット」と
+    /// 照合し、一致しなければ 400 で拒否する。計画と比較が別の baseline を
+    /// 見てしまう取り違えを finalize 時点で検出するための任意フィールド。
+    #[serde(default)]
+    pub expected_baseline_commit_sha: Option<String>,
 }
 
-/// `only_story_ids` の要素数上限。DoS 対策の緩い上限。
+/// `only_story_ids` / `captured_names` の要素数上限。DoS 対策の緩い上限。
 pub const MAX_ONLY_STORY_IDS: usize = 10_000;
-/// ストーリー ID 1 件あたりの最大長。
+/// ストーリー ID / スクリーンショット名 1 件あたりの最大長。
 pub const MAX_STORY_ID_LEN: usize = 512;
 
 impl FinalizeBuildRequest {
-    /// `only_story_ids` の要素数・各 ID の長さを検証する。
+    /// `only_story_ids` / `captured_names` の要素数・各要素の長さを検証する。
     ///
     /// 違反時はエラーメッセージを返す（呼び出し側で 400 にする）。
     pub fn validate_story_ids(&self) -> Result<(), String> {
-        let Some(ids) = &self.only_story_ids else {
-            return Ok(());
-        };
-        if ids.len() > MAX_ONLY_STORY_IDS {
-            return Err(format!(
-                "only_story_ids must contain at most {MAX_ONLY_STORY_IDS} entries"
-            ));
-        }
-        for id in ids {
-            if id.is_empty() {
-                return Err("only_story_ids must not contain empty ids".into());
-            }
-            if id.len() > MAX_STORY_ID_LEN {
-                return Err(format!(
-                    "each story id must be {MAX_STORY_ID_LEN} characters or fewer"
-                ));
-            }
-        }
+        validate_id_list(self.only_story_ids.as_deref(), "only_story_ids")?;
+        validate_id_list(self.captured_names.as_deref(), "captured_names")?;
         Ok(())
     }
+}
+
+/// ID / 名前リストの共通検証（要素数・空要素・長さ）。
+fn validate_id_list(list: Option<&[String]>, field: &str) -> Result<(), String> {
+    let Some(ids) = list else {
+        return Ok(());
+    };
+    if ids.len() > MAX_ONLY_STORY_IDS {
+        return Err(format!(
+            "{field} must contain at most {MAX_ONLY_STORY_IDS} entries"
+        ));
+    }
+    for id in ids {
+        if id.is_empty() {
+            return Err(format!("{field} must not contain empty entries"));
+        }
+        if id.len() > MAX_STORY_ID_LEN {
+            return Err(format!(
+                "each {field} entry must be {MAX_STORY_ID_LEN} characters or fewer"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Storybook バンドルのアップロード結果。
@@ -285,6 +314,14 @@ mod tests {
     fn req(ids: Option<Vec<&str>>) -> FinalizeBuildRequest {
         FinalizeBuildRequest {
             only_story_ids: ids.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn req_names(names: Option<Vec<&str>>) -> FinalizeBuildRequest {
+        FinalizeBuildRequest {
+            captured_names: names.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
         }
     }
 
@@ -321,7 +358,27 @@ mod tests {
         let ids: Vec<String> = (0..=MAX_ONLY_STORY_IDS).map(|i| i.to_string()).collect();
         let r = FinalizeBuildRequest {
             only_story_ids: Some(ids),
+            ..Default::default()
         };
         assert!(r.validate_story_ids().is_err());
+    }
+
+    #[test]
+    fn captured_names_share_the_same_limits() {
+        assert!(req_names(None).validate_story_ids().is_ok());
+        // 空配列は「今回撮った名前は無い」= 全流用の宣言として有効。
+        assert!(req_names(Some(vec![])).validate_story_ids().is_ok());
+        assert!(req_names(Some(vec!["home"])).validate_story_ids().is_ok());
+        assert!(
+            req_names(Some(vec!["ok", ""]))
+                .validate_story_ids()
+                .is_err()
+        );
+        let long = "a".repeat(MAX_STORY_ID_LEN + 1);
+        assert!(
+            req_names(Some(vec![long.as_str()]))
+                .validate_story_ids()
+                .is_err()
+        );
     }
 }

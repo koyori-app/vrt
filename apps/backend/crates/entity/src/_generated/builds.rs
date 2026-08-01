@@ -24,8 +24,13 @@ pub struct Model {
     /// storybook モードでアップロードされた zip のストレージキー。
     #[sea_orm(column_type = "Text", nullable)]
     pub storybook_key: Option<String>,
-    /// 比較に使った baseline。FK にすると `baselines.source_build_id` と循環するため素のカラム。
+    /// 比較に使う baseline。ビルド作成時に解決して固定する（NULL = 作成時点で baseline 無し）。
+    /// FK にすると `baselines.source_build_id` と循環するため素のカラム。
     pub baseline_id: Option<Uuid>,
+    /// screenshots モードの部分アップロードで finalize 時に宣言された
+    /// 「今回撮影したスクリーンショット名」の集合（JSON 配列）。NULL は全撮影。
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub captured_names: Option<Json>,
     pub total_count: i32,
     pub changed_count: i32,
     pub added_count: i32,

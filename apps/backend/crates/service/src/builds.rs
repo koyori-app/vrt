@@ -82,10 +82,20 @@ pub async fn next_build_number<C: ConnectionTrait>(
 ///
 /// `mode` は入力形式。`storybook` のときは screenshot のアップロードを受け付けず、
 /// 代わりに `POST /v1/ci/builds/{id}/storybook` でバンドルを受け取る。
+///
+/// ## baseline の固定（`baseline_id`）
+///
+/// 比較に使う baseline は**作成時にここで一度だけ解決して焼き付ける**。
+/// 比較ジョブ・storybook の流用テーブルは、比較時点の最新ではなく
+/// この固定値を使う。作成レスポンスの `baseline_commit_sha`（クライアントが
+/// 撮り直し範囲を絞る起点）と比較対象が常に同一の baseline を指すことを、
+/// 解決タイミングを 1 点に潰すことで保証する。途中で別ビルドが承認されて
+/// 最新 baseline が動いても、このビルドの比較はずれない。
+/// `None` は「作成時点で baseline が無い」（初回・新規ブランチ）。
 #[allow(clippy::too_many_arguments)]
 pub async fn create_build<C: ConnectionTrait>(
     db: &C,
-    project_id: Uuid,
+    project: &projects::Model,
     branch: String,
     commit_sha: String,
     commit_message: Option<String>,
@@ -99,11 +109,12 @@ pub async fn create_build<C: ConnectionTrait>(
         return Err(AppError::BadRequestDetail("commit_sha is required".into()));
     }
 
-    let number = next_build_number(db, project_id).await?;
+    let number = next_build_number(db, project.id).await?;
+    let baseline = crate::baselines::latest_for(db, project, &branch).await?;
 
     Ok(builds::ActiveModel {
         id: Set(Uuid::new_v4()),
-        project_id: Set(project_id),
+        project_id: Set(project.id),
         number: Set(number),
         branch: Set(branch),
         commit_sha: Set(commit_sha),
@@ -112,7 +123,8 @@ pub async fn create_build<C: ConnectionTrait>(
         status: Set(BuildStatus::Pending),
         mode: Set(mode),
         storybook_key: Set(None),
-        baseline_id: Set(None),
+        baseline_id: Set(baseline.map(|b| b.id)),
+        captured_names: Set(None),
         total_count: Set(0),
         changed_count: Set(0),
         added_count: Set(0),
@@ -208,6 +220,68 @@ pub async fn finalize<C: ConnectionTrait>(
     build: builds::Model,
 ) -> Result<builds::Model, AppError> {
     transition(db, build, BuildStatus::Processing).await
+}
+
+/// screenshots モードの finalize。`captured_names` の宣言があれば検証して記録する。
+///
+/// 部分アップロードは「宣言した名前 == 実際にアップロードされた名前」のときだけ
+/// 成立させる。宣言したのにアップロードが欠けた名前を黙って baseline 流用に
+/// 回すと、撮影の失敗が「差分なし」に化ける。逆にアップロードされたのに
+/// 宣言に無い名前は、選択計画と実際の撮影がずれている兆候なので同様に拒否する。
+pub async fn finalize_screenshots<C: ConnectionTrait>(
+    db: &C,
+    build: builds::Model,
+    captured_names: Option<Vec<String>>,
+) -> Result<builds::Model, AppError> {
+    let build = match captured_names {
+        None => build,
+        Some(names) => {
+            let declared: std::collections::BTreeSet<String> = names.into_iter().collect();
+            let uploaded: std::collections::BTreeSet<String> =
+                crate::screenshots::list_for_build(db, build.id)
+                    .await?
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+
+            if declared != uploaded {
+                let missing: Vec<&String> = declared.difference(&uploaded).take(10).collect();
+                let extra: Vec<&String> = uploaded.difference(&declared).take(10).collect();
+                return Err(AppError::BadRequestDetail(format!(
+                    "captured_names does not match the uploaded screenshots \
+                     (declared but not uploaded: {missing:?}; uploaded but not declared: {extra:?})"
+                )));
+            }
+
+            let mut active: builds::ActiveModel = build.into();
+            active.captured_names = Set(Some(serde_json::json!(
+                declared.into_iter().collect::<Vec<String>>()
+            )));
+            active.update(db).await?
+        }
+    };
+    transition(db, build, BuildStatus::Processing).await
+}
+
+/// ビルドに固定された baseline の「昇格元ビルドのコミット SHA」を解決する。
+///
+/// baseline が固定されていない、または昇格元ビルドが削除済みなら `None`。
+pub async fn pinned_baseline_commit_sha<C: ConnectionTrait>(
+    db: &C,
+    build: &builds::Model,
+) -> Result<Option<String>, AppError> {
+    let Some(baseline_id) = build.baseline_id else {
+        return Ok(None);
+    };
+    let baseline = crate::baselines::get_baseline(db, baseline_id).await?;
+    let Some(source_build_id) = baseline.source_build_id else {
+        return Ok(None);
+    };
+    match get_build(db, source_build_id).await {
+        Ok(source) => Ok(Some(source.commit_sha)),
+        Err(AppError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// storybook モードの finalize: `pending → rendering`。

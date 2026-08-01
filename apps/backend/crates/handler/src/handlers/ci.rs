@@ -116,9 +116,12 @@ pub async fn create_build(
         ));
     }
 
+    // 比較に使う baseline は create_build がここで解決してビルドに焼き付ける。
+    // 以降（レスポンスの baseline_commit_sha・finalize の照合・比較ジョブ）は
+    // すべてこの固定値を参照するので、途中で別ビルドが承認されてもずれない。
     let build = build_service::create_build(
         &state.db,
-        project.id,
+        &project,
         payload.branch,
         payload.commit_sha,
         payload.commit_message,
@@ -127,36 +130,14 @@ pub async fn create_build(
     )
     .await?;
 
-    // 将来の CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
-    // 作成レスポンスにだけ baseline のコミット SHA を載せる。
-    let baseline_commit_sha = resolve_baseline_commit_sha(&state, &project, &build.branch).await?;
+    // CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
+    // 作成レスポンスにだけ固定済み baseline のコミット SHA を載せる。
+    let baseline_commit_sha = build_service::pinned_baseline_commit_sha(&state.db, &build).await?;
 
     let mut response: BuildResponse = build.into();
     response.baseline_commit_sha = baseline_commit_sha;
 
     Ok((StatusCode::CREATED, Json(response)))
-}
-
-/// 対象ブランチの baseline の昇格元ビルドのコミット SHA を解決する。
-///
-/// baseline が無い、または昇格元ビルドが削除済み（`source_build_id` が NULL、
-/// あるいは行が消えている）なら `None`。
-async fn resolve_baseline_commit_sha(
-    state: &AppState,
-    project: &entity::projects::Model,
-    branch: &str,
-) -> Result<Option<String>, AppError> {
-    let Some(baseline) = service::baselines::latest_for(&state.db, project, branch).await? else {
-        return Ok(None);
-    };
-    let Some(source_build_id) = baseline.source_build_id else {
-        return Ok(None);
-    };
-    match build_service::get_build(&state.db, source_build_id).await {
-        Ok(source) => Ok(Some(source.commit_sha)),
-        Err(AppError::NotFound) => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 #[axum::debug_handler]
@@ -343,13 +324,18 @@ pub async fn upload_storybook_bundle(
                    （レンダリングが済むと自動で `processing` に繋がる）。\
                    以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。\
                    ボディは任意。`storybook` モードで `only_story_ids` を渡すと、\
-                   そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。",
+                   そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。\
+                   `screenshots` モードで `captured_names` を渡すと、宣言と実際の\
+                   アップロードの一致を検証したうえで、宣言外の baseline エントリを\
+                   removed ではなく流用扱いにする（部分アップロード）。\
+                   `expected_baseline_commit_sha` を渡すと、ビルドに固定された baseline と\
+                   一致するかを finalize 時点で照合する。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
     request_body(content = FinalizeBuildRequest, description = "任意。省略・空ボディ可"),
     security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
-        (status = 400, description = "storybook バンドルが未アップロード / only_story_ids が不正 / screenshots モードで only_story_ids 指定", body = ServerError),
+        (status = 400, description = "storybook バンドルが未アップロード / リストが不正 / モードとフィールドの組合せが不正 / captured_names とアップロードの不一致 / expected_baseline_commit_sha の不一致", body = ServerError),
         (status = 409, description = "既に finalize 済みです", body = ServerError),
         CrudErrors,
     )
@@ -379,15 +365,34 @@ pub async fn finalize_build(
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
+    // クライアントが計画に使った baseline と、このビルドに固定された baseline の照合。
+    // 一致しなければ比較結果が計画と別物になるので、ジョブを積む前に断る。
+    if let Some(expected) = &payload.expected_baseline_commit_sha {
+        let pinned = build_service::pinned_baseline_commit_sha(&state.db, &build).await?;
+        if pinned.as_deref() != Some(expected.as_str()) {
+            return Err(AppError::BadRequestDetail(format!(
+                "expected_baseline_commit_sha does not match the baseline pinned to this build \
+                 (expected {expected}, pinned {})",
+                pinned.as_deref().unwrap_or("none")
+            )));
+        }
+    }
+
     let build = match build.mode {
         BuildMode::Screenshots => {
-            // screenshots モードはサーバーがレンダリングしないので流用制御は無意味。
+            // screenshots モードはサーバーがレンダリングしないため、ストーリー ID を
+            // スクリーンショット名へ写像できず only_story_ids は成立しない。
+            // 部分アップロードは名前ベースの captured_names で宣言する。
             if payload.only_story_ids.is_some() {
                 return Err(AppError::BadRequestDetail(
-                    "only_story_ids is not supported for screenshots-mode builds".into(),
+                    "only_story_ids is not supported for screenshots-mode builds; \
+                     declare the uploaded screenshot names via captured_names instead"
+                        .into(),
                 ));
             }
-            let build = build_service::finalize(&state.db, build).await?;
+            let build =
+                build_service::finalize_screenshots(&state.db, build, payload.captured_names)
+                    .await?;
             job::compare_build::enqueue(
                 &state.compare_build_storage,
                 job::CompareBuildJob { build_id: build.id },
@@ -397,6 +402,14 @@ pub async fn finalize_build(
             build
         }
         BuildMode::Storybook => {
+            // storybook モードはサーバーが撮るので「CI が撮った名前」の宣言は成立しない。
+            if payload.captured_names.is_some() {
+                return Err(AppError::BadRequestDetail(
+                    "captured_names is not supported for storybook-mode builds; \
+                     use only_story_ids to narrow the capture set"
+                        .into(),
+                ));
+            }
             let build = build_service::finalize_storybook(&state.db, build).await?;
             job::render_build::enqueue(
                 &state.render_build_storage,
