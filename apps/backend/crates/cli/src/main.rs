@@ -18,6 +18,7 @@ use vrt_cli::git;
 use vrt_cli::plan::{
     self, CorruptInput, PlanCoordinates, PlanDocument, Selection, SelectionInputs,
 };
+use vrt_cli::provenance::{self, ArtifactPaths, Verification};
 
 #[derive(Parser)]
 #[command(name = "vrt", version, about = "VRT CI クライアント")]
@@ -36,6 +37,13 @@ enum Command {
     /// 撮影は行わない。CI ランナーがこの JSON を読み、`plan = "only"` のときだけ
     /// 列挙された story を撮る。
     Plan(PlanArgs),
+
+    /// storybook 成果物に生成元コミットの provenance を書き込む。
+    ///
+    /// `storybook build` の**直後**に同じ CI ステップで実行すること。
+    /// `vrt plan` / `vrt upload --only-changed` は絞り込みの前にこれを検証し、
+    /// 別コミットで生成された成果物（古いキャッシュ等）での絞り込みを拒否する。
+    Stamp(StampArgs),
 }
 
 #[derive(Parser)]
@@ -132,6 +140,22 @@ struct PlanArgs {
     output: Option<PathBuf>,
 }
 
+#[derive(Parser)]
+struct StampArgs {
+    /// provenance を書き込む storybook-static ディレクトリ。
+    #[arg(long, default_value = "./storybook-static")]
+    dir: PathBuf,
+
+    /// webpack stats JSON のパス。省略時は `<dir>/preview-stats.json`。
+    /// plan / upload に渡すのと同じ値を渡すこと（解決規則が同一）。
+    #[arg(long)]
+    stats_json: Option<PathBuf>,
+
+    /// Storybook index JSON のパス。省略時は `<dir>/index.json`。
+    #[arg(long)]
+    index_json: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -146,6 +170,52 @@ async fn main() -> ExitCode {
             init_logging();
             finish(run_plan(args).await)
         }
+        Command::Stamp(args) => {
+            init_logging();
+            finish(run_stamp(args))
+        }
+    }
+}
+
+/// `vrt stamp`: 成果物へ生成元コミットの provenance を書き込む。
+///
+/// worktree の HEAD を記録するので、HEAD が成果物と対応していない状態
+/// （追跡ファイルに未コミット変更がある等）では嘘の証明になる。
+/// そのため plan と同じ worktree 検査をここでも通す。
+fn run_stamp(args: StampArgs) -> Result<ExitCode> {
+    let head = git::head_commit().context("failed to resolve HEAD; run inside a git checkout")?;
+    // 追跡ファイルが汚れたままの stamp は「HEAD でビルドした」証明にならない。
+    git::verify_worktree_matches(&head)?;
+
+    let paths = ArtifactPaths {
+        dir: &args.dir,
+        stats_json: args.stats_json.as_deref(),
+        index_json: args.index_json.as_deref(),
+    };
+    let out = provenance::stamp(&paths, &head)?;
+    tracing::info!(commit = %head, path = %out.display(), "stamped artifact provenance");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// 絞り込みの前に、成果物が計画の終点 commit で生成されたものか検証する。
+///
+/// `Ok(true)` = 検証済み（絞り込んでよい）、`Ok(false)` = provenance 不在
+/// （呼び出し側は全撮影へ倒す）。不一致・破損は `Err`（設定ミスを黙って
+/// 全撮影に読み替えない——worktree 不一致と同じ方針）。
+fn verify_artifact_provenance(
+    dir: &Path,
+    stats_json: Option<&Path>,
+    index_json: Option<&Path>,
+    head_commit_sha: &str,
+) -> Result<bool> {
+    let paths = ArtifactPaths {
+        dir,
+        stats_json,
+        index_json,
+    };
+    match provenance::verify(&paths, head_commit_sha)? {
+        Verification::Verified => Ok(true),
+        Verification::Missing => Ok(false),
     }
 }
 
@@ -369,6 +439,18 @@ fn resolve_only_story_ids(
     // ここは全撮影へ倒さずエラーにする（設定ミスを黙って読み替えない）。
     git::verify_worktree_matches(commit)?;
 
+    // worktree 検査は tracked しか見ない。実入力の stats / index は通常
+    // untracked なので、成果物自体が `commit` で生成された証明（provenance）を
+    // 別途検証する。不在は全撮影へ（stats 不在と同じ扱い）、不一致はエラー。
+    if !verify_artifact_provenance(dir, stats_json, None, commit)? {
+        tracing::warn!(
+            "no artifact provenance ({}); capturing all stories. \
+             run `vrt stamp` right after `storybook build` to enable per-story capture",
+            provenance::PROVENANCE_FILE
+        );
+        return Ok(None);
+    }
+
     let repo_root = git::repo_root()?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
 
@@ -495,27 +577,50 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                 // 終点 commit と一致しない・追跡ファイルが汚れている状態で
                 // 絞り込むと、別内容に対する計画になる。エラーで止める。
                 git::verify_worktree_matches(&head_for_diff)?;
-                let repo_root = git::repo_root()?;
-                let cwd = std::env::current_dir().context("failed to read current directory")?;
-                let selection = plan::select_stories(
-                    &SelectionInputs {
-                        dir: &args.dir,
-                        stats_json: args.stats_json.as_deref(),
-                        index_json: args.index_json.as_deref(),
-                        repo_root: &repo_root,
-                        cwd: &cwd,
-                        changed_files: &changed_files,
-                    },
-                    CorruptInput::FailClosed,
-                )?;
-                if let Selection::Only {
-                    manifest_story_ids: manifest,
-                    ..
-                } = &selection
-                {
-                    manifest_story_ids = Some(manifest.clone());
+                // worktree 検査は tracked のみ。untracked の stats / index が
+                // `head_for_diff` で生成された成果物であることは provenance で
+                // 検証する。不在は全撮影へ倒し（移行期）、不一致はエラー。
+                if !verify_artifact_provenance(
+                    &args.dir,
+                    args.stats_json.as_deref(),
+                    args.index_json.as_deref(),
+                    &head_for_diff,
+                )? {
+                    PlanDocument::capture_all(
+                        coords,
+                        format!(
+                            "no artifact provenance ({} in {}). run `vrt stamp` right \
+                             after `storybook build` to bind the artifact to its commit \
+                             and enable per-story capture",
+                            provenance::PROVENANCE_FILE,
+                            args.dir.display()
+                        ),
+                        Vec::new(),
+                    )
+                } else {
+                    let repo_root = git::repo_root()?;
+                    let cwd =
+                        std::env::current_dir().context("failed to read current directory")?;
+                    let selection = plan::select_stories(
+                        &SelectionInputs {
+                            dir: &args.dir,
+                            stats_json: args.stats_json.as_deref(),
+                            index_json: args.index_json.as_deref(),
+                            repo_root: &repo_root,
+                            cwd: &cwd,
+                            changed_files: &changed_files,
+                        },
+                        CorruptInput::FailClosed,
+                    )?;
+                    if let Selection::Only {
+                        manifest_story_ids: manifest,
+                        ..
+                    } = &selection
+                    {
+                        manifest_story_ids = Some(manifest.clone());
+                    }
+                    PlanDocument::from_selection(coords, selection)
                 }
-                PlanDocument::from_selection(coords, selection)
             }
         },
     };
@@ -875,6 +980,27 @@ mod tests {
         }
     }
 
+    /// graph fixture（stats / index）を temp dir へ複製し、`commit` で stamp した
+    /// 成果物ディレクトリを作る。fixture はリポジトリ内の読み取り専用ファイルで、
+    /// provenance はテストごとの commit に依存するため、複製してから stamp する。
+    fn stamped_graph_artifact(commit: &str) -> tempfile::TempDir {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+        let tmp = tempfile::TempDir::new().expect("artifact tempdir");
+        for name in ["preview-stats.json", "index.json"] {
+            std::fs::copy(fixture.join(name), tmp.path().join(name)).expect("copy fixture");
+        }
+        vrt_cli::provenance::stamp(
+            &ArtifactPaths {
+                dir: tmp.path(),
+                stats_json: None,
+                index_json: None,
+            },
+            commit,
+        )
+        .expect("stamp");
+        tmp
+    }
+
     /// `--only-changed` の絞り込みは、worktree が記録した `--commit` と一致して
     /// いなければエラーにする。stats / index は worktree から読むため、終点だけを
     /// `--commit` に固定しても worktree が別コミットなら別内容に対する選別になる。
@@ -886,10 +1012,10 @@ mod tests {
         let _guard = ChdirGuard::change_to(&frontend_cwd);
 
         let build = pending_build(c1);
-        let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+        let artifact = stamped_graph_artifact(&c2);
 
         // worktree は c3 のまま --commit c2 → 前提不一致でエラー。
-        let err = resolve_only_story_ids(&graph_fixture, None, &build, &c2)
+        let err = resolve_only_story_ids(artifact.path(), None, &build, &c2)
             .expect_err("worktree/commit mismatch must not narrow silently");
         assert!(
             format!("{err:#}").contains("does not match the recorded commit"),
@@ -908,14 +1034,60 @@ mod tests {
         let _guard = ChdirGuard::change_to(&frontend_cwd);
 
         let build = pending_build(c1);
-        let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+        let artifact = stamped_graph_artifact(&c2);
 
-        let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
+        let only = resolve_only_story_ids(artifact.path(), None, &build, &c2).expect("resolve");
         let ids = only.expect("expected a narrowed story set");
         assert_eq!(
             ids,
             vec!["a--one".to_string(), "a--two".to_string()],
             "diff end is --commit (c2: A.tsx only), so only A stories are selected"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// 別コミットで生成（stamp）された成果物では絞り込まない。worktree は
+    /// `--commit` と完全に一致している（HEAD 一致・clean）にもかかわらず、
+    /// untracked の成果物が別コミット由来なら拒否される。
+    /// positive control: HEAD/clean 検査しか無い修正前の実装ではここが
+    /// `Ok(Some([...]))` になり（tracked しか見ないため素通り）、このテストは落ちる。
+    #[test]
+    fn only_changed_rejects_an_artifact_stamped_at_another_commit() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, c3, frontend_cwd) = init_story_diff_repo();
+        git_in(tmp.path(), &["checkout", "--detach", &c2]);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let build = pending_build(c1);
+        // 成果物は c3 でビルドされた体（古いキャッシュを掴んだ状況の再現）。
+        let artifact = stamped_graph_artifact(&c3);
+
+        let err = resolve_only_story_ids(artifact.path(), None, &build, &c2)
+            .expect_err("an artifact from another commit must not narrow the capture set");
+        assert!(
+            format!("{err:#}").contains("built from commit"),
+            "err={err:#}"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// provenance が無い成果物は絞り込まず全撮影へ倒す（stamp 未導入の移行経路）。
+    #[test]
+    fn only_changed_falls_back_to_full_capture_without_provenance() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        git_in(tmp.path(), &["checkout", "--detach", &c2]);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let build = pending_build(c1);
+        let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+
+        let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
+        assert!(
+            only.is_none(),
+            "without provenance the CLI must capture everything instead of narrowing"
         );
 
         let _keep_tmp = tmp;

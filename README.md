@@ -167,6 +167,7 @@ export VRT_TOKEN=...                              # write:build
 export VRT_PROJECT=<tenant-slug>/<project-slug>
 
 pnpm build-storybook --stats-json                 # preview-stats.json と index.json を出す
+vrt stamp --dir ./storybook-static                # 成果物を生成元コミットへ束縛する（直後に実行）
 vrt plan --dir ./storybook-static --output plan.json
 
 # build_id はキーがあるときだけ使う（--baseline-commit 経路では省略される）。
@@ -214,6 +215,38 @@ worktree のファイルから読むため、worktree の内容が計画の終�
 
 - worktree の `HEAD` が `--commit`（省略時は `HEAD` 解決値）と一致していること
 - 追跡ファイルに未コミットの変更が無いこと（未追跡ファイルは対象外）
+
+##### 成果物を生成元コミットへ束縛する（`vrt stamp`）
+
+上の worktree 検査は**追跡ファイルしか見ない**。ところが絞り込みの実入力である
+`preview-stats.json` / `index.json` は通常 untracked なので、worktree 検査だけでは
+「別コミットでビルドされた成果物」（古い CI キャッシュ、rebase 前のビルドなど）を
+掴んだまま絞り込んでしまう。その場合、変更の影響を受けた story が選別から漏れて
+偽 PASS になりうる。
+
+そこで `storybook build` の**直後**、同じ CI ステップで `vrt stamp` を実行する。
+stamp は `<dir>/vrt-provenance.json` に次を記録する。
+
+- 生成時の worktree の HEAD commit OID
+- `preview-stats.json` / `index.json`（`--stats-json` / `--index-json` で
+  パスを変えている場合はその解決後ファイル）の SHA-256
+
+`vrt plan` / `vrt upload --only-changed` は絞り込みの前にこれを検証する。
+
+- **provenance が無い** → 絞り込まず**全撮影へ倒す**（理由に stamp の導入手順を残す）。
+  stamp 未導入の既存パイプラインはこの移行経路でそのまま動き続ける——絞り込みが
+  効かなくなるだけで、全撮影は撮り逃しを作らないため安全側である。絞り込みを
+  再度有効にするには build 直後に `vrt stamp` を 1 行足す
+- **provenance があるのにコミットが一致しない／stats・index の内容ハッシュが
+  一致しない／壊れている** → 全撮影へ倒さず**終了コード 2 で落ちる**。
+  別コミットの成果物や stamp 後の差し替えは設定ミスの積極的な証拠であり、
+  黙って全撮影に読み替えると誤設定に永久に気づけない（worktree 不一致を
+  エラーにするのと同じ方針）
+
+いずれの場合も「生成元を検証できないまま絞り込む」ことはない。
+`vrt stamp` 自体も worktree が clean（追跡ファイルに未コミット変更なし）で
+なければ拒否する——汚れた worktree での stamp は「HEAD でビルドした」証明に
+ならないためである。
 
 #### 部分アップロードは撮影前に計画を固定する（capture plan）
 
@@ -368,6 +401,7 @@ vrt upload --dir ./storybook-static
 
 # 変更されたストーリーだけ撮り直す（TurboSnap 相当）
 pnpm build-storybook --stats-json          # preview-stats.json を出す
+vrt stamp --dir ./storybook-static         # 成果物を生成元コミットへ束縛する
 vrt upload --dir ./storybook-static --only-changed --wait
 ```
 
@@ -407,6 +441,11 @@ finalize 時点の既知情報（`build_id` / `build_number` / `tenant_slug` /
 - **stats-json が必要**: `storybook build --stats-json` で `preview-stats.json`
   を出す（既定の探索先は `<dir>/preview-stats.json`、`--stats-json` で変更可）。
   無い場合は警告して全撮影にフォールバックする
+- **provenance（`vrt stamp`）が必要**: build 直後に `vrt stamp` で成果物を
+  生成元コミットへ束縛する（詳細は `vrt plan` の節を参照）。無い場合は警告して
+  全撮影にフォールバックする（移行期）。**あるのにコミットや内容ハッシュが
+  合わない場合はエラー（終了コード 2）**——別コミットの成果物での絞り込みは
+  偽 PASS を作るため、黙って読み替えない
 - **git 履歴が baseline コミットまで必要**: 差分は
   `git diff <baseline> <commit>` で取る（`<commit>` は `--commit` 解決値、
   未指定なら worktree の `HEAD`）。shallow clone で baseline が手元に無いと
