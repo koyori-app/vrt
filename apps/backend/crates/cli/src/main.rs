@@ -219,7 +219,7 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
 
     // 5. finalize（--only-changed なら影響ストーリーだけ）。
     let only_story_ids = if args.only_changed {
-        resolve_only_story_ids(&args.dir, args.stats_json.as_deref(), &build)?
+        resolve_only_story_ids(&args.dir, args.stats_json.as_deref(), &build, &commit)?
     } else {
         None
     };
@@ -336,6 +336,7 @@ fn resolve_only_story_ids(
     dir: &Path,
     stats_json: Option<&Path>,
     build: &BuildResponse,
+    commit: &str,
 ) -> Result<Option<Vec<String>>> {
     // baseline が無ければ差分の起点が無い → 全撮影。
     let Some(baseline) = &build.baseline_commit_sha else {
@@ -343,9 +344,9 @@ fn resolve_only_story_ids(
         return Ok(None);
     };
 
-    // git 差分。履歴不足（shallow clone 等）は全撮影にフォールバック。
-    let head = git::head_commit()?;
-    let changed_files = match git::changed_files(baseline, &head) {
+    // git 差分。`--commit` で記録した終点と baseline の 2 点間を使う（worktree HEAD ではない）。
+    // 履歴不足（shallow clone 等）は全撮影にフォールバック。
+    let changed_files = match git::changed_files(baseline, commit) {
         Ok(files) => files,
         Err(e) => {
             tracing::warn!("could not diff against baseline ({e:#}); capturing all stories");
@@ -595,6 +596,9 @@ fn exit_code_for(status: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static REPO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// 終了コードは CI の合否判定そのものなので、8 状態すべてを固定する。
     /// `changes_detected` は「差分あり = レビュー待ち」であって失敗ではないため、
@@ -715,5 +719,119 @@ mod tests {
         for s in ["pending", "rendering", "processing"] {
             assert!(!is_settled(s), "{s} should not be terminal");
         }
+    }
+
+    struct ChdirGuard {
+        previous: PathBuf,
+    }
+
+    impl ChdirGuard {
+        fn change_to(dir: &Path) -> Self {
+            let previous = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(dir).expect("chdir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for ChdirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "`git {}` failed in {}",
+            args.join(" "),
+            dir.display()
+        );
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "`git {}` failed in {}",
+            args.join(" "),
+            dir.display()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// upload の only-changed 用。c2 で A.tsx、c3 で B.tsx を変更する 3 段履歴。
+    fn init_story_diff_repo() -> (tempfile::TempDir, String, String, String, PathBuf) {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        git_in(root, &["init", "-b", "main"]);
+        git_in(root, &["config", "user.email", "vrt@test.local"]);
+        git_in(root, &["config", "user.name", "vrt test"]);
+
+        let a_path = root.join("apps/frontend/src/A.tsx");
+        let b_path = root.join("apps/frontend/src/B.tsx");
+        fs::create_dir_all(a_path.parent().expect("parent")).expect("mkdir");
+        fs::write(&a_path, "export const A = 1;\n").expect("write A");
+        fs::write(&b_path, "export const B = 1;\n").expect("write B");
+        git_in(root, &["add", "apps"]);
+        git_in(root, &["commit", "-m", "c1"]);
+        let c1 = git_output(root, &["rev-parse", "HEAD"]);
+
+        fs::write(&a_path, "export const A = 2;\n").expect("write A");
+        git_in(root, &["add", "apps/frontend/src/A.tsx"]);
+        git_in(root, &["commit", "-m", "c2"]);
+        let c2 = git_output(root, &["rev-parse", "HEAD"]);
+
+        fs::write(&b_path, "export const B = 2;\n").expect("write B");
+        git_in(root, &["add", "apps/frontend/src/B.tsx"]);
+        git_in(root, &["commit", "-m", "c3"]);
+        let c3 = git_output(root, &["rev-parse", "HEAD"]);
+
+        let frontend = root.join("apps/frontend");
+        (tmp, c1, c2, c3, frontend)
+    }
+
+    /// `--only-changed` は build 記録の `--commit` 終点を使い、worktree HEAD を使わない。
+    #[test]
+    fn only_changed_uses_explicit_commit_not_worktree_head() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let build = BuildResponse {
+            id: "build-test".into(),
+            number: 1,
+            status: "pending".into(),
+            baseline_commit_sha: Some(c1),
+            total_count: 0,
+            changed_count: 0,
+            added_count: 0,
+            removed_count: 0,
+            error_message: None,
+        };
+
+        let graph_fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+
+        let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
+        let ids = only.expect("expected a narrowed story set");
+        assert_eq!(
+            ids,
+            vec!["a--one".to_string(), "a--two".to_string()],
+            "diff end must be --commit (c2: A.tsx only), not worktree HEAD (c3: B.tsx too)"
+        );
+
+        // worktree はまだ c3。壊れた実装（HEAD 差分）なら B の story も混ざる。
+        let _keep_tmp = tmp;
     }
 }

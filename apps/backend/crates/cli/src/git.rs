@@ -50,14 +50,6 @@ pub fn head_commit() -> Result<String> {
     resolve_commit("HEAD")
 }
 
-/// baseline コミットが手元に存在するか。
-///
-/// [`resolve_commit`] への薄いラッパー。cmd_591 の cat-file 経路は廃止し、
-/// 存在確認と OID 正規化を一本化する。
-pub fn commit_exists(baseline_commit: &str) -> Result<()> {
-    resolve_commit(baseline_commit).map(|_| ())
-}
-
 /// `from_commit` から `to_commit` までの変更ファイル一覧（リポジトリルート相対）。
 ///
 /// 両端は [`resolve_commit`] で正規化してから `git diff --name-only` する。
@@ -78,32 +70,116 @@ pub fn changed_files(from_commit: &str, to_commit: &str) -> Result<Vec<String>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    static REPO_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ChdirGuard {
+        previous: PathBuf,
+    }
+
+    impl ChdirGuard {
+        fn change_to(dir: &Path) -> Self {
+            let previous = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(dir).expect("chdir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for ChdirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.previous);
+        }
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git");
+        assert!(
+            status.success(),
+            "`git {}` failed in {}",
+            args.join(" "),
+            dir.display()
+        );
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "`git {}` failed in {}",
+            args.join(" "),
+            dir.display()
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// 3 段の線形履歴（c1 → c2 で a.txt、c2 → c3 で b.txt）。
+    fn init_linear_repo() -> (TempDir, String, String, String) {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        git_in(root, &["init", "-b", "main"]);
+        git_in(root, &["config", "user.email", "vrt@test.local"]);
+        git_in(root, &["config", "user.name", "vrt test"]);
+
+        fs::write(root.join("a.txt"), "a1\n").expect("write a.txt");
+        git_in(root, &["add", "a.txt"]);
+        git_in(root, &["commit", "-m", "c1"]);
+        let c1 = git_output(root, &["rev-parse", "HEAD"]);
+
+        fs::write(root.join("a.txt"), "a2\n").expect("write a.txt");
+        git_in(root, &["add", "a.txt"]);
+        git_in(root, &["commit", "-m", "c2"]);
+        let c2 = git_output(root, &["rev-parse", "HEAD"]);
+
+        fs::write(root.join("b.txt"), "b1\n").expect("write b.txt");
+        git_in(root, &["add", "b.txt"]);
+        git_in(root, &["commit", "-m", "c3"]);
+        let c3 = git_output(root, &["rev-parse", "HEAD"]);
+
+        (tmp, c1, c2, c3)
+    }
 
     #[test]
     fn resolve_commit_normalizes_head_ref() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, _c2, c3) = init_linear_repo();
+        let _guard = ChdirGuard::change_to(tmp.path());
         let oid = resolve_commit("HEAD").expect("HEAD");
+        assert_eq!(oid, c3);
         assert_eq!(oid.len(), 40);
         assert!(oid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn resolve_commit_accepts_head_tilde_notation() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, _c1, c2, c3) = init_linear_repo();
+        let _guard = ChdirGuard::change_to(tmp.path());
         let head = resolve_commit("HEAD").expect("HEAD");
-        // shallow clone では親が無いことがある。
-        let Ok(parent) = resolve_commit("HEAD~1") else {
-            return;
-        };
+        let parent = resolve_commit("HEAD~1").expect("HEAD~1");
+        assert_eq!(head, c3);
+        assert_eq!(parent, c2);
         assert_ne!(head, parent);
     }
 
     #[test]
     fn changed_files_diffs_between_two_explicit_commits() {
-        let Ok(parent) = resolve_commit("HEAD~1") else {
-            return;
-        };
-        let head = resolve_commit("HEAD").expect("head");
-        let files = changed_files(&parent, &head).expect("diff");
-        // 差分の有無は履歴依存なので、呼び出しが成功することだけ固定する。
-        let _ = files;
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, _c3) = init_linear_repo();
+        let _guard = ChdirGuard::change_to(tmp.path());
+        let files = changed_files(&c1, &c2).expect("diff");
+        assert_eq!(files, vec!["a.txt".to_string()]);
     }
 }
