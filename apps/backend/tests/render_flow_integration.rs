@@ -241,6 +241,7 @@ struct Fixture {
     app: TestApp,
     tenant_slug: String,
     project_slug: String,
+    project_id: Uuid,
     token: String,
 }
 
@@ -270,7 +271,7 @@ async fn setup() -> Fixture {
         .await;
     assert_eq!(res.status(), StatusCode::CREATED, "create project");
     let project: Value = res.json().await.expect("project json");
-    let project_id = project["id"].as_str().expect("project id").to_string();
+    let project_id: Uuid = project["id"].as_str().expect("project id").parse().unwrap();
     assert_eq!(
         project["viewport_width"].as_i64(),
         Some(1280),
@@ -306,6 +307,7 @@ async fn setup() -> Fixture {
         app,
         tenant_slug,
         project_slug,
+        project_id,
         token,
     }
 }
@@ -419,6 +421,30 @@ impl Fixture {
             .as_array()
             .expect("comparisons array")
             .clone()
+    }
+
+    /// 最新 baseline の ID と、その `Demo/Box/Red` エントリのストレージキー。
+    async fn latest_baseline_red_entry(&self) -> (Uuid, String) {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+
+        let baseline = entity::baselines::Entity::find()
+            .filter(entity::baselines::Column::ProjectId.eq(self.project_id))
+            .order_by_desc(entity::baselines::Column::CreatedAt)
+            .order_by_desc(entity::baselines::Column::Id)
+            .one(&self.app.state.db)
+            .await
+            .expect("query baseline")
+            .expect("baseline exists");
+
+        let entry = entity::baseline_entries::Entity::find()
+            .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+            .filter(entity::baseline_entries::Column::Name.eq("Demo/Box/Red"))
+            .one(&self.app.state.db)
+            .await
+            .expect("query red entry")
+            .expect("red entry exists");
+
+        (baseline.id, entry.storage_key)
     }
 }
 
@@ -778,6 +804,114 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
         .filter_map(|c| c["name"].as_str())
         .collect();
     assert_eq!(added, vec!["Demo/Box/Green"], "only the new story is added");
+}
+
+/// storybook の流用（`only_story_ids`）もビルド作成時に固定した baseline を使う。
+///
+/// 作成後に別ビルドが承認されて最新 baseline が入れ替わっても、流用画像と比較対象は
+/// 固定した baseline から引く（クライアントが差分計画の起点にしたものとずれない）。
+///
+/// positive control: 流用・比較時に最新 baseline を引き直す旧実装では、流用画像が
+/// 入れ替わり後の baseline（暗い赤）になり、`baseline_id` も新 baseline を指すため、
+/// このテストのバイト列比較と `baseline_id` の両方が落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn reuse_pulls_from_the_baseline_pinned_at_build_creation() {
+    if !chromium_or_skip("reuse_pulls_from_the_baseline_pinned_at_build_creation") {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 明るい赤で全撮影 → 承認して baseline B1 を確立 ───────────
+    let build_a = fx.create_storybook_build("pin0001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_a_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build A");
+    let (pinned_baseline_id, red_v1_key) = fx.latest_baseline_red_entry().await;
+
+    // ── ビルド B: この時点で作成 → baseline B1 に固定される ────────────────
+    let build_b = fx.create_storybook_build("pin0002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // ── ビルド C: 暗い赤で全撮影 → 承認して最新 baseline を B2 へ動かす ────
+    let build_c = fx.create_storybook_build("pin0003").await;
+    let build_c_id = build_id_of(&build_c);
+    assert_eq!(
+        fx.upload_bundle(build_c_id, bundle_zip("#880000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_c_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_c_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_c_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build C");
+    let (moved_baseline_id, red_v2_key) = fx.latest_baseline_red_entry().await;
+    assert_ne!(pinned_baseline_id, moved_baseline_id, "baseline moved");
+
+    // ── ビルド B を Blue だけ絞って finalize → Red は流用される ───────────
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--blue"])
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let build_b = fx.wait_for_terminal(build_b_id).await;
+    assert_eq!(
+        build_b["baseline_id"].as_str().map(|s| s.parse().unwrap()),
+        Some(pinned_baseline_id),
+        "the build must record the baseline pinned at creation, not the moved one"
+    );
+
+    // 流用された Red のバイト列は固定 baseline（明るい赤）と一致し、
+    // 入れ替わり後の baseline（暗い赤）とは一致しない。
+    let shots = fx.screenshots(build_b_id).await;
+    let red_shot = shots
+        .iter()
+        .find(|s| s.name == "Demo/Box/Red")
+        .expect("reused red screenshot");
+    let reused = service::screenshots::read_all(&fx.app.state.storage, &red_shot.storage_key)
+        .await
+        .expect("read reused bytes");
+    let v1 = service::screenshots::read_all(&fx.app.state.storage, &red_v1_key)
+        .await
+        .expect("read pinned baseline bytes");
+    let v2 = service::screenshots::read_all(&fx.app.state.storage, &red_v2_key)
+        .await
+        .expect("read moved baseline bytes");
+    assert_eq!(
+        reused, v1,
+        "reuse must copy from the pinned baseline (bright red)"
+    );
+    assert_ne!(
+        reused, v2,
+        "reuse must not follow the baseline that moved after build creation"
+    );
 }
 
 /// `screenshots` モードに `only_story_ids` を渡すと 400（サーバー撮影しない）。

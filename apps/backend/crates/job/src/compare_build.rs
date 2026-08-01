@@ -20,7 +20,7 @@ use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use entity::{
@@ -190,12 +190,31 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
     service::comparisons::delete_for_build(db, build_id).await?;
 
-    let baseline = service::baselines::latest_for(db, &project, &build.branch).await?;
+    // baseline はビルド作成時に固定されたもの（`builds.baseline_id`）を使う。
+    // ここで最新を引き直すと、作成〜比較の間に別ビルドが承認された場合に
+    // クライアントが計画した baseline と違うものと比較してしまう。
+    let baseline = match build.baseline_id {
+        Some(id) => Some(service::baselines::get_baseline(db, id).await?),
+        None => None,
+    };
     let baseline_entries = match &baseline {
         Some(b) => service::baselines::entries(db, b.id).await?,
         None => Vec::new(),
     };
     let shots = service::screenshots::list_for_build(db, build_id).await?;
+
+    // screenshots モードの部分アップロード: 宣言集合の外にある baseline エントリは
+    // 「今回撮らなかった」だけで削除ではない。baseline の PNG をこのビルドの
+    // スクリーンショットとして複製してから通常の比較に入れる（unchanged になり、
+    // 承認時も全スクリーンショット昇格の経路がそのまま新 baseline へ引き継ぐ。
+    // storybook モードの only_story_ids 流用と同じ帰結）。
+    let shots = match captured_name_set(&build)? {
+        Some(selected) => {
+            materialize_carry_forward(state, &project, &build, &baseline_entries, &selected, shots)
+                .await?
+        }
+        None => shots,
+    };
 
     let pairs = join_by_name(shots, baseline_entries);
     let total = pairs.len();
@@ -333,6 +352,109 @@ impl Outcome {
             diff_ratio: None,
         }
     }
+}
+
+/// ビルドに宣言された「今回撮影した名前」の集合を取り出す。
+///
+/// `None` は全撮影（従来どおり）。宣言はサーバー自身が finalize で書いた値なので
+/// 配列以外の形は想定外＝壊れたデータとして即エラーにする（黙って全撮影として
+/// 読み替えると、宣言外の baseline エントリが removed になり誤承認で消える）。
+fn captured_name_set(build: &builds::Model) -> Result<Option<HashSet<String>>, anyhow::Error> {
+    let Some(value) = &build.captured_names else {
+        return Ok(None);
+    };
+    let names: Vec<String> = serde_json::from_value(value.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "build {} has malformed captured_names ({e}); refusing to compare",
+            build.id
+        )
+    })?;
+    Ok(Some(names.into_iter().collect()))
+}
+
+/// スクリーンショットが baseline 流用の複製（`metadata.reused == true`）か。
+fn is_reused(shot: &screenshots::Model) -> bool {
+    shot.metadata
+        .as_ref()
+        .and_then(|m| m.get("reused"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 宣言集合の外にある baseline エントリを、このビルドのスクリーンショットとして複製する。
+///
+/// finalize 時点の「宣言 == アップロード」検証をここでも再確認する。finalize の
+/// 検証と遷移の間に紛れ込んだアップロードや、宣言に無い名前の混入を、比較を
+/// 始める前に落とすための多重防御（流用の複製は `reused` メタデータで除外して数える）。
+///
+/// リトライ安全性: 複製済みの名前はスキップするので、途中で落ちて再実行されても
+/// `(build_id, name)` の UNIQUE 制約にぶつからない。
+async fn materialize_carry_forward(
+    state: &JobState,
+    project: &projects::Model,
+    build: &builds::Model,
+    baseline_entries: &[baseline_entries::Model],
+    selected: &HashSet<String>,
+    shots: Vec<screenshots::Model>,
+) -> Result<Vec<screenshots::Model>, anyhow::Error> {
+    let db = &state.db;
+
+    let uploaded: HashSet<&str> = shots
+        .iter()
+        .filter(|s| !is_reused(s))
+        .map(|s| s.name.as_str())
+        .collect();
+    let declared: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    if uploaded != declared {
+        let mut missing: Vec<&&str> = declared.difference(&uploaded).collect();
+        let mut extra: Vec<&&str> = uploaded.difference(&declared).collect();
+        missing.sort();
+        extra.sort();
+        anyhow::bail!(
+            "captured_names does not match the uploaded screenshots \
+             (declared but not uploaded: {missing:?}; uploaded but not declared: {extra:?})"
+        );
+    }
+
+    let existing: HashSet<String> = shots.iter().map(|s| s.name.clone()).collect();
+    let mut carried = 0usize;
+    for entry in baseline_entries {
+        if selected.contains(&entry.name) || existing.contains(&entry.name) {
+            continue;
+        }
+        // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
+        // バイト列が同一なので、後段の比較が unchanged と判定する
+        // （render_build.rs の Reuse 経路と同じ手口）。
+        let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("download baseline for `{}`: {e}", entry.name))?;
+        service::screenshots::store_screenshot_with_metadata(
+            db,
+            &state.storage,
+            project.tenant_id,
+            project.id,
+            build.id,
+            entry.name.clone(),
+            bytes::Bytes::from(png),
+            Some(serde_json::json!({ "reused": true })),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("store carried-forward screenshot `{}`: {e}", entry.name))?;
+        carried += 1;
+    }
+
+    if carried > 0 {
+        service::build_logs::append(
+            db,
+            build.id,
+            LogLevel::Info,
+            format!("carried forward {carried} baseline screenshots outside the captured set"),
+        )
+        .await?;
+    }
+
+    // 複製ぶんを含めた最新の一覧で比較する。
+    Ok(service::screenshots::list_for_build(db, build.id).await?)
 }
 
 /// name をキーにスクリーンショットと baseline エントリを完全外部結合する。

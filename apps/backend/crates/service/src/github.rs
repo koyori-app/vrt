@@ -466,6 +466,7 @@ mod tests {
             mode: builds::BuildMode::Screenshots,
             storybook_key: None,
             baseline_id: None,
+            captured_names: None,
             total_count: 0,
             changed_count: changed,
             added_count: added,
