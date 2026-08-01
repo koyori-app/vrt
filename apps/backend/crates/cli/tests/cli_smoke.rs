@@ -234,6 +234,231 @@ fn plan_normalizes_baseline_ref_to_full_oid() {
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), head);
 }
 
+/// stamp 用: リポジトリ内に成果物ディレクトリを掘り、fixture の stats / index を
+/// 「build コマンドが生成する」シェルスクリプトを返す。
+///
+/// stamp は build 後に stats / index の存在を要求するため、build コマンド側で
+/// 複製することで「vrt が build を実行してから stamp した」順序そのものを検証する。
+fn copy_fixture_build_command(dest: &Path) -> String {
+    let fixture = graph_fixture();
+    format!(
+        "mkdir -p '{dest}' && cp '{fix}/preview-stats.json' '{fix}/index.json' '{dest}/'",
+        dest = dest.display(),
+        fix = fixture.display()
+    )
+}
+
+fn provenance_file(dir: &Path) -> PathBuf {
+    dir.join("vrt-provenance.json")
+}
+
+/// `vrt stamp -- <build command>` の基本形: vrt が build を実行し、前後で観測した
+/// HEAD を v2 provenance として書く。
+#[test]
+fn stamp_runs_the_build_and_writes_v2_provenance() {
+    let (tmp, _c1, _c2, head) = init_linear_repo();
+    let repo = tmp.path();
+    let dest = repo.join("storybook-static");
+
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            &copy_fixture_build_command(&dest),
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = fs::read_to_string(provenance_file(&dest)).expect("provenance written");
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["head_commit_sha"].as_str().expect("head"), head);
+    assert_eq!(value["build_command"][0], "sh");
+}
+
+/// build コマンドが失敗したら stamp しない（証明の無い成果物を作らない）。
+#[test]
+fn stamp_does_not_stamp_when_the_build_fails() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let repo = tmp.path();
+    let dest = repo.join("storybook-static");
+
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            "exit 7",
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("build command"), "stderr={stderr}");
+    assert!(!provenance_file(&dest).exists(), "nothing may be stamped");
+}
+
+/// build 中に HEAD が動いたら stamp しない——build 前後の HEAD 同一性こそが
+/// 「その commit でビルドした」証明の中身だからである。
+/// positive control: stamp 時点の HEAD しか見ない旧形（build 非所有）では
+/// この状況を観測する計器が存在せず、検出のしようがなかった。
+#[test]
+fn stamp_rejects_a_build_that_moves_head() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let repo = tmp.path();
+    let dest = repo.join("storybook-static");
+    let build = format!(
+        "{} && git commit --allow-empty -m moved",
+        copy_fixture_build_command(&dest)
+    );
+
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            &build,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HEAD moved during the build"),
+        "stderr={stderr}"
+    );
+    assert!(!provenance_file(&dest).exists(), "nothing may be stamped");
+}
+
+/// build が追跡ファイルを書き換えたら stamp しない（成果物を HEAD へ帰属できない）。
+#[test]
+fn stamp_rejects_a_build_that_dirties_tracked_files() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let repo = tmp.path();
+    let dest = repo.join("storybook-static");
+    let build = format!(
+        "{} && printf dirty >> README.md",
+        copy_fixture_build_command(&dest)
+    );
+
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            &build,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dirty"), "stderr={stderr}");
+    assert!(!provenance_file(&dest).exists(), "nothing may be stamped");
+}
+
+/// build コマンド無しの stamp は受け付けない（build 後の後追い stamp の口を
+/// CLI から消す）。clap の usage エラーで終了コード 2。
+#[test]
+fn stamp_without_a_build_command_is_a_usage_error() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let repo = tmp.path();
+
+    let output = vrt()
+        .args(["stamp", "--dir", "storybook-static"])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert!(!output.status.success());
+    assert!(!provenance_file(&repo.join("storybook-static")).exists());
+}
+
+/// キャッシュ復元シナリオの端から端まで: c2 で vrt が build を所有して stamp した
+/// 成果物を、c3 の checkout（キャッシュ復元で古い成果物を掴んだ状況）で plan に
+/// 使うと、計画は出ず終了コード 2 で落ちる。
+/// positive control: provenance を見ない実装では c3 の diff に c2 の stats を
+/// 混ぜた計画が exit 0 で出てしまう（修正前は通る）。
+#[test]
+fn plan_rejects_a_cache_restored_artifact_built_at_an_older_commit() {
+    let (tmp, c1, c2, c3) = init_linear_repo();
+    let repo = tmp.path();
+    let dest = repo.join("storybook-static");
+
+    // c2 を checkout し、vrt が build を所有して stamp（正しい生成手順）。
+    git_in(repo, &["checkout", "--detach", &c2]);
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            &copy_fixture_build_command(&dest),
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // c3 へ進む（キャッシュから古い成果物を復元した CI の再現）。
+    git_in(repo, &["checkout", "--detach", &c3]);
+    let output = vrt()
+        .args([
+            "plan",
+            "--baseline-commit",
+            &c1,
+            "--dir",
+            dest.to_str().expect("utf8"),
+            "--branch",
+            "feat/test",
+            "--commit",
+            &c3,
+        ])
+        .current_dir(repo)
+        .output()
+        .expect("spawn vrt");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a stale artifact must not narrow; stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stdout.is_empty(), "no plan may be emitted");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("built from commit"), "stderr={stderr}");
+}
+
 /// 絞り込み時、worktree は `--commit` の内容と一致していなければならない。
 ///
 /// 選別の入力（stats / index）は worktree のファイルから読むため、diff の終点だけを

@@ -38,9 +38,12 @@ enum Command {
     /// 列挙された story を撮る。
     Plan(PlanArgs),
 
-    /// storybook 成果物に生成元コミットの provenance を書き込む。
+    /// storybook build を実行し、成果物に生成元コミットの provenance を書き込む。
     ///
-    /// `storybook build` の**直後**に同じ CI ステップで実行すること。
+    /// `vrt stamp -- <build command...>` の形で build コマンドを渡す。vrt が
+    /// build 開始前に HEAD と worktree の clean を観測し、build を実行し、
+    /// 成功後に同一 HEAD・clean を再観測してから stamp する——「build がその
+    /// commit で走った」ことを vrt 自身の計器で証明するためである。
     /// `vrt plan` / `vrt upload --only-changed` は絞り込みの前にこれを検証し、
     /// 別コミットで生成された成果物（古いキャッシュ等）での絞り込みを拒否する。
     Stamp(StampArgs),
@@ -154,6 +157,16 @@ struct StampArgs {
     /// Storybook index JSON のパス。省略時は `<dir>/index.json`。
     #[arg(long)]
     index_json: Option<PathBuf>,
+
+    /// storybook build を実行するコマンド。`--` の後に argv をそのまま並べる
+    /// （シェル展開はしない。シェル機能が要るなら `sh -c '...'` を渡す）。
+    ///
+    /// 例: `vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json`
+    ///
+    /// build 後の stamp だけを単独で行う形は提供しない——build と stamp の間に
+    /// checkout が挟まると「その commit でビルドした」証明にならないためである。
+    #[arg(last = true, required = true, num_args = 1..)]
+    build_command: Vec<String>,
 }
 
 #[tokio::main]
@@ -177,45 +190,102 @@ async fn main() -> ExitCode {
     }
 }
 
-/// `vrt stamp`: 成果物へ生成元コミットの provenance を書き込む。
+/// `vrt stamp -- <build command>`: build を実行し、成果物へ provenance を書き込む。
 ///
-/// worktree の HEAD を記録するので、HEAD が成果物と対応していない状態
-/// （追跡ファイルに未コミット変更がある等）では嘘の証明になる。
-/// そのため plan と同じ worktree 検査をここでも通す。
+/// 「stamp 時点の HEAD」ではなく「build がその HEAD で走った」ことを証明する
+/// ため、観測は build を挟んで二度行う。
+///
+/// 1. build 開始前: HEAD を解決し、worktree が clean（追跡ファイルに
+///    未コミット変更なし）であることを検査する
+/// 2. build コマンドを実行する（失敗したら stamp しない）
+/// 3. build 成功後: HEAD が開始前と同一のまま動いていないこと、worktree が
+///    依然 clean であることを再検査する（build 中の checkout / commit /
+///    追跡ファイル書き換えはここで検出され、stamp は行われない）
+/// 4. その HEAD で provenance を書く
 fn run_stamp(args: StampArgs) -> Result<ExitCode> {
-    let head = git::head_commit().context("failed to resolve HEAD; run inside a git checkout")?;
-    // 追跡ファイルが汚れたままの stamp は「HEAD でビルドした」証明にならない。
-    git::verify_worktree_matches(&head)?;
+    // 1. build 開始前の観測。
+    let head_before =
+        git::head_commit().context("failed to resolve HEAD; run inside a git checkout")?;
+    git::verify_worktree_matches(&head_before)
+        .context("the worktree must be clean before the build so the stamp can prove it")?;
 
+    // 2. build 実行。argv をそのまま起動する（シェルを介さない）。
+    let (program, rest) = args
+        .build_command
+        .split_first()
+        .context("pass the build command after `--`")?;
+    tracing::info!(command = %args.build_command.join(" "), commit = %head_before, "running the build");
+    let status = std::process::Command::new(program)
+        .args(rest)
+        .status()
+        .with_context(|| format!("failed to spawn the build command `{program}`"))?;
+    if !status.success() {
+        bail!(
+            "the build command `{}` failed ({status}); nothing was stamped",
+            args.build_command.join(" ")
+        );
+    }
+
+    // 3. build 成功後の再観測。HEAD が動いた・worktree が汚れた build は
+    //    「head_before でビルドした」証明にならないので stamp しない。
+    let head_after = git::head_commit().context("failed to re-resolve HEAD after the build")?;
+    if head_after != head_before {
+        bail!(
+            "HEAD moved during the build ({head_before} -> {head_after}); \
+             the artifact cannot be attributed to a single commit, so nothing was stamped"
+        );
+    }
+    git::verify_worktree_matches(&head_after).context(
+        "the build left the worktree dirty, so the artifact cannot be attributed to HEAD",
+    )?;
+
+    // 4. stamp。
     let paths = ArtifactPaths {
         dir: &args.dir,
         stats_json: args.stats_json.as_deref(),
         index_json: args.index_json.as_deref(),
     };
-    let out = provenance::stamp(&paths, &head)?;
-    tracing::info!(commit = %head, path = %out.display(), "stamped artifact provenance");
+    let out = provenance::stamp(&paths, &head_after, &args.build_command)?;
+    tracing::info!(commit = %head_after, path = %out.display(), "stamped artifact provenance");
     Ok(ExitCode::SUCCESS)
 }
 
 /// 絞り込みの前に、成果物が計画の終点 commit で生成されたものか検証する。
 ///
-/// `Ok(true)` = 検証済み（絞り込んでよい）、`Ok(false)` = provenance 不在
-/// （呼び出し側は全撮影へ倒す）。不一致・破損は `Err`（設定ミスを黙って
+/// `Verified` = 絞り込んでよい。`Missing` / `Unowned`（v1 の旧形式）は
+/// 呼び出し側が全撮影へ倒す。不一致・破損は `Err`（設定ミスを黙って
 /// 全撮影に読み替えない——worktree 不一致と同じ方針）。
 fn verify_artifact_provenance(
     dir: &Path,
     stats_json: Option<&Path>,
     index_json: Option<&Path>,
     head_commit_sha: &str,
-) -> Result<bool> {
+) -> Result<Verification> {
     let paths = ArtifactPaths {
         dir,
         stats_json,
         index_json,
     };
-    match provenance::verify(&paths, head_commit_sha)? {
-        Verification::Verified => Ok(true),
-        Verification::Missing => Ok(false),
+    provenance::verify(&paths, head_commit_sha)
+}
+
+/// provenance が絞り込みを許さなかった（`Missing` / `Unowned`）ときの説明文。
+/// plan の `reason` と upload の警告ログで共用する。
+fn provenance_fallback_reason(verification: &Verification, dir: &Path) -> String {
+    match verification {
+        Verification::Missing => format!(
+            "no artifact provenance ({} in {}). build via `vrt stamp -- <build command>` \
+             to bind the artifact to its commit and enable per-story capture",
+            provenance::PROVENANCE_FILE,
+            dir.display()
+        ),
+        Verification::Unowned => format!(
+            "the artifact provenance in {} predates build ownership (version 1: it proves \
+             the HEAD at stamp time, not at build time). re-build via \
+             `vrt stamp -- <build command>` to enable per-story capture",
+            dir.display()
+        ),
+        Verification::Verified => unreachable!("verified provenance never falls back"),
     }
 }
 
@@ -441,12 +511,13 @@ fn resolve_only_story_ids(
 
     // worktree 検査は tracked しか見ない。実入力の stats / index は通常
     // untracked なので、成果物自体が `commit` で生成された証明（provenance）を
-    // 別途検証する。不在は全撮影へ（stats 不在と同じ扱い）、不一致はエラー。
-    if !verify_artifact_provenance(dir, stats_json, None, commit)? {
+    // 別途検証する。不在と build 所有なしの旧形式（v1）は全撮影へ
+    // （stats 不在と同じ扱い）、不一致はエラー。
+    let verification = verify_artifact_provenance(dir, stats_json, None, commit)?;
+    if verification != Verification::Verified {
         tracing::warn!(
-            "no artifact provenance ({}); capturing all stories. \
-             run `vrt stamp` right after `storybook build` to enable per-story capture",
-            provenance::PROVENANCE_FILE
+            "{}; capturing all stories",
+            provenance_fallback_reason(&verification, dir)
         );
         return Ok(None);
     }
@@ -579,22 +650,18 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                 git::verify_worktree_matches(&head_for_diff)?;
                 // worktree 検査は tracked のみ。untracked の stats / index が
                 // `head_for_diff` で生成された成果物であることは provenance で
-                // 検証する。不在は全撮影へ倒し（移行期）、不一致はエラー。
-                if !verify_artifact_provenance(
+                // 検証する。不在と build 所有なしの旧形式（v1）は全撮影へ倒し
+                // （移行期）、不一致はエラー。
+                let verification = verify_artifact_provenance(
                     &args.dir,
                     args.stats_json.as_deref(),
                     args.index_json.as_deref(),
                     &head_for_diff,
-                )? {
+                )?;
+                if verification != Verification::Verified {
                     PlanDocument::capture_all(
                         coords,
-                        format!(
-                            "no artifact provenance ({} in {}). run `vrt stamp` right \
-                             after `storybook build` to bind the artifact to its commit \
-                             and enable per-story capture",
-                            provenance::PROVENANCE_FILE,
-                            args.dir.display()
-                        ),
+                        provenance_fallback_reason(&verification, &args.dir),
                         Vec::new(),
                     )
                 } else {
@@ -996,8 +1063,41 @@ mod tests {
                 index_json: None,
             },
             commit,
+            &["storybook".to_string(), "build".to_string()],
         )
         .expect("stamp");
+        tmp
+    }
+
+    /// graph fixture を複製し、v1（build 所有なしの旧形式）の provenance を
+    /// 手書きした成果物ディレクトリを作る。旧 CLI で stamp されたキャッシュの再現。
+    fn legacy_v1_graph_artifact(commit: &str) -> tempfile::TempDir {
+        use sha2::{Digest, Sha256};
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+        let tmp = tempfile::TempDir::new().expect("artifact tempdir");
+        let mut hashes = Vec::new();
+        for name in ["preview-stats.json", "index.json"] {
+            let bytes = std::fs::read(fixture.join(name)).expect("read fixture");
+            std::fs::write(tmp.path().join(name), &bytes).expect("copy fixture");
+            let mut hex = String::new();
+            for byte in Sha256::digest(&bytes) {
+                use std::fmt::Write;
+                write!(hex, "{byte:02x}").expect("hex");
+            }
+            hashes.push(hex);
+        }
+        let v1 = serde_json::json!({
+            "version": 1,
+            "head_commit_sha": commit,
+            "stats_sha256": hashes[0],
+            "index_sha256": hashes[1],
+        });
+        std::fs::write(
+            tmp.path().join(vrt_cli::provenance::PROVENANCE_FILE),
+            serde_json::to_string_pretty(&v1).expect("serialize"),
+        )
+        .expect("write v1 provenance");
         tmp
     }
 
@@ -1068,6 +1168,31 @@ mod tests {
         assert!(
             format!("{err:#}").contains("built from commit"),
             "err={err:#}"
+        );
+
+        let _keep_tmp = tmp;
+    }
+
+    /// v1（build 所有なしの旧形式）で stamp された成果物は、コミットも内容
+    /// ハッシュも一致していて「正しく見える」にもかかわらず絞り込みに使わない。
+    /// v1 は stamp 時点の HEAD しか証明せず、build と stamp の間の checkout
+    /// （キャッシュ復元と同型の false green 経路）を検出できないためである。
+    /// positive control: v1 を Verified として通す修正前の実装ではここが
+    /// `Ok(Some([...]))` になり、このテストは落ちる。
+    #[test]
+    fn only_changed_does_not_narrow_on_a_legacy_v1_stamp() {
+        let _lock = REPO_TEST_LOCK.lock().expect("repo test lock");
+        let (tmp, c1, c2, _c3, frontend_cwd) = init_story_diff_repo();
+        git_in(tmp.path(), &["checkout", "--detach", &c2]);
+        let _guard = ChdirGuard::change_to(&frontend_cwd);
+
+        let build = pending_build(c1);
+        let artifact = legacy_v1_graph_artifact(&c2);
+
+        let only = resolve_only_story_ids(artifact.path(), None, &build, &c2).expect("resolve");
+        assert!(
+            only.is_none(),
+            "a v1 stamp proves nothing about build time and must fall back to full capture"
         );
 
         let _keep_tmp = tmp;
