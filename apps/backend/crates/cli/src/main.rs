@@ -820,8 +820,7 @@ mod tests {
             error_message: None,
         };
 
-        let graph_fixture =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
+        let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
 
         let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
         let ids = only.expect("expected a narrowed story set");
