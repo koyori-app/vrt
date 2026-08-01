@@ -1499,7 +1499,7 @@
           "CI"
         ],
         "summary": "アップロードを締めてジョブを投入する",
-        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。ボディは任意。`storybook` モードで `only_story_ids` を渡すと、そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。`screenshots` モードで `captured_names` を渡すと、宣言と実際のアップロードの一致を検証したうえで、宣言外の baseline エントリをremoved ではなく流用扱いにする（部分アップロード）。`expected_baseline_commit_sha` を渡すと、ビルドに固定された baseline と一致するかを finalize 時点で照合する。",
+        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。ボディは任意。`storybook` モードで `only_story_ids` を渡すと、そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当。このとき `expected_baseline_commit_sha` は必須で、現在の baseline と照合してから比較対象として固定する）。`screenshots` モードの部分アップロードは、事前に`POST /v1/ci/builds/{build_id}/plan` で固定された capture plan と実際のアップロードの一致を検証する。`captured_names` は保存済み計画との任意のクロスチェックで、計画なしのビルドに渡すと 400。",
         "operationId": "finalize_build",
         "parameters": [
           {
@@ -1772,13 +1772,162 @@
         ]
       }
     },
+    "/v1/ci/builds/{build_id}/plan": {
+      "post": {
+        "tags": [
+          "CI"
+        ],
+        "summary": "部分アップロード計画（capture plan）をビルドへ固定する",
+        "description": "`screenshots` モード専用。撮影を始める**前**に「今回撮る名前」（`selected_names`）と「現時点で存在する全名前」（`manifest_names`）をビルドへ保存し、比較に使う baseline を固定する。以降のアップロードは`selected_names` 内の名前だけが受理され、finalize は保存された計画と実アップロードの一致を検証する。計画の起点 `baseline_commit_sha` が現在の baseline と一致しない場合は 409（再計画が必要）。スクリーンショットのアップロード後には添付できない（409）。",
+        "operationId": "attach_capture_plan",
+        "parameters": [
+          {
+            "name": "build_id",
+            "in": "path",
+            "description": "ビルドID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachCapturePlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "計画を固定したビルド（baseline_commit_sha は固定値）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "リストが不正 / selected が manifest の部分集合でない / storybook モード",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "pending でない / 計画添付済み / アップロード済み / baseline が移動した / baseline が無い",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
+      }
+    },
     "/v1/ci/builds/{build_id}/screenshots": {
       "post": {
         "tags": [
           "CI"
         ],
         "summary": "スクリーンショットをアップロードする",
-        "description": "multipart/form-data。`name` フィールドを `file` より**前**に送ること。PNG のみ受け付ける（最大 25MB / 10000x10000）。`pending` 以外のビルドへのアップロードは 409、同名の重複も 409。",
+        "description": "multipart/form-data。`name` フィールドを `file` より**前**に送ること。PNG のみ受け付ける（最大 25MB / 10000x10000）。`pending` 以外のビルドへのアップロードは 409、同名の重複も 409。capture plan が固定されたビルドでは、計画の `selected_names` に無い名前のアップロードは 400 で拒否される。",
         "operationId": "upload_screenshot",
         "parameters": [
           {
@@ -5570,6 +5719,35 @@
           }
         }
       },
+      "AttachCapturePlanRequest": {
+        "type": "object",
+        "description": "`POST /v1/ci/builds/{id}/plan` — screenshots モードの部分アップロード計画。\n\n撮影を始める**前**に「今回撮る名前」と「現時点で存在する全名前（現行 index）」を\nビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。\n撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき\n空の申告と空のアップロードが循環一致して偽 PASS になるためである。",
+        "required": [
+          "selected_names",
+          "manifest_names",
+          "baseline_commit_sha"
+        ],
+        "properties": {
+          "baseline_commit_sha": {
+            "type": "string",
+            "description": "この計画の起点にした baseline のコミット SHA（ビルド作成レスポンスの\n`baseline_commit_sha`）。現在の baseline と一致しなければ 409 で拒否され、\nクライアントは再計画する。"
+          },
+          "manifest_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "現時点で存在する全スクリーンショット名（現行 story index の写し）。\n\nbaseline にあってここに無い名前は「story が消えた」とみなし、流用せず\n`removed` として報告される。ここを実際の index より狭く申告すると\n消滅扱いが増える方向（差分が見える方向）にしか倒れない。"
+          },
+          "selected_names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "今回撮影してアップロードするスクリーンショット名（`manifest_names` の部分集合）。\n\n空配列は「変更の影響を受けた story は無い」という選択結果で、baseline の\n全エントリ（manifest に残っているもの）が流用される。"
+          }
+        }
+      },
       "BuildListResponse": {
         "type": "object",
         "required": [
@@ -5690,7 +5868,7 @@
               "string",
               "null"
             ],
-            "description": "このビルドが比較する baseline のコミット SHA。\n\n将来の CLI が「どのコミットとの差分か」を知り、\n撮り直しの必要なストーリーを自分で絞り込めるように公開する。\nビルド作成（`POST /v1/ci/builds`）のレスポンスでのみ埋まり、\nそれ以外の経路（一覧・状態ポーリング等）では常に `None`。\nbaseline が無い、または昇格元ビルドが削除済みなら `None`。"
+            "description": "このビルドが比較する baseline のコミット SHA。\n\nCLI が「どのコミットとの差分か」を知り、撮り直しの必要なストーリーを\n自分で絞り込めるように公開する。ビルド作成（`POST /v1/ci/builds`）の\nレスポンス（現時点の baseline。未固定）と、capture plan 添付\n（`POST /v1/ci/builds/{id}/plan`）のレスポンス（固定済み baseline）でのみ\n埋まり、それ以外の経路（一覧・状態ポーリング等）では常に `None`。\nbaseline が無い、または昇格元ビルドが削除済みなら `None`。"
           },
           "baseline_id": {
             "type": [
@@ -6094,14 +6272,14 @@
             "items": {
               "type": "string"
             },
-            "description": "`screenshots` モードの部分アップロードで、今回 CI が撮影して\nアップロードしたスクリーンショット名の集合。\n\n宣言するとサーバーは「宣言 == 実際にアップロードされた名前」を検証し、\n一致しなければ 400 で拒否する（撮るつもりだった名前が欠けたまま\nbaseline を流用してしまう事故を防ぐ）。宣言に無い baseline エントリは\nremoved ではなく前回の baseline を流用（carry-forward）する。\n`null`・省略は全撮影（従来どおり。baseline に無い名前は added、\nアップロードされなかった baseline エントリは removed）。\n`storybook` モードで指定すると 400（サーバーが撮るので宣言が成立しない）。"
+            "description": "`screenshots` モードの部分アップロードで、今回 CI が撮影して\nアップロードしたスクリーンショット名の集合（任意のクロスチェック）。\n\n部分アップロードの「撮る集合」の出所は、撮影前に\n`POST /v1/ci/builds/{id}/plan` で保存された capture plan である。\nこのフィールドを渡した場合、サーバーは保存済み計画との完全一致を検証し、\nずれていれば 400 で拒否する。**計画が保存されていないビルドに渡すと 400**\n——finalize 時の自己申告だけの部分アップロードは、撮影が全滅したときに\n空の申告と空のアップロードが循環一致して偽 PASS になるため受け付けない。\n`null`・省略で計画ありのビルドは計画どおり、計画なしのビルドは全撮影。\n`storybook` モードで指定すると 400（サーバーが撮るので宣言が成立しない）。"
           },
           "expected_baseline_commit_sha": {
             "type": [
               "string",
               "null"
             ],
-            "description": "クライアントが撮影計画の起点にした baseline のコミット SHA。\n\n渡すとサーバーは「このビルドに固定された baseline の昇格元コミット」と\n照合し、一致しなければ 400 で拒否する。計画と比較が別の baseline を\n見てしまう取り違えを finalize 時点で検出するための任意フィールド。"
+            "description": "クライアントが撮影計画の起点にした baseline のコミット SHA。\n\n`screenshots` モード: capture plan 付きビルドで渡すと、計画添付時に\n固定された baseline と照合し、一致しなければ 400。計画なしのビルドに\n渡すと 400（照合すべき固定値が無い）。\n`storybook` モード: `only_story_ids` を渡すときは**必須**。サーバーは\n現在の baseline と照合してから比較 baseline を固定する。ずれていれば\n400 で拒否する（流用画像と比較対象が計画と別物になるのを防ぐ）。"
           },
           "only_story_ids": {
             "type": [

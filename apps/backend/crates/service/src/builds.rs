@@ -83,15 +83,14 @@ pub async fn next_build_number<C: ConnectionTrait>(
 /// `mode` は入力形式。`storybook` のときは screenshot のアップロードを受け付けず、
 /// 代わりに `POST /v1/ci/builds/{id}/storybook` でバンドルを受け取る。
 ///
-/// ## baseline の固定（`baseline_id`）
+/// ## baseline はここでは固定しない
 ///
-/// 比較に使う baseline は**作成時にここで一度だけ解決して焼き付ける**。
-/// 比較ジョブ・storybook の流用テーブルは、比較時点の最新ではなく
-/// この固定値を使う。作成レスポンスの `baseline_commit_sha`（クライアントが
-/// 撮り直し範囲を絞る起点）と比較対象が常に同一の baseline を指すことを、
-/// 解決タイミングを 1 点に潰すことで保証する。途中で別ビルドが承認されて
-/// 最新 baseline が動いても、このビルドの比較はずれない。
-/// `None` は「作成時点で baseline が無い」（初回・新規ブランチ）。
+/// `baseline_id` は作成時には常に NULL のまま。作成時に固定すると、作成から
+/// finalize まで時間の空いたビルド（例: 他ブランチの fallback baseline を使う
+/// feature ビルド）が、その間に前進した最新 baseline と比較できなくなる。
+/// 固定は部分撮影の計画が確定した時点——screenshots モードは
+/// [`attach_capture_plan`]、storybook モードは finalize の `only_story_ids`——
+/// でだけ行い、それ以外は従来どおり比較ジョブが比較時点の最新を解決する。
 #[allow(clippy::too_many_arguments)]
 pub async fn create_build<C: ConnectionTrait>(
     db: &C,
@@ -110,7 +109,6 @@ pub async fn create_build<C: ConnectionTrait>(
     }
 
     let number = next_build_number(db, project.id).await?;
-    let baseline = crate::baselines::latest_for(db, project, &branch).await?;
 
     Ok(builds::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -123,8 +121,8 @@ pub async fn create_build<C: ConnectionTrait>(
         status: Set(BuildStatus::Pending),
         mode: Set(mode),
         storybook_key: Set(None),
-        baseline_id: Set(baseline.map(|b| b.id)),
-        captured_names: Set(None),
+        baseline_id: Set(None),
+        capture_plan: Set(None),
         total_count: Set(0),
         changed_count: Set(0),
         added_count: Set(0),
@@ -221,45 +219,211 @@ pub async fn finalize<C: ConnectionTrait>(
     transition(db, build, BuildStatus::Processing).await
 }
 
-/// screenshots モードの finalize。`captured_names` の宣言があれば検証して記録する。
+/// screenshots モードの部分アップロード計画。
 ///
-/// 部分アップロードは「宣言した名前 == 実際にアップロードされた名前」のときだけ
-/// 成立させる。宣言したのにアップロードが欠けた名前を黙って baseline 流用に
-/// 回すと、撮影の失敗が「差分なし」に化ける。逆にアップロードされたのに
-/// 宣言に無い名前は、選択計画と実際の撮影がずれている兆候なので同様に拒否する。
+/// [`attach_capture_plan`] が撮影開始前に `builds.capture_plan` へ書き込む。
+/// finalize と比較ジョブの「今回撮る集合」は必ずこの保存値から来る——
+/// finalize 時の自己申告（`captured_names`）を出所にすると、撮影が全滅した
+/// ときに空の申告と空のアップロードが循環一致して偽 PASS になるためである。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CapturePlan {
+    /// 今回撮影（アップロード）するスクリーンショット名。
+    pub selected_names: Vec<String>,
+    /// 現時点で存在する全スクリーンショット名（現行 index の写し）。
+    /// baseline にあってここに無い名前は「消滅した」とみなし、流用せず
+    /// `removed` として報告する。
+    pub manifest_names: Vec<String>,
+}
+
+impl CapturePlan {
+    pub fn selected_set(&self) -> HashSet<&str> {
+        self.selected_names.iter().map(String::as_str).collect()
+    }
+
+    pub fn manifest_set(&self) -> HashSet<&str> {
+        self.manifest_names.iter().map(String::as_str).collect()
+    }
+}
+
+/// ビルドに保存された部分アップロード計画を取り出す。
+///
+/// `None` は計画なし（全撮影）。サーバー自身が書いた値なので、壊れた形は
+/// データ破損として即エラーにする（黙って全撮影に読み替えると、計画外の
+/// baseline エントリが removed になり誤承認で消える）。
+pub fn capture_plan(build: &builds::Model) -> Result<Option<CapturePlan>, AppError> {
+    let Some(value) = &build.capture_plan else {
+        return Ok(None);
+    };
+    let plan: CapturePlan = serde_json::from_value(value.clone()).map_err(|e| {
+        AppError::Internal(anyhow::anyhow!(
+            "build {} has a malformed capture_plan ({e})",
+            build.id
+        ))
+    })?;
+    Ok(Some(plan))
+}
+
+/// 部分アップロード計画をビルドへ保存し、比較 baseline を固定する。
+///
+/// 循環（撮影結果から計画を逆算する偽 PASS）を断つため、計画は
+/// **スクリーンショットを 1 枚もアップロードしていない pending ビルド**にしか
+/// 添付できない。また計画の起点にした baseline（`planned_baseline_commit_sha`）が
+/// いまも最新であることを確認してから `baseline_id` に固定する。作成〜計画の間に
+/// baseline が動いていた場合は 409 で拒否し、クライアントに再計画させる。
+pub async fn attach_capture_plan<C: ConnectionTrait>(
+    db: &C,
+    build: builds::Model,
+    project: &projects::Model,
+    selected_names: Vec<String>,
+    manifest_names: Vec<String>,
+    planned_baseline_commit_sha: &str,
+) -> Result<builds::Model, AppError> {
+    if build.mode != BuildMode::Screenshots {
+        return Err(AppError::BadRequestDetail(
+            "a capture plan applies to screenshots-mode builds only; \
+             storybook-mode builds narrow the capture set via only_story_ids at finalize"
+                .into(),
+        ));
+    }
+    if build.status != BuildStatus::Pending {
+        return Err(AppError::Conflict);
+    }
+    if build.capture_plan.is_some() {
+        return Err(AppError::ConflictDetail(
+            "a capture plan is already attached to this build".into(),
+        ));
+    }
+    if !crate::screenshots::list_for_build(db, build.id)
+        .await?
+        .is_empty()
+    {
+        return Err(AppError::ConflictDetail(
+            "screenshots were already uploaded; the capture plan must be attached \
+             before any upload so the selection cannot be derived from what happened \
+             to be captured"
+                .into(),
+        ));
+    }
+
+    let selected: std::collections::BTreeSet<String> = selected_names.into_iter().collect();
+    let manifest: std::collections::BTreeSet<String> = manifest_names.into_iter().collect();
+    let outside: Vec<&String> = selected.difference(&manifest).take(10).collect();
+    if !outside.is_empty() {
+        return Err(AppError::BadRequestDetail(format!(
+            "selected_names must be a subset of manifest_names \
+             (selected but not in the manifest: {outside:?})"
+        )));
+    }
+
+    // 計画の起点 baseline を検証してから固定する。
+    let Some(baseline) = crate::baselines::latest_for(db, project, &build.branch).await? else {
+        return Err(AppError::ConflictDetail(
+            "no baseline exists for this branch yet; there is nothing to carry forward. \
+             capture and upload all stories instead of attaching a plan"
+                .into(),
+        ));
+    };
+    let current_sha = baseline_source_commit_sha(db, &baseline).await?;
+    if current_sha.as_deref() != Some(planned_baseline_commit_sha) {
+        return Err(AppError::ConflictDetail(format!(
+            "the baseline moved after this plan was computed \
+             (planned against {planned_baseline_commit_sha}, current {}). \
+             re-run the plan against the current baseline.",
+            current_sha.as_deref().unwrap_or("none")
+        )));
+    }
+
+    let mut active: builds::ActiveModel = build.into();
+    active.baseline_id = Set(Some(baseline.id));
+    active.capture_plan = Set(Some(
+        serde_json::to_value(CapturePlan {
+            selected_names: selected.into_iter().collect(),
+            manifest_names: manifest.into_iter().collect(),
+        })
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("serialize capture plan: {e}")))?,
+    ));
+    Ok(active.update(db).await?)
+}
+
+/// screenshots モードの finalize。
+///
+/// 部分アップロードの「今回撮る集合」は finalize の申告ではなく、撮影前に
+/// [`attach_capture_plan`] で保存された計画から取る。`captured_names` は
+/// 後方互換のための任意のクロスチェックで、渡された場合は保存済み計画と
+/// 完全一致しなければ拒否する。計画なしのビルドに `captured_names` を渡すのも
+/// 拒否する——申告だけの部分アップロードは、撮影が全滅したときに
+/// 「空の申告 == 空のアップロード」が成立して偽 PASS になるためである。
 pub async fn finalize_screenshots<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
     captured_names: Option<Vec<String>>,
 ) -> Result<builds::Model, AppError> {
-    let build = match captured_names {
-        None => build,
-        Some(names) => {
-            let declared: std::collections::BTreeSet<String> = names.into_iter().collect();
+    let plan = capture_plan(&build)?;
+    match &plan {
+        None => {
+            if captured_names.is_some() {
+                return Err(AppError::BadRequestDetail(
+                    "captured_names requires a capture plan attached via \
+                     POST /v1/ci/builds/{id}/plan before uploading; a partial upload \
+                     declared only at finalize cannot be trusted (an empty declaration \
+                     would match an empty upload even when every capture failed)"
+                        .into(),
+                ));
+            }
+        }
+        Some(plan) => {
+            let selected: std::collections::BTreeSet<String> =
+                plan.selected_names.iter().cloned().collect();
+
+            // 任意のクロスチェック: 申告が来たら保存済み計画と一致すること。
+            if let Some(names) = captured_names {
+                let declared: std::collections::BTreeSet<String> = names.into_iter().collect();
+                if declared != selected {
+                    let missing: Vec<&String> = selected.difference(&declared).take(10).collect();
+                    let extra: Vec<&String> = declared.difference(&selected).take(10).collect();
+                    return Err(AppError::BadRequestDetail(format!(
+                        "captured_names does not match the capture plan attached to this build \
+                         (planned but not declared: {missing:?}; declared but not planned: {extra:?})"
+                    )));
+                }
+            }
+
+            // 計画した集合が 1 枚残らずアップロードされていること。欠けを黙って
+            // baseline 流用に回すと、撮影の失敗が「差分なし」に化ける。
             let uploaded: std::collections::BTreeSet<String> =
                 crate::screenshots::list_for_build(db, build.id)
                     .await?
                     .into_iter()
                     .map(|s| s.name)
                     .collect();
-
-            if declared != uploaded {
-                let missing: Vec<&String> = declared.difference(&uploaded).take(10).collect();
-                let extra: Vec<&String> = uploaded.difference(&declared).take(10).collect();
+            if uploaded != selected {
+                let missing: Vec<&String> = selected.difference(&uploaded).take(10).collect();
+                let extra: Vec<&String> = uploaded.difference(&selected).take(10).collect();
                 return Err(AppError::BadRequestDetail(format!(
-                    "captured_names does not match the uploaded screenshots \
-                     (declared but not uploaded: {missing:?}; uploaded but not declared: {extra:?})"
+                    "the uploaded screenshots do not match the capture plan \
+                     (planned but not uploaded: {missing:?}; uploaded but not planned: {extra:?})"
                 )));
             }
-
-            let mut active: builds::ActiveModel = build.into();
-            active.captured_names = Set(Some(serde_json::json!(
-                declared.into_iter().collect::<Vec<String>>()
-            )));
-            active.update(db).await?
         }
-    };
+    }
     transition(db, build, BuildStatus::Processing).await
+}
+
+/// baseline の「昇格元ビルドのコミット SHA」を解決する。
+///
+/// 昇格元ビルドが記録されていない・削除済みなら `None`。
+pub async fn baseline_source_commit_sha<C: ConnectionTrait>(
+    db: &C,
+    baseline: &baselines::Model,
+) -> Result<Option<String>, AppError> {
+    let Some(source_build_id) = baseline.source_build_id else {
+        return Ok(None);
+    };
+    match get_build(db, source_build_id).await {
+        Ok(source) => Ok(Some(source.commit_sha)),
+        Err(AppError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// ビルドに固定された baseline の「昇格元ビルドのコミット SHA」を解決する。
@@ -273,14 +437,58 @@ pub async fn pinned_baseline_commit_sha<C: ConnectionTrait>(
         return Ok(None);
     };
     let baseline = crate::baselines::get_baseline(db, baseline_id).await?;
-    let Some(source_build_id) = baseline.source_build_id else {
+    baseline_source_commit_sha(db, &baseline).await
+}
+
+/// このブランチの「いまの」baseline のコミット SHA（固定はしない）。
+///
+/// ビルド作成レスポンスの `baseline_commit_sha` 用。クライアントはこれを起点に
+/// 撮り直し範囲を計画し、計画を固定するとき（capture plan の添付 /
+/// storybook の only_story_ids finalize）に同じ値を渡して照合させる。
+pub async fn current_baseline_commit_sha<C: ConnectionTrait>(
+    db: &C,
+    project: &projects::Model,
+    branch: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(baseline) = crate::baselines::latest_for(db, project, branch).await? else {
         return Ok(None);
     };
-    match get_build(db, source_build_id).await {
-        Ok(source) => Ok(Some(source.commit_sha)),
-        Err(AppError::NotFound) => Ok(None),
-        Err(e) => Err(e),
+    baseline_source_commit_sha(db, &baseline).await
+}
+
+/// storybook の部分レンダリング（`only_story_ids`）向けに比較 baseline を固定する。
+///
+/// クライアントが差分計画の起点にした baseline（`expected_baseline_commit_sha`）が
+/// いまも最新であることを確認してから `baseline_id` に固定する。ずれていれば
+/// 400 で拒否し、再計画させる（流用画像と比較対象が計画と別の baseline に
+/// なるのを finalize 時点で断つ）。baseline が無いのに部分レンダリングを
+/// 要求された場合も拒否する（流用元が無い）。
+pub async fn pin_baseline_for_partial_render<C: ConnectionTrait>(
+    db: &C,
+    build: builds::Model,
+    project: &projects::Model,
+    expected_baseline_commit_sha: &str,
+) -> Result<builds::Model, AppError> {
+    let Some(baseline) = crate::baselines::latest_for(db, project, &build.branch).await? else {
+        return Err(AppError::BadRequestDetail(
+            "only_story_ids was provided but no baseline exists for this branch; \
+             there is nothing to reuse. finalize without only_story_ids to capture \
+             all stories"
+                .into(),
+        ));
+    };
+    let current_sha = baseline_source_commit_sha(db, &baseline).await?;
+    if current_sha.as_deref() != Some(expected_baseline_commit_sha) {
+        return Err(AppError::BadRequestDetail(format!(
+            "expected_baseline_commit_sha does not match the current baseline \
+             (expected {expected_baseline_commit_sha}, current {}). \
+             re-plan against the current baseline.",
+            current_sha.as_deref().unwrap_or("none")
+        )));
     }
+    let mut active: builds::ActiveModel = build.into();
+    active.baseline_id = Set(Some(baseline.id));
+    Ok(active.update(db).await?)
 }
 
 /// storybook モードの finalize: `pending → rendering`。

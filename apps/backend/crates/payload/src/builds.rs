@@ -32,10 +32,11 @@ pub struct BuildResponse {
     pub baseline_id: Option<Uuid>,
     /// このビルドが比較する baseline のコミット SHA。
     ///
-    /// 将来の CLI が「どのコミットとの差分か」を知り、
-    /// 撮り直しの必要なストーリーを自分で絞り込めるように公開する。
-    /// ビルド作成（`POST /v1/ci/builds`）のレスポンスでのみ埋まり、
-    /// それ以外の経路（一覧・状態ポーリング等）では常に `None`。
+    /// CLI が「どのコミットとの差分か」を知り、撮り直しの必要なストーリーを
+    /// 自分で絞り込めるように公開する。ビルド作成（`POST /v1/ci/builds`）の
+    /// レスポンス（現時点の baseline。未固定）と、capture plan 添付
+    /// （`POST /v1/ci/builds/{id}/plan`）のレスポンス（固定済み baseline）でのみ
+    /// 埋まり、それ以外の経路（一覧・状態ポーリング等）では常に `None`。
     /// baseline が無い、または昇格元ビルドが削除済みなら `None`。
     #[schema(nullable)]
     pub baseline_commit_sha: Option<String>,
@@ -128,25 +129,66 @@ pub struct FinalizeBuildRequest {
     pub only_story_ids: Option<Vec<String>>,
 
     /// `screenshots` モードの部分アップロードで、今回 CI が撮影して
-    /// アップロードしたスクリーンショット名の集合。
+    /// アップロードしたスクリーンショット名の集合（任意のクロスチェック）。
     ///
-    /// 宣言するとサーバーは「宣言 == 実際にアップロードされた名前」を検証し、
-    /// 一致しなければ 400 で拒否する（撮るつもりだった名前が欠けたまま
-    /// baseline を流用してしまう事故を防ぐ）。宣言に無い baseline エントリは
-    /// removed ではなく前回の baseline を流用（carry-forward）する。
-    /// `null`・省略は全撮影（従来どおり。baseline に無い名前は added、
-    /// アップロードされなかった baseline エントリは removed）。
+    /// 部分アップロードの「撮る集合」の出所は、撮影前に
+    /// `POST /v1/ci/builds/{id}/plan` で保存された capture plan である。
+    /// このフィールドを渡した場合、サーバーは保存済み計画との完全一致を検証し、
+    /// ずれていれば 400 で拒否する。**計画が保存されていないビルドに渡すと 400**
+    /// ——finalize 時の自己申告だけの部分アップロードは、撮影が全滅したときに
+    /// 空の申告と空のアップロードが循環一致して偽 PASS になるため受け付けない。
+    /// `null`・省略で計画ありのビルドは計画どおり、計画なしのビルドは全撮影。
     /// `storybook` モードで指定すると 400（サーバーが撮るので宣言が成立しない）。
     #[serde(default)]
     pub captured_names: Option<Vec<String>>,
 
     /// クライアントが撮影計画の起点にした baseline のコミット SHA。
     ///
-    /// 渡すとサーバーは「このビルドに固定された baseline の昇格元コミット」と
-    /// 照合し、一致しなければ 400 で拒否する。計画と比較が別の baseline を
-    /// 見てしまう取り違えを finalize 時点で検出するための任意フィールド。
+    /// `screenshots` モード: capture plan 付きビルドで渡すと、計画添付時に
+    /// 固定された baseline と照合し、一致しなければ 400。計画なしのビルドに
+    /// 渡すと 400（照合すべき固定値が無い）。
+    /// `storybook` モード: `only_story_ids` を渡すときは**必須**。サーバーは
+    /// 現在の baseline と照合してから比較 baseline を固定する。ずれていれば
+    /// 400 で拒否する（流用画像と比較対象が計画と別物になるのを防ぐ）。
     #[serde(default)]
     pub expected_baseline_commit_sha: Option<String>,
+}
+
+/// `POST /v1/ci/builds/{id}/plan` — screenshots モードの部分アップロード計画。
+///
+/// 撮影を始める**前**に「今回撮る名前」と「現時点で存在する全名前（現行 index）」を
+/// ビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。
+/// 撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき
+/// 空の申告と空のアップロードが循環一致して偽 PASS になるためである。
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct AttachCapturePlanRequest {
+    /// 今回撮影してアップロードするスクリーンショット名（`manifest_names` の部分集合）。
+    ///
+    /// 空配列は「変更の影響を受けた story は無い」という選択結果で、baseline の
+    /// 全エントリ（manifest に残っているもの）が流用される。
+    pub selected_names: Vec<String>,
+    /// 現時点で存在する全スクリーンショット名（現行 story index の写し）。
+    ///
+    /// baseline にあってここに無い名前は「story が消えた」とみなし、流用せず
+    /// `removed` として報告される。ここを実際の index より狭く申告すると
+    /// 消滅扱いが増える方向（差分が見える方向）にしか倒れない。
+    pub manifest_names: Vec<String>,
+    /// この計画の起点にした baseline のコミット SHA（ビルド作成レスポンスの
+    /// `baseline_commit_sha`）。現在の baseline と一致しなければ 409 で拒否され、
+    /// クライアントは再計画する。
+    pub baseline_commit_sha: String,
+}
+
+impl AttachCapturePlanRequest {
+    /// 各リストの要素数・空要素・長さ、および baseline SHA の妥当性を検証する。
+    pub fn validate_lists(&self) -> Result<(), String> {
+        validate_id_list(Some(&self.selected_names), "selected_names")?;
+        validate_id_list(Some(&self.manifest_names), "manifest_names")?;
+        if self.baseline_commit_sha.is_empty() || self.baseline_commit_sha.len() > 100 {
+            return Err("baseline_commit_sha must be 1..=100 characters".into());
+        }
+        Ok(())
+    }
 }
 
 /// `only_story_ids` / `captured_names` の要素数上限。DoS 対策の緩い上限。

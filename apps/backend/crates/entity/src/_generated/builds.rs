@@ -24,13 +24,16 @@ pub struct Model {
     /// storybook モードでアップロードされた zip のストレージキー。
     #[sea_orm(column_type = "Text", nullable)]
     pub storybook_key: Option<String>,
-    /// 比較に使う baseline。ビルド作成時に解決して固定する（NULL = 作成時点で baseline 無し）。
+    /// 比較に使う baseline。部分撮影（capture plan / only_story_ids）が固定した
+    /// ときだけ事前に埋まり、それ以外は比較ジョブが比較後に記録する
+    /// （NULL = 未固定。比較時に最新を解決する従来動作）。
     /// FK にすると `baselines.source_build_id` と循環するため素のカラム。
     pub baseline_id: Option<Uuid>,
-    /// screenshots モードの部分アップロードで finalize 時に宣言された
-    /// 「今回撮影したスクリーンショット名」の集合（JSON 配列）。NULL は全撮影。
+    /// screenshots モードの部分アップロード計画
+    /// （`{"selected_names": [...], "manifest_names": [...]}`）。
+    /// 撮影開始前に `POST /v1/ci/builds/{id}/plan` が書き込む。NULL は全撮影。
     #[sea_orm(column_type = "JsonBinary", nullable)]
-    pub captured_names: Option<Json>,
+    pub capture_plan: Option<Json>,
     pub total_count: i32,
     pub changed_count: i32,
     pub added_count: i32,
