@@ -905,3 +905,52 @@ async fn plan_with_empty_manifest_reports_full_deletion_as_removed() {
     );
     assert_eq!(build["unchanged_count"].as_i64(), Some(0));
 }
+
+/// 実測デモ（修正前 head の挙動をそのまま記録する。修正後はテスト
+/// `name_rules_are_identical_across_plan_upload_and_finalize` が計画の時点で
+/// 400 にするため、この状況自体が作れなくなる）:
+///
+/// 計画側の上限が 512 **文字**のままだと 256 バイトの名前が計画に固定できて
+/// しまうが、アップロード側は 255 バイト上限で同じ名前を拒否する。finalize は
+/// 「計画した集合が 1 枚残らずアップロードされていること」を要求するため、
+/// この計画を固定したビルドは何をしても finalize できない。
+#[tokio::test(flavor = "multi_thread")]
+async fn pc_demo_a_256_byte_planned_name_dooms_the_build() {
+    let fx = setup().await;
+    fx.establish_baseline("basepc01", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    let build = fx.create_build("pcdoom01").await;
+    let build_id = build_id_of(&build);
+    let long = "a".repeat(256);
+    let manifest: Vec<&str> = vec!["home", "about", "pricing", long.as_str()];
+    // 修正前: 計画は 512 文字上限なので 256 バイトの名前を受け入れてしまう。
+    fx.attach_plan_ok(build_id, &[long.as_str()], &manifest, "basepc01")
+        .await;
+
+    // アップロード側は 255 バイト上限で拒否——計画に載った当の名前が上げられない。
+    let res = fx
+        .app
+        .upload_screenshot(
+            build_id,
+            &fx.token,
+            long.as_str(),
+            png(8, 8, [1, 2, 3, 255]),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "the planned 256-byte name is rejected by the upload path"
+    );
+
+    // finalize は uploaded == selected を要求する。欠けた 1 枚は永遠に
+    // アップロードできないので、このビルドは永久に finalize 不能である。
+    let res = fx.finalize(build_id, None).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("planned but not uploaded"),
+        "the build is stuck: the plan demands a name the upload path forbids: {body}"
+    );
+}
