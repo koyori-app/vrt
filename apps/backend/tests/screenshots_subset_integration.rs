@@ -452,17 +452,6 @@ async fn empty_selection_plan_reuses_the_whole_baseline() {
             "carry-forward must hash the PNG bytes it already downloaded"
         );
     }
-    assert!(
-        service::screenshots::verify_baseline_candidate(
-            &fx.app.state.storage,
-            &carried[0].storage_key,
-            None,
-        )
-        .await
-        .is_err(),
-        "positive control: the pre-fix inherited NULL made approval verification fail"
-    );
-
     fx.approve_force(build_id).await;
     let (_, names) = fx.latest_baseline().await;
     assert_eq!(names, vec!["about", "home", "pricing"]);

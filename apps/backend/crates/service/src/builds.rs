@@ -5,7 +5,7 @@
 //! baseline を作るため、同一プロジェクトの並行承認でも baseline が競合しない。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
@@ -29,9 +29,27 @@ use crate::storage::StorageBackend;
 /// エラーメッセージに並べる story 名の上限。超過分は件数だけ示す。
 const MAX_REPORTED_NAMES: usize = 10;
 
-/// baseline 昇格候補の storage 読み出し・decode を同時に行う上限。
-/// 1 枚 25 MiB までなので、無制限並列によるメモリ圧迫を避けつつ、decode を逐次化しない。
-const BASELINE_VERIFICATION_CONCURRENCY: usize = 8;
+/// request 内の storage read 数だけを抑える上限。decode メモリは request 数ではなく
+/// screenshots のプロセス全体 weighted semaphore が decoded bytes 単位で制御する。
+const BASELINE_STORAGE_READ_CONCURRENCY: usize = 8;
+
+static APPROVAL_PREFLIGHT_LOCKS: LazyLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 同じ build への並行 approve が同じ全 shot を重複 download/decode しないための
+/// process-local single-flight。build lock を待たず、重い preflight より前に取得する。
+fn approval_preflight_lock(build_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = APPROVAL_PREFLIGHT_LOCKS
+        .lock()
+        .expect("approval preflight lock registry poisoned");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&build_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(build_id, Arc::downgrade(&lock));
+    lock
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShotVerificationSnapshot {
@@ -74,7 +92,7 @@ async fn verify_baseline_candidates(
             Ok::<_, AppError>((shot.id, verified))
         }
     }))
-    .buffer_unordered(BASELINE_VERIFICATION_CONCURRENCY)
+    .buffer_unordered(BASELINE_STORAGE_READ_CONCURRENCY)
     .try_collect()
     .await
 }
@@ -808,6 +826,9 @@ pub async fn approve_build(
         )));
     }
 
+    let preflight_lock = approval_preflight_lock(build.id);
+    let _single_flight = preflight_lock.lock().await;
+
     // storage I/O・SHA-256・full decode は、build/project の排他ロックを取る前に
     // bounded parallel で済ませる。後続 transaction では、この検証が依存した
     // build 状態・baseline ID・shot の ID/key/hash 集合を読み直して TOCTOU を閉じる。
@@ -1075,7 +1096,9 @@ pub async fn approve_build(
                     storage_key: Set(shot.storage_key),
                     width: Set(shot.width),
                     height: Set(shot.height),
-                    content_hash: Set(shot.content_hash),
+                    // pre-migration screenshot の NULL を新 baseline へ伝播させない。
+                    // full decode 済み実体から得た hash と marker を同じ値で保存する。
+                    content_hash: Set(Some(verified_content_hash.clone())),
                     verified_content_hash: Set(Some(verified_content_hash)),
                 }
                 .insert(txn)

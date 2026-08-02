@@ -10,11 +10,11 @@
 //! baseline エントリは昇格元スクリーンショットのキーをそのまま参照する（コピーしない）。
 //! ビルドを消すと baseline の実体も消えるため、ビルドの物理削除は行わない前提。
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use chrono::Utc;
-use image::{ImageFormat, RgbaImage};
+use image::{ImageDecoder, ImageFormat, RgbaImage};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, prelude::Uuid,
@@ -35,6 +35,25 @@ use crate::storage::{ByteStream, StorageBackend, StorageError};
 pub const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
 /// 許容する最大寸法（幅・高さとも）。diff ジョブのメモリを保護する。
 pub const MAX_DIMENSION: u32 = 10_000;
+/// 承認 preflight がプロセス全体で同時に保持してよい decode 出力の上限。
+///
+/// 最大寸法の RGBA16 PNG（10,000 * 10,000 * 8 = 800 MB）も単独なら通しつつ、
+/// approve request 数に比例して decode buffer が増えることを防ぐ。
+pub const BASELINE_DECODE_BUDGET_BYTES: u32 = 1024 * 1024 * 1024;
+static BASELINE_DECODE_BUDGET: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        BASELINE_DECODE_BUDGET_BYTES as usize,
+    ))
+});
+
+async fn acquire_baseline_decode_budget(
+    decoded_bytes: u32,
+) -> Result<tokio::sync::OwnedSemaphorePermit, anyhow::Error> {
+    Arc::clone(&BASELINE_DECODE_BUDGET)
+        .acquire_many_owned(decoded_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("baseline decode memory budget closed: {e}"))
+}
 /// PNG のシグネチャ。
 pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 /// 配信時の Content-Type。
@@ -207,11 +226,16 @@ pub async fn verify_baseline_candidate(
     expected: Option<&str>,
 ) -> Result<String, anyhow::Error> {
     let bytes = read_all(storage, key).await?;
+    let decoded_bytes = baseline_decoded_bytes(&bytes)?;
+    let _decode_budget = acquire_baseline_decode_budget(decoded_bytes).await?;
     let expected = expected.map(str::to_owned);
     let key = key.to_owned();
     tokio::task::spawn_blocking(move || {
         let actual = content_hash(&bytes);
-        if !content_hashes_match(Some(&actual), expected.as_deref()) {
+        // migration 前の screenshot は記録 hash が NULL である。その場合だけ、full
+        // decode に成功した実体 hash を新 baseline の正準値として採用する。記録済み
+        // hash がある場合は malformed/mismatch を従来どおり fail-closed にする。
+        if expected.is_some() && !content_hashes_match(Some(&actual), expected.as_deref()) {
             anyhow::bail!("stored object hash does not match recorded content hash for {key}");
         }
         image::ImageReader::with_format(std::io::Cursor::new(&bytes), ImageFormat::Png)
@@ -221,6 +245,27 @@ pub async fn verify_baseline_candidate(
     })
     .await
     .map_err(|e| anyhow::anyhow!("baseline PNG verification task failed: {e}"))?
+}
+
+/// PNG decoder が実際に返す native buffer と、比較処理で使う RGBA8 buffer の
+/// 大きい方を予約量にする。RGBA16 等は `total_bytes` が width*height*4 を上回るため、
+/// bit depth を落として見積もらない。
+fn baseline_decoded_bytes(bytes: &[u8]) -> Result<u32, anyhow::Error> {
+    let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|e| anyhow::anyhow!("read baseline PNG header: {e}"))?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+        anyhow::bail!("baseline PNG dimensions are outside the supported range: {width}x{height}");
+    }
+    let rgba8_bytes = u64::from(width) * u64::from(height) * 4;
+    let decoded_bytes = decoder.total_bytes().max(rgba8_bytes);
+    if decoded_bytes > u64::from(BASELINE_DECODE_BUDGET_BYTES) {
+        anyhow::bail!(
+            "baseline PNG requires {decoded_bytes} decoded bytes, exceeding the process budget of {BASELINE_DECODE_BUDGET_BYTES}"
+        );
+    }
+    u32::try_from(decoded_bytes)
+        .map_err(|_| anyhow::anyhow!("baseline decoded byte count does not fit semaphore weight"))
 }
 
 /// `RgbaImage` を PNG にエンコードする。
@@ -444,7 +489,9 @@ pub async fn open_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{Rgba, RgbaImage};
+    use image::{ImageBuffer, Rgba, RgbaImage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     fn png_bytes(width: u32, height: u32) -> Bytes {
         let image = RgbaImage::from_pixel(width, height, Rgba([1, 2, 3, 255]));
@@ -455,6 +502,52 @@ mod tests {
     fn accepts_valid_png() {
         let bytes = png_bytes(12, 7);
         assert_eq!(validate_png(&bytes).expect("valid"), (12, 7));
+    }
+
+    #[test]
+    fn decoded_byte_weight_accounts_for_sixteen_bit_rgba() {
+        let image = ImageBuffer::from_pixel(2, 3, Rgba([1_u16, 2, 3, u16::MAX]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut buf, ImageFormat::Png)
+            .expect("encode rgba16 PNG");
+        assert_eq!(
+            baseline_decoded_bytes(&buf.into_inner()).expect("decoded byte weight"),
+            2 * 3 * 8,
+            "native RGBA16 buffer, not an RGBA8-only estimate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maximum_dimension_parallel_approvals_are_weighted_by_decoded_bytes() {
+        const MAX_RGBA8_BYTES: u32 = MAX_DIMENSION * MAX_DIMENSION * 4;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Instant::now();
+        let mut tasks = Vec::new();
+
+        for _ in 0..3 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                let _permit = acquire_baseline_decode_budget(MAX_RGBA8_BYTES)
+                    .await
+                    .expect("maximum-size decode must fit the process budget");
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for task in tasks {
+            task.await.expect("budget load task");
+        }
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(75),
+            "the third maximum-size approval must wait for decoded-byte budget"
+        );
     }
 
     #[test]
