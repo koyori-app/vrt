@@ -1020,7 +1020,10 @@ async fn a_second_finalize_cannot_overwrite_the_pinned_baseline() {
         .await;
     assert_eq!(res.status(), StatusCode::OK, "approve build C");
     let (moved_baseline_id, _) = fx.latest_baseline_red_entry().await;
-    assert_ne!(pinned_baseline_id, moved_baseline_id, "baseline moved to B2");
+    assert_ne!(
+        pinned_baseline_id, moved_baseline_id,
+        "baseline moved to B2"
+    );
 
     // ── 2 度目の finalize（起点 = 現行 B2）は 409 で、pin を上書きしない ────
     // 現行 baseline の SHA を正しく持ってきても、finalize 済みビルドの pin は動かせない。

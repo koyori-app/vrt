@@ -1180,7 +1180,8 @@ mod tests {
         let build = pending_build(c1);
         let artifact = stamped_graph_artifact(&c2);
 
-        let only = resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
+        let only =
+            resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
         let ids = only.expect("expected a narrowed story set");
         assert_eq!(
             ids,
@@ -1233,7 +1234,8 @@ mod tests {
         let build = pending_build(c1);
         let artifact = legacy_v1_graph_artifact(&c2);
 
-        let only = resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
+        let only =
+            resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
         assert!(
             only.is_none(),
             "a v1 stamp proves nothing about build time and must fall back to full capture"
@@ -1357,7 +1359,8 @@ mod tests {
         let build = pending_build(c1);
         let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
 
-        let only = resolve_only_story_ids(&graph_fixture, None, None, &build, &c2).expect("resolve");
+        let only =
+            resolve_only_story_ids(&graph_fixture, None, None, &build, &c2).expect("resolve");
         assert!(
             only.is_none(),
             "without provenance the CLI must capture everything instead of narrowing"

@@ -512,7 +512,9 @@ pub async fn finalize_build(
                     // （固定はしない読み取り検査なので、finalize の行ロックの外でよい）。
                     // 「baseline が動いた（再計画で解消）」は plan 添付と同じ 409。
                     let current = build_service::current_baseline_commit_sha(
-                        &state.db, &project, &build.branch,
+                        &state.db,
+                        &project,
+                        &build.branch,
                     )
                     .await?;
                     if current.as_deref() != Some(expected.as_str()) {
