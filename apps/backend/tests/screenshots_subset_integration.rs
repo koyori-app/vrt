@@ -878,6 +878,56 @@ async fn plan_with_zero_baseline_overlap_is_rejected_as_naming_mismatch() {
     .await;
 }
 
+/// 新規 story（manifest にあり baseline に無い）を selected から落とした計画は 400。
+///
+/// 新規 story には carry-forward の引き継ぎ元が無いため、選択から漏れると
+/// アップロードも流用もされず比較結果のどこにも現れない——CI の選択ロジックの
+/// バグが「added の報告なし・レビュー可視性ゼロの PASS」に化ける。
+///
+/// positive control: この検査の無い実装では最初の添付が 200 で通り、
+/// 400 のアサーションで落ちる。後半は同じ新規 story を selected に含めれば
+/// 通ることを確認する（正当な部分撮影を弾く検査ではない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_that_omits_a_new_story_from_selection_is_rejected() {
+    let fx = setup().await;
+    fx.establish_baseline("base0011", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    let build = fx.create_build("newsty01").await;
+    let build_id = build_id_of(&build);
+
+    // manifest に新規 "contact" が現れたのに selected に入っていない → 400。
+    let res = fx
+        .attach_plan(
+            build_id,
+            &["home"],
+            &["home", "about", "pricing", "contact"],
+            "base0011",
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a new story missing from selected_names would vanish from the comparison \
+         without ever being reported as added"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("contact") && body.contains("carry forward"),
+        "the error must name the unselected new screenshot and explain why: {body}"
+    );
+
+    // 同じ計画でも新規 story を選択していれば通る。既存 story（about / pricing）は
+    // baseline にあるので、絞り込み（selected から外す）は引き続き正当。
+    fx.attach_plan_ok(
+        build_id,
+        &["home", "contact"],
+        &["home", "about", "pricing", "contact"],
+        "base0011",
+    )
+    .await;
+}
+
 /// 正当な「story を全部削除した」ケース（manifest が空）はゼロ交差ガードに
 /// 当たらず、全エントリが removed として**見える形で**報告される。
 #[tokio::test(flavor = "multi_thread")]

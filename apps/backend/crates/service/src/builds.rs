@@ -393,6 +393,33 @@ pub async fn attach_capture_plan(
                 )));
             }
 
+            // 新規 story（manifest にあり baseline に無い）の選択漏れ検出:
+            // 新規 story には流用元（carry-forward の引き継ぎ元）が無いため、
+            // selected から漏れるとアップロードも流用もされず、比較結果の
+            // どこにも現れない——CI の選択ロジックにバグがあると、新規 story が
+            // `added` として報告されないままレビュー可視性ゼロで PASS しうる。
+            // `selected ⊇ manifest ∖ baseline` を要求して 400 で気づかせる。
+            // 正当な部分撮影（既存 story の絞り込み）はこの検査に当たらない——
+            // 既存 story は baseline にあるので差集合に入らない。
+            let baseline_set: HashSet<&str> =
+                baseline_names.iter().map(String::as_str).collect();
+            let unselected_new: Vec<&String> = manifest
+                .iter()
+                .filter(|name| !baseline_set.contains(name.as_str()) && !selected.contains(*name))
+                .collect();
+            if !unselected_new.is_empty() {
+                let shown: Vec<&&String> =
+                    unselected_new.iter().take(MAX_REPORTED_NAMES).collect();
+                return Err(AppError::BadRequestDetail(format!(
+                    "{} new screenshot(s) exist in manifest_names but not in the baseline, \
+                     yet are missing from selected_names: {shown:?}. a new screenshot has \
+                     nothing to carry forward, so leaving it unselected would drop it from \
+                     the comparison entirely (it would never be reported as added). \
+                     select every name in manifest_names that the baseline does not have",
+                    unselected_new.len()
+                )));
+            }
+
             let mut active: builds::ActiveModel = build.into();
             active.baseline_id = Set(Some(baseline.id));
             active.capture_plan = Set(Some(
