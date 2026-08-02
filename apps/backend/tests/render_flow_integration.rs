@@ -833,8 +833,8 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
 /// storybook の流用（`only_story_ids`）は、finalize が照合のうえ固定した baseline を使う。
 ///
 /// 作成〜finalize の間に別ビルドが承認されて最新 baseline が入れ替わった場合、
-/// 古い起点のままの finalize は 400 で拒否される（流用画像と比較対象が計画と
-/// 別物になる前に断つ）。現在の baseline へ再計画すれば、その baseline が固定され、
+/// 古い起点のままの finalize は 409 で拒否される（流用画像と比較対象が計画と
+/// 別物になる前に断つ。「baseline が動いた」は plan 添付と同じ 409）。現在の baseline へ再計画すれば、その baseline が固定され、
 /// 流用画像・比較対象・`baseline_id` のすべてが一致する。
 ///
 /// positive control: 起点の照合をせず finalize 時の最新へ黙って倒す実装では、
@@ -900,13 +900,14 @@ async fn stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baselin
     let (moved_baseline_id, red_v2_key) = fx.latest_baseline_red_entry().await;
     assert_ne!(old_baseline_id, moved_baseline_id, "baseline moved");
 
-    // ── 古い起点（B1 = pin0001）のままの部分 finalize は 400 ───────────────
+    // ── 古い起点（B1 = pin0001）のままの部分 finalize は 409 ───────────────
+    // 「baseline が動いた（再計画で解消）」は plan 添付と同じ 409 に揃えてある。
     let res = fx
         .finalize_with_only(build_b_id, &["demo-box--blue"], "pin0001")
         .await;
     assert_eq!(
         res.status(),
-        StatusCode::BAD_REQUEST,
+        StatusCode::CONFLICT,
         "a partial render planned against a baseline that has since moved must be rejected"
     );
 

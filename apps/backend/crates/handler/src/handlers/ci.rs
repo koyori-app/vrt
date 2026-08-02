@@ -160,7 +160,7 @@ pub async fn create_build(
     security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "計画を固定したビルド（baseline_commit_sha は固定値）", body = BuildResponse),
-        (status = 400, description = "リストが不正 / selected が manifest の部分集合でない / storybook モード", body = ServerError),
+        (status = 400, description = "リストが不正（名前は空でなく前後空白なし・255 バイト以内） / selected が manifest の部分集合でない / 新規名（manifest にあり baseline に無い）が selected から漏れている / baseline と manifest の名前が 1 件も重ならない（命名規則の不一致とみなす） / storybook モード", body = ServerError),
         (status = 409, description = "pending でない / 計画添付済み / アップロード済み / baseline が移動した / baseline が無い", body = ServerError),
         CrudErrors,
     )
@@ -403,8 +403,8 @@ pub async fn upload_storybook_bundle(
     security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
-        (status = 400, description = "storybook バンドルが未アップロード / リストが不正 / モードとフィールドの組合せが不正 / captured_names とアップロードの不一致 / expected_baseline_commit_sha の不一致", body = ServerError),
-        (status = 409, description = "既に finalize 済みです", body = ServerError),
+        (status = 400, description = "storybook バンドルが未アップロード / リストが不正 / モードとフィールドの組合せが不正 / captured_names とアップロードの不一致 / expected_baseline_commit_sha と固定済み baseline の不一致（screenshots モードのクロスチェック）", body = ServerError),
+        (status = 409, description = "既に finalize 済みです / baseline が計画後に動いた（expected_baseline_commit_sha と現在の baseline の不一致。現在の baseline へ再計画すれば解消）", body = ServerError),
         CrudErrors,
     )
 )]
@@ -510,12 +510,13 @@ pub async fn finalize_build(
                 if let Some(expected) = &payload.expected_baseline_commit_sha {
                     // 全撮影でも、渡された起点が現在の baseline とずれていれば断る
                     // （固定はしない読み取り検査なので、finalize の行ロックの外でよい）。
+                    // 「baseline が動いた（再計画で解消）」は plan 添付と同じ 409。
                     let current = build_service::current_baseline_commit_sha(
                         &state.db, &project, &build.branch,
                     )
                     .await?;
                     if current.as_deref() != Some(expected.as_str()) {
-                        return Err(AppError::BadRequestDetail(format!(
+                        return Err(AppError::ConflictDetail(format!(
                             "expected_baseline_commit_sha does not match the current baseline \
                              (expected {expected}, current {})",
                             current.as_deref().unwrap_or("none")

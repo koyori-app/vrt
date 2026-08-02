@@ -87,6 +87,14 @@ struct UploadArgs {
     #[arg(long)]
     stats_json: Option<PathBuf>,
 
+    /// storybook index JSON のパス。省略時は `<dir>/index.json`。
+    ///
+    /// `vrt stamp` にカスタムパスを渡した場合は、ここにも同じ値を渡すこと。
+    /// stamp と upload で解決パスが違うと provenance の内容ハッシュが一致せず、
+    /// エラー（`its content changed after vrt stamp`）になる。
+    #[arg(long)]
+    index_json: Option<PathBuf>,
+
     /// ビルドが終端状態になるまでポーリングして待つ。
     #[arg(long)]
     wait: bool,
@@ -377,7 +385,13 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
 
     // 5. finalize（--only-changed なら影響ストーリーだけ）。
     let only_story_ids = if args.only_changed {
-        resolve_only_story_ids(&args.dir, args.stats_json.as_deref(), &build, &commit)?
+        resolve_only_story_ids(
+            &args.dir,
+            args.stats_json.as_deref(),
+            args.index_json.as_deref(),
+            &build,
+            &commit,
+        )?
     } else {
         None
     };
@@ -502,6 +516,7 @@ fn json_result_value(
 fn resolve_only_story_ids(
     dir: &Path,
     stats_json: Option<&Path>,
+    index_json: Option<&Path>,
     build: &BuildResponse,
     commit: &str,
 ) -> Result<Option<Vec<String>>> {
@@ -531,7 +546,7 @@ fn resolve_only_story_ids(
     // untracked なので、成果物自体が `commit` で生成された証明（provenance）を
     // 別途検証する。不在と build 所有なしの旧形式（v1）は全撮影へ
     // （stats 不在と同じ扱い）、不一致はエラー。
-    let verified = match verify_artifact_provenance(dir, stats_json, None, commit)? {
+    let verified = match verify_artifact_provenance(dir, stats_json, index_json, commit)? {
         Verification::Verified(verified) => verified,
         fallback => {
             tracing::warn!(
@@ -550,7 +565,7 @@ fn resolve_only_story_ids(
         &SelectionInputs {
             dir,
             stats_json,
-            index_json: None,
+            index_json,
             repo_root: &repo_root,
             cwd: &cwd,
             changed_files: &changed_files,
@@ -1141,7 +1156,7 @@ mod tests {
         let artifact = stamped_graph_artifact(&c2);
 
         // worktree は c3 のまま --commit c2 → 前提不一致でエラー。
-        let err = resolve_only_story_ids(artifact.path(), None, &build, &c2)
+        let err = resolve_only_story_ids(artifact.path(), None, None, &build, &c2)
             .expect_err("worktree/commit mismatch must not narrow silently");
         assert!(
             format!("{err:#}").contains("does not match the recorded commit"),
@@ -1162,7 +1177,7 @@ mod tests {
         let build = pending_build(c1);
         let artifact = stamped_graph_artifact(&c2);
 
-        let only = resolve_only_story_ids(artifact.path(), None, &build, &c2).expect("resolve");
+        let only = resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
         let ids = only.expect("expected a narrowed story set");
         assert_eq!(
             ids,
@@ -1189,7 +1204,7 @@ mod tests {
         // 成果物は c3 でビルドされた体（古いキャッシュを掴んだ状況の再現）。
         let artifact = stamped_graph_artifact(&c3);
 
-        let err = resolve_only_story_ids(artifact.path(), None, &build, &c2)
+        let err = resolve_only_story_ids(artifact.path(), None, None, &build, &c2)
             .expect_err("an artifact from another commit must not narrow the capture set");
         assert!(
             format!("{err:#}").contains("built from commit"),
@@ -1215,7 +1230,7 @@ mod tests {
         let build = pending_build(c1);
         let artifact = legacy_v1_graph_artifact(&c2);
 
-        let only = resolve_only_story_ids(artifact.path(), None, &build, &c2).expect("resolve");
+        let only = resolve_only_story_ids(artifact.path(), None, None, &build, &c2).expect("resolve");
         assert!(
             only.is_none(),
             "a v1 stamp proves nothing about build time and must fall back to full capture"
@@ -1339,7 +1354,7 @@ mod tests {
         let build = pending_build(c1);
         let graph_fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph");
 
-        let only = resolve_only_story_ids(&graph_fixture, None, &build, &c2).expect("resolve");
+        let only = resolve_only_story_ids(&graph_fixture, None, None, &build, &c2).expect("resolve");
         assert!(
             only.is_none(),
             "without provenance the CLI must capture everything instead of narrowing"

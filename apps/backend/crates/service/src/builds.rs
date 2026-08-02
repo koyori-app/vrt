@@ -627,7 +627,9 @@ pub async fn finalize_storybook(
                     };
                     let current_sha = baseline_source_commit_sha(txn, &baseline).await?;
                     if current_sha.as_deref() != Some(expected.as_str()) {
-                        return Err(AppError::BadRequestDetail(format!(
+                        // 「baseline が動いた（再計画で解消）」は plan 添付
+                        // （attach_capture_plan）と同じく 409 に揃える。
+                        return Err(AppError::ConflictDetail(format!(
                             "expected_baseline_commit_sha does not match the current baseline \
                              (expected {expected}, current {}). \
                              re-plan against the current baseline.",

@@ -239,12 +239,17 @@ vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
 2. **旧成果物を無効化する**——`<dir>/vrt-provenance.json` と stats / index を
    削除する。「コマンドが成功した」ことと「成果物がその build で生成された」
    ことは別であり（何も生成しない命令でも成功はする）、build 前の成果物が
-   build を経ずに生き残る経路をここで断つ
+   build を経ずに生き残る経路をここで断つ。**`--stats-json` / `--index-json` で
+   指定したパスはその解決値のまま build 前に削除される**——タイポで無関係な
+   ファイルを指すと、そのファイルが消える。カスタムパスを渡すときは
+   指定先をよく確かめること
 3. build コマンドを実行する。失敗したら何も stamp しない。旧 provenance は
    手順 2 で既に消えているため、**失敗した stamp が古い証明を残すこともない**
 4. build 成功後、HEAD が動いていないこと・worktree が依然 clean であることを
-   再検査する。build 中の checkout / commit / 追跡ファイル書き換えはここで
-   検出され、stamp は行われない
+   再検査する。build を跨いで HEAD が動いた・追跡ファイルが汚れたままの
+   checkout はここで検出され、stamp は行われない（観測は build の前後 2 点
+   だけなので、途中で往復して元に戻る操作までは検出しない——下の
+   「保証しないこと」参照）
 5. stats / index が存在することを確認し、その HEAD で
    `<dir>/vrt-provenance.json` を書く。両ファイルは手順 2 で削除済みなので、
    ここで存在する＝**build の実行中に再生成された**ことの証明になる。
@@ -322,6 +327,11 @@ build 後の後追い stamp（build コマンド無しの形）は提供しな�
 - **untracked な build 入力**: clean 検査は追跡ファイルのみ。untracked の
   ローカルファイルが build に影響しても検出できない（CI の fresh checkout では
   実害になりにくいが、ローカル実行では注意）
+- **build 中の一時的な checkout 往復**: worktree の観測は build の開始前と
+  成功後の 2 点だけ。build の途中で別コミットへ checkout し、終了までに元の
+  HEAD へ clean に戻す操作（A→B→A の往復）は 2 点観測では検出できない。
+  build コマンドの中で checkout を行わないこと（CI の通常運用でこの形に
+  なることはない——事故ではなく意図的な操作でしか作れない状態である）
 - **改竄への防御**: provenance は無署名で、手で書けば偽装できる。脅威モデルは
   「事故（キャッシュ復元・rebase・手順ミス）」であり、悪意ある CI ランナーへの
   防御ではない
@@ -618,7 +628,7 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 - `only_story_ids` を渡すときは `expected_baseline_commit_sha`（差分計画の
   起点にした baseline のコミット SHA。ビルド作成レスポンスの
   `baseline_commit_sha`）が**必須**。サーバーは現在の baseline と照合してから
-  流用と比較の対象として固定する。ずれていれば 400 で拒否されるので再計画する。
+  流用と比較の対象として固定する。ずれていれば 409 で拒否されるので再計画する。
   全撮影ビルドは固定されず、比較時点の最新 baseline と比較される
 - `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
   1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
