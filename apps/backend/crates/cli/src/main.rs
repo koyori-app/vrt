@@ -303,7 +303,7 @@ fn provenance_fallback_reason(verification: &Verification, dir: &Path) -> String
              `vrt stamp -- <build command>` to enable per-story capture",
             dir.display()
         ),
-        Verification::Verified => unreachable!("verified provenance never falls back"),
+        Verification::Verified(_) => unreachable!("verified provenance never falls back"),
     }
 }
 
@@ -531,19 +531,22 @@ fn resolve_only_story_ids(
     // untracked なので、成果物自体が `commit` で生成された証明（provenance）を
     // 別途検証する。不在と build 所有なしの旧形式（v1）は全撮影へ
     // （stats 不在と同じ扱い）、不一致はエラー。
-    let verification = verify_artifact_provenance(dir, stats_json, None, commit)?;
-    if verification != Verification::Verified {
-        tracing::warn!(
-            "{}; capturing all stories",
-            provenance_fallback_reason(&verification, dir)
-        );
-        return Ok(None);
-    }
+    let verified = match verify_artifact_provenance(dir, stats_json, None, commit)? {
+        Verification::Verified(verified) => verified,
+        fallback => {
+            tracing::warn!(
+                "{}; capturing all stories",
+                provenance_fallback_reason(&fallback, dir)
+            );
+            return Ok(None);
+        }
+    };
 
     let repo_root = git::repo_root()?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
 
-    let selection = plan::select_stories(
+    // 選別の入力は verify がハッシュ照合したバイト列そのもの（読み直さない）。
+    let selection = plan::select_stories_from_verified(
         &SelectionInputs {
             dir,
             stats_json,
@@ -552,6 +555,7 @@ fn resolve_only_story_ids(
             cwd: &cwd,
             changed_files: &changed_files,
         },
+        &verified,
         CorruptInput::Error,
     )?;
 
@@ -676,35 +680,39 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
                     args.index_json.as_deref(),
                     &head_for_diff,
                 )?;
-                if verification != Verification::Verified {
-                    PlanDocument::capture_all(
-                        coords,
-                        provenance_fallback_reason(&verification, &args.dir),
-                        Vec::new(),
-                    )
-                } else {
-                    let repo_root = git::repo_root()?;
-                    let cwd =
-                        std::env::current_dir().context("failed to read current directory")?;
-                    let selection = plan::select_stories(
-                        &SelectionInputs {
-                            dir: &args.dir,
-                            stats_json: args.stats_json.as_deref(),
-                            index_json: args.index_json.as_deref(),
-                            repo_root: &repo_root,
-                            cwd: &cwd,
-                            changed_files: &changed_files,
-                        },
-                        CorruptInput::FailClosed,
-                    )?;
-                    if let Selection::Only {
-                        manifest_story_ids: manifest,
-                        ..
-                    } = &selection
-                    {
-                        manifest_story_ids = Some(manifest.clone());
+                match verification {
+                    Verification::Verified(verified) => {
+                        let repo_root = git::repo_root()?;
+                        let cwd =
+                            std::env::current_dir().context("failed to read current directory")?;
+                        // 選別の入力は verify がハッシュ照合したバイト列そのもの
+                        // （読み直さない）。
+                        let selection = plan::select_stories_from_verified(
+                            &SelectionInputs {
+                                dir: &args.dir,
+                                stats_json: args.stats_json.as_deref(),
+                                index_json: args.index_json.as_deref(),
+                                repo_root: &repo_root,
+                                cwd: &cwd,
+                                changed_files: &changed_files,
+                            },
+                            &verified,
+                            CorruptInput::FailClosed,
+                        )?;
+                        if let Selection::Only {
+                            manifest_story_ids: manifest,
+                            ..
+                        } = &selection
+                        {
+                            manifest_story_ids = Some(manifest.clone());
+                        }
+                        PlanDocument::from_selection(coords, selection)
                     }
-                    PlanDocument::from_selection(coords, selection)
+                    fallback => PlanDocument::capture_all(
+                        coords,
+                        provenance_fallback_reason(&fallback, &args.dir),
+                        Vec::new(),
+                    ),
                 }
             }
         },
@@ -1287,7 +1295,7 @@ mod tests {
             &c3,
         )
         .expect("verify the fresh stamp");
-        assert_eq!(verification, Verification::Verified);
+        assert!(matches!(verification, Verification::Verified(_)));
 
         let _keep_tmp = tmp;
     }

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::turbosnap::{self, Plan, StoryEntry, WebpackStats};
+use crate::turbosnap::{self, Plan, WebpackStats};
 
 /// 選択計画 JSON の契約 version。
 ///
@@ -104,8 +104,12 @@ impl SelectionInputs<'_> {
 /// stats が存在しない場合は `on_corrupt` に関わらず全撮影へ倒す（差分撮影を
 /// 有効にする手順を理由に載せる）。読めたが壊れている場合の扱いだけを
 /// `on_corrupt` で切り替える。
+///
+/// provenance 検証を通った経路では、このファイル読み直しを使わず
+/// [`select_stories_from_verified`] に verify が読んだバイト列を渡すこと
+/// （読み直すと照合したバイト列との同一性が保証されない——TOCTOU）。
 pub fn select_stories(inputs: &SelectionInputs<'_>, on_corrupt: CorruptInput) -> Result<Selection> {
-    let mut notes: Vec<String> = Vec::new();
+    let notes: Vec<String> = Vec::new();
 
     let stats_path = inputs.stats_path();
     if !stats_path.is_file() {
@@ -118,13 +122,59 @@ pub fn select_stories(inputs: &SelectionInputs<'_>, on_corrupt: CorruptInput) ->
             notes,
         });
     }
-    let stats = match load_stats(&stats_path) {
+    let stats_raw = match std::fs::read_to_string(&stats_path)
+        .with_context(|| format!("failed to read {}", stats_path.display()))
+    {
+        Ok(raw) => raw,
+        Err(e) => return on_corrupt_input(on_corrupt, e, notes),
+    };
+
+    let index_path = inputs.index_path();
+    let index_raw = match std::fs::read_to_string(&index_path)
+        .with_context(|| format!("failed to read {}", index_path.display()))
+    {
+        Ok(raw) => raw,
+        Err(e) => return on_corrupt_input(on_corrupt, e, notes),
+    };
+
+    select_stories_from_content(inputs, &stats_raw, &index_raw, on_corrupt)
+}
+
+/// provenance 検証（[`crate::provenance::verify`]）を通った成果物から選択する。
+///
+/// 入力は verify がハッシュ照合に使ったバイト列そのもの
+/// （[`crate::provenance::VerifiedArtifacts`]）。ここでファイルを読み直さない
+/// ことで、「照合したバイト列 == 選別に使うバイト列」がプロセス内で保証される。
+pub fn select_stories_from_verified(
+    inputs: &SelectionInputs<'_>,
+    verified: &crate::provenance::VerifiedArtifacts,
+    on_corrupt: CorruptInput,
+) -> Result<Selection> {
+    select_stories_from_content(inputs, &verified.stats_raw, &verified.index_raw, on_corrupt)
+}
+
+/// 選択の本体。stats / index の内容（バイト列）を受け取り、パースして
+/// [`turbosnap::compute_affected_stories`] で選択する。
+fn select_stories_from_content(
+    inputs: &SelectionInputs<'_>,
+    stats_raw: &str,
+    index_raw: &str,
+    on_corrupt: CorruptInput,
+) -> Result<Selection> {
+    let mut notes: Vec<String> = Vec::new();
+
+    let stats_path = inputs.stats_path();
+    let stats = match WebpackStats::parse(stats_raw)
+        .with_context(|| format!("failed to parse {}", stats_path.display()))
+    {
         Ok(stats) => stats,
         Err(e) => return on_corrupt_input(on_corrupt, e, notes),
     };
 
     let index_path = inputs.index_path();
-    let stories = match load_index(&index_path) {
+    let stories = match turbosnap::parse_index(index_raw)
+        .with_context(|| format!("failed to parse {}", index_path.display()))
+    {
         Ok(stories) => stories,
         Err(e) => return on_corrupt_input(on_corrupt, e, notes),
     };
@@ -162,18 +212,6 @@ fn on_corrupt_input(
             notes,
         }),
     }
-}
-
-fn load_stats(path: &Path) -> Result<WebpackStats> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    WebpackStats::parse(&raw).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn load_index(path: &Path) -> Result<Vec<StoryEntry>> {
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    turbosnap::parse_index(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 /// 計画を固定するビルド座標。

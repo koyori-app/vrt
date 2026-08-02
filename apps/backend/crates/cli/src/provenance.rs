@@ -99,8 +99,8 @@ impl ArtifactPaths<'_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verification {
     /// provenance が存在し、build 所有・コミット・内容ハッシュとも一致した。
-    /// 絞り込んでよい。
-    Verified,
+    /// 絞り込んでよい。照合に使った stats / index のバイト列そのものを持ち回る。
+    Verified(VerifiedArtifacts),
     /// provenance が存在しない。絞り込まず全撮影へ倒すこと（移行期の既定）。
     Missing,
     /// v1（build 所有なしの旧形式）。生成時点を観測していない証明なので
@@ -108,16 +108,34 @@ pub enum Verification {
     Unowned,
 }
 
-fn sha256_hex(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let digest = Sha256::digest(&bytes);
+/// [`verify`] がハッシュ照合に使った stats / index の内容そのもの。
+///
+/// 選別（[`crate::plan::select_stories_from_verified`]）は必ずこの値から
+/// 読む——verify の後にファイルを読み直すと、照合したバイト列と選別に使う
+/// バイト列の同一性がプロセス内で保証されず、その間の差し替え（TOCTOU）を
+/// 内容ハッシュの束縛がすり抜ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedArtifacts {
+    /// `preview-stats.json`（解決後のパス）の内容。
+    pub stats_raw: String,
+    /// `index.json`（解決後のパス）の内容。
+    pub index_raw: String,
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write;
         write!(out, "{byte:02x}").expect("write to String never fails");
     }
-    Ok(out)
+    out
+}
+
+fn sha256_hex(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(sha256_hex_bytes(&bytes))
 }
 
 /// build 開始前に旧 provenance と絞り込み入力（stats / index）を削除する。
@@ -265,14 +283,16 @@ pub fn verify(paths: &ArtifactPaths<'_>, expected_head_commit_sha: &str) -> Resu
         );
     }
 
+    // 実入力は 1 度だけ読み、ハッシュ照合したバイト列そのものを返す。
+    // 照合と選別で別々に読むと、その間の差し替えが束縛をすり抜ける（TOCTOU）。
     let stats_path = paths.stats_path();
-    let actual_stats = sha256_hex(&stats_path).with_context(|| {
+    let stats_raw = std::fs::read_to_string(&stats_path).with_context(|| {
         format!(
-            "could not hash {} to verify provenance",
+            "could not read {} to verify provenance",
             stats_path.display()
         )
     })?;
-    if actual_stats != provenance.stats_sha256 {
+    if sha256_hex_bytes(stats_raw.as_bytes()) != provenance.stats_sha256 {
         bail!(
             "{} does not match the stamped artifact (its content changed after `vrt stamp`); \
              re-run `vrt stamp -- <build command>` so the stamp observes the build",
@@ -281,13 +301,13 @@ pub fn verify(paths: &ArtifactPaths<'_>, expected_head_commit_sha: &str) -> Resu
     }
 
     let index_path = paths.index_path();
-    let actual_index = sha256_hex(&index_path).with_context(|| {
+    let index_raw = std::fs::read_to_string(&index_path).with_context(|| {
         format!(
-            "could not hash {} to verify provenance",
+            "could not read {} to verify provenance",
             index_path.display()
         )
     })?;
-    if actual_index != provenance.index_sha256 {
+    if sha256_hex_bytes(index_raw.as_bytes()) != provenance.index_sha256 {
         bail!(
             "{} does not match the stamped artifact (its content changed after `vrt stamp`); \
              re-run `vrt stamp -- <build command>` so the stamp observes the build",
@@ -295,7 +315,10 @@ pub fn verify(paths: &ArtifactPaths<'_>, expected_head_commit_sha: &str) -> Resu
         );
     }
 
-    Ok(Verification::Verified)
+    Ok(Verification::Verified(VerifiedArtifacts {
+        stats_raw,
+        index_raw,
+    }))
 }
 
 #[cfg(test)]
@@ -331,9 +354,13 @@ mod tests {
         let tmp = artifact_dir();
         let out = stamp(&paths(tmp.path()), HEAD, &build_command()).expect("stamp");
         assert_eq!(out, tmp.path().join(PROVENANCE_FILE));
+        // Verified は照合したバイト列そのものを返す（選別はこれを読む——read-once）。
         assert_eq!(
             verify(&paths(tmp.path()), HEAD).expect("verify"),
-            Verification::Verified
+            Verification::Verified(VerifiedArtifacts {
+                stats_raw: r#"{"modules":[]}"#.to_string(),
+                index_raw: r#"{"v":5,"entries":{}}"#.to_string(),
+            })
         );
     }
 
@@ -512,10 +539,10 @@ mod tests {
             index_json: Some(&index),
         };
         stamp(&custom, HEAD, &build_command()).expect("stamp");
-        assert_eq!(
+        assert!(matches!(
             verify(&custom, HEAD).expect("verify"),
-            Verification::Verified
-        );
+            Verification::Verified(_)
+        ));
 
         fs::write(&stats, r#"{"modules":[1]}"#).expect("swap");
         assert!(verify(&custom, HEAD).is_err());
