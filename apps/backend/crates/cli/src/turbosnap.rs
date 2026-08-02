@@ -534,6 +534,52 @@ mod tests {
         );
     }
 
+    /// 非 ASCII（日本語）パスの変更が依存グラフのキーに一致し、story 選択まで
+    /// 到達する。壊れうるのは選択側ではなく git 側——修正前の
+    /// `git::changed_files` は C-quoted 文字列を返すためキーに一致せず
+    /// 「グラフ外 → capture_all」へ倒れていた（その退行は git.rs の
+    /// positive control が固定する）。ここは quoting を解いた生パスが
+    /// そのまま選択に効くことを、選択側の視点から固定する。
+    #[test]
+    fn non_ascii_changed_path_reaches_its_story() {
+        let stats = WebpackStats::parse(
+            r#"{
+              "modules": [
+                {
+                  "name": "./src/部品/ボタン.tsx",
+                  "reasons": [
+                    { "moduleName": "./src/部品/ボタン.stories.tsx" }
+                  ]
+                },
+                {
+                  "name": "./src/部品/ボタン.stories.tsx",
+                  "reasons": []
+                }
+              ]
+            }"#,
+        )
+        .expect("parse stats");
+        let stories = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "部品-ボタン--primary": {
+                  "id": "部品-ボタン--primary",
+                  "type": "story",
+                  "importPath": "./src/部品/ボタン.stories.tsx"
+                }
+              }
+            }"#,
+        )
+        .expect("parse index");
+        let changed = vec!["apps/frontend/src/部品/ボタン.tsx".to_string()];
+        let out = compute_affected_stories(&root(), &cwd(), &changed, &stats, &stories);
+        assert_eq!(
+            out.plan,
+            Plan::Only(vec!["部品-ボタン--primary".to_string()])
+        );
+    }
+
     #[test]
     fn unrelated_change_reaches_no_story() {
         // Card.tsx を変更 → Card ストーリーだけ、Button には届かない。
