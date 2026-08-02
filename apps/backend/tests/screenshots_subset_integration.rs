@@ -657,11 +657,16 @@ async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
     );
 
     // ロックを保持したまま計画を添付して commit（home のみ選択）。
+    // 保存形は手書き JSON ではなく本物の CapturePlan の serialize から作る——
+    // 手書きだと保存形が変わったときにこのテストだけ旧形のまま緑を保ってしまう。
+    let plan = service::builds::CapturePlan {
+        selected_names: vec!["home".to_string()],
+        manifest_names: FULL_MANIFEST.iter().map(|s| s.to_string()).collect(),
+    };
     let mut active: entity::builds::ActiveModel = locked.into();
-    active.capture_plan = Set(Some(serde_json::json!({
-        "selected_names": ["home"],
-        "manifest_names": FULL_MANIFEST,
-    })));
+    active.capture_plan = Set(Some(
+        serde_json::to_value(plan).expect("serialize capture plan"),
+    ));
     active.baseline_id = Set(Some(baseline_id));
     active
         .update(&txn)
@@ -686,6 +691,66 @@ async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
     assert_eq!(
         rows, 0,
         "the rejected upload must not leave a screenshot row"
+    );
+}
+
+/// 計画添付（attach_capture_plan）自身が build 行ロックを取ることを固定する。
+///
+/// 上のテストは「添付がロックを持っている間、アップロードが待つ」ことを
+/// 自前トランザクションの再現で確かめるが、それだけでは将来
+/// attach_capture_plan からロック取得が消えても緑のままである。ここでは
+/// 逆向き——別トランザクションが build 行ロックを保持している間、本物の
+/// 添付 API がブロックされる——を確かめ、attach 側のロック取得を直接固定する。
+///
+/// positive control: attach_capture_plan がロックを取らない実装では、
+/// 添付はブロックされず `!handle.is_finished()` が落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_attachment_takes_the_build_row_lock() {
+    use sea_orm::TransactionTrait;
+
+    let fx = setup().await;
+    fx.establish_baseline("base0012", png(40, 30, [255, 255, 255, 255]))
+        .await;
+    let build = fx.create_build("serial02").await;
+    let build_id = build_id_of(&build);
+
+    // 別経路が build 行ロックを保持したまま止まっている状態を作る。
+    let txn = fx.app.state.db.begin().await.expect("begin");
+    service::review_lock::build(&txn, build_id)
+        .await
+        .expect("lock build row");
+
+    // その間に届いた本物の添付リクエスト。
+    let base_url = fx.app.base_url().to_string();
+    let token = fx.token.clone();
+    let handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{base_url}/v1/ci/builds/{build_id}/plan"))
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&json!({
+                "selected_names": ["home"],
+                "manifest_names": FULL_MANIFEST,
+                "baseline_commit_sha": "base0012",
+            }))
+            .send()
+            .await
+            .expect("attach request")
+            .status()
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !handle.is_finished(),
+        "attach_capture_plan must take the build row lock and wait for the holder"
+    );
+
+    // ロックを手放すと添付は完走する。
+    txn.commit().await.expect("commit");
+    let status = handle.await.expect("join attach");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the attachment must complete once the row lock is released"
     );
 }
 
@@ -876,6 +941,63 @@ async fn plan_with_zero_baseline_overlap_is_rejected_as_naming_mismatch() {
         "base0009",
     )
     .await;
+}
+
+/// 計画ありビルドの finalize で `expected_baseline_commit_sha` が固定値と
+/// 不一致なら 400（実装・openapi には宣言済みだが否定側が未固定だった）。
+#[tokio::test(flavor = "multi_thread")]
+async fn finalize_with_a_mismatched_expected_baseline_sha_is_rejected() {
+    let fx = setup().await;
+    fx.establish_baseline("base0013", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    let build = fx.create_build("shamis01").await;
+    let build_id = build_id_of(&build);
+    fx.attach_plan_ok(build_id, &["home"], &FULL_MANIFEST, "base0013")
+        .await;
+    fx.upload(build_id, "home", png(40, 30, [255, 0, 0, 255]))
+        .await;
+
+    let res = fx
+        .finalize(
+            build_id,
+            Some(json!({ "expected_baseline_commit_sha": "someothersha" })),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a cross-check against a different planning basis must fail loudly"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("does not match the baseline pinned"),
+        "the error must name the pinned-basis mismatch: {body}"
+    );
+}
+
+/// baseline がまだ無いブランチへの plan 添付は 409（流用元が無い）。
+/// 実装・openapi には宣言済みだが否定側が未固定だった。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_attachment_without_a_baseline_is_rejected() {
+    let fx = setup().await;
+
+    // establish_baseline を呼ばない——このブランチに baseline は無い。
+    let build = fx.create_build("nobase01").await;
+    let build_id = build_id_of(&build);
+    let res = fx
+        .attach_plan(build_id, &["home"], &FULL_MANIFEST, "whatever")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "with no baseline there is nothing to carry forward; the plan must be refused"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("no baseline exists"),
+        "the error must say the baseline is missing: {body}"
+    );
 }
 
 /// 新規 story（manifest にあり baseline に無い）を selected から落とした計画は 400。

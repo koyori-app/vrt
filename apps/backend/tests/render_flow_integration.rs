@@ -1054,6 +1054,64 @@ async fn a_second_finalize_cannot_overwrite_the_pinned_baseline() {
     );
 }
 
+/// `only_story_ids` に `expected_baseline_commit_sha` を添えない finalize は 400。
+///
+/// 後方互換を破ってでも照合を必須にした当のガードの否定側。バンドルの有無より
+/// 前に入口で効く（照合できない部分レンダリングを開始させない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn only_story_ids_without_expected_baseline_sha_is_rejected() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("neg00001").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json_with_bearer(
+            &format!("/v1/ci/builds/{build_id}/finalize"),
+            &fx.token,
+            json!({ "only_story_ids": ["demo-box--red"] }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a partial render without its planning basis cannot be verified or pinned"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("requires expected_baseline_commit_sha"),
+        "the error must demand the planning basis: {body}"
+    );
+}
+
+/// `storybook` モードに `captured_names` を渡すと 400（サーバーが撮るので
+/// 「CI が撮った名前」の宣言は成立しない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_names_is_rejected_for_storybook_mode() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("neg00002").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json_with_bearer(
+            &format!("/v1/ci/builds/{build_id}/finalize"),
+            &fx.token,
+            json!({ "captured_names": ["Demo/Box/Red"] }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "captured_names is a screenshots-mode declaration"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("not supported for storybook-mode"),
+        "the error must point at the mode mismatch: {body}"
+    );
+}
+
 /// `screenshots` モードに `only_story_ids` を渡すと 400（サーバー撮影しない）。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_story_ids_is_rejected_for_screenshot_mode() {

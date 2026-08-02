@@ -77,6 +77,32 @@ fn init_linear_repo() -> (TempDir, String, String, String) {
     (tmp, c1, c2, c3)
 }
 
+/// graph fixture の依存グラフに対応する 2 段履歴。c1 → c2 で
+/// `apps/frontend/src/A.tsx` を変更する（stats のモジュール名と揃えた配置）。
+fn init_story_diff_repo() -> (TempDir, String, String) {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path();
+    git_in(root, &["init", "-b", "main"]);
+    git_in(root, &["config", "user.email", "vrt@test.local"]);
+    git_in(root, &["config", "user.name", "vrt test"]);
+
+    let a_path = root.join("apps/frontend/src/A.tsx");
+    let b_path = root.join("apps/frontend/src/B.tsx");
+    fs::create_dir_all(a_path.parent().expect("parent")).expect("mkdir");
+    fs::write(&a_path, "export const A = 1;\n").expect("write A");
+    fs::write(&b_path, "export const B = 1;\n").expect("write B");
+    git_in(root, &["add", "apps"]);
+    git_in(root, &["commit", "-m", "c1"]);
+    let c1 = git_output(root, &["rev-parse", "HEAD"]);
+
+    fs::write(&a_path, "export const A = 2;\n").expect("write A");
+    git_in(root, &["add", "apps/frontend/src/A.tsx"]);
+    git_in(root, &["commit", "-m", "c2"]);
+    let c2 = git_output(root, &["rev-parse", "HEAD"]);
+
+    (tmp, c1, c2)
+}
+
 fn git_rev_parse(repo: &Path, rev: &str) -> String {
     git_rev_parse_opt(repo, rev).unwrap_or_else(|| panic!("git rev-parse {rev} failed"))
 }
@@ -506,9 +532,15 @@ fn plan_diff_uses_explicit_commit_not_worktree_head() {
     );
 }
 
-/// worktree を `--commit` に合わせてあれば絞り込みは成立する（過剰ブロックの回帰防止）。
+/// worktree が `--commit` と一致していてもエラーにはならない（過剰ブロックの
+/// 回帰防止）が、fixture に provenance が無いため計画は全撮影へ倒れる。
+///
+/// かつてこのテストは SHA 2 つしか assert しておらず、名前に反して
+/// 「絞り込めたか」を見ていなかった（provenance 無しでは capture_all になる）。
+/// 実際に絞り込める連鎖は [`a_stamped_artifact_narrows_the_plan_to_affected_stories`]
+/// が固定する。
 #[test]
-fn plan_narrows_when_worktree_matches_the_recorded_commit() {
+fn plan_without_provenance_falls_back_to_capture_all_even_when_worktree_matches() {
     let (tmp, c1, c2, _head) = init_linear_repo();
     let repo = tmp.path();
     git_in(repo, &["checkout", "--detach", &c2]);
@@ -536,6 +568,93 @@ fn plan_narrows_when_worktree_matches_the_recorded_commit() {
     );
     let value: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
+    assert_eq!(value["baseline_commit_sha"].as_str().expect("baseline"), c1);
+    assert_eq!(value["head_commit_sha"].as_str().expect("head"), c2);
+    // provenance の無い成果物では絞り込まない（撮り逃しを作らない側へ倒す）。
+    assert_eq!(value["plan"].as_str(), Some("capture_all"), "value={value}");
+    assert!(
+        value["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("provenance"),
+        "the fallback reason must point at the missing provenance: {value}"
+    );
+}
+
+/// `stamp → plan` の成功連鎖の smoke: stamp した成果物なら計画は
+/// `plan = "only"` に絞られ、変更の影響を受けた story だけが載る。
+///
+/// positive control: 絞り込みが成立しない実装（provenance 検証や選択が
+/// 壊れて capture_all に倒れる等）では `plan = "only"` のアサートで落ちる。
+#[test]
+fn a_stamped_artifact_narrows_the_plan_to_affected_stories() {
+    let (tmp, c1, c2) = init_story_diff_repo();
+    let repo = tmp.path();
+    git_in(repo, &["checkout", "--detach", &c2]);
+    let frontend = repo.join("apps/frontend");
+
+    // 成果物は stamp の build コマンドが再生成する（後追い stamp は受け付けない）。
+    // fixture はリポジトリ内の読み取り専用ファイルなので、複製元を backup に置き、
+    // build コマンドにコピーさせる。
+    let backup = TempDir::new().expect("backup tempdir");
+    for name in ["preview-stats.json", "index.json"] {
+        fs::copy(graph_fixture().join(name), backup.path().join(name)).expect("copy fixture");
+    }
+    let artifact = TempDir::new().expect("artifact tempdir");
+    let script = format!(
+        "cp '{b}/preview-stats.json' '{b}/index.json' '{a}/'",
+        b = backup.path().display(),
+        a = artifact.path().display()
+    );
+    let output = vrt()
+        .args([
+            "stamp",
+            "--dir",
+            artifact.path().to_str().expect("utf8"),
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .current_dir(&frontend)
+        .output()
+        .expect("spawn vrt stamp");
+    assert!(
+        output.status.success(),
+        "stamp stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // c1 → c2 の変更は A.tsx。graph fixture では A の story 2 件に届く。
+    let output = vrt()
+        .args([
+            "plan",
+            "--baseline-commit",
+            &c1,
+            "--dir",
+            artifact.path().to_str().expect("utf8"),
+            "--branch",
+            "feat/test",
+            "--commit",
+            &c2,
+        ])
+        .current_dir(&frontend)
+        .output()
+        .expect("spawn vrt plan");
+    assert!(
+        output.status.success(),
+        "plan stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("json");
+    assert_eq!(value["plan"].as_str(), Some("only"), "value={value}");
+    assert_eq!(
+        value["story_ids"],
+        serde_json::json!(["a--one", "a--two"]),
+        "only the stories reachable from the changed file are selected: {value}"
+    );
+    assert_eq!(value["reason"], serde_json::Value::Null);
     assert_eq!(value["baseline_commit_sha"].as_str().expect("baseline"), c1);
     assert_eq!(value["head_commit_sha"].as_str().expect("head"), c2);
 }
