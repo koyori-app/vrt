@@ -171,7 +171,9 @@ export VRT_PROJECT=<tenant-slug>/<project-slug>
 vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
 vrt plan --dir ./storybook-static --output plan.json
 
-# build_id はキーがあるときだけ使う（--baseline-commit 経路では省略される）。
+# build_id はキーがあるときだけ入る（--baseline-commit 経路では省略される）。
+# 撮影後のアップロード先・finalize 先のビルド ID として後段で使う
+# （API を直接叩く場合の例は下の capture plan 節の $BUILD）。
 BUILD=$(jq -r '.build_id // empty' plan.json)
 
 # 契約 version を確認する。未知の値なら計画を捨てて全撮影へ倒す。

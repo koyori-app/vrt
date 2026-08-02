@@ -767,12 +767,15 @@ async fn run_plan(args: PlanArgs) -> Result<ExitCode> {
     }
 
     let json = document.to_json()?;
-    println!("{json}");
+    // --output の書き込みは stdout より先に行う。stdout を読んだ消費者が
+    // 動き出した時点でファイルも揃っていることを保証する（逆順だと、stdout を
+    // 合図にファイルを読む消費者が書き込み前のファイルを掴みうる）。
     if let Some(path) = &args.output {
         std::fs::write(path, format!("{json}\n"))
             .with_context(|| format!("failed to write {}", path.display()))?;
         tracing::info!(path = %path.display(), "wrote the selection plan");
     }
+    println!("{json}");
     Ok(ExitCode::SUCCESS)
 }
 

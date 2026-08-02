@@ -215,14 +215,7 @@ impl Fixture {
     async fn latest_baseline(&self) -> (Uuid, Vec<String>) {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
-        let baseline = entity::baselines::Entity::find()
-            .filter(entity::baselines::Column::ProjectId.eq(self.project_id))
-            .order_by_desc(entity::baselines::Column::CreatedAt)
-            .order_by_desc(entity::baselines::Column::Id)
-            .one(&self.app.state.db)
-            .await
-            .expect("query baseline")
-            .expect("baseline exists");
+        let baseline = common::latest_baseline_of(&self.app.state.db, self.project_id).await;
 
         let names = entity::baseline_entries::Entity::find()
             .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
@@ -691,6 +684,33 @@ async fn uploads_are_serialized_with_plan_attachment_on_the_build_row() {
     assert_eq!(
         rows, 0,
         "the rejected upload must not leave a screenshot row"
+    );
+
+    // ストレージ側にも残らない（補償削除の実体確認）。テストのストレージは
+    // LOCAL_UPLOAD_DIR 配下のローカルバックエンドで、キーは
+    // tenants/{t}/projects/{p}/builds/{b}/... に階層化されている。
+    let project = entity::projects::Entity::find_by_id(fx.project_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("query project")
+        .expect("project exists");
+    let build_dir = std::path::Path::new(
+        &std::env::var("LOCAL_UPLOAD_DIR").expect("tests always set LOCAL_UPLOAD_DIR"),
+    )
+    .join(format!(
+        "tenants/{}/projects/{}/builds/{build_id}",
+        project.tenant_id, fx.project_id
+    ));
+    let leftover: Vec<std::path::PathBuf> = match std::fs::read_dir(&build_dir) {
+        Ok(entries) => entries
+            .map(|entry| entry.expect("dir entry").path())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("read {}: {e}", build_dir.display()),
+    };
+    assert!(
+        leftover.is_empty(),
+        "the compensating delete must also remove the stored object: {leftover:?}"
     );
 }
 

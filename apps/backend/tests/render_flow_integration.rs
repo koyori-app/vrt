@@ -433,16 +433,9 @@ impl Fixture {
 
     /// 最新 baseline の ID と、その `Demo/Box/Red` エントリのストレージキー。
     async fn latest_baseline_red_entry(&self) -> (Uuid, String) {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        let baseline = entity::baselines::Entity::find()
-            .filter(entity::baselines::Column::ProjectId.eq(self.project_id))
-            .order_by_desc(entity::baselines::Column::CreatedAt)
-            .order_by_desc(entity::baselines::Column::Id)
-            .one(&self.app.state.db)
-            .await
-            .expect("query baseline")
-            .expect("baseline exists");
+        let baseline = common::latest_baseline_of(&self.app.state.db, self.project_id).await;
 
         let entry = entity::baseline_entries::Entity::find()
             .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
