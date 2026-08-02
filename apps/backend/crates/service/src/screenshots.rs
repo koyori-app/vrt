@@ -207,14 +207,20 @@ pub async fn verify_baseline_candidate(
     expected: Option<&str>,
 ) -> Result<String, anyhow::Error> {
     let bytes = read_all(storage, key).await?;
-    let actual = content_hash(&bytes);
-    if !content_hashes_match(Some(&actual), expected) {
-        anyhow::bail!("stored object hash does not match recorded content hash for {key}");
-    }
-    image::ImageReader::with_format(std::io::Cursor::new(&bytes), ImageFormat::Png)
-        .decode()
-        .map_err(|e| anyhow::anyhow!("decode png {key}: {e}"))?;
-    Ok(actual)
+    let expected = expected.map(str::to_owned);
+    let key = key.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let actual = content_hash(&bytes);
+        if !content_hashes_match(Some(&actual), expected.as_deref()) {
+            anyhow::bail!("stored object hash does not match recorded content hash for {key}");
+        }
+        image::ImageReader::with_format(std::io::Cursor::new(&bytes), ImageFormat::Png)
+            .decode()
+            .map_err(|e| anyhow::anyhow!("decode png {key}: {e}"))?;
+        Ok(actual)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("baseline PNG verification task failed: {e}"))?
 }
 
 /// `RgbaImage` を PNG にエンコードする。

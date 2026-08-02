@@ -537,9 +537,10 @@ async fn materialize_carry_forward(
             storage_key: sea_orm::ActiveValue::Set(key.clone()),
             width: sea_orm::ActiveValue::Set(entry.width),
             height: sea_orm::ActiveValue::Set(entry.height),
-            // carry-forward は baseline の PNG バイト列を無加工でコピーするため
-            // 再計算せず引き継げる。旧 NULL も NULL のままにし、通常比較へ倒す。
-            content_hash: sea_orm::ActiveValue::Set(entry.content_hash.clone()),
+            // carry-forward は上で読み込んだ PNG バイト列を無加工でコピーする。
+            // migration 前の baseline は hash が NULL なので、継承ではなく、この既読
+            // バイト列から再計算する。追加の storage 読み出しは発生しない。
+            content_hash: sea_orm::ActiveValue::Set(Some(service::screenshots::content_hash(&png))),
             metadata: sea_orm::ActiveValue::Set(Some(serde_json::json!({ "reused": true }))),
             created_at: sea_orm::ActiveValue::Set(Utc::now().fixed_offset()),
         };
