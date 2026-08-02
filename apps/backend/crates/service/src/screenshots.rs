@@ -274,13 +274,17 @@ pub async fn store_ci_screenshot(
             // capture plan が固定されたビルドは、計画で選択された名前しか受け付けない。
             // 計画外の名前を黙って受けると、finalize の「計画 == アップロード」検証が
             // そこで初めて落ちるまで撮影のずれに気づけない。
-            if let Some(plan) = crate::builds::capture_plan(&build)?
-                && !plan.selected_names.iter().any(|n| n == &name)
-            {
-                return Err(AppError::BadRequestDetail(format!(
-                    "screenshot `{name}` is not in the capture plan attached to this build; \
-                     only planned names can be uploaded (re-run the plan if the selection changed)"
-                )));
+            // 照合は HashSet（selected は最大 1 万件で、行ロック保持中の Vec 線形
+            // 走査による文字列比較を避ける）。
+            if let Some(plan) = crate::builds::capture_plan(&build)? {
+                let selected: std::collections::HashSet<&str> =
+                    plan.selected_names.iter().map(String::as_str).collect();
+                if !selected.contains(name.as_str()) {
+                    return Err(AppError::BadRequestDetail(format!(
+                        "screenshot `{name}` is not in the capture plan attached to this build; \
+                         only planned names can be uploaded (re-run the plan if the selection changed)"
+                    )));
+                }
             }
 
             let duplicate = screenshots::Entity::find()

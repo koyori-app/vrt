@@ -43,7 +43,9 @@ pub struct NewBuild<'a> {
 /// finalize のリクエストボディ（payload::builds::FinalizeBuildRequest に一致）。
 #[derive(Debug, Serialize)]
 struct FinalizeBody<'a> {
-    only_story_ids: Vec<String>,
+    /// `None` は「全ストーリー撮影」（サーバーは省略・null を同義に扱う）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only_story_ids: Option<Vec<String>>,
     /// 差分計画の起点にした baseline のコミット SHA。サーバーはビルドに
     /// 固定された baseline と照合し、ずれていれば finalize を拒否する。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -213,9 +215,15 @@ impl Client {
     ) -> Result<BuildResponse> {
         let url = format!("{}/v1/ci/builds/{}/finalize", self.base_url, build_id);
         let mut req = self.bearer(self.http.post(&url));
-        if let Some(ids) = only_story_ids {
+        // `expected_baseline_commit_sha` は `only_story_ids` が無くても単独で
+        // 送る。以前は `only_story_ids: Some` のときしかボディを付けず、
+        // expected だけを渡した呼び出しが黙って捨てられていた——サーバーの
+        // 「screenshots モード + 計画あり + expected のみ」の照合にこの
+        // クライアントから到達できず、照合したつもりで送られていない
+        // footgun になる。
+        if only_story_ids.is_some() || expected_baseline_commit_sha.is_some() {
             req = req.json(&FinalizeBody {
-                only_story_ids: ids,
+                only_story_ids,
                 expected_baseline_commit_sha,
             });
         }
@@ -246,5 +254,26 @@ impl Client {
             .await
             .context("get build logs request failed")?;
         Self::read_json(resp, "get build logs").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// expected 単独のボディが only_story_ids 無しで送れる形になっていること。
+    /// 修正前は only_story_ids が必須フィールドの Vec で、expected 単独の
+    /// リクエストは構造的に組めなかった（呼び出し側で黙って捨てていた）。
+    #[test]
+    fn finalize_body_serializes_expected_without_story_ids() {
+        let body = FinalizeBody {
+            only_story_ids: None,
+            expected_baseline_commit_sha: Some("abc123"),
+        };
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "expected_baseline_commit_sha": "abc123" })
+        );
     }
 }

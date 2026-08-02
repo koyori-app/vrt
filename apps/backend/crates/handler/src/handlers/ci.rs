@@ -456,6 +456,21 @@ pub async fn finalize_build(
             if let Some(expected) = &payload.expected_baseline_commit_sha {
                 let pinned = build_service::pinned_baseline_commit_sha(&state.db, &build).await?;
                 match pinned {
+                    // 固定 SHA を解決できない理由は 2 つあり、文言を分ける:
+                    // baseline 自体が固定されていない（計画なし）のか、固定は
+                    // されているが昇格元ビルドが削除されて SHA を辿れないのか。
+                    // 後者に「requires a capture plan」を返すと、計画も pin も
+                    // あるのに無いと言われて原因に辿れない。
+                    None if build.baseline_id.is_some() => {
+                        return Err(AppError::BadRequestDetail(
+                            "expected_baseline_commit_sha cannot be verified: a baseline \
+                             is pinned to this build, but the build it was promoted from \
+                             (which carries the commit SHA) no longer exists. re-create \
+                             the build and attach a fresh capture plan, or finalize \
+                             without expected_baseline_commit_sha"
+                                .into(),
+                        ));
+                    }
                     None => {
                         return Err(AppError::BadRequestDetail(
                             "expected_baseline_commit_sha requires a capture plan: \

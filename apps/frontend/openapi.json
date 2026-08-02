@@ -5725,7 +5725,7 @@
       },
       "AttachCapturePlanRequest": {
         "type": "object",
-        "description": "`POST /v1/ci/builds/{id}/plan` — screenshots モードの部分アップロード計画。\n\n撮影を始める**前**に「今回撮る名前」と「現時点で存在する全名前（現行 index）」を\nビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。\n撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき\n空の申告と空のアップロードが循環一致して偽 PASS になるためである。",
+        "description": "`POST /v1/ci/builds/{id}/plan` — screenshots モードの部分アップロード計画。\n\n撮影を始める**前**に「今回撮る名前」と「現時点で存在する全名前（現行 index）」を\nビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。\n撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき\n空の申告と空のアップロードが循環一致して偽 PASS になるためである。\n未知フィールドは拒否する（`deny_unknown_fields`）。`baseline_commit_sha` を\n`baseline_sha` などと typo すると、黙って無視されて必須フィールド欠落の\nエラーになる代わりに typo そのものが指摘され、安全照合のサイレント無効化を\n防ぐ。本エンドポイントは本 PR 新設でクライアントは同梱 CLI のみのため、\n旧クライアント互換の考慮は不要。\n（既設の [`FinalizeBuildRequest`] には付けない——付けると、CLI だけが先に\n新フィールドを送る移行期間・新旧混在デプロイで既存 CI が一斉に 400 になる。\n既存エンドポイントの未知フィールド許容は後方互換として維持する。）",
         "required": [
           "selected_names",
           "manifest_names",
@@ -5750,7 +5750,8 @@
             },
             "description": "今回撮影してアップロードするスクリーンショット名（`manifest_names` の部分集合）。\n\n空配列は「変更の影響を受けた story は無い」という選択結果で、baseline の\n全エントリ（manifest に残っているもの）が流用される。"
           }
-        }
+        },
+        "additionalProperties": false
       },
       "BuildListResponse": {
         "type": "object",

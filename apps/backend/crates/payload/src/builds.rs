@@ -165,7 +165,16 @@ pub struct FinalizeBuildRequest {
 /// ビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。
 /// 撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき
 /// 空の申告と空のアップロードが循環一致して偽 PASS になるためである。
+/// 未知フィールドは拒否する（`deny_unknown_fields`）。`baseline_commit_sha` を
+/// `baseline_sha` などと typo すると、黙って無視されて必須フィールド欠落の
+/// エラーになる代わりに typo そのものが指摘され、安全照合のサイレント無効化を
+/// 防ぐ。本エンドポイントは本 PR 新設でクライアントは同梱 CLI のみのため、
+/// 旧クライアント互換の考慮は不要。
+/// （既設の [`FinalizeBuildRequest`] には付けない——付けると、CLI だけが先に
+/// 新フィールドを送る移行期間・新旧混在デプロイで既存 CI が一斉に 400 になる。
+/// 既存エンドポイントの未知フィールド許容は後方互換として維持する。）
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AttachCapturePlanRequest {
     /// 今回撮影してアップロードするスクリーンショット名（`manifest_names` の部分集合）。
     ///
@@ -391,6 +400,39 @@ pub struct BuildLogsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 安全照合フィールドの typo が unknown field として黙殺されない。
+    /// `deny_unknown_fields` を外すと typo が黙って無視されて計画が通って
+    /// しまい、このテストは落ちる（positive control）。
+    #[test]
+    fn attach_plan_rejects_unknown_fields() {
+        let err = serde_json::from_value::<AttachCapturePlanRequest>(serde_json::json!({
+            "selected_names": ["a"],
+            "manifest_names": ["a"],
+            "baseline_commit_sha": "abc",
+            "expected_baseline_sha": "typo-of-a-safety-field"
+        }))
+        .expect_err("a typo field must be rejected, not silently dropped");
+        assert!(
+            err.to_string().contains("expected_baseline_sha"),
+            "the error should name the offending field: {err}"
+        );
+    }
+
+    /// 既設の finalize は逆に未知フィールドを**許容し続ける**（新旧混在デプロイで
+    /// 新しい CLI のフィールドを古いサーバーが 400 にしない後方互換）。
+    #[test]
+    fn finalize_request_tolerates_unknown_fields() {
+        let req: FinalizeBuildRequest = serde_json::from_value(serde_json::json!({
+            "only_story_ids": ["a--one"],
+            "some_future_field": true
+        }))
+        .expect("unknown fields must be tolerated for forward compatibility");
+        assert_eq!(
+            req.only_story_ids.as_deref(),
+            Some(&["a--one".to_string()][..])
+        );
+    }
 
     fn req(ids: Option<Vec<&str>>) -> FinalizeBuildRequest {
         FinalizeBuildRequest {
