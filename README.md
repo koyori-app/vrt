@@ -671,5 +671,20 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
   `mode=storybook` のビルド作成が 400 で拒否される。同梱の Docker イメージには
   Chromium が入っている
 
+### content hash による比較省略の安全境界
+
+同じ名前の current と baseline で `sha256:<64 hex>` が完全一致した場合、PNG の
+decode と pixel diff を省略できる。ただし hash が証明するのは、その hash を計算した
+時点で受け取った**バイト列の一致だけ**であり、保存実体の存在・不変性・PNG としての
+健全性を単独では証明しない。
+
+そのため baseline 昇格時に保存実体を再読し、SHA-256 の再照合と full decode に成功した
+hash だけを `verified_content_hash` marker として記録する。marker が無い旧 baseline、
+形式不正、`content_hash` と marker の不一致は従来どおり full decode + pixel diff へ倒す。
+marker は昇格時点の健全性しか証明しないため、fast path の直前にも baseline と current の
+両実体を再読して hash を照合する。欠損・後発破損・DB hash との不一致は比較失敗となり、
+`passed` にはしない。upload 時は寸法検査だけに留め、全 upload へ full decode の費用を
+二重に課さない。
+
 GitHub App を設定してあれば、承認 / 却下の結果は PR の commit status に返る
 （[docs/github-app.md](docs/github-app.md)）。

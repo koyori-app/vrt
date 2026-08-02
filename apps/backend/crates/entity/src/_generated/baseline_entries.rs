@@ -19,6 +19,9 @@ pub struct Model {
     /// 昇格元 screenshot の content hash。旧データは NULL のまま通常比較する。
     #[sea_orm(column_type = "Text", nullable)]
     pub content_hash: Option<String>,
+    /// 昇格時に保存実体を再読・hash 再照合・full decode した証跡。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub verified_content_hash: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "baseline_id",

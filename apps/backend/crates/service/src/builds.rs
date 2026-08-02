@@ -741,6 +741,7 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 /// `(project_id, branch, created_at DESC)` 先頭が確定する。
 pub async fn approve_build(
     db: &DatabaseConnection,
+    storage: &Arc<dyn StorageBackend>,
     build: builds::Model,
     reviewer_id: Uuid,
     options: ApproveOptions,
@@ -756,6 +757,7 @@ pub async fn approve_build(
         )));
     }
 
+    let storage = Arc::clone(storage);
     with_transaction(db, move |txn| {
         Box::pin(async move {
             // 三つのレビュー判断経路で共通の順序（build -> project）を使う。
@@ -963,6 +965,17 @@ pub async fn approve_build(
             .await?;
 
             for shot in shots {
+                // content hash は upload 時の入力しか証明しない。baseline に昇格する
+                // 保存実体をここで再読し、hash と full decode の双方を検証する。
+                // marker はこの時点の健全性だけを示し、後発の欠損・破損は比較時の
+                // 実体 hash 再照合で検出する。
+                let verified_content_hash = crate::screenshots::verify_baseline_candidate(
+                    &storage,
+                    &shot.storage_key,
+                    shot.content_hash.as_deref(),
+                )
+                .await
+                .map_err(AppError::Internal)?;
                 baseline_entries::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     baseline_id: Set(baseline.id),
@@ -971,6 +984,7 @@ pub async fn approve_build(
                     width: Set(shot.width),
                     height: Set(shot.height),
                     content_hash: Set(shot.content_hash),
+                    verified_content_hash: Set(Some(verified_content_hash)),
                 }
                 .insert(txn)
                 .await?;

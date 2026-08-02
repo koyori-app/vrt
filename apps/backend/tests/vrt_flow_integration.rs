@@ -19,6 +19,7 @@ use common::TestApp;
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -93,6 +94,21 @@ fn encode(image: &RgbaImage) -> Vec<u8> {
         .write_to(&mut buf, image::ImageFormat::Png)
         .expect("encode png");
     buf.into_inner()
+}
+
+/// IHDR は保ったまま IDAT を壊す。寸法取得は通るが full decode は失敗する。
+fn corrupt_idat(mut png: Vec<u8>) -> Vec<u8> {
+    let mut offset = 8;
+    while offset + 12 <= png.len() {
+        let len = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &png[offset + 4..offset + 8];
+        if kind == b"IDAT" && len > 0 {
+            png[offset + 8 + len / 2] ^= 0xff;
+            return png;
+        }
+        offset += 12 + len;
+    }
+    panic!("encoded PNG has no IDAT chunk");
 }
 
 // ── フローのヘルパー ────────────────────────────────────────────────────
@@ -566,6 +582,132 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         .map(|b| b["number"].as_i64().unwrap_or(-1))
         .collect();
     assert_eq!(numbers, vec![3, 2, 1], "builds are listed newest first");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_fast_path_rejects_dimension_readable_but_corrupt_stored_png() {
+    let fx = setup().await;
+    let original = png(12, 12, [20, 40, 60, 255]);
+    let baseline_build = fx.create_build("main", "baseline-corrupt-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    assert_eq!(
+        fx.wait_for_terminal(baseline_build_id).await["status"],
+        "changes_detected"
+    );
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "corrupt-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let entry = entity::baseline_entries::Entity::find()
+        .order_by_desc(entity::baseline_entries::Column::Id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref()
+        ),
+        "positive control: the pre-fix metadata-only fast path would pass"
+    );
+
+    let corrupt = corrupt_idat(original);
+    assert!(
+        service::screenshots::validate_png(&corrupt).is_ok(),
+        "dimensions remain readable"
+    );
+    assert!(
+        image::load_from_memory(&corrupt).is_err(),
+        "full decode detects broken IDAT"
+    );
+    service::screenshots::upload_png(&fx.app.state.storage, &shot.storage_key, corrupt.into())
+        .await
+        .expect("replace fixture object with corrupt bytes");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "corrupt object must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_fast_path_rejects_missing_stored_object() {
+    let fx = setup().await;
+    let original = png(12, 12, [80, 100, 120, 255]);
+    let baseline_build = fx.create_build("main", "baseline-missing-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    fx.wait_for_terminal(baseline_build_id).await;
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "missing-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let entry = entity::baseline_entries::Entity::find()
+        .order_by_desc(entity::baseline_entries::Column::Id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref()
+        ),
+        "positive control: the pre-fix metadata-only fast path would pass"
+    );
+    fx.app
+        .state
+        .storage
+        .delete(&shot.storage_key)
+        .await
+        .expect("delete fixture object");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "missing object must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
 }
 
 /// このプロジェクトの最新 baseline のエントリ数。

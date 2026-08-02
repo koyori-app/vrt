@@ -178,6 +178,45 @@ pub async fn read_all(
     Ok(buf)
 }
 
+/// 保存実体を再読し、DB に記録した hash と一致することを確かめる。
+///
+/// hash は「以前受け取ったバイト列」しか証明しないため、fast path の直前にも
+/// 実体を読み直す。これにより marker 記録後の欠損・破損を `unchanged` にしない。
+pub async fn verify_stored_content_hash(
+    storage: &Arc<dyn StorageBackend>,
+    key: &str,
+    expected: Option<&str>,
+) -> Result<bool, anyhow::Error> {
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    let bytes = read_all(storage, key).await?;
+    Ok(content_hashes_match(
+        Some(&content_hash(&bytes)),
+        Some(expected),
+    ))
+}
+
+/// baseline 昇格時の検証済み marker を作る。
+///
+/// 実体の hash 再照合に加えて full decode を成功条件にする。marker はこの時点の
+/// バイト列が健全だった証跡であり、将来の存在・不変性までは証明しない。
+pub async fn verify_baseline_candidate(
+    storage: &Arc<dyn StorageBackend>,
+    key: &str,
+    expected: Option<&str>,
+) -> Result<String, anyhow::Error> {
+    let bytes = read_all(storage, key).await?;
+    let actual = content_hash(&bytes);
+    if !content_hashes_match(Some(&actual), expected) {
+        anyhow::bail!("stored object hash does not match recorded content hash for {key}");
+    }
+    image::ImageReader::with_format(std::io::Cursor::new(&bytes), ImageFormat::Png)
+        .decode()
+        .map_err(|e| anyhow::anyhow!("decode png {key}: {e}"))?;
+    Ok(actual)
+}
+
 /// `RgbaImage` を PNG にエンコードする。
 pub fn encode_png(image: &RgbaImage) -> Result<Bytes, anyhow::Error> {
     let mut buf = std::io::Cursor::new(Vec::new());

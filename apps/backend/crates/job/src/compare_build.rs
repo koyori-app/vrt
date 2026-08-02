@@ -641,10 +641,30 @@ async fn compare_pair(
 ) -> Result<Outcome, anyhow::Error> {
     let storage: &Arc<dyn StorageBackend> = &state.storage;
 
-    if service::screenshots::content_hashes_match(
+    // marker は昇格時点の hash 再照合と full decode の成功だけを証明する。
+    // その後の欠損・破損は証明しないため、fast path の直前に baseline/current の
+    // 保存実体を再読して hash を照合する。読めない場合は比較ジョブを失敗させる。
+    let hashes_match = service::screenshots::content_hashes_match(
         shot.content_hash.as_deref(),
         entry.content_hash.as_deref(),
-    ) {
+    ) && service::screenshots::content_hashes_match(
+        entry.content_hash.as_deref(),
+        entry.verified_content_hash.as_deref(),
+    );
+    if hashes_match
+        && service::screenshots::verify_stored_content_hash(
+            storage,
+            &entry.storage_key,
+            entry.content_hash.as_deref(),
+        )
+        .await?
+        && service::screenshots::verify_stored_content_hash(
+            storage,
+            &shot.storage_key,
+            shot.content_hash.as_deref(),
+        )
+        .await?
+    {
         return Ok(Outcome {
             id: Uuid::new_v4(),
             status: ComparisonStatus::Unchanged,
@@ -730,6 +750,7 @@ mod tests {
             width: 1,
             height: 1,
             content_hash: None,
+            verified_content_hash: None,
         }
     }
 
