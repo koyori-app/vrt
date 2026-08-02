@@ -1220,6 +1220,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "tracing",
+ "unicode-normalization",
  "url",
  "utoipa",
  "validator",
