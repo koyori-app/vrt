@@ -22,6 +22,7 @@ use sea_orm::{
 
 use common::db::with_transaction;
 use common::error::AppError;
+use common::validation::ScreenshotName;
 use entity::{
     builds::{BuildMode, BuildStatus},
     screenshots,
@@ -168,7 +169,7 @@ pub async fn store_screenshot<C: ConnectionTrait>(
     tenant_id: Uuid,
     project_id: Uuid,
     build_id: Uuid,
-    name: String,
+    name: ScreenshotName,
     bytes: Bytes,
 ) -> Result<screenshots::Model, AppError> {
     store_screenshot_with_metadata(
@@ -180,6 +181,11 @@ pub async fn store_screenshot<C: ConnectionTrait>(
 /// [`store_screenshot`] と同じだが、`metadata` を添えて保存する。
 ///
 /// storybook モードのレンダリングが `{"story_id": ..., "title": ...}` を入れる。
+///
+/// 名前の規則（空白拒否・255 バイト上限）は [`ScreenshotName`] に一本化してあり、
+/// この関数は検証済みの型しか受け取らない——計画・アップロード・finalize の
+/// 突き合わせは名前の文字列一致なので、経路ごとに規則がずれると
+/// 「計画には載るのに保存できない名前」ができ、そのビルドは finalize できなくなる。
 #[allow(clippy::too_many_arguments)]
 pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
     db: &C,
@@ -187,20 +193,11 @@ pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
     tenant_id: Uuid,
     project_id: Uuid,
     build_id: Uuid,
-    name: String,
+    name: ScreenshotName,
     bytes: Bytes,
     metadata: Option<serde_json::Value>,
 ) -> Result<screenshots::Model, AppError> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::BadRequestDetail("name is required".into()));
-    }
-    if name.len() > 255 {
-        return Err(AppError::BadRequestDetail(
-            "name must be 255 characters or fewer".into(),
-        ));
-    }
-
+    let name = name.into_string();
     let (width, height) = validate_png(&bytes)?;
 
     let duplicate = screenshots::Entity::find()
@@ -251,18 +248,10 @@ pub async fn store_ci_screenshot(
     tenant_id: Uuid,
     project_id: Uuid,
     build_id: Uuid,
-    name: String,
+    name: ScreenshotName,
     bytes: Bytes,
 ) -> Result<screenshots::Model, AppError> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err(AppError::BadRequestDetail("name is required".into()));
-    }
-    if name.len() > 255 {
-        return Err(AppError::BadRequestDetail(
-            "name must be 255 characters or fewer".into(),
-        ));
-    }
+    let name = name.into_string();
     let (width, height) = validate_png(&bytes)?;
 
     let screenshot_id = Uuid::new_v4();

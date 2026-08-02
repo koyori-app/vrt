@@ -17,6 +17,8 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use validator::Validate;
 
+use common::validation::ScreenshotName;
+
 use crate::AppState;
 use crate::error::{AppError, ServerError};
 use crate::extractors::AuthUser;
@@ -170,9 +172,9 @@ pub async fn attach_capture_plan(
     Json(payload): Json<AttachCapturePlanRequest>,
 ) -> Result<Json<BuildResponse>, AppError> {
     auth.require_scope(Scope::WriteBuild)?;
-    payload
-        .validate_lists()
-        .map_err(AppError::BadRequestDetail)?;
+    // 名前規則（ScreenshotName——アップロード・finalize と同一）での検証と型変換。
+    let (selected_names, manifest_names) =
+        payload.parse_lists().map_err(AppError::BadRequestDetail)?;
 
     let (build, project) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
@@ -181,8 +183,8 @@ pub async fn attach_capture_plan(
         &state.db,
         build,
         &project,
-        payload.selected_names,
-        payload.manifest_names,
+        selected_names,
+        manifest_names,
         &payload.baseline_commit_sha,
     )
     .await?;
@@ -272,6 +274,10 @@ pub async fn upload_screenshot(
     }
 
     let name = name.ok_or_else(|| AppError::BadRequestDetail("name field is required".into()))?;
+    // 名前規則（ScreenshotName——capture plan・finalize と同一）。空白付きを黙って
+    // trim すると、計画に載せた名前と保存された名前がずれて突き合わせが壊れる。
+    let name = ScreenshotName::parse(name)
+        .map_err(|e| AppError::BadRequestDetail(format!("name: {e}")))?;
     let file = file.ok_or_else(|| AppError::BadRequestDetail("file field is required".into()))?;
 
     // 状態・モード・capture plan（計画外の名前は 400）・重複の権威ある検査は、
@@ -423,6 +429,11 @@ pub async fn finalize_build(
     payload
         .validate_story_ids()
         .map_err(AppError::BadRequestDetail)?;
+    // captured_names はスクリーンショット名なので、story ID の規則ではなく
+    // 名前規則（ScreenshotName——capture plan・アップロードと同一）で検証する。
+    let captured_names = payload
+        .parse_captured_names()
+        .map_err(AppError::BadRequestDetail)?;
 
     let (build, project) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
@@ -463,8 +474,7 @@ pub async fn finalize_build(
                 }
             }
             let build =
-                build_service::finalize_screenshots(&state.db, build, payload.captured_names)
-                    .await?;
+                build_service::finalize_screenshots(&state.db, build, captured_names).await?;
             job::compare_build::enqueue(
                 &state.compare_build_storage,
                 job::CompareBuildJob { build_id: build.id },

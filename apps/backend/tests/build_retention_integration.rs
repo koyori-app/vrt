@@ -74,7 +74,7 @@ async fn make_passed_build(
         tenant_id,
         project_id,
         build.id,
-        "home".to_string(),
+        ::common::validation::ScreenshotName::parse("home").expect("valid name"),
         png,
     )
     .await

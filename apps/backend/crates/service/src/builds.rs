@@ -16,6 +16,7 @@ use sea_orm::{
 
 use common::db::with_transaction;
 use common::error::AppError;
+use common::validation::ScreenshotName;
 use entity::{
     baseline_entries, baselines, builds, builds::BuildMode, builds::BuildStatus, comparisons,
     comparisons::ComparisonStatus, comparisons::ReviewStatus, projects, screenshots,
@@ -281,13 +282,24 @@ pub async fn attach_capture_plan(
     db: &DatabaseConnection,
     build: builds::Model,
     project: &projects::Model,
-    selected_names: Vec<String>,
-    manifest_names: Vec<String>,
+    selected_names: Vec<ScreenshotName>,
+    manifest_names: Vec<ScreenshotName>,
     planned_baseline_commit_sha: &str,
 ) -> Result<builds::Model, AppError> {
+    // 名前の規則（空白拒否・255 バイト上限）は ScreenshotName に一本化してあり、
+    // ここへは検証済みの型しか入らない。計画・アップロード・finalize は名前の
+    // 文字列一致で突き合わせるため、計画側だけ規則が緩いと「計画には載るのに
+    // アップロードできない名前」ができ、そのビルドは永久に finalize できない。
+    //
     // DB 状態に依存しない検証はロックの外で済ませる。
-    let selected: std::collections::BTreeSet<String> = selected_names.into_iter().collect();
-    let manifest: std::collections::BTreeSet<String> = manifest_names.into_iter().collect();
+    let selected: std::collections::BTreeSet<String> = selected_names
+        .into_iter()
+        .map(ScreenshotName::into_string)
+        .collect();
+    let manifest: std::collections::BTreeSet<String> = manifest_names
+        .into_iter()
+        .map(ScreenshotName::into_string)
+        .collect();
     let outside: Vec<&String> = selected.difference(&manifest).take(10).collect();
     if !outside.is_empty() {
         return Err(AppError::BadRequestDetail(format!(
@@ -350,6 +362,37 @@ pub async fn attach_capture_plan(
                 )));
             }
 
+            // 命名規則の不一致検出: baseline が非空・manifest も非空なのに名前が
+            // 1 件も重ならない計画は、「story が全部消えた」のではなく命名の付け方が
+            // 変わった（例: PNG パス由来の `mobile/home` で育てた baseline に
+            // story ID の manifest を当てた）とみなして拒否する。素通しすると
+            // baseline の全エントリが removed になり、比較自体は成功扱いで進むため
+            // 命名のずれに気づけない。
+            //
+            // 正当な「story を全部削除した」ケースは manifest_names が空になるので
+            // このガードには当たらない（1 件でも story が残っていて命名が合っていれば
+            // 交差は必ず 1 以上になる）。部分的な改名は removed + added として
+            // 差分に見えるので、ここでは全滅だけを設定ミスとして扱う。
+            let baseline_names: Vec<String> = crate::baselines::entries(txn, baseline.id)
+                .await?
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            if !baseline_names.is_empty()
+                && !manifest.is_empty()
+                && !baseline_names.iter().any(|n| manifest.contains(n))
+            {
+                return Err(AppError::BadRequestDetail(format!(
+                    "none of the baseline's {} entries appear in manifest_names; \
+                     this looks like a naming-scheme mismatch (e.g. a baseline built from \
+                     PNG paths vs. a manifest of story IDs), not a deletion of every story. \
+                     attaching this plan would silently mark every baseline entry as removed. \
+                     if the naming scheme changed, rebuild the baseline once with a full \
+                     capture (no plan) under the new names, then resume partial uploads",
+                    baseline_names.len()
+                )));
+            }
+
             let mut active: builds::ActiveModel = build.into();
             active.baseline_id = Set(Some(baseline.id));
             active.capture_plan = Set(Some(
@@ -382,7 +425,7 @@ pub async fn attach_capture_plan(
 pub async fn finalize_screenshots(
     db: &DatabaseConnection,
     build: builds::Model,
-    captured_names: Option<Vec<String>>,
+    captured_names: Option<Vec<ScreenshotName>>,
 ) -> Result<builds::Model, AppError> {
     let build_id = build.id;
     with_transaction(db, move |txn| {
@@ -408,8 +451,10 @@ pub async fn finalize_screenshots(
 
                     // 任意のクロスチェック: 申告が来たら保存済み計画と一致すること。
                     if let Some(names) = captured_names {
-                        let declared: std::collections::BTreeSet<String> =
-                            names.into_iter().collect();
+                        let declared: std::collections::BTreeSet<String> = names
+                            .into_iter()
+                            .map(ScreenshotName::into_string)
+                            .collect();
                         if declared != selected {
                             let missing: Vec<&String> =
                                 selected.difference(&declared).take(10).collect();

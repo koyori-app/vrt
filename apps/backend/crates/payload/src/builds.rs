@@ -1,6 +1,7 @@
 //! ビルド関連の DTO。
 
 use chrono::{DateTime, Utc};
+use common::validation::ScreenshotName;
 use sea_orm::prelude::Uuid;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -184,34 +185,72 @@ pub struct AttachCapturePlanRequest {
 }
 
 impl AttachCapturePlanRequest {
-    /// 各リストの要素数・空要素・長さ、および baseline SHA の妥当性を検証する。
-    pub fn validate_lists(&self) -> Result<(), String> {
-        validate_id_list(Some(&self.selected_names), "selected_names")?;
-        validate_id_list(Some(&self.manifest_names), "manifest_names")?;
+    /// 各リストを名前規則で検証し、型付きの名前へ変換する。
+    /// 要素数の上限と baseline SHA の妥当性もここで検査する。
+    ///
+    /// 名前規則は [`common::validation::ScreenshotName`] の一本だけ——
+    /// アップロード・finalize の `captured_names` と同じ関数である。計画側だけ
+    /// 緩いと「計画には載るのにアップロードできない名前」ができ、そのビルドは
+    /// 永久に finalize できない。
+    pub fn parse_lists(&self) -> Result<(Vec<ScreenshotName>, Vec<ScreenshotName>), String> {
+        let selected = parse_name_list(&self.selected_names, "selected_names")?;
+        let manifest = parse_name_list(&self.manifest_names, "manifest_names")?;
         if self.baseline_commit_sha.is_empty() || self.baseline_commit_sha.len() > 100 {
             return Err("baseline_commit_sha must be 1..=100 characters".into());
         }
-        Ok(())
+        Ok((selected, manifest))
     }
 }
 
 /// `only_story_ids` / `captured_names` の要素数上限。DoS 対策の緩い上限。
 pub const MAX_ONLY_STORY_IDS: usize = 10_000;
-/// ストーリー ID / スクリーンショット名 1 件あたりの最大長。
+/// storybook モードの story ID 1 件あたりの最大長。
+///
+/// story ID はスクリーンショット**名**とは別の名前空間である（storybook モードの
+/// スクリーンショット名は `{title}/{name}` で、保存時に
+/// [`common::validation::ScreenshotName`] で改めて検証される）。screenshots
+/// モードの名前リストにこの上限を使ってはならない——名前の規則は
+/// `ScreenshotName` の一本だけである。
 pub const MAX_STORY_ID_LEN: usize = 512;
 
 impl FinalizeBuildRequest {
-    /// `only_story_ids` / `captured_names` の要素数・各要素の長さを検証する。
+    /// `only_story_ids`（storybook モードの story ID）の要素数・各要素の長さを検証する。
     ///
     /// 違反時はエラーメッセージを返す（呼び出し側で 400 にする）。
+    /// `captured_names` はスクリーンショット名なので、こちらではなく
+    /// [`FinalizeBuildRequest::parse_captured_names`] で名前規則により検証する。
     pub fn validate_story_ids(&self) -> Result<(), String> {
-        validate_id_list(self.only_story_ids.as_deref(), "only_story_ids")?;
-        validate_id_list(self.captured_names.as_deref(), "captured_names")?;
-        Ok(())
+        validate_id_list(self.only_story_ids.as_deref(), "only_story_ids")
+    }
+
+    /// `captured_names` を名前規則（[`common::validation::ScreenshotName`]——
+    /// 計画・アップロードと同一）で検証し、型付きの名前へ変換する。
+    pub fn parse_captured_names(&self) -> Result<Option<Vec<ScreenshotName>>, String> {
+        self.captured_names
+            .as_deref()
+            .map(|list| parse_name_list(list, "captured_names"))
+            .transpose()
     }
 }
 
-/// ID / 名前リストの共通検証（要素数・空要素・長さ）。
+/// スクリーンショット名リストの共通検証。
+///
+/// 要素数の上限（[`MAX_ONLY_STORY_IDS`]）と、各要素の名前規則
+/// （[`ScreenshotName::parse`]——plan・アップロード・finalize で同一）を適用する。
+fn parse_name_list(list: &[String], field: &str) -> Result<Vec<ScreenshotName>, String> {
+    if list.len() > MAX_ONLY_STORY_IDS {
+        return Err(format!(
+            "{field} must contain at most {MAX_ONLY_STORY_IDS} entries"
+        ));
+    }
+    list.iter()
+        .map(|name| {
+            ScreenshotName::parse(name.clone()).map_err(|e| format!("{field}: `{name}`: {e}"))
+        })
+        .collect()
+}
+
+/// storybook モードの story ID リストの検証（要素数・空要素・長さ）。
 fn validate_id_list(list: Option<&[String]>, field: &str) -> Result<(), String> {
     let Some(ids) = list else {
         return Ok(());
@@ -406,21 +445,69 @@ mod tests {
     }
 
     #[test]
-    fn captured_names_share_the_same_limits() {
-        assert!(req_names(None).validate_story_ids().is_ok());
+    fn captured_names_follow_the_screenshot_name_rule() {
+        use common::validation::SCREENSHOT_NAME_MAX_BYTES;
+
+        assert!(req_names(None).parse_captured_names().is_ok());
         // 空配列は「今回撮った名前は無い」= 全流用の宣言として有効。
-        assert!(req_names(Some(vec![])).validate_story_ids().is_ok());
-        assert!(req_names(Some(vec!["home"])).validate_story_ids().is_ok());
+        assert!(req_names(Some(vec![])).parse_captured_names().is_ok());
+        assert!(req_names(Some(vec!["home"])).parse_captured_names().is_ok());
         assert!(
             req_names(Some(vec!["ok", ""]))
-                .validate_story_ids()
+                .parse_captured_names()
                 .is_err()
         );
-        let long = "a".repeat(MAX_STORY_ID_LEN + 1);
+        // 前後空白はアップロード経路と同じ規則で拒否（trim して受けない）。
+        assert!(
+            req_names(Some(vec!["home "]))
+                .parse_captured_names()
+                .is_err()
+        );
+        // 上限もアップロード経路と同じ 255 **バイト**。story ID の 512 ではない。
+        let long = "a".repeat(SCREENSHOT_NAME_MAX_BYTES + 1);
         assert!(
             req_names(Some(vec![long.as_str()]))
-                .validate_story_ids()
+                .parse_captured_names()
                 .is_err()
         );
+        let ok = "a".repeat(SCREENSHOT_NAME_MAX_BYTES);
+        assert!(
+            req_names(Some(vec![ok.as_str()]))
+                .parse_captured_names()
+                .is_ok()
+        );
+    }
+
+    fn plan_req(selected: Vec<&str>, manifest: Vec<&str>) -> AttachCapturePlanRequest {
+        AttachCapturePlanRequest {
+            selected_names: selected.into_iter().map(String::from).collect(),
+            manifest_names: manifest.into_iter().map(String::from).collect(),
+            baseline_commit_sha: "abc123".into(),
+        }
+    }
+
+    #[test]
+    fn plan_lists_follow_the_screenshot_name_rule() {
+        use common::validation::SCREENSHOT_NAME_MAX_BYTES;
+
+        assert!(
+            plan_req(vec!["home"], vec!["home", "about"])
+                .parse_lists()
+                .is_ok()
+        );
+        // アップロードで通らない名前は計画にも載せられない（永久 finalize 不能の防止）。
+        let long = "a".repeat(SCREENSHOT_NAME_MAX_BYTES + 1);
+        assert!(
+            plan_req(vec![long.as_str()], vec![long.as_str()])
+                .parse_lists()
+                .is_err()
+        );
+        assert!(
+            plan_req(vec![" home"], vec![" home"])
+                .parse_lists()
+                .is_err()
+        );
+        assert!(plan_req(vec![], vec!["home "]).parse_lists().is_err());
+        assert!(plan_req(vec![], vec![""]).parse_lists().is_err());
     }
 }
