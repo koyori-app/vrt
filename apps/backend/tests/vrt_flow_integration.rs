@@ -19,7 +19,7 @@ use common::TestApp;
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -616,12 +616,19 @@ async fn hash_fast_path_rejects_dimension_readable_but_corrupt_stored_png() {
         .await
         .expect("query shot")
         .expect("shot");
-    let entry = entity::baseline_entries::Entity::find()
-        .order_by_desc(entity::baseline_entries::Column::Id)
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
         .one(&fx.app.state.db)
         .await
         .expect("query baseline")
         .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
     assert!(
         service::screenshots::content_hashes_match(
             shot.content_hash.as_deref(),
@@ -681,12 +688,19 @@ async fn hash_fast_path_rejects_missing_stored_object() {
         .await
         .expect("query shot")
         .expect("shot");
-    let entry = entity::baseline_entries::Entity::find()
-        .order_by_desc(entity::baseline_entries::Column::Id)
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
         .one(&fx.app.state.db)
         .await
         .expect("query baseline")
         .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
     assert!(
         service::screenshots::content_hashes_match(
             shot.content_hash.as_deref(),
