@@ -581,6 +581,81 @@ async fn explicit_revert_records_stories_added_after_the_target_build() {
     assert_eq!(names, vec!["home".to_string()]);
 }
 
+// 通常承認そのものは証跡を増やさない。一方、その承認済み build を明示的に
+// 巻き戻し再承認する場合は、上書きされる承認者と承認時刻を復元可能にする。
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_revert_preserves_the_superseded_normal_approval() {
+    let fx = setup().await;
+
+    let old = fx.run_build("sha-superseded-old", &[("home", RED)]).await;
+    let old_id = build_id_of(&old);
+    let res = fx.approve(old_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve old baseline");
+    let originally_approved: Value = res.json().await.expect("original approval json");
+    assert!(
+        originally_approved["approval_evidence"].is_null(),
+        "a normal approval must not create evidence"
+    );
+
+    let new = fx.run_build("sha-superseded-new", &[("home", BLUE)]).await;
+    let res = fx
+        .approve(build_id_of(&new), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve newer baseline");
+
+    let res = fx.approve(old_id, json!({ "accept_revert": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "re-approve old baseline");
+    let reverted: Value = res.json().await.expect("reverted build json");
+    let evidence = reverted["approval_evidence"]
+        .as_array()
+        .expect("approval evidence array");
+    assert_eq!(evidence.len(), 1, "revert creates the first evidence entry");
+    assert_eq!(
+        evidence[0]["superseded_approved_by"], originally_approved["approved_by"],
+        "the overwritten approver remains recoverable"
+    );
+    assert_eq!(
+        evidence[0]["superseded_approved_at"], originally_approved["approved_at"],
+        "the overwritten approval time remains recoverable"
+    );
+
+    let newer = fx
+        .run_build("sha-superseded-newer", &[("home", BLUE)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&newer), json!({ "force": true }))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "approve another newer baseline"
+    );
+
+    let res = fx.approve(old_id, json!({ "accept_revert": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "re-approve old baseline again"
+    );
+    let reverted_again: Value = res.json().await.expect("second reverted build json");
+    let evidence = reverted_again["approval_evidence"]
+        .as_array()
+        .expect("approval evidence array");
+    assert_eq!(evidence.len(), 2, "each revert appends one evidence entry");
+    assert_eq!(
+        evidence[0]["superseded_approved_at"], originally_approved["approved_at"],
+        "the first approval remains recoverable after repeated reverts"
+    );
+    assert_eq!(
+        evidence[1]["superseded_approved_by"], reverted["approved_by"],
+        "the next overwritten approver is appended"
+    );
+    assert_eq!(
+        evidence[1]["superseded_approved_at"], reverted["approved_at"],
+        "the next overwritten approval time is appended"
+    );
+}
+
 // accept_revert は却下済み比較を上書きしない。
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_revert_does_not_override_a_rejected_comparison() {

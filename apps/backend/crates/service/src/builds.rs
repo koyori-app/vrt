@@ -557,15 +557,19 @@ pub async fn approve_build(
             let backfill = build.completed_at.is_none();
             let build_number = build.number;
             let previous_approval_evidence = build.approval_evidence.clone();
+            let superseded_approved_by = build.approved_by;
+            let superseded_approved_at = build.approved_at;
             let mut active: builds::ActiveModel = build.into();
             active.status = Set(BuildStatus::Approved);
             active.approved_by = Set(Some(reviewer_id));
             active.approved_at = Set(Some(now));
+            // 通常承認は専用列だけを更新し、evidence を作らない。明示的な例外操作
+            // （revert/removal/failure の受容）だけを監査履歴へ追記する。
             if reverted_from_build.is_some()
                 || !accepted_removals.is_empty()
                 || !accepted_failures.is_empty()
             {
-                let evidence = serde_json::json!({
+                let mut evidence = serde_json::json!({
                     "accepted_removals": accepted_removals,
                     "accepted_failures": accepted_failures,
                     "removed_by_revert": removed_by_revert,
@@ -577,6 +581,20 @@ pub async fn approve_build(
                         None
                     },
                 });
+                if reverted_from_build.is_some()
+                    && let Some(fields) = evidence.as_object_mut()
+                {
+                    // Approved build の再承認で上書きされる元の承認情報を、同じ
+                    // revert イベントから復元できるようにする。
+                    fields.insert(
+                        "superseded_approved_by".to_string(),
+                        serde_json::json!(superseded_approved_by),
+                    );
+                    fields.insert(
+                        "superseded_approved_at".to_string(),
+                        serde_json::json!(superseded_approved_at),
+                    );
+                }
                 active.approval_evidence = Set(Some(append_approval_evidence(
                     previous_approval_evidence,
                     evidence,
