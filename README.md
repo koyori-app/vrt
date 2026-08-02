@@ -515,8 +515,9 @@ pnpm build-storybook
 vrt upload --dir ./storybook-static
 
 # 変更されたストーリーだけ撮り直す（TurboSnap 相当）
-pnpm build-storybook --stats-json          # preview-stats.json を出す
-vrt stamp --dir ./storybook-static         # 成果物を生成元コミットへ束縛する
+# build は vrt stamp に実行させる（後追いの stamp は受け付けない。
+# --stats-json 付きの build が preview-stats.json も出す）
+vrt stamp --dir ./storybook-static -- pnpm build-storybook --stats-json
 vrt upload --dir ./storybook-static --only-changed --wait
 ```
 
