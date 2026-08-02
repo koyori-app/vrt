@@ -726,3 +726,182 @@ async fn plan_attachment_guards() {
         .await;
     assert_eq!(res.status(), StatusCode::CONFLICT, "double attach");
 }
+
+/// 名前規則の一箇所寄せ: 計画・アップロード・finalize の `captured_names` は
+/// すべて同じ規則（空でない・前後空白なし・255 **バイト**以内）で検証される。
+///
+/// positive control: 規則が経路ごとに二重定義だった実装（計画側 512 文字上限で
+/// 空白素通し、アップロード側 trim + 255 バイト）では、256 バイトの名前や
+/// 空白付きの名前が**計画には載ってしまう**——アップロードだけが拒否され、
+/// finalize は計画とアップロードの完全一致を要求するため、そのビルドは永久に
+/// finalize できない。その実装では本テストの計画側 400 アサーションが落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn name_rules_are_identical_across_plan_upload_and_finalize() {
+    let fx = setup().await;
+    fx.establish_baseline("base0008", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    // 256 バイトの名前はアップロードで通らないので、計画の時点で拒否する。
+    let build = fx.create_build("names001").await;
+    let build_id = build_id_of(&build);
+    let long = "a".repeat(256);
+    let manifest: Vec<&str> = vec!["home", "about", "pricing", long.as_str()];
+    let res = fx
+        .attach_plan(build_id, &[long.as_str()], &manifest, "base0008")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a 256-byte name can never be uploaded, so the plan must reject it up front"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("bytes"),
+        "the limit is bytes, not characters, and the error must say so: {body}"
+    );
+
+    // 前後空白付きの名前も同様（アップロード側は trim せず拒否するため、
+    // 計画に載せると突き合わせが永久に成立しない）。
+    let res = fx
+        .attach_plan(
+            build_id,
+            &["home "],
+            &["home ", "about", "pricing"],
+            "base0008",
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a whitespace-padded name must be rejected at plan time"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("whitespace"),
+        "the error must explain the whitespace rule: {body}"
+    );
+
+    // 境界値: ちょうど 255 バイトはどの経路でも有効。
+    let max = "a".repeat(255);
+    let manifest: Vec<&str> = vec!["home", "about", "pricing", max.as_str()];
+    fx.attach_plan_ok(build_id, &[max.as_str()], &manifest, "base0008")
+        .await;
+
+    // アップロードは同じ規則で拒否する。かつては黙って trim して受けていたが、
+    // それでは計画の `home ` と保存名 `home` がずれて突き合わせが壊れる。
+    let build = fx.create_build("names002").await;
+    let build_id = build_id_of(&build);
+    let res = fx
+        .app
+        .upload_screenshot(build_id, &fx.token, "home ", png(8, 8, [1, 2, 3, 255]))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "upload must reject (not silently trim) a whitespace-padded name"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("whitespace"),
+        "the upload error must state the shared whitespace rule: {body}"
+    );
+
+    // finalize の captured_names も同じ規則。規則違反は「計画との不一致」より
+    // 手前の、名前規則そのものの 400 として報告される。
+    let build = fx.create_build("names003").await;
+    let build_id = build_id_of(&build);
+    fx.attach_plan_ok(build_id, &["home"], &FULL_MANIFEST, "base0008")
+        .await;
+    fx.upload(build_id, "home", png(8, 8, [9, 9, 9, 255])).await;
+    let res = fx
+        .finalize(build_id, Some(json!({ "captured_names": ["home "] })))
+        .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("whitespace"),
+        "captured_names must be validated by the shared name rule, \
+         not merely fail the plan cross-check: {body}"
+    );
+
+    // 正しい名前で finalize は通る（規則の締めすぎで正常経路を壊していない）。
+    let res = fx
+        .finalize(build_id, Some(json!({ "captured_names": ["home"] })))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "valid names still finalize");
+}
+
+/// 命名規則ずれの検出: baseline が非空・`manifest_names` も非空なのに名前が
+/// 1 件も重ならない計画は、story の全削除ではなく命名の変更（例: PNG パス由来の
+/// 名前で育てた baseline に story ID の manifest を当てた）とみなして 400。
+///
+/// positive control: このガードが無い実装では添付が通り、baseline の全エントリが
+/// removed として報告されるだけで比較は成功扱いになる——命名のずれに気づけない。
+/// その実装では最初の 400 アサーションが落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_with_zero_baseline_overlap_is_rejected_as_naming_mismatch() {
+    let fx = setup().await;
+    fx.establish_baseline("base0009", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    // baseline は home / about / pricing。パス由来の別命名 manifest は交差ゼロ。
+    let build = fx.create_build("names004").await;
+    let build_id = build_id_of(&build);
+    let res = fx
+        .attach_plan(
+            build_id,
+            &["mobile/home"],
+            &["mobile/home", "mobile/about", "mobile/pricing"],
+            "base0009",
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a plan whose manifest shares no name with the baseline would silently \
+         turn every baseline entry into `removed`"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("naming-scheme mismatch"),
+        "the error must point at the naming mismatch and the rebuild path: {body}"
+    );
+
+    // 1 件でも重なれば添付できる（部分的な改名は removed + added として差分に
+    // 見えるので、ここで拒否するのは「全滅」だけ）。
+    fx.attach_plan_ok(
+        build_id,
+        &["mobile/home"],
+        &["mobile/home", "home"],
+        "base0009",
+    )
+    .await;
+}
+
+/// 正当な「story を全部削除した」ケース（manifest が空）はゼロ交差ガードに
+/// 当たらず、全エントリが removed として**見える形で**報告される。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_with_empty_manifest_reports_full_deletion_as_removed() {
+    let fx = setup().await;
+    fx.establish_baseline("base0010", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    let build = fx.create_build("names005").await;
+    let build_id = build_id_of(&build);
+    fx.attach_plan_ok(build_id, &[], &[], "base0010").await;
+    let res = fx.finalize(build_id, None).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "an empty manifest declares every story deleted; nothing is uploaded"
+    );
+
+    let build = fx.wait_for_terminal(build_id).await;
+    assert_eq!(build["status"].as_str(), Some("changes_detected"));
+    assert_eq!(
+        build["removed_count"].as_i64(),
+        Some(3),
+        "full deletion is reported as removed, never hidden by carry-forward"
+    );
+    assert_eq!(build["unchanged_count"].as_i64(), Some(0));
+}
