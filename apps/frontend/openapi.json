@@ -5847,6 +5847,7 @@
           "added_count",
           "removed_count",
           "unchanged_count",
+          "content_hash_skipped_count",
           "created_at"
         ],
         "properties": {
@@ -5908,6 +5909,10 @@
               "null"
             ],
             "format": "date-time"
+          },
+          "content_hash_skipped_count": {
+            "type": "integer",
+            "format": "int32"
           },
           "created_at": {
             "type": "string",

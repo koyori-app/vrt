@@ -850,8 +850,12 @@ fn is_settled(status: &str) -> bool {
 fn report(build: &BuildResponse) {
     println!("final_status={}", build.status);
     println!(
-        "counts total={} changed={} added={} removed={}",
-        build.total_count, build.changed_count, build.added_count, build.removed_count
+        "counts total={} changed={} added={} removed={} content_hash_skipped={}",
+        build.total_count,
+        build.changed_count,
+        build.added_count,
+        build.removed_count,
+        build.content_hash_skipped_count
     );
     if let Some(msg) = &build.error_message {
         println!("error_message={msg}");
@@ -912,6 +916,7 @@ mod tests {
             changed_count: 0,
             added_count: 0,
             removed_count: 0,
+            content_hash_skipped_count: 0,
             error_message: None,
         }
     }
@@ -1057,6 +1062,7 @@ mod tests {
             changed_count: 0,
             added_count: 0,
             removed_count: 0,
+            content_hash_skipped_count: 0,
             error_message: None,
         }
     }

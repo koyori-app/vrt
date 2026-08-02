@@ -472,6 +472,7 @@ mod tests {
             added_count: added,
             removed_count: removed,
             unchanged_count: 0,
+            content_hash_skipped_count: 0,
             error_message: None,
             approval_evidence: None,
             approved_by: None,

@@ -41,6 +41,7 @@ pub struct BuildCounts {
     pub added: i32,
     pub removed: i32,
     pub unchanged: i32,
+    pub content_hash_skipped: i32,
 }
 
 impl BuildCounts {
@@ -129,6 +130,7 @@ pub async fn create_build<C: ConnectionTrait>(
         added_count: Set(0),
         removed_count: Set(0),
         unchanged_count: Set(0),
+        content_hash_skipped_count: Set(0),
         error_message: Set(None),
         approval_evidence: Set(None),
         approved_by: Set(None),
@@ -682,6 +684,7 @@ pub async fn apply_counts<C: ConnectionTrait>(
     active.added_count = Set(counts.added);
     active.removed_count = Set(counts.removed);
     active.unchanged_count = Set(counts.unchanged);
+    active.content_hash_skipped_count = Set(counts.content_hash_skipped);
     active.baseline_id = Set(baseline_id);
     Ok(active.update(db).await?)
 }
@@ -967,6 +970,7 @@ pub async fn approve_build(
                     storage_key: Set(shot.storage_key),
                     width: Set(shot.width),
                     height: Set(shot.height),
+                    content_hash: Set(shot.content_hash),
                 }
                 .insert(txn)
                 .await?;

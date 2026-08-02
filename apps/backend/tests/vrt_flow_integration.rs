@@ -217,6 +217,16 @@ impl Fixture {
             .clone()
     }
 
+    async fn build_logs(&self, build_id: Uuid) -> Vec<Value> {
+        let res = self
+            .app
+            .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &self.token)
+            .await;
+        assert_eq!(res.status(), StatusCode::OK, "list build logs");
+        let body: Value = res.json().await.expect("build logs json");
+        body["entries"].as_array().expect("log entries").clone()
+    }
+
     async fn approve(&self, build_id: Uuid, force: bool) -> reqwest::Response {
         self.app
             .post_json(
@@ -388,6 +398,11 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         (3, 1, 1, 0, 1),
         "expected unchanged:1 changed:1 added:1"
     );
+    assert_eq!(
+        build2["content_hash_skipped_count"].as_i64(),
+        Some(1),
+        "only the byte-identical screenshot skips decode/diff"
+    );
 
     let cmps = fx.comparisons(build2_id).await;
     assert_eq!(cmps.len(), 3);
@@ -517,6 +532,20 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         "identical build needs no review"
     );
     assert_eq!(counts(&build3), (3, 0, 0, 0, 3));
+    assert_eq!(
+        build3["content_hash_skipped_count"].as_i64(),
+        Some(3),
+        "all byte-identical screenshots skip decode/diff"
+    );
+    let logs = fx.build_logs(build3_id).await;
+    assert!(
+        logs.iter().any(|entry| {
+            entry["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("content_hash_skipped 3"))
+        }),
+        "build log records how many comparisons skipped decode/diff"
+    );
 
     let cmps = fx.comparisons(build3_id).await;
     assert!(cmps.iter().all(|c| c["status"] == "unchanged"));

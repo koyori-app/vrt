@@ -80,6 +80,8 @@ pub struct BuildResponse {
     #[serde(default)]
     pub removed_count: i32,
     #[serde(default)]
+    pub content_hash_skipped_count: i32,
+    #[serde(default)]
     pub error_message: Option<String>,
 }
 

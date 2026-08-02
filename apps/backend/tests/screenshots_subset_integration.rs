@@ -292,6 +292,11 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
         "unselected baseline entries must be carried forward, not reported as removed"
     );
     assert_eq!(build["unchanged_count"].as_i64(), Some(2));
+    assert_eq!(
+        build["content_hash_skipped_count"].as_i64(),
+        Some(2),
+        "byte-identical carry-forward copies reuse the baseline hash and skip decode/diff"
+    );
 
     let cmps = fx.comparisons(build_id).await;
     for name in ["about", "pricing"] {
@@ -321,6 +326,12 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
                 row.id,
                 service::screenshots::carry_forward_screenshot_id(build_id, name),
                 "carried-forward `{name}` must use the deterministic id so retries converge"
+            );
+            assert!(
+                row.content_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash.starts_with("sha256:")),
+                "carried-forward `{name}` inherits the hash because its PNG bytes are copied unchanged"
             );
         }
     }
@@ -398,6 +409,7 @@ async fn empty_selection_plan_reuses_the_whole_baseline() {
     assert_eq!(build["total_count"].as_i64(), Some(3));
     assert_eq!(build["unchanged_count"].as_i64(), Some(3));
     assert_eq!(build["removed_count"].as_i64(), Some(0));
+    assert_eq!(build["content_hash_skipped_count"].as_i64(), Some(3));
 }
 
 /// 「撮る集合」は保存済み計画からのみ来る。

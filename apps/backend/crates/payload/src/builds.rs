@@ -46,6 +46,7 @@ pub struct BuildResponse {
     pub added_count: i32,
     pub removed_count: i32,
     pub unchanged_count: i32,
+    pub content_hash_skipped_count: i32,
     #[schema(nullable)]
     pub error_message: Option<String>,
     /// 危険を明示的に承知して承認した場合の証跡。
@@ -84,6 +85,7 @@ impl From<builds::Model> for BuildResponse {
             added_count: model.added_count,
             removed_count: model.removed_count,
             unchanged_count: model.unchanged_count,
+            content_hash_skipped_count: model.content_hash_skipped_count,
             error_message: model.error_message,
             approval_evidence: model.approval_evidence,
             approved_by: model.approved_by,

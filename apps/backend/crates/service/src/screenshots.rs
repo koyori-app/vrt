@@ -19,6 +19,7 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     EntityTrait, QueryFilter, QueryOrder, prelude::Uuid,
 };
+use sha2::{Digest, Sha256};
 
 use common::db::with_transaction;
 use common::error::AppError;
@@ -38,6 +39,32 @@ pub const MAX_DIMENSION: u32 = 10_000;
 pub const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 /// 配信時の Content-Type。
 pub const PNG_MIME: &str = "image/png";
+/// 保存する content hash の方式。値にも方式を含め、将来の方式変更時に
+/// 異なる方式同士を一致扱いしない（判断不能なら通常比較へ倒す）。
+pub const CONTENT_HASH_SCHEME: &str = "sha256";
+
+/// 受領した PNG の**バイト列**から content hash を作る。
+///
+/// デコード後ピクセルを hash すると、hash 判定の前に高コストな decode が必要になり
+/// この最適化の目的を失う。さらに見た目が同じでもエンコードが異なる PNG は一致扱いせず、
+/// 従来比較へ倒すことで偽 PASS を避ける。
+pub fn content_hash(bytes: &[u8]) -> String {
+    format!(
+        "{CONTENT_HASH_SCHEME}:{}",
+        hex::encode(Sha256::digest(bytes))
+    )
+}
+
+/// 両側に既知方式の hash が揃い、完全一致したときだけ比較を省略する。
+pub fn content_hashes_match(left: Option<&str>, right: Option<&str>) -> bool {
+    let prefix = format!("{CONTENT_HASH_SCHEME}:");
+    let valid = |value: &str| {
+        value.strip_prefix(&prefix).is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    };
+    matches!((left, right), (Some(a), Some(b)) if valid(a) && valid(b) && a == b)
+}
 
 /// スクリーンショット本体のストレージキー。
 pub fn screenshot_key(
@@ -199,6 +226,7 @@ pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
 ) -> Result<screenshots::Model, AppError> {
     let name = name.into_string();
     let (width, height) = validate_png(&bytes)?;
+    let content_hash = content_hash(&bytes);
 
     let duplicate = screenshots::Entity::find()
         .filter(screenshots::Column::BuildId.eq(build_id))
@@ -222,6 +250,7 @@ pub async fn store_screenshot_with_metadata<C: ConnectionTrait>(
         storage_key: Set(key),
         width: Set(width as i32),
         height: Set(height as i32),
+        content_hash: Set(Some(content_hash)),
         metadata: Set(metadata),
         created_at: Set(Utc::now().fixed_offset()),
     }
@@ -253,6 +282,7 @@ pub async fn store_ci_screenshot(
 ) -> Result<screenshots::Model, AppError> {
     let name = name.into_string();
     let (width, height) = validate_png(&bytes)?;
+    let content_hash = content_hash(&bytes);
 
     let screenshot_id = Uuid::new_v4();
     let key = screenshot_key(tenant_id, project_id, build_id, screenshot_id);
@@ -303,6 +333,7 @@ pub async fn store_ci_screenshot(
                 storage_key: Set(stored_key),
                 width: Set(width as i32),
                 height: Set(height as i32),
+                content_hash: Set(Some(content_hash)),
                 metadata: Set(None),
                 created_at: Set(Utc::now().fixed_offset()),
             }
@@ -406,6 +437,40 @@ mod tests {
         assert!(matches!(
             validate_png(&bytes).unwrap_err(),
             AppError::ContentTooLarge
+        ));
+    }
+
+    #[test]
+    fn identical_png_bytes_have_matching_content_hashes() {
+        let bytes = png_bytes(2, 2);
+        let hash = content_hash(&bytes);
+        assert!(content_hashes_match(Some(&hash), Some(&hash)));
+    }
+
+    #[test]
+    fn one_byte_difference_requires_normal_comparison() {
+        let bytes = png_bytes(2, 2);
+        let mut different = bytes.to_vec();
+        let last = different.last_mut().expect("encoded PNG is non-empty");
+        *last ^= 1;
+        assert!(!content_hashes_match(
+            Some(&content_hash(&bytes)),
+            Some(&content_hash(&different)),
+        ));
+    }
+
+    #[test]
+    fn missing_or_unknown_hash_scheme_requires_normal_comparison() {
+        let hash = content_hash(&png_bytes(2, 2));
+        assert!(!content_hashes_match(None, Some(&hash)));
+        assert!(!content_hashes_match(Some(&hash), None));
+        assert!(!content_hashes_match(
+            Some("sha999:abc"),
+            Some("sha999:abc")
+        ));
+        assert!(!content_hashes_match(
+            Some("sha256:abc"),
+            Some("sha256:abc")
         ));
     }
 

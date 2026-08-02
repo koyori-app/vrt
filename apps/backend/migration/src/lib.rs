@@ -6,6 +6,7 @@ mod m20260730000000_build_retention_limit;
 mod m20260801000000_build_approval_evidence;
 mod m20260802000000_build_capture_plan;
 mod m20260803000000_build_captured_names;
+mod m20260804000000_content_hash_decode_skip;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260801000000_build_approval_evidence::Migration),
             Box::new(m20260802000000_build_capture_plan::Migration),
             Box::new(m20260803000000_build_captured_names::Migration),
+            Box::new(m20260804000000_content_hash_decode_skip::Migration),
         ]
     }
 }

@@ -16,6 +16,9 @@ pub struct Model {
     pub storage_key: String,
     pub width: i32,
     pub height: i32,
+    /// 昇格元 screenshot の content hash。旧データは NULL のまま通常比較する。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub content_hash: Option<String>,
     #[sea_orm(
         belongs_to,
         from = "baseline_id",

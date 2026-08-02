@@ -39,6 +39,8 @@ pub struct Model {
     pub added_count: i32,
     pub removed_count: i32,
     pub unchanged_count: i32,
+    /// content hash 一致により decode と diff を省略した比較数。
+    pub content_hash_skipped_count: i32,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
