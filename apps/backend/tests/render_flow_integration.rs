@@ -950,6 +950,110 @@ async fn stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baselin
     );
 }
 
+/// リトライで届いた 2 度目の部分 finalize は、固定済みの baseline を上書きできない。
+///
+/// 「pending 再確認 → SHA 照合 → pin → 遷移」が build 行ロックの 1 トランザクション
+/// になっていないと、finalize 済みビルドへ届いた 2 度目の finalize（起点 = その後
+/// 前進した現行 baseline）が SHA 照合を通過して `baseline_id` だけを先に上書きし、
+/// 本体は 409 で弾かれてもレンダリング・比較ジョブは以後 新しい baseline を読む
+/// ——計画の根拠と比較相手がずれる。
+///
+/// positive control: pin を遷移チェックの前に単独コミットしていた旧実装では、
+/// 2 度目の finalize 後の `baseline_id` が B2 に化け、最後のアサートで落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_finalize_cannot_overwrite_the_pinned_baseline() {
+    if !chromium_or_skip("a_second_finalize_cannot_overwrite_the_pinned_baseline") {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 全撮影 → 承認して baseline B1 を確立 ─────────────────────
+    let build_a = fx.create_storybook_build("repin001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_a_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build A");
+    let (pinned_baseline_id, _) = fx.latest_baseline_red_entry().await;
+
+    // ── ビルド B: B1 を起点に部分 finalize（1 度目）→ B1 が固定される ──────
+    let build_b = fx.create_storybook_build("repin002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--blue"], "repin001")
+            .await
+            .status(),
+        StatusCode::OK,
+        "first finalize pins B1"
+    );
+    fx.wait_for_terminal(build_b_id).await;
+
+    // ── ビルド C: 暗い赤で全撮影 → 承認して最新 baseline を B2 へ動かす ────
+    let build_c = fx.create_storybook_build("repin003").await;
+    let build_c_id = build_id_of(&build_c);
+    assert_eq!(
+        fx.upload_bundle(build_c_id, bundle_zip("#880000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_c_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_c_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_c_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build C");
+    let (moved_baseline_id, _) = fx.latest_baseline_red_entry().await;
+    assert_ne!(pinned_baseline_id, moved_baseline_id, "baseline moved to B2");
+
+    // ── 2 度目の finalize（起点 = 現行 B2）は 409 で、pin を上書きしない ────
+    // 現行 baseline の SHA を正しく持ってきても、finalize 済みビルドの pin は動かせない。
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--blue"], "repin003")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "a second finalize on an already-finalized build must be rejected"
+    );
+
+    use sea_orm::EntityTrait;
+    let row = entity::builds::Entity::find_by_id(build_b_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("query build B")
+        .expect("build B exists");
+    assert_eq!(
+        row.baseline_id,
+        Some(pinned_baseline_id),
+        "the rejected second finalize must not overwrite the pinned baseline \
+         (render/compare jobs read baseline_id; silently repinning to B2 would \
+         desync the reuse basis from the comparison target)"
+    );
+}
+
 /// `screenshots` モードに `only_story_ids` を渡すと 400（サーバー撮影しない）。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_story_ids_is_rejected_for_screenshot_mode() {

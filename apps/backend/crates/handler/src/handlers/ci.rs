@@ -492,10 +492,11 @@ pub async fn finalize_build(
                         .into(),
                 ));
             }
-            // 部分レンダリングは、計画の起点 baseline の照合と固定を finalize で行う。
+            // 部分レンダリングは、計画の起点 baseline の照合と固定を finalize の
+            // 行ロック 1 トランザクション内（finalize_storybook）で行う。
             // 全撮影（only_story_ids 無し）は固定しない——比較ジョブが比較時点の
             // 最新 baseline を解決する従来動作のまま。
-            let build = if payload.only_story_ids.is_some() {
+            let pin_expected = if payload.only_story_ids.is_some() {
                 let Some(expected) = &payload.expected_baseline_commit_sha else {
                     return Err(AppError::BadRequestDetail(
                         "only_story_ids requires expected_baseline_commit_sha so the \
@@ -504,25 +505,27 @@ pub async fn finalize_build(
                             .into(),
                     ));
                 };
-                build_service::pin_baseline_for_partial_render(&state.db, build, &project, expected)
-                    .await?
-            } else if let Some(expected) = &payload.expected_baseline_commit_sha {
-                // 全撮影でも、渡された起点が現在の baseline とずれていれば断る。
-                let current =
-                    build_service::current_baseline_commit_sha(&state.db, &project, &build.branch)
-                        .await?;
-                if current.as_deref() != Some(expected.as_str()) {
-                    return Err(AppError::BadRequestDetail(format!(
-                        "expected_baseline_commit_sha does not match the current baseline \
-                         (expected {expected}, current {})",
-                        current.as_deref().unwrap_or("none")
-                    )));
-                }
-                build
+                Some(expected.clone())
             } else {
-                build
+                if let Some(expected) = &payload.expected_baseline_commit_sha {
+                    // 全撮影でも、渡された起点が現在の baseline とずれていれば断る
+                    // （固定はしない読み取り検査なので、finalize の行ロックの外でよい）。
+                    let current = build_service::current_baseline_commit_sha(
+                        &state.db, &project, &build.branch,
+                    )
+                    .await?;
+                    if current.as_deref() != Some(expected.as_str()) {
+                        return Err(AppError::BadRequestDetail(format!(
+                            "expected_baseline_commit_sha does not match the current baseline \
+                             (expected {expected}, current {})",
+                            current.as_deref().unwrap_or("none")
+                        )));
+                    }
+                }
+                None
             };
-            let build = build_service::finalize_storybook(&state.db, build).await?;
+            let build =
+                build_service::finalize_storybook(&state.db, build, &project, pin_expected).await?;
             job::render_build::enqueue(
                 &state.render_build_storage,
                 job::RenderBuildJob {

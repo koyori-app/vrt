@@ -540,55 +540,83 @@ pub async fn current_baseline_commit_sha<C: ConnectionTrait>(
     baseline_source_commit_sha(db, &baseline).await
 }
 
-/// storybook の部分レンダリング（`only_story_ids`）向けに比較 baseline を固定する。
-///
-/// クライアントが差分計画の起点にした baseline（`expected_baseline_commit_sha`）が
-/// いまも最新であることを確認してから `baseline_id` に固定する。ずれていれば
-/// 400 で拒否し、再計画させる（流用画像と比較対象が計画と別の baseline に
-/// なるのを finalize 時点で断つ）。baseline が無いのに部分レンダリングを
-/// 要求された場合も拒否する（流用元が無い）。
-pub async fn pin_baseline_for_partial_render<C: ConnectionTrait>(
-    db: &C,
-    build: builds::Model,
-    project: &projects::Model,
-    expected_baseline_commit_sha: &str,
-) -> Result<builds::Model, AppError> {
-    let Some(baseline) = crate::baselines::latest_for(db, project, &build.branch).await? else {
-        return Err(AppError::BadRequestDetail(
-            "only_story_ids was provided but no baseline exists for this branch; \
-             there is nothing to reuse. finalize without only_story_ids to capture \
-             all stories"
-                .into(),
-        ));
-    };
-    let current_sha = baseline_source_commit_sha(db, &baseline).await?;
-    if current_sha.as_deref() != Some(expected_baseline_commit_sha) {
-        return Err(AppError::BadRequestDetail(format!(
-            "expected_baseline_commit_sha does not match the current baseline \
-             (expected {expected_baseline_commit_sha}, current {}). \
-             re-plan against the current baseline.",
-            current_sha.as_deref().unwrap_or("none")
-        )));
-    }
-    let mut active: builds::ActiveModel = build.into();
-    active.baseline_id = Set(Some(baseline.id));
-    Ok(active.update(db).await?)
-}
-
 /// storybook モードの finalize: `pending → rendering`。
 ///
-/// バンドルが未アップロードなら 409（`RenderBuildJob` が拾うものが無いため）。
+/// バンドルが未アップロードなら 400（`RenderBuildJob` が拾うものが無いため）。
 /// ジョブ投入は呼び出し側（ハンドラ）が行う。
-pub async fn finalize_storybook<C: ConnectionTrait>(
-    db: &C,
+///
+/// 部分レンダリング（`only_story_ids`）のときは
+/// `pin_expected_baseline_commit_sha` に、クライアントが差分計画の起点にした
+/// baseline の昇格元コミット SHA を渡す。その baseline がいまも最新である
+/// ことを確認してから `baseline_id` に固定する。ずれていれば拒否し、
+/// 再計画させる（流用画像と比較対象が計画と別の baseline になるのを
+/// finalize 時点で断つ）。baseline が無いのに部分レンダリングを要求された
+/// 場合も拒否する（流用元が無い）。
+///
+/// 「pending 再確認 → SHA 照合 → pin → 遷移」は build 行ロック
+/// （[`crate::review_lock::build`]）を取った 1 トランザクション内で行う。
+/// pending 再確認を pin より先に置くことで、リトライで届いた 2 度目の
+/// finalize は baseline_id に触れる前に 409 で弾かれる——ロック無しで
+/// pin を先に単独コミットすると、その間に別ビルドの承認で baseline が
+/// 前進していた場合、2 度目の finalize が SHA 照合を通過して baseline_id を
+/// 新 baseline へ上書きし、本体は 409 でもレンダリング・比較ジョブは
+/// 以後その新 baseline を読んでしまう（計画の根拠と比較相手のズレ）。
+pub async fn finalize_storybook(
+    db: &DatabaseConnection,
     build: builds::Model,
+    project: &projects::Model,
+    pin_expected_baseline_commit_sha: Option<String>,
 ) -> Result<builds::Model, AppError> {
-    if build.storybook_key.is_none() {
-        return Err(AppError::BadRequestDetail(
-            "storybook bundle has not been uploaded for this build".into(),
-        ));
-    }
-    transition(db, build, BuildStatus::Rendering).await
+    let build_id = build.id;
+    let project = project.clone();
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // ロック順 1（build のみ）。状態はこの取り直した行を正とする。
+            let build = crate::review_lock::build(txn, build_id).await?;
+
+            if build.storybook_key.is_none() {
+                return Err(AppError::BadRequestDetail(
+                    "storybook bundle has not been uploaded for this build".into(),
+                ));
+            }
+            // pending 再確認は pin より先。2 度目の finalize はここで止まり、
+            // baseline_id を上書きできない。
+            if build.status != BuildStatus::Pending {
+                return Err(AppError::Conflict);
+            }
+
+            let build = match pin_expected_baseline_commit_sha {
+                None => build,
+                Some(expected) => {
+                    let Some(baseline) =
+                        crate::baselines::latest_for(txn, &project, &build.branch).await?
+                    else {
+                        return Err(AppError::BadRequestDetail(
+                            "only_story_ids was provided but no baseline exists for this \
+                             branch; there is nothing to reuse. finalize without \
+                             only_story_ids to capture all stories"
+                                .into(),
+                        ));
+                    };
+                    let current_sha = baseline_source_commit_sha(txn, &baseline).await?;
+                    if current_sha.as_deref() != Some(expected.as_str()) {
+                        return Err(AppError::BadRequestDetail(format!(
+                            "expected_baseline_commit_sha does not match the current baseline \
+                             (expected {expected}, current {}). \
+                             re-plan against the current baseline.",
+                            current_sha.as_deref().unwrap_or("none")
+                        )));
+                    }
+                    let mut active: builds::ActiveModel = build.into();
+                    active.baseline_id = Set(Some(baseline.id));
+                    active.update(txn).await?
+                }
+            };
+
+            transition(txn, build, BuildStatus::Rendering).await
+        })
+    })
+    .await
 }
 
 /// アップロードされた Storybook バンドルのストレージキーを記録する。
