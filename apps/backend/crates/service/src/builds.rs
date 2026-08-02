@@ -326,8 +326,8 @@ pub async fn approve_build(
         || options.accept_revert && build.status == BuildStatus::Approved)
     {
         return Err(AppError::ConflictDetail(format!(
-            "cannot approve: build #{} has status {:?}, which cannot transition to approved. \
-             An already approved older build may be restored with accept_revert; otherwise wait \
+            "cannot approve: build #{} has status {:?}, which cannot transition to approved; \
+             an already approved older build may be restored with accept_revert; otherwise wait \
              for processing to finish or create a new build.",
             build.number, build.status
         )));
@@ -344,7 +344,7 @@ pub async fn approve_build(
             {
                 return Err(AppError::ConflictDetail(format!(
                     "cannot approve: build #{} now has status {:?}, which cannot transition to \
-                     approved. Refresh the build before retrying.",
+                     approved; refresh the build before retrying.",
                     build.number, build.status
                 )));
             }
@@ -357,31 +357,60 @@ pub async fn approve_build(
             let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
 
             let mut reverted_from_build = None;
+            let mut baseline_source_missing = false;
             if let Some(baseline) = &current
                 && baseline.branch == build.branch
-                && let Some(source_build_id) = baseline.source_build_id
-                && source_build_id != build.id
             {
-                let source_number = match get_build(txn, source_build_id).await {
-                    Ok(source) => Some(source.number),
-                    Err(AppError::NotFound) => None,
-                    Err(error) => return Err(error),
-                };
-                if let Some(source_number) = source_number
-                    && approval::is_older_than_baseline_source(build.number, Some(source_number))
-                {
-                    if options.accept_revert {
-                        reverted_from_build = Some(source_number);
-                    } else {
-                        return Err(AppError::ConflictDetail(format!(
-                            "cannot approve: build #{} is older than the current baseline \
-                             (created from build #{}). To intentionally restore this build, \
-                             retry with accept_revert; otherwise re-run it against the current \
-                             baseline.",
-                            build.number, source_number
-                        )));
+                if let Some(source_build_id) = baseline.source_build_id {
+                    if source_build_id != build.id {
+                        let source_number = match get_build(txn, source_build_id).await {
+                            Ok(source) => Some(source.number),
+                            Err(AppError::NotFound) => {
+                                baseline_source_missing = true;
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if let Some(source_number) = source_number
+                            && approval::is_older_than_baseline_source(
+                                build.number,
+                                Some(source_number),
+                            )
+                        {
+                            if options.accept_revert {
+                                reverted_from_build = Some(source_number);
+                            } else {
+                                return Err(AppError::ConflictDetail(format!(
+                                    "cannot approve: build #{} is older than the current baseline \
+                                     (created from build #{}); to intentionally restore this build, \
+                                     retry with accept_revert; otherwise re-run it against the current \
+                                     baseline.",
+                                    build.number, source_number
+                                )));
+                            }
+                        }
                     }
+                } else {
+                    // Retention や旧データで source が無い baseline は、通常承認には使えるが
+                    // 世代の前後関係を証明できないため revert 判定には使わない。
+                    baseline_source_missing = true;
                 }
+            }
+
+            if options.accept_revert && reverted_from_build.is_none() {
+                if baseline_source_missing {
+                    return Err(AppError::ConflictDetail(
+                        "cannot approve: accept_revert was provided, but the current baseline \
+                         source build is no longer retained, so the revert cannot be verified; \
+                         re-run this build against the current baseline."
+                            .to_string(),
+                    ));
+                }
+                return Err(AppError::ConflictDetail(
+                    "cannot approve: accept_revert was provided, but this approval is not a \
+                     revert to an older build; retry without accept_revert."
+                        .to_string(),
+                ));
             }
 
             if reverted_from_build.is_none()
@@ -390,8 +419,16 @@ pub async fn approve_build(
                     current.as_ref().map(|b| b.id),
                 )
             {
+                if baseline_source_missing {
+                    return Err(AppError::ConflictDetail(
+                        "cannot approve: the baseline moved and its source build is no longer \
+                         retained, so the build ordering cannot be verified; re-run this build \
+                         against the current baseline."
+                            .to_string(),
+                    ));
+                }
                 return Err(AppError::ConflictDetail(
-                    "cannot approve: the baseline moved after this build was compared. \
+                    "cannot approve: the baseline moved after this build was compared; \
                      re-run the build so it is compared against the current baseline."
                         .to_string(),
                 ));
@@ -414,7 +451,7 @@ pub async fn approve_build(
             let rejected = approval::rejected_names(&facts);
             if !rejected.is_empty() {
                 return Err(AppError::ConflictDetail(format!(
-                    "cannot approve: {} comparison(s) are rejected: {}. \
+                    "cannot approve: {} comparison(s) are rejected: {}; \
                      reject the build, or re-review these comparisons as approved.",
                     rejected.len(),
                     approval::summarize_names(&rejected, MAX_REPORTED_NAMES)
@@ -425,12 +462,12 @@ pub async fn approve_build(
             let blocking = approval::blocking_pending_names(&facts, options);
             if !blocking.is_empty() {
                 let hint = if options.force {
-                    " story removals require accept_removals; failed comparisons require accept_failures."
+                    "story removals require accept_removals; failed comparisons require accept_failures"
                 } else {
-                    " review them, or set force to bulk-approve."
+                    "review them, or set force to bulk-approve"
                 };
                 return Err(AppError::ConflictDetail(format!(
-                    "cannot approve: {} comparison(s) are still awaiting review: {}.{hint}",
+                    "cannot approve: {} comparison(s) are still awaiting review: {}; {hint}.",
                     blocking.len(),
                     approval::summarize_names(&blocking, MAX_REPORTED_NAMES)
                 )));
@@ -453,6 +490,7 @@ pub async fn approve_build(
             // 現行 baseline から予期せず欠落した story を検出する。
             // 「消えてよい」と承認された story 以外が今回のビルドから欠けていたら、
             // 撮影漏れ・アップロード失敗と区別がつかないので承認しない。
+            let mut removed_by_revert = Vec::new();
             if let Some(baseline) = &current {
                 let baseline_names: Vec<String> = crate::baselines::entries(txn, baseline.id)
                     .await?
@@ -461,15 +499,28 @@ pub async fn approve_build(
                     .collect();
                 let shot_names: HashSet<String> =
                     shots.iter().map(|shot| shot.name.clone()).collect();
+
+                // 実際の世代巻き戻しに限り、新しい baseline で追加された story は
+                // 古い build の比較に removal として存在し得ないため、専用の証跡で許可する。
+                if reverted_from_build.is_some() {
+                    removed_by_revert = baseline_names
+                        .iter()
+                        .filter(|name| !shot_names.contains(*name))
+                        .cloned()
+                        .collect();
+                    removed_by_revert.sort();
+                }
+                let mut allowed_missing = approval::approved_removal_names(&facts);
+                allowed_missing.extend(removed_by_revert.iter().cloned());
                 let missing = approval::unexpected_missing_names(
                     &baseline_names,
                     &shot_names,
-                    &approval::approved_removal_names(&facts),
+                    &allowed_missing,
                 );
                 if !missing.is_empty() {
                     return Err(AppError::ConflictDetail(format!(
                         "cannot approve: {} story/stories in the current baseline are missing \
-                         from this build without an approved removal: {}. \
+                         from this build without an approved removal: {}; \
                          re-run the build, review the removals explicitly, or use force with \
                          accept_removals after confirming every removal.",
                         missing.len(),
@@ -505,6 +556,7 @@ pub async fn approve_build(
             // 比較フェーズで打ったものを保持する。未設定の古い行だけ埋める。
             let backfill = build.completed_at.is_none();
             let build_number = build.number;
+            let previous_approval_evidence = build.approval_evidence.clone();
             let mut active: builds::ActiveModel = build.into();
             active.status = Set(BuildStatus::Approved);
             active.approved_by = Set(Some(reviewer_id));
@@ -513,12 +565,22 @@ pub async fn approve_build(
                 || !accepted_removals.is_empty()
                 || !accepted_failures.is_empty()
             {
-                active.approval_evidence = Set(Some(serde_json::json!({
+                let evidence = serde_json::json!({
                     "accepted_removals": accepted_removals,
                     "accepted_failures": accepted_failures,
+                    "removed_by_revert": removed_by_revert,
                     "reverted_from_build": reverted_from_build,
-                    "reverted_to_build": reverted_from_build.map(|_| build_number),
-                })));
+                    // 対象番号は巻き戻し時だけ意味を持つ。map で暗黙に流用しない。
+                    "reverted_to_build": if reverted_from_build.is_some() {
+                        Some(build_number)
+                    } else {
+                        None
+                    },
+                });
+                active.approval_evidence = Set(Some(append_approval_evidence(
+                    previous_approval_evidence,
+                    evidence,
+                )));
             }
             if backfill {
                 active.completed_at = Set(Some(now));
@@ -527,6 +589,22 @@ pub async fn approve_build(
         })
     })
     .await
+}
+
+/// 承認証跡は操作ごとの配列として保持し、再承認で過去の判断を失わない。
+/// 単一 object で保存済みの行も、次回更新時に履歴の先頭要素として移行する。
+fn append_approval_evidence(
+    previous: Option<serde_json::Value>,
+    evidence: serde_json::Value,
+) -> serde_json::Value {
+    match previous {
+        None => serde_json::Value::Array(vec![evidence]),
+        Some(serde_json::Value::Array(mut entries)) => {
+            entries.push(evidence);
+            serde_json::Value::Array(entries)
+        }
+        Some(legacy) => serde_json::Value::Array(vec![legacy, evidence]),
+    }
 }
 
 /// 承認判定に使う比較の情報を読み込む。
@@ -834,5 +912,20 @@ mod tests {
             }
             .has_differences()
         );
+    }
+
+    #[test]
+    fn approval_evidence_appends_without_losing_existing_entries() {
+        let first = serde_json::json!({ "accepted_removals": ["old"] });
+        let second = serde_json::json!({ "removed_by_revert": ["new"] });
+        let third = serde_json::json!({ "accepted_failures": ["broken"] });
+
+        let history = append_approval_evidence(None, first.clone());
+        let history = append_approval_evidence(Some(history), second.clone());
+        assert_eq!(history, serde_json::json!([first, second]));
+
+        let migrated =
+            append_approval_evidence(Some(serde_json::json!({ "legacy": true })), third.clone());
+        assert_eq!(migrated, serde_json::json!([{ "legacy": true }, third]));
     }
 }
