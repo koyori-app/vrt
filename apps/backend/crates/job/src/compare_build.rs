@@ -652,28 +652,41 @@ async fn compare_pair(
         entry.content_hash.as_deref(),
         entry.verified_content_hash.as_deref(),
     );
-    if hashes_match
-        && service::screenshots::verify_stored_content_hash(
+    if hashes_match {
+        let baseline_ok = service::screenshots::verify_stored_content_hash(
             storage,
             &entry.storage_key,
             entry.content_hash.as_deref(),
         )
-        .await?
-        && service::screenshots::verify_stored_content_hash(
+        .await?;
+        let current_ok = service::screenshots::verify_stored_content_hash(
             storage,
             &shot.storage_key,
             shot.content_hash.as_deref(),
         )
-        .await?
-    {
-        return Ok(Outcome {
-            id: Uuid::new_v4(),
-            status: ComparisonStatus::Unchanged,
-            diff_storage_key: None,
-            diff_pixel_count: Some(0),
-            diff_ratio: Some(0.0),
-            content_hash_skipped: true,
-        });
+        .await?;
+        if baseline_ok && current_ok {
+            return Ok(Outcome {
+                id: Uuid::new_v4(),
+                status: ComparisonStatus::Unchanged,
+                diff_storage_key: None,
+                diff_pixel_count: Some(0),
+                diff_ratio: Some(0.0),
+                content_hash_skipped: true,
+            });
+        }
+        if !baseline_ok {
+            anyhow::bail!(
+                "baseline entry `{}` integrity check failed: \
+                 stored content does not match recorded content hash",
+                entry.name
+            );
+        }
+        anyhow::bail!(
+            "screenshot `{}` integrity check failed: \
+             stored content does not match recorded content hash",
+            shot.name
+        );
     }
 
     let baseline_image = service::screenshots::load_rgba(storage, &entry.storage_key).await?;
