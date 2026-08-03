@@ -833,9 +833,10 @@ pub async fn approve_build(
     // bounded parallel で済ませる。後続 transaction では、この検証が依存した
     // build 状態・baseline ID・shot の ID/key/hash 集合を読み直して TOCTOU を閉じる。
     let preflight_build = get_build(db, build.id).await?;
-    if !preflight_build
+    if !(preflight_build
         .status
         .can_transition_to(BuildStatus::Approved)
+        || options.accept_revert && preflight_build.status == BuildStatus::Approved)
     {
         return Err(AppError::Conflict);
     }
