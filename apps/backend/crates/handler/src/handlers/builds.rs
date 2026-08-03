@@ -324,6 +324,7 @@ pub async fn approve_build(
             force: b.force,
             accept_removals: b.accept_removals,
             accept_failures: b.accept_failures,
+            accept_revert: b.accept_revert,
         })
         .unwrap_or_default();
     let approved = build_service::approve_build(&state.db, build, auth.user_id, options).await?;

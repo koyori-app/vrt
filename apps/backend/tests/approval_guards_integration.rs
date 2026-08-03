@@ -519,13 +519,233 @@ async fn approving_a_stale_build_after_a_newer_one_is_rejected() {
     );
     let message = error_message(res).await;
     assert!(
-        message.contains("older") || message.contains("baseline moved"),
-        "巻き戻りだと分かるメッセージであること: {message}"
+        message.contains("accept_revert") && message.contains("re-run"),
+        "巻き戻しの明示経路と安全な代替を示すこと: {message}"
     );
 
     // baseline は新しい方のまま。
     let (still, _) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(still, after_third, "baseline は巻き戻っていない");
+
+    // 専用フラグで意図を明示した場合だけ古いビルドへ戻せる。
+    let res = fx
+        .approve(second_id, json!({ "force": true, "accept_revert": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "明示した revert は承認できる");
+    let reverted: Value = res.json().await.expect("reverted build json");
+    assert_eq!(
+        reverted["approval_evidence"][0]["reverted_from_build"],
+        third["number"]
+    );
+    assert_eq!(
+        reverted["approval_evidence"][0]["reverted_to_build"],
+        second["number"]
+    );
+    let (after_revert, _) = fx.current_baseline().await.expect("baseline exists");
+    assert_ne!(
+        after_revert, after_third,
+        "revert は新しい baseline record を作る"
+    );
+}
+
+// 新しい baseline で story が増えても、明示した revert なら古い集合へ戻せる。
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_revert_records_stories_added_after_the_target_build() {
+    let fx = setup().await;
+
+    let old = fx.run_build("sha-old", &[("home", RED)]).await;
+    let old_id = build_id_of(&old);
+    let res = fx.approve(old_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve old baseline");
+
+    let new = fx
+        .run_build("sha-new", &[("home", BLUE), ("new-story", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&new), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve expanded baseline");
+
+    let res = fx.approve(old_id, json!({ "accept_revert": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "an explicit revert may remove stories that only exist in the newer baseline"
+    );
+    let reverted: Value = res.json().await.expect("reverted build json");
+    assert_eq!(
+        reverted["approval_evidence"][0]["removed_by_revert"],
+        json!(["new-story"])
+    );
+    let (_, names) = fx.current_baseline().await.expect("baseline exists");
+    assert_eq!(names, vec!["home".to_string()]);
+}
+
+// 通常承認そのものは証跡を増やさない。一方、その承認済み build を明示的に
+// 巻き戻し再承認する場合は、上書きされる承認者と承認時刻を復元可能にする。
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_revert_preserves_the_superseded_normal_approval() {
+    let fx = setup().await;
+
+    let old = fx.run_build("sha-superseded-old", &[("home", RED)]).await;
+    let old_id = build_id_of(&old);
+    let res = fx.approve(old_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve old baseline");
+    let originally_approved: Value = res.json().await.expect("original approval json");
+    assert!(
+        originally_approved["approval_evidence"].is_null(),
+        "a normal approval must not create evidence"
+    );
+
+    let new = fx.run_build("sha-superseded-new", &[("home", BLUE)]).await;
+    let res = fx
+        .approve(build_id_of(&new), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve newer baseline");
+
+    let res = fx.approve(old_id, json!({ "accept_revert": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "re-approve old baseline");
+    let reverted: Value = res.json().await.expect("reverted build json");
+    let evidence = reverted["approval_evidence"]
+        .as_array()
+        .expect("approval evidence array");
+    assert_eq!(evidence.len(), 1, "revert creates the first evidence entry");
+    assert_eq!(
+        evidence[0]["superseded_approved_by"], originally_approved["approved_by"],
+        "the overwritten approver remains recoverable"
+    );
+    assert_eq!(
+        evidence[0]["superseded_approved_at"], originally_approved["approved_at"],
+        "the overwritten approval time remains recoverable"
+    );
+
+    let newer = fx
+        .run_build("sha-superseded-newer", &[("home", BLUE)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&newer), json!({ "force": true }))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "approve another newer baseline"
+    );
+
+    let res = fx.approve(old_id, json!({ "accept_revert": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "re-approve old baseline again"
+    );
+    let reverted_again: Value = res.json().await.expect("second reverted build json");
+    let evidence = reverted_again["approval_evidence"]
+        .as_array()
+        .expect("approval evidence array");
+    assert_eq!(evidence.len(), 2, "each revert appends one evidence entry");
+    assert_eq!(
+        evidence[0]["superseded_approved_at"], originally_approved["approved_at"],
+        "the first approval remains recoverable after repeated reverts"
+    );
+    assert_eq!(
+        evidence[1]["superseded_approved_by"], reverted["approved_by"],
+        "the next overwritten approver is appended"
+    );
+    assert_eq!(
+        evidence[1]["superseded_approved_at"], reverted["approved_at"],
+        "the next overwritten approval time is appended"
+    );
+}
+
+// accept_revert は却下済み比較を上書きしない。
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_revert_does_not_override_a_rejected_comparison() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha-reject-1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let older = fx.run_build("sha-reject-2", &[("home", BLUE)]).await;
+    let newer = fx.run_build("sha-reject-3", &[("home", BLUE)]).await;
+    let older_id = build_id_of(&older);
+    fx.review(older_id, "home", "reject").await;
+    let res = fx
+        .approve(build_id_of(&newer), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = fx
+        .approve(older_id, json!({ "force": true, "accept_revert": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert!(error_message(res).await.contains("rejected"));
+}
+
+// フラグだけで通常の baseline 移動を revert 経路へ混ぜない。
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_revert_is_rejected_when_the_approval_is_not_a_revert() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha-not-revert-1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let second = fx.run_build("sha-not-revert-2", &[("home", BLUE)]).await;
+    let res = fx
+        .approve(
+            build_id_of(&second),
+            json!({ "force": true, "accept_revert": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    assert!(error_message(res).await.contains("not a revert"));
+}
+
+// retention 後に source build が消えた baseline では、世代を推測せず状況を示す。
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_revert_reports_when_the_baseline_source_was_not_retained() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha-retained-1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let older = fx.run_build("sha-retained-2", &[("home", BLUE)]).await;
+    let newer = fx.run_build("sha-retained-3", &[("home", BLUE)]).await;
+    let res = fx
+        .approve(build_id_of(&newer), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let (baseline_id, _) = fx.current_baseline().await.expect("baseline exists");
+    let baseline = entity::baselines::Entity::find_by_id(baseline_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load baseline")
+        .expect("baseline row");
+    let mut active: entity::baselines::ActiveModel = baseline.into();
+    active.source_build_id = Set(None);
+    active
+        .update(&fx.app.state.db)
+        .await
+        .expect("model retention removing the source build reference");
+
+    let res = fx
+        .approve(
+            build_id_of(&older),
+            json!({ "force": true, "accept_revert": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let message = error_message(res).await;
+    assert!(message.contains("no longer retained"), "{message}");
+    assert!(message.contains("cannot be verified"), "{message}");
 }
 
 // force でも story の削除を明示確認なしに承認しないことを検証する。
@@ -569,6 +789,12 @@ async fn force_does_not_silently_approve_story_removals() {
         .approve(second_id, json!({ "force": true, "accept_removals": true }))
         .await;
     assert_eq!(res.status(), StatusCode::OK, "明示確認すれば承認できる");
+    let approved: Value = res.json().await.expect("approved build json");
+    assert_eq!(
+        approved["approval_evidence"][0]["accepted_removals"],
+        json!(["legacy"]),
+        "消えた story 名を build record に残す"
+    );
     let (_, names) = fx.current_baseline().await.expect("baseline exists");
     assert_eq!(names, vec!["home".to_string()]);
 }
@@ -691,6 +917,12 @@ async fn force_requires_explicit_acknowledgement_for_failed_comparisons() {
         res.status(),
         StatusCode::OK,
         "a separate explicit acknowledgement permits the exceptional operation"
+    );
+    let approved: Value = res.json().await.expect("approved build json");
+    assert_eq!(
+        approved["approval_evidence"][0]["accepted_failures"],
+        json!(["home"]),
+        "failed screenshot name is retained as approval evidence"
     );
 }
 
