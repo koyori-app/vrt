@@ -19,6 +19,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
             crate::handlers::github::list_unclaimed_installations
         ))
         .routes(routes!(crate::handlers::github::claim_installation))
+        .routes(routes!(crate::handlers::github::create_setup_state))
         .routes(routes!(
             crate::handlers::github::list_installation_repositories
         ))

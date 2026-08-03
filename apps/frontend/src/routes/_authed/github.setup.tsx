@@ -1,6 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
 
+import { readSetupReturnPath } from "@/lib/github-setup";
+
 type GithubSetupSearch = {
   installation_id?: number;
   setup_action?: string;
@@ -24,12 +26,15 @@ function GithubSetupPage() {
   const { installation_id, setup_action, state } = Route.useSearch();
 
   useEffect(() => {
-    const fallback = "/";
-    const safeState = state?.startsWith("/") && !state.startsWith("//") ? state : fallback;
-    const target = new URL(safeState, window.location.origin);
+    // `state` は不透明な one-time トークン。戻り先はインストール開始時に
+    // このタブの sessionStorage へ書いた値だけを使い、URL の値は経路に使わない。
+    const target = new URL(readSetupReturnPath(state), window.location.origin);
     target.searchParams.set("tab", "settings");
     if (installation_id) {
       target.searchParams.set("github_installation_id", String(installation_id));
+    }
+    if (state) {
+      target.searchParams.set("github_setup_state", state);
     }
     if (setup_action) {
       target.searchParams.set("github_setup_action", setup_action);

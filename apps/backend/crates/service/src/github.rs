@@ -36,6 +36,11 @@ pub const INSTALLATION_TOKEN_TTL_SECS: u64 = 50 * 60;
 /// GitHub API 呼び出しの User-Agent（GitHub は UA 必須）。
 const USER_AGENT: &str = "vrt";
 
+/// repository 一覧で辿るページ数の上限（1 ページ 100 件）。
+/// 暴走した場合の安全弁であって、通常は `total_count` に到達して先に抜ける。
+/// ここに達したときは黙って切り捨てず、明示的なエラーにする。
+const MAX_REPOSITORY_PAGES: u32 = 100;
+
 /// GitHub API 呼び出しの失敗。リトライすべきかどうかで分ける。
 #[derive(Debug, thiserror::Error)]
 pub enum GithubApiError {
@@ -45,6 +50,42 @@ pub enum GithubApiError {
     /// 4xx（リポジトリが無い・権限が無い・SHA が不正など）。リトライしても直らない。
     #[error("permanent github api error: {0}")]
     Permanent(String),
+}
+
+/// 失敗レスポンスを Transient / Permanent に振り分ける。
+///
+/// レート制限は 429 のほか、**403 + `X-RateLimit-Remaining: 0`** でも返ってくる。
+/// どちらも時間が経てば回復するので、[`GithubApiError`] の契約どおり Transient にする
+/// （Permanent にすると 400 になり、呼び出し側が「入力を直せば通る」と誤解する）。
+/// 回復時刻の手掛かりとして `Retry-After` / `X-RateLimit-Reset` をメッセージに残す。
+fn classify_failure(
+    context: &str,
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> GithubApiError {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+    };
+
+    let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN && header("x-ratelimit-remaining") == "0");
+    if rate_limited {
+        return GithubApiError::Transient(anyhow::anyhow!(
+            "{context} rate limited: {status} retry_after={} rate_limit_reset={} {body}",
+            header("retry-after"),
+            header("x-ratelimit-reset"),
+        ));
+    }
+
+    if status.is_client_error() {
+        GithubApiError::Permanent(format!("{context} failed: {status} {body}"))
+    } else {
+        GithubApiError::Transient(anyhow::anyhow!("{context} failed: {status} {body}"))
+    }
 }
 
 /// コミットステータスの state。
@@ -198,6 +239,90 @@ async fn cache_set(
         .map_err(|e| anyhow::anyhow!("redis SET failed: {e}"))
 }
 
+async fn cache_getdel(redis: &RedisConnection, key: &str) -> Result<Option<String>, anyhow::Error> {
+    let mut conn = redis
+        .conn
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("redis acquire failed: {e}"))?;
+    // GETDEL は取得と削除が原子的なので、同じ state を 2 回消費できない。
+    redis::cmd("GETDEL")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("redis GETDEL failed: {e}"))
+}
+
+// ── GitHub App インストール導線の one-time state ────────────────────────────
+//
+// GitHub の setup URL には任意の `installation_id` と `state` を付けて他人に踏ませられる。
+// state をサーバ側で発行・保存し、claim 時に消費・照合することで
+// 「攻撃者の installation を、罠 URL を踏んだ admin のテナントに紐付ける」経路を塞ぐ。
+
+/// setup state の有効期限（秒）。GitHub のインストール画面を操作する時間を見て 15 分。
+pub const SETUP_STATE_TTL_SECS: u64 = 15 * 60;
+
+const SETUP_STATE_PREFIX: &str = "github:setup_state:";
+
+/// setup state に結び付けた発行元。claim 時にこの 2 つが一致しなければ拒否する。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SetupState {
+    pub user_id: Uuid,
+    pub tenant_id: Uuid,
+}
+
+/// インストール開始時に one-time state を発行して Valkey に保存する。
+pub async fn issue_setup_state(
+    redis: &RedisConnection,
+    user_id: Uuid,
+    tenant_id: Uuid,
+) -> Result<String, AppError> {
+    let state = auth_core::pkce::generate_state();
+    let payload = serde_json::to_string(&SetupState { user_id, tenant_id })
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("setup state encode failed: {e}")))?;
+    cache_set(
+        redis,
+        &format!("{SETUP_STATE_PREFIX}{state}"),
+        &payload,
+        SETUP_STATE_TTL_SECS,
+    )
+    .await
+    .map_err(AppError::Internal)?;
+    Ok(state)
+}
+
+/// setup state を読む。存在しない / 期限切れ / 消費済みなら `None`。
+///
+/// ここでは削除しない。webhook の到着待ちで claim が数回リトライされるため、
+/// 削除は claim が成功した時点（[`consume_setup_state`]）に行う。
+pub async fn peek_setup_state(
+    redis: &RedisConnection,
+    state: &str,
+) -> Result<Option<SetupState>, AppError> {
+    let raw = cache_get(redis, &format!("{SETUP_STATE_PREFIX}{state}"))
+        .await
+        .map_err(AppError::Internal)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    // 壊れた値は「無効な state」と同じ扱いにする（発行形式を変えた直後など）。
+    Ok(serde_json::from_str(&raw).ok())
+}
+
+/// setup state を消費する（取得と削除は原子的）。claim 成功後に呼ぶ。
+pub async fn consume_setup_state(
+    redis: &RedisConnection,
+    state: &str,
+) -> Result<Option<SetupState>, AppError> {
+    let raw = cache_getdel(redis, &format!("{SETUP_STATE_PREFIX}{state}"))
+        .await
+        .map_err(AppError::Internal)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&raw).ok())
+}
+
 #[derive(serde::Deserialize)]
 struct InstallationRepositoriesPage {
     total_count: u64,
@@ -219,7 +344,7 @@ pub async fn list_installation_repositories(
     let token = installation_token(redis, &app, installation_id).await?;
     let mut repositories = Vec::new();
 
-    for page in 1..=100_u32 {
+    for page in 1..=MAX_REPOSITORY_PAGES {
         let url = format!(
             "{}/installation/repositories?per_page=100&page={page}",
             settings.github_api_base_url()
@@ -238,6 +363,7 @@ pub async fn list_installation_repositories(
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let body: String = response
                 .text()
                 .await
@@ -245,23 +371,31 @@ pub async fn list_installation_repositories(
                 .chars()
                 .take(500)
                 .collect();
-            if status.is_client_error() {
-                return Err(GithubApiError::Permanent(format!(
-                    "list installation repositories failed: {status} {body}"
-                )));
-            }
-            return Err(GithubApiError::Transient(anyhow::anyhow!(
-                "list installation repositories failed: {status} {body}"
-            )));
+            return Err(classify_failure(
+                "list installation repositories",
+                status,
+                &headers,
+                &body,
+            ));
         }
 
         let body: InstallationRepositoriesPage = response.json().await.map_err(|e| {
             GithubApiError::Transient(anyhow::anyhow!("decode installation repositories: {e}"))
         })?;
+        let total_count = body.total_count;
         let page_len = body.repositories.len();
         repositories.extend(body.repositories);
-        if page_len == 0 || repositories.len() as u64 >= body.total_count {
+        if page_len == 0 || repositories.len() as u64 >= total_count {
             break;
+        }
+        if page == MAX_REPOSITORY_PAGES {
+            // 途中までの一覧を正常結果として返すと「権限が無い」と区別できない。
+            // 部分結果は捨てて、何件目で打ち切ったかが分かるエラーにする。
+            return Err(GithubApiError::Permanent(format!(
+                "list installation repositories exceeded the {MAX_REPOSITORY_PAGES} page limit: \
+                 fetched {} of {total_count} repositories",
+                repositories.len()
+            )));
         }
     }
 
@@ -395,17 +529,15 @@ pub async fn post_commit_status(
         return Ok(());
     }
 
+    let headers = response.headers().clone();
     let body = response.text().await.unwrap_or_default();
     let body: String = body.chars().take(500).collect();
-    if status.is_client_error() {
-        Err(GithubApiError::Permanent(format!(
-            "post commit status failed: {status} {body}"
-        )))
-    } else {
-        Err(GithubApiError::Transient(anyhow::anyhow!(
-            "post commit status failed: {status} {body}"
-        )))
-    }
+    Err(classify_failure(
+        "post commit status",
+        status,
+        &headers,
+        &body,
+    ))
 }
 
 // ── installations（claim とプロジェクト紐付け）──────────────────────────────

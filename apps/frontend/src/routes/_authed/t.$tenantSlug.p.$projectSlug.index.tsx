@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { $api, errorMessage, type Project } from "@/lib/api";
+import { rememberSetupReturnPath } from "@/lib/github-setup";
 import {
   roleAtLeast,
   useBuilds,
@@ -42,6 +43,7 @@ const NO_INSTALLATION = "none";
 type ProjectSearch = {
   tab?: "builds" | "settings" | "ci";
   github_installation_id?: number;
+  github_setup_state?: string;
   github_setup_action?: string;
 };
 
@@ -53,6 +55,8 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/")({
       tab: tab === "builds" || tab === "settings" || tab === "ci" ? tab : undefined,
       github_installation_id:
         Number.isSafeInteger(installationId) && installationId > 0 ? installationId : undefined,
+      github_setup_state:
+        typeof search.github_setup_state === "string" ? search.github_setup_state : undefined,
       github_setup_action:
         typeof search.github_setup_action === "string" ? search.github_setup_action : undefined,
     };
@@ -62,7 +66,11 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/")({
 
 function ProjectPage() {
   const { tenantSlug, projectSlug } = Route.useParams();
-  const { tab, github_installation_id: setupInstallationId } = Route.useSearch();
+  const {
+    tab,
+    github_installation_id: setupInstallationId,
+    github_setup_state: setupState,
+  } = Route.useSearch();
   const { me } = Route.useRouteContext();
   const { tenant } = useResolvedTenant(tenantSlug);
   const { project, isLoading } = useResolvedProject(tenant?.id, projectSlug);
@@ -109,6 +117,7 @@ function ProjectPage() {
             tenantSlug={tenantSlug}
             projectSlug={project.slug}
             setupInstallationId={setupInstallationId}
+            setupState={setupState}
             canEdit={roleAtLeast(role, "admin")}
           />
         </TabsContent>
@@ -384,6 +393,7 @@ function GithubLink({
   tenantSlug,
   projectSlug,
   setupInstallationId,
+  setupState,
   canEdit,
 }: {
   project: Project;
@@ -391,6 +401,7 @@ function GithubLink({
   tenantSlug: string;
   projectSlug: string;
   setupInstallationId?: number;
+  setupState?: string;
   canEdit: boolean;
 }) {
   const queryClient = useQueryClient();
@@ -414,7 +425,8 @@ function GithubLink({
         query: { tenant_id: tenantId },
       },
     },
-    { enabled: installationId !== "" },
+    // repository 名（private 含む）は admin にしか出さない。
+    { enabled: canEdit && installationId !== "" },
   );
 
   useEffect(() => {
@@ -446,32 +458,53 @@ function GithubLink({
       toast.error(errorMessage(error, "Could not connect the GitHub installation")),
   });
 
+  // claim はサーバ発行の one-time state が揃っているときだけ走る。
+  // installation_id だけの URL を踏まされても、state が無ければ何も起きない。
   useEffect(() => {
-    if (!canEdit || !setupInstallationId || claimedSetupId.current === setupInstallationId) return;
+    if (!canEdit || !setupInstallationId || !setupState) return;
+    if (claimedSetupId.current === setupInstallationId) return;
     claimedSetupId.current = setupInstallationId;
     claim.mutate({
       params: { path: { installation_id: setupInstallationId } },
-      body: { tenant_id: tenantId },
+      body: { tenant_id: tenantId, state: setupState },
     });
-  }, [canEdit, claim, setupInstallationId, tenantId]);
+  }, [canEdit, claim, setupInstallationId, setupState, tenantId]);
 
   const normalizedSearch = repoSearch.trim().toLocaleLowerCase();
   const filteredRepositories = repositories.data?.repositories.filter((repository) =>
     repository.full_name.toLocaleLowerCase().includes(normalizedSearch),
   );
 
-  let installHref: string | undefined;
+  // install_url が設定済みで、かつ URL として解釈できるときだけ導線を出す。
+  let installBaseUrl: URL | undefined;
   if (app.data?.install_url) {
     try {
-      const url = new URL(app.data.install_url);
-      url.searchParams.set(
-        "state",
-        `/t/${encodeURIComponent(tenantSlug)}/p/${encodeURIComponent(projectSlug)}?tab=settings`,
-      );
-      installHref = url.toString();
+      installBaseUrl = new URL(app.data.install_url);
     } catch {
-      installHref = undefined;
+      installBaseUrl = undefined;
     }
+  }
+
+  const setupStateMutation = $api.useMutation("post", "/v1/github/setup/state", {
+    onError: (error) => toast.error(errorMessage(error, "Could not start the GitHub install")),
+  });
+
+  function startInstall() {
+    if (!installBaseUrl) return;
+    setupStateMutation.mutate(
+      { body: { tenant_id: tenantId } },
+      {
+        onSuccess: ({ state }) => {
+          rememberSetupReturnPath(
+            state,
+            `/t/${encodeURIComponent(tenantSlug)}/p/${encodeURIComponent(projectSlug)}?tab=settings`,
+          );
+          const url = new URL(installBaseUrl);
+          url.searchParams.set("state", state);
+          window.location.assign(url.toString());
+        },
+      },
+    );
   }
 
   function onSubmit(event: FormEvent) {
@@ -490,12 +523,15 @@ function GithubLink({
       <CardHeader>
         <div className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>GitHub</CardTitle>
-          {installHref && canEdit ? (
-            <Button asChild variant="outline" size="sm">
-              <a href={installHref}>
-                Install GitHub App
-                <ExternalLinkIcon className="size-4" />
-              </a>
+          {installBaseUrl && canEdit ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={startInstall}
+              disabled={setupStateMutation.isPending}
+            >
+              Install GitHub App
+              <ExternalLinkIcon className="size-4" />
             </Button>
           ) : null}
         </div>
@@ -506,7 +542,7 @@ function GithubLink({
       </CardHeader>
       <CardContent>
         <form onSubmit={onSubmit} className="grid max-w-xl gap-4">
-          {!app.isLoading && !installHref ? (
+          {!app.isLoading && !installBaseUrl ? (
             <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
               The install link is not configured. Set GITHUB_APP_INSTALL_URL on the server.
             </p>

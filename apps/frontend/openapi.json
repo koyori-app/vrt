@@ -2877,7 +2877,7 @@
           "GitHub"
         ],
         "summary": "installation をテナントに紐付ける",
-        "description": "対象テナントの admin 以上が必要。既に同じテナントが claim 済みなら冪等に成功する。",
+        "description": "対象テナントの admin 以上が必要。`state` は `POST /v1/github/setup/state` で 発行した one-time state で、発行者・テナントが一致し未使用かつ期限内で なければならない（罠 URL 経由の claim を防ぐ）。既に同じテナントが claim 済みなら冪等に成功する。",
         "operationId": "claim_installation",
         "parameters": [
           {
@@ -3011,7 +3011,7 @@
           "GitHub"
         ],
         "summary": "GitHub installation の repository 一覧",
-        "description": "対象テナントに claim 済みの installation で参照できる repository を返す。",
+        "description": "対象テナントに claim 済みの installation で参照できる repository を返す。private repository の名前まで列挙できるため admin 以上が必要。",
         "operationId": "list_installation_repositories",
         "parameters": [
           {
@@ -3042,6 +3042,118 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GithubRepositoryListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/github/setup/state": {
+      "post": {
+        "tags": [
+          "GitHub"
+        ],
+        "summary": "GitHub App インストール導線の one-time state を発行",
+        "description": "対象テナントの admin 以上が必要。返した `state` を GitHub のインストール URL に 付与すると、setup callback 経由の claim でサーバ側の検証が通るようになる。",
+        "operationId": "create_setup_state",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSetupStateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "発行した state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSetupStateResponse"
                 }
               }
             }
@@ -6031,9 +6143,14 @@
         "type": "object",
         "description": "`POST /v1/github/installations/{installation_id}/claim` のボディ。",
         "required": [
-          "tenant_id"
+          "tenant_id",
+          "state"
         ],
         "properties": {
+          "state": {
+            "type": "string",
+            "description": "`POST /v1/github/setup/state` で発行した one-time state。\n発行したユーザー・テナントと一致し、未使用かつ期限内である必要がある。"
+          },
           "tenant_id": {
             "type": "string",
             "format": "uuid",
@@ -6275,6 +6392,40 @@
           "slug": {
             "type": "string",
             "description": "小文字英数とハイフンのみ。テナント内で一意。"
+          }
+        }
+      },
+      "CreateSetupStateRequest": {
+        "type": "object",
+        "description": "`POST /v1/github/setup/state` のボディ。",
+        "required": [
+          "tenant_id"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "インストール先として想定するテナント。admin 以上であることが必要。"
+          }
+        }
+      },
+      "CreateSetupStateResponse": {
+        "type": "object",
+        "description": "`POST /v1/github/setup/state` のレスポンス。",
+        "required": [
+          "state",
+          "expires_in"
+        ],
+        "properties": {
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "state の有効期限（秒）。",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "GitHub のインストール URL に `state` として付与する値。"
           }
         }
       },

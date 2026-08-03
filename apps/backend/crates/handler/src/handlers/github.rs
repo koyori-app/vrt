@@ -9,7 +9,8 @@
 //! - `GET /v1/github/app` — インストール導線の設定。
 //! - `GET /v1/github/installations/{id}/repositories` — 選択可能な repository 一覧。
 //! - `GET /v1/github/installations/unclaimed` — 未 claim の installation 一覧。
-//! - `POST /v1/github/installations/{installation_id}/claim` — テナントへの紐付け。
+//! - `POST /v1/github/setup/state` — インストール導線の one-time state 発行。
+//! - `POST /v1/github/installations/{installation_id}/claim` — テナントへの紐付け（state 検証あり）。
 //! - `PATCH /v1/projects/{project_id}/github` — プロジェクトとリポジトリの紐付け。
 
 use axum::{
@@ -184,7 +185,8 @@ pub async fn list_installations(
     path = "/installations/{installation_id}/repositories",
     tag = "GitHub",
     summary = "GitHub installation の repository 一覧",
-    description = "対象テナントに claim 済みの installation で参照できる repository を返す。",
+    description = "対象テナントに claim 済みの installation で参照できる repository を返す。\
+                   private repository の名前まで列挙できるため admin 以上が必要。",
     params(
         ("installation_id" = i64, Path, description = "GitHub の installation ID"),
         InstallationListQuery,
@@ -201,7 +203,9 @@ pub async fn list_installation_repositories(
     Query(query): Query<InstallationListQuery>,
 ) -> Result<Json<GithubRepositoryListResponse>, AppError> {
     auth.require_session()?;
-    tenant_service::require_role(&state.db, query.tenant_id, auth.user_id, TenantRole::Member)
+    // レスポンスに private repository の full_name / html_url が含まれるため、
+    // テナントの一般メンバーには開示しない。
+    tenant_service::require_role(&state.db, query.tenant_id, auth.user_id, TenantRole::Admin)
         .await?;
 
     let installation = github_service::find_installation(&state.db, installation_id)
@@ -259,7 +263,10 @@ pub async fn list_unclaimed_installations(
     path = "/installations/{installation_id}/claim",
     tag = "GitHub",
     summary = "installation をテナントに紐付ける",
-    description = "対象テナントの admin 以上が必要。既に同じテナントが claim 済みなら冪等に成功する。",
+    description = "対象テナントの admin 以上が必要。`state` は `POST /v1/github/setup/state` で \
+                   発行した one-time state で、発行者・テナントが一致し未使用かつ期限内で \
+                   なければならない（罠 URL 経由の claim を防ぐ）。既に同じテナントが \
+                   claim 済みなら冪等に成功する。",
     params(("installation_id" = i64, Path, description = "GitHub の installation ID")),
     request_body = ClaimInstallationRequest,
     responses(
@@ -283,9 +290,58 @@ pub async fn claim_installation(
     )
     .await?;
 
+    // 発行者とテナントが一致する state が無い限り claim しない。
+    // ここでは消費せず、claim が成功してから削除する（webhook 到着待ちのリトライを許すため）。
+    let setup_state = github_service::peek_setup_state(&state.redis_client, &payload.state)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequestDetail("invalid or expired github setup state".into())
+        })?;
+    if setup_state.user_id != auth.user_id || setup_state.tenant_id != payload.tenant_id {
+        return Err(AppError::Forbidden);
+    }
+
     let claimed =
         github_service::claim_installation(&state.db, installation_id, payload.tenant_id).await?;
+    github_service::consume_setup_state(&state.redis_client, &payload.state).await?;
     Ok(Json(claimed.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/setup/state",
+    tag = "GitHub",
+    summary = "GitHub App インストール導線の one-time state を発行",
+    description = "対象テナントの admin 以上が必要。返した `state` を GitHub のインストール URL に \
+                   付与すると、setup callback 経由の claim でサーバ側の検証が通るようになる。",
+    request_body = CreateSetupStateRequest,
+    responses(
+        (status = 200, description = "発行した state", body = CreateSetupStateResponse),
+        CrudErrors,
+    )
+)]
+pub async fn create_setup_state(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<CreateSetupStateRequest>,
+) -> Result<Json<CreateSetupStateResponse>, AppError> {
+    auth.require_session()?;
+    tenant_service::require_role(
+        &state.db,
+        payload.tenant_id,
+        auth.user_id,
+        TenantRole::Admin,
+    )
+    .await?;
+
+    let issued =
+        github_service::issue_setup_state(&state.redis_client, auth.user_id, payload.tenant_id)
+            .await?;
+    Ok(Json(CreateSetupStateResponse {
+        state: issued,
+        expires_in: github_service::SETUP_STATE_TTL_SECS,
+    }))
 }
 
 // ── /v1/projects/{project_id}/github ────────────────────────────────────────

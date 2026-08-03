@@ -279,6 +279,25 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
     onError: (error) => toast.error(errorMessage(error, "Could not claim installation")),
   });
 
+  // claim には admin が発行した one-time state が要る。
+  // ここは管理画面からの明示操作なので、押した時点で発行してそのまま使う。
+  const setupState = $api.useMutation("post", "/v1/github/setup/state", {
+    onError: (error) => toast.error(errorMessage(error, "Could not claim installation")),
+  });
+
+  function claimInstallation(installationId: number) {
+    setupState.mutate(
+      { body: { tenant_id: tenantId } },
+      {
+        onSuccess: ({ state }) =>
+          claim.mutate({
+            params: { path: { installation_id: installationId } },
+            body: { tenant_id: tenantId, state },
+          }),
+      },
+    );
+  }
+
   return (
     <Card>
       <CardHeader>
@@ -332,13 +351,8 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={!canManage || claim.isPending}
-                    onClick={() =>
-                      claim.mutate({
-                        params: { path: { installation_id: installation.installation_id } },
-                        body: { tenant_id: tenantId },
-                      })
-                    }
+                    disabled={!canManage || claim.isPending || setupState.isPending}
+                    onClick={() => claimInstallation(installation.installation_id)}
                   >
                     Claim
                   </Button>
