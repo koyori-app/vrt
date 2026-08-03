@@ -104,6 +104,25 @@ fn change_outside_the_graph_falls_back_to_capture_all() {
     assert!(matches!(selection, Selection::CaptureAll { .. }));
 }
 
+/// `public/` の Markdown は文書とは限らず、ランタイムに配信されるアセットである。
+/// positive control: パスを見ず全 `.md` を無視する旧実装では seed が空になり、
+/// `Selection::Only { story_ids: [] }` が返るため、このテストは落ちる。
+#[test]
+fn public_markdown_outside_the_graph_falls_back_to_capture_all() {
+    let selection = plan_selection("graph", &["public/copy.md"]);
+    assert!(matches!(selection, Selection::CaptureAll { .. }));
+}
+
+#[test]
+fn known_root_document_outside_the_graph_is_still_ignored() {
+    let selection = plan_selection("graph", &["README.md", "apps/frontend/src/A.tsx"]);
+    assert_eq!(story_ids(&selection), vec!["a--one", "a--two"]);
+    let Selection::Only { notes, .. } = selection else {
+        panic!("README.md must not force a full capture");
+    };
+    assert!(notes.iter().any(|note| note.contains("README.md")));
+}
+
 #[test]
 fn missing_stats_falls_back_to_capture_all() {
     let selection = plan_selection("no-stats", &["apps/frontend/src/A.tsx"]);
@@ -354,7 +373,7 @@ fn explicit_missing_baseline_commit_is_not_capture_all() {
 
 #[test]
 fn notes_survive_into_the_plan() {
-    // グラフ外でも .md は無視される。その判断は notes に残す。
+    // allowlist 済みのルート文書を無視した判断は notes に残す。
     let selection = plan_selection("graph", &["README.md", "apps/frontend/src/A.tsx"]);
     let document = PlanDocument::from_selection(coords(), selection);
     assert!(

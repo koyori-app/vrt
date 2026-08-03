@@ -297,9 +297,14 @@ fn is_full_capture_trigger(repo_relative: &str) -> bool {
 /// ここに載らないグラフ外の変更は全撮影のトリガーになる。
 fn is_ignorable_outside_graph(repo_relative: &str) -> bool {
     let path = repo_relative.replace('\\', "/").to_ascii_lowercase();
-    let file_name = path.rsplit('/').next().unwrap_or(&path);
-    // Markdown ドキュメント（README 等）はレンダリング対象のストーリーに影響しない。
-    file_name.ends_with(".md")
+    // リポジトリ直下の既知ドキュメントだけを無視する。任意の `.md` を拡張子だけで
+    // 除外すると、`public/` のランタイムアセットまで撮影対象から漏れるためである。
+    // サブディレクトリの Markdown は同名でも判定不能として全撮影へ倒す。
+    !path.contains('/')
+        && matches!(
+            path.as_str(),
+            "readme.md" | "changelog.md" | "contributing.md" | "code_of_conduct.md" | "security.md"
+        )
 }
 
 // ── 影響ストーリー算出（本体） ─────────────────────────────────────────
@@ -631,8 +636,8 @@ mod tests {
     }
 
     #[test]
-    fn markdown_outside_graph_is_ignored() {
-        // グラフ外でも .md は無視してよい。加えて Button 変更で Button 系は撮る。
+    fn known_root_document_outside_graph_is_ignored() {
+        // allowlist 済みのルート文書は無視する。加えて Button 変更で Button 系は撮る。
         let changed = vec![
             "README.md".to_string(),
             "apps/frontend/src/Button.tsx".to_string(),
@@ -646,6 +651,15 @@ mod tests {
             ])
         );
         assert!(out.notes.iter().any(|n| n.contains("README.md")));
+    }
+
+    #[test]
+    fn public_markdown_outside_graph_forces_full_capture() {
+        // positive control: 拡張子だけで全 `.md` を無視する旧実装では seed が空になり、
+        // `Plan::Only([])` が返るため、このアサートは落ちる。
+        let changed = vec!["public/copy.md".to_string()];
+        let out = compute_affected_stories(&root(), &cwd(), &changed, &stats(), &stories());
+        assert!(matches!(out.plan, Plan::CaptureAll(_)));
     }
 
     #[test]

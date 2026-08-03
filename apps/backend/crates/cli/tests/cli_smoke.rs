@@ -56,6 +56,7 @@ fn init_linear_repo() -> (TempDir, String, String, String) {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
     git_in(root, &["init", "-b", "main"]);
+    git_in(root, &["config", "commit.gpgsign", "false"]);
     git_in(root, &["config", "user.email", "vrt@test.local"]);
     git_in(root, &["config", "user.name", "vrt test"]);
 
@@ -83,6 +84,7 @@ fn init_story_diff_repo() -> (TempDir, String, String) {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
     git_in(root, &["init", "-b", "main"]);
+    git_in(root, &["config", "commit.gpgsign", "false"]);
     git_in(root, &["config", "user.email", "vrt@test.local"]);
     git_in(root, &["config", "user.name", "vrt test"]);
 
