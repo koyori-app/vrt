@@ -738,6 +738,7 @@ dependencies = [
  "chrono",
  "common",
  "cookie",
+ "crc32fast",
  "dotenvy",
  "entity",
  "handler",

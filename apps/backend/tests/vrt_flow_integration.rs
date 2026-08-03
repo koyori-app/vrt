@@ -96,6 +96,26 @@ fn encode(image: &RgbaImage) -> Vec<u8> {
     buf.into_inner()
 }
 
+/// IEND の直前に tEXt チャンクを挿入してバイト列を変える。
+/// ピクセルは同一のままハッシュだけが変わる。
+fn inject_text_chunk(mut png: Vec<u8>) -> Vec<u8> {
+    let iend_pos = png
+        .windows(4)
+        .rposition(|w| w == b"IEND")
+        .expect("IEND chunk")
+        - 4;
+    let key_value = b"Comment\0injected";
+    let data_len = (key_value.len() as u32).to_be_bytes();
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&data_len);
+    chunk.extend_from_slice(b"tEXt");
+    chunk.extend_from_slice(key_value);
+    let crc = crc32fast::hash(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    png.splice(iend_pos..iend_pos, chunk);
+    png
+}
+
 /// IHDR は保ったまま IDAT を壊す。寸法取得は通るが full decode は失敗する。
 fn corrupt_idat(mut png: Vec<u8>) -> Vec<u8> {
     let mut offset = 8;
@@ -720,6 +740,77 @@ async fn hash_fast_path_rejects_missing_stored_object() {
     assert_eq!(
         failed["status"], "failed",
         "missing object must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_mismatch_rejects_pixel_identical_replacement_png() {
+    let fx = setup().await;
+    let original = png(12, 12, [20, 40, 60, 255]);
+    let baseline_build = fx.create_build("main", "baseline-swap-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    assert_eq!(
+        fx.wait_for_terminal(baseline_build_id).await["status"],
+        "changes_detected"
+    );
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "swap-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref(),
+        ),
+        "positive control: DB hashes match before replacement"
+    );
+
+    let reencoded = inject_text_chunk(original);
+    assert!(
+        image::load_from_memory(&reencoded).is_ok(),
+        "replacement PNG is valid"
+    );
+    service::screenshots::upload_png(&fx.app.state.storage, &shot.storage_key, reencoded.into())
+        .await
+        .expect("replace fixture object with pixel-identical but byte-different PNG");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "pixel-identical but byte-different replacement must not become passed"
     );
     assert_eq!(failed["content_hash_skipped_count"], 0);
 }

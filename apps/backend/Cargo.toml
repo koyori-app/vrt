@@ -80,6 +80,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+crc32fast = "1"
 image = { workspace = true }
 cookie = "0.18"
 dotenvy = { workspace = true }
