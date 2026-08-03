@@ -107,6 +107,7 @@ services:
       # 未設定なら連携は無効のまま起動する。有効にするには docs/github-app.md を参照して
       # 3 つとも設定すること（PEM は改行を \n でエスケープして 1 行に入れる）。
       # GITHUB_APP_ID: "123456"
+      # GITHUB_APP_INSTALL_URL: https://github.com/apps/your-app-slug/installations/new
       # GITHUB_APP_PRIVATE_KEY_PEM: "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
       # GITHUB_WEBHOOK_SECRET: "..."
       # GitHub Enterprise を使う場合のみ（既定は https://api.github.com）。

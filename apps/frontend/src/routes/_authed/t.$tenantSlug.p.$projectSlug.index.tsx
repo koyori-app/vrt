@@ -1,7 +1,7 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowRightIcon, CopyIcon } from "lucide-react";
-import { useEffect, useState, type FormEvent } from "react";
+import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
 import { CommitLink } from "@/components/commit-link";
@@ -39,12 +39,30 @@ import { formatDate } from "@/lib/utils";
 /** Radix Select treats "" as "clear", so the GitHub link form needs a sentinel. */
 const NO_INSTALLATION = "none";
 
+type ProjectSearch = {
+  tab?: "builds" | "settings" | "ci";
+  github_installation_id?: number;
+  github_setup_action?: string;
+};
+
 export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/")({
+  validateSearch: (search: Record<string, unknown>): ProjectSearch => {
+    const installationId = Number(search.github_installation_id);
+    const tab = search.tab;
+    return {
+      tab: tab === "builds" || tab === "settings" || tab === "ci" ? tab : undefined,
+      github_installation_id:
+        Number.isSafeInteger(installationId) && installationId > 0 ? installationId : undefined,
+      github_setup_action:
+        typeof search.github_setup_action === "string" ? search.github_setup_action : undefined,
+    };
+  },
   component: ProjectPage,
 });
 
 function ProjectPage() {
   const { tenantSlug, projectSlug } = Route.useParams();
+  const { tab, github_installation_id: setupInstallationId } = Route.useSearch();
   const { me } = Route.useRouteContext();
   const { tenant } = useResolvedTenant(tenantSlug);
   const { project, isLoading } = useResolvedProject(tenant?.id, projectSlug);
@@ -67,7 +85,7 @@ function ProjectPage() {
         </p>
       </div>
 
-      <Tabs defaultValue="builds" className="space-y-4">
+      <Tabs defaultValue={tab ?? "builds"} className="space-y-4">
         <TabsList>
           <TabsTrigger value="builds">Builds</TabsTrigger>
           <TabsTrigger value="settings">Settings</TabsTrigger>
@@ -85,7 +103,14 @@ function ProjectPage() {
 
         <TabsContent value="settings" className="space-y-4">
           <ProjectSettings project={project} canEdit={roleAtLeast(role, "admin")} />
-          <GithubLink project={project} tenantId={tenant.id} canEdit={roleAtLeast(role, "admin")} />
+          <GithubLink
+            project={project}
+            tenantId={tenant.id}
+            tenantSlug={tenantSlug}
+            projectSlug={project.slug}
+            setupInstallationId={setupInstallationId}
+            canEdit={roleAtLeast(role, "admin")}
+          />
         </TabsContent>
 
         <TabsContent value="ci">
@@ -356,13 +381,20 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
 function GithubLink({
   project,
   tenantId,
+  tenantSlug,
+  projectSlug,
+  setupInstallationId,
   canEdit,
 }: {
   project: Project;
   tenantId: string;
+  tenantSlug: string;
+  projectSlug: string;
+  setupInstallationId?: number;
   canEdit: boolean;
 }) {
   const queryClient = useQueryClient();
+  const app = $api.useQuery("get", "/v1/github/app", {});
   const installations = $api.useQuery("get", "/v1/github/installations", {
     params: { query: { tenant_id: tenantId } },
   });
@@ -370,6 +402,20 @@ function GithubLink({
     project.github_installation_id ? String(project.github_installation_id) : "",
   );
   const [repo, setRepo] = useState(project.github_repo ?? "");
+  const [repoSearch, setRepoSearch] = useState("");
+  const claimedSetupId = useRef<number | undefined>(undefined);
+
+  const repositories = $api.useQuery(
+    "get",
+    "/v1/github/installations/{installation_id}/repositories",
+    {
+      params: {
+        path: { installation_id: Number(installationId || 0) },
+        query: { tenant_id: tenantId },
+      },
+    },
+    { enabled: installationId !== "" },
+  );
 
   useEffect(() => {
     setInstallationId(project.github_installation_id ? String(project.github_installation_id) : "");
@@ -386,6 +432,48 @@ function GithubLink({
     onError: (error) => toast.error(errorMessage(error, "Could not update GitHub link")),
   });
 
+  const claim = $api.useMutation("post", "/v1/github/installations/{installation_id}/claim", {
+    retry: (failureCount, error) => failureCount < 10 && errorMessage(error, "") === "not-found",
+    retryDelay: 1_000,
+    onSuccess: async (installation) => {
+      setInstallationId(String(installation.installation_id));
+      await queryClient.invalidateQueries({
+        queryKey: ["get", "/v1/github/installations"],
+      });
+      toast.success(`GitHub App installed for ${installation.account_login}`);
+    },
+    onError: (error) =>
+      toast.error(errorMessage(error, "Could not connect the GitHub installation")),
+  });
+
+  useEffect(() => {
+    if (!canEdit || !setupInstallationId || claimedSetupId.current === setupInstallationId) return;
+    claimedSetupId.current = setupInstallationId;
+    claim.mutate({
+      params: { path: { installation_id: setupInstallationId } },
+      body: { tenant_id: tenantId },
+    });
+  }, [canEdit, claim, setupInstallationId, tenantId]);
+
+  const normalizedSearch = repoSearch.trim().toLocaleLowerCase();
+  const filteredRepositories = repositories.data?.repositories.filter((repository) =>
+    repository.full_name.toLocaleLowerCase().includes(normalizedSearch),
+  );
+
+  let installHref: string | undefined;
+  if (app.data?.install_url) {
+    try {
+      const url = new URL(app.data.install_url);
+      url.searchParams.set(
+        "state",
+        `/t/${encodeURIComponent(tenantSlug)}/p/${encodeURIComponent(projectSlug)}?tab=settings`,
+      );
+      installHref = url.toString();
+    } catch {
+      installHref = undefined;
+    }
+  }
+
   function onSubmit(event: FormEvent) {
     event.preventDefault();
     update.mutate({
@@ -400,48 +488,107 @@ function GithubLink({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>GitHub</CardTitle>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <CardTitle>GitHub</CardTitle>
+          {installHref && canEdit ? (
+            <Button asChild variant="outline" size="sm">
+              <a href={installHref}>
+                Install GitHub App
+                <ExternalLinkIcon className="size-4" />
+              </a>
+            </Button>
+          ) : null}
+        </div>
         <CardDescription>
-          Pick a linked installation and the repository builds belong to; VRT then posts a commit
-          status for every build.
+          Install the App, choose an Organization or account, then select a repository. VRT posts a
+          commit status for every build.
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <form onSubmit={onSubmit} className="grid max-w-xl gap-4 sm:grid-cols-2">
+        <form onSubmit={onSubmit} className="grid max-w-xl gap-4">
+          {!app.isLoading && !installHref ? (
+            <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
+              The install link is not configured. Set GITHUB_APP_INSTALL_URL on the server.
+            </p>
+          ) : null}
+          {claim.isPending ? (
+            <p className="text-sm text-muted-foreground">Connecting the new GitHub installation…</p>
+          ) : null}
           <div className="space-y-2">
-            <Label htmlFor="gh-installation">Installation</Label>
+            <Label htmlFor="gh-installation">Organization / account</Label>
             <Select
               // Radix reserves the empty string, so "none" is the sentinel for
               // "no installation linked" and is mapped back to "" in state.
               value={installationId === "" ? NO_INSTALLATION : installationId}
               disabled={!canEdit}
-              onValueChange={(value) => setInstallationId(value === NO_INSTALLATION ? "" : value)}
+              onValueChange={(value) => {
+                const next = value === NO_INSTALLATION ? "" : value;
+                setInstallationId(next);
+                setRepo("");
+                setRepoSearch("");
+              }}
             >
               <SelectTrigger id="gh-installation" className="w-full">
-                <SelectValue placeholder="None" />
+                <SelectValue placeholder="Choose an Organization" />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value={NO_INSTALLATION}>None</SelectItem>
                 {installations.data?.installations.map((installation) => (
                   <SelectItem key={installation.id} value={String(installation.installation_id)}>
-                    {installation.account_login} (#{installation.installation_id})
+                    {installation.account_login}
+                    {installation.account_type === "Organization" ? " · Organization" : ""}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="gh-repo">Repository</Label>
-            <Input
-              id="gh-repo"
-              value={repo}
-              disabled={!canEdit}
-              placeholder="owner/repo"
-              onChange={(event) => setRepo(event.target.value)}
-            />
-          </div>
-          <div className="sm:col-span-2">
-            <Button type="submit" disabled={!canEdit || update.isPending}>
+          {installationId ? (
+            <div className="space-y-2">
+              <Label htmlFor="gh-repo-search">Repository</Label>
+              <div className="relative">
+                <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  id="gh-repo-search"
+                  value={repoSearch}
+                  disabled={!canEdit || repositories.isLoading}
+                  className="pl-9"
+                  placeholder="Search repositories…"
+                  onChange={(event) => setRepoSearch(event.target.value)}
+                />
+              </div>
+              <Select value={repo || undefined} disabled={!canEdit} onValueChange={setRepo}>
+                <SelectTrigger className="w-full">
+                  <SelectValue
+                    placeholder={
+                      repositories.isLoading ? "Loading repositories…" : "Choose a repository"
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {filteredRepositories?.map((repository) => (
+                    <SelectItem key={repository.id} value={repository.full_name}>
+                      {repository.full_name}
+                      {repository.private ? " · Private" : ""}
+                      {repository.archived ? " · Archived" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {!repositories.isLoading && filteredRepositories?.length === 0 ? (
+                <p className="text-xs text-muted-foreground">No matching repositories.</p>
+              ) : null}
+              {repositories.isError ? (
+                <p className="text-xs text-destructive">
+                  {errorMessage(repositories.error, "Could not load repositories")}
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          <div>
+            <Button
+              type="submit"
+              disabled={!canEdit || update.isPending || (!!installationId && !repo)}
+            >
               {update.isPending ? "Saving…" : "Save GitHub link"}
             </Button>
           </div>

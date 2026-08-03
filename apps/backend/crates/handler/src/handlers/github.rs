@@ -6,6 +6,8 @@
 //!   本文の解釈はワーカー側。CSRF ミドルウェアは Origin ヘッダが無いリクエストを
 //!   素通しするため、GitHub からの配信はそのまま通る。
 //! - `GET /v1/github/installations` — テナントが claim 済みの installation 一覧。
+//! - `GET /v1/github/app` — インストール導線の設定。
+//! - `GET /v1/github/installations/{id}/repositories` — 選択可能な repository 一覧。
 //! - `GET /v1/github/installations/unclaimed` — 未 claim の installation 一覧。
 //! - `POST /v1/github/installations/{installation_id}/claim` — テナントへの紐付け。
 //! - `PATCH /v1/projects/{project_id}/github` — プロジェクトとリポジトリの紐付け。
@@ -117,6 +119,34 @@ pub async fn github_webhook(
     Ok(StatusCode::ACCEPTED)
 }
 
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/app",
+    tag = "GitHub",
+    summary = "GitHub App の UI 設定",
+    description = "インストール画面と、GitHub App に設定すべき setup URL を返す。",
+    responses(
+        (status = 200, description = "GitHub App 設定", body = GithubAppResponse),
+        CrudErrors,
+    )
+)]
+pub async fn get_github_app(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> Result<Json<GithubAppResponse>, AppError> {
+    auth.require_session()?;
+    let setup_url = format!(
+        "{}/github/setup",
+        state.settings.app_url.trim_end_matches('/')
+    );
+    Ok(Json(GithubAppResponse {
+        enabled: state.settings.github_app_enabled(),
+        install_url: state.settings.github_app_install_url.clone(),
+        setup_url,
+    }))
+}
+
 // ── /v1/github/installations ────────────────────────────────────────────────
 
 #[axum::debug_handler]
@@ -145,6 +175,56 @@ pub async fn list_installations(
     Ok(Json(GithubInstallationListResponse {
         total: list.len() as u64,
         installations: list.into_iter().map(Into::into).collect(),
+    }))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    get,
+    path = "/installations/{installation_id}/repositories",
+    tag = "GitHub",
+    summary = "GitHub installation の repository 一覧",
+    description = "対象テナントに claim 済みの installation で参照できる repository を返す。",
+    params(
+        ("installation_id" = i64, Path, description = "GitHub の installation ID"),
+        InstallationListQuery,
+    ),
+    responses(
+        (status = 200, description = "repository 一覧", body = GithubRepositoryListResponse),
+        CrudErrors,
+    )
+)]
+pub async fn list_installation_repositories(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(installation_id): Path<i64>,
+    Query(query): Query<InstallationListQuery>,
+) -> Result<Json<GithubRepositoryListResponse>, AppError> {
+    auth.require_session()?;
+    tenant_service::require_role(&state.db, query.tenant_id, auth.user_id, TenantRole::Member)
+        .await?;
+
+    let installation = github_service::find_installation(&state.db, installation_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if installation.tenant_id != Some(query.tenant_id) {
+        return Err(AppError::Forbidden);
+    }
+
+    let repositories = github_service::list_installation_repositories(
+        &state.redis_client,
+        &state.http,
+        &state.settings,
+        installation_id,
+    )
+    .await
+    .map_err(|error| match error {
+        github_service::GithubApiError::Permanent(message) => AppError::BadRequestDetail(message),
+        github_service::GithubApiError::Transient(error) => AppError::Internal(error),
+    })?;
+    Ok(Json(GithubRepositoryListResponse {
+        total: repositories.len() as u64,
+        repositories,
     }))
 }
 

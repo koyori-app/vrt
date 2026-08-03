@@ -52,6 +52,9 @@ pub fn register_schemas(openapi: &mut OpenApi) {
     register_schema::<payload::comparisons::ReviewComparisonRequest>(components);
     register_schema::<payload::github::GithubInstallationResponse>(components);
     register_schema::<payload::github::GithubInstallationListResponse>(components);
+    register_schema::<payload::github::GithubAppResponse>(components);
+    register_schema::<payload::github::GithubRepositoryResponse>(components);
+    register_schema::<payload::github::GithubRepositoryListResponse>(components);
     register_schema::<payload::github::ClaimInstallationRequest>(components);
     register_schema::<payload::github::UpdateProjectGithubRequest>(components);
     register_security_schemes(components);

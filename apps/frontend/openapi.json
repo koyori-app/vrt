@@ -2553,6 +2553,108 @@
         }
       }
     },
+    "/v1/github/app": {
+      "get": {
+        "tags": [
+          "GitHub"
+        ],
+        "summary": "GitHub App の UI 設定",
+        "description": "インストール画面と、GitHub App に設定すべき setup URL を返す。",
+        "operationId": "get_github_app",
+        "responses": {
+          "200": {
+            "description": "GitHub App 設定",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAppResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/github/installations": {
       "get": {
         "tags": [
@@ -2876,6 +2978,130 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/github/installations/{installation_id}/repositories": {
+      "get": {
+        "tags": [
+          "GitHub"
+        ],
+        "summary": "GitHub installation の repository 一覧",
+        "description": "対象テナントに claim 済みの installation で参照できる repository を返す。",
+        "operationId": "list_installation_repositories",
+        "parameters": [
+          {
+            "name": "installation_id",
+            "in": "path",
+            "description": "GitHub の installation ID",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "description": "対象テナント。メンバーであることが必要。",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "repository 一覧",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubRepositoryListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
                 }
               }
             }
@@ -6090,6 +6316,32 @@
           }
         }
       },
+      "GithubAppResponse": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "setup_url"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "App の資格情報が設定済みか。"
+          },
+          "install_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "GitHub のインストール画面。未設定なら `null`。",
+            "example": "https://github.com/apps/vrt/installations/new"
+          },
+          "setup_url": {
+            "type": "string",
+            "description": "GitHub App に設定すべき setup URL。",
+            "example": "https://vrt.example.com/github/setup"
+          }
+        }
+      },
       "GithubInstallationListResponse": {
         "type": "object",
         "required": [
@@ -6152,6 +6404,58 @@
             ],
             "format": "uuid",
             "description": "claim 済みのテナント。未 claim なら `null`。"
+          }
+        }
+      },
+      "GithubRepositoryListResponse": {
+        "type": "object",
+        "required": [
+          "repositories",
+          "total"
+        ],
+        "properties": {
+          "repositories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GithubRepositoryResponse"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "GithubRepositoryResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "full_name",
+          "private",
+          "archived",
+          "html_url"
+        ],
+        "properties": {
+          "archived": {
+            "type": "boolean"
+          },
+          "full_name": {
+            "type": "string"
+          },
+          "html_url": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "private": {
+            "type": "boolean"
           }
         }
       },

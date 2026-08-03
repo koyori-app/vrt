@@ -45,6 +45,9 @@ pub struct Settings {
     pub github_app_id: Option<u64>,
     /// GitHub App の秘密鍵（PEM。`\n` エスケープ可）。
     pub github_app_private_key_pem: Option<String>,
+    /// GitHub App のインストール画面 URL。
+    /// 例: `https://github.com/apps/my-vrt-app/installations/new`。
+    pub github_app_install_url: Option<String>,
     /// GitHub Webhook の署名検証シークレット。
     pub github_webhook_secret: Option<String>,
     /// GitHub API のベース URL。GitHub Enterprise と統合テスト（wiremock）用の差し替え口。
@@ -220,6 +223,7 @@ mod tests {
             gitlab_instance_url: None,
             github_app_id: None,
             github_app_private_key_pem: None,
+            github_app_install_url: None,
             github_webhook_secret: None,
             github_api_base_url: None,
             storage_backend: default_storage_backend(),

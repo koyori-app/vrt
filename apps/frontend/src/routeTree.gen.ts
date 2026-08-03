@@ -13,6 +13,7 @@ import { Route as AuthedRouteImport } from './routes/_authed'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AuthedIndexRouteImport } from './routes/_authed/index'
 import { Route as ApiSplatRouteImport } from './routes/api.$'
+import { Route as AuthedGithubSetupRouteImport } from './routes/_authed/github.setup'
 import { Route as AuthedSettingsTokensRouteImport } from './routes/_authed/settings.tokens'
 import { Route as AuthedTTenantSlugIndexRouteImport } from './routes/_authed/t.$tenantSlug.index'
 import { Route as AuthedTTenantSlugSettingsRouteImport } from './routes/_authed/t.$tenantSlug.settings'
@@ -37,6 +38,11 @@ const ApiSplatRoute = ApiSplatRouteImport.update({
   id: '/api/$',
   path: '/api/$',
   getParentRoute: () => rootRouteImport,
+} as any)
+const AuthedGithubSetupRoute = AuthedGithubSetupRouteImport.update({
+  id: '/github/setup',
+  path: '/github/setup',
+  getParentRoute: () => AuthedRoute,
 } as any)
 const AuthedSettingsTokensRoute = AuthedSettingsTokensRouteImport.update({
   id: '/settings/tokens',
@@ -71,6 +77,7 @@ export interface FileRoutesByFullPath {
   '/': typeof AuthedIndexRoute
   '/login': typeof LoginRoute
   '/api/$': typeof ApiSplatRoute
+  '/github/setup': typeof AuthedGithubSetupRoute
   '/settings/tokens': typeof AuthedSettingsTokensRoute
   '/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/t/$tenantSlug/': typeof AuthedTTenantSlugIndexRoute
@@ -81,6 +88,7 @@ export interface FileRoutesByTo {
   '/login': typeof LoginRoute
   '/api/$': typeof ApiSplatRoute
   '/': typeof AuthedIndexRoute
+  '/github/setup': typeof AuthedGithubSetupRoute
   '/settings/tokens': typeof AuthedSettingsTokensRoute
   '/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/t/$tenantSlug': typeof AuthedTTenantSlugIndexRoute
@@ -93,6 +101,7 @@ export interface FileRoutesById {
   '/login': typeof LoginRoute
   '/api/$': typeof ApiSplatRoute
   '/_authed/': typeof AuthedIndexRoute
+  '/_authed/github/setup': typeof AuthedGithubSetupRoute
   '/_authed/settings/tokens': typeof AuthedSettingsTokensRoute
   '/_authed/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/_authed/t/$tenantSlug/': typeof AuthedTTenantSlugIndexRoute
@@ -105,6 +114,7 @@ export interface FileRouteTypes {
     | '/'
     | '/login'
     | '/api/$'
+    | '/github/setup'
     | '/settings/tokens'
     | '/t/$tenantSlug/settings'
     | '/t/$tenantSlug/'
@@ -115,6 +125,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/api/$'
     | '/'
+    | '/github/setup'
     | '/settings/tokens'
     | '/t/$tenantSlug/settings'
     | '/t/$tenantSlug'
@@ -126,6 +137,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/api/$'
     | '/_authed/'
+    | '/_authed/github/setup'
     | '/_authed/settings/tokens'
     | '/_authed/t/$tenantSlug/settings'
     | '/_authed/t/$tenantSlug/'
@@ -169,6 +181,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiSplatRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/_authed/github/setup': {
+      id: '/_authed/github/setup'
+      path: '/github/setup'
+      fullPath: '/github/setup'
+      preLoaderRoute: typeof AuthedGithubSetupRouteImport
+      parentRoute: typeof AuthedRoute
+    }
     '/_authed/settings/tokens': {
       id: '/_authed/settings/tokens'
       path: '/settings/tokens'
@@ -209,6 +228,7 @@ declare module '@tanstack/react-router' {
 
 interface AuthedRouteChildren {
   AuthedIndexRoute: typeof AuthedIndexRoute
+  AuthedGithubSetupRoute: typeof AuthedGithubSetupRoute
   AuthedSettingsTokensRoute: typeof AuthedSettingsTokensRoute
   AuthedTTenantSlugSettingsRoute: typeof AuthedTTenantSlugSettingsRoute
   AuthedTTenantSlugIndexRoute: typeof AuthedTTenantSlugIndexRoute
@@ -218,6 +238,7 @@ interface AuthedRouteChildren {
 
 const AuthedRouteChildren: AuthedRouteChildren = {
   AuthedIndexRoute: AuthedIndexRoute,
+  AuthedGithubSetupRoute: AuthedGithubSetupRoute,
   AuthedSettingsTokensRoute: AuthedSettingsTokensRoute,
   AuthedTTenantSlugSettingsRoute: AuthedTTenantSlugSettingsRoute,
   AuthedTTenantSlugIndexRoute: AuthedTTenantSlugIndexRoute,

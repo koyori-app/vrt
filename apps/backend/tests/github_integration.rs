@@ -23,6 +23,7 @@ use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wiremock::{Mock, ResponseTemplate, matchers::method, matchers::path};
 
 /// ワーカー（webhook / status / compare）の処理待ちタイムアウト。
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -396,6 +397,72 @@ async fn claim_flow_enforces_roles_and_single_tenant_ownership() {
         res.status(),
         StatusCode::CONFLICT,
         "installation already claimed by another tenant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claimed_installation_lists_accessible_repositories() {
+    let app = TestApp::new_with_github().await;
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let github = app.github.as_ref().expect("mock github");
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 2,
+            "repositories": [
+                {
+                    "id": 2,
+                    "name": "website",
+                    "full_name": "acme-inc/website",
+                    "private": true,
+                    "archived": false,
+                    "html_url": "https://github.com/acme-inc/website"
+                },
+                {
+                    "id": 1,
+                    "name": "design-system",
+                    "full_name": "acme-inc/design-system",
+                    "private": false,
+                    "archived": false,
+                    "html_url": "https://github.com/acme-inc/design-system"
+                }
+            ]
+        })))
+        .mount(&github.server)
+        .await;
+
+    let res = app
+        .get(&format!(
+            "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+            project.tenant_id
+        ))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = res.json().await.expect("repositories json");
+    assert_eq!(body["total"].as_u64(), Some(2));
+    assert_eq!(
+        body["repositories"][0]["full_name"].as_str(),
+        Some("acme-inc/design-system"),
+        "repositories are sorted for the selector"
     );
 }
 

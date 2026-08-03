@@ -8,6 +8,18 @@ use utoipa::{IntoParams, ToSchema};
 use entity::github_installations;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubAppResponse {
+    /// App の資格情報が設定済みか。
+    pub enabled: bool,
+    /// GitHub のインストール画面。未設定なら `null`。
+    #[schema(nullable, example = "https://github.com/apps/vrt/installations/new")]
+    pub install_url: Option<String>,
+    /// GitHub App に設定すべき setup URL。
+    #[schema(example = "https://vrt.example.com/github/setup")]
+    pub setup_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GithubInstallationResponse {
     #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
@@ -42,6 +54,22 @@ impl From<github_installations::Model> for GithubInstallationResponse {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GithubInstallationListResponse {
     pub installations: Vec<GithubInstallationResponse>,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct GithubRepositoryResponse {
+    pub id: i64,
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub archived: bool,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubRepositoryListResponse {
+    pub repositories: Vec<GithubRepositoryResponse>,
     pub total: u64,
 }
 

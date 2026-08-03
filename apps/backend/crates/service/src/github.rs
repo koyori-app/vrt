@@ -24,6 +24,7 @@ use common::cache::redis::RedisConnection;
 use common::settings::Settings;
 use entity::builds;
 use forge_github::{GithubApp, GithubAppCredentials};
+use payload::github::GithubRepositoryResponse;
 
 /// コミットステータスの `context`（GitHub の PR チェック一覧に出る名前）。
 pub const STATUS_CONTEXT: &str = "vrt";
@@ -195,6 +196,81 @@ async fn cache_set(
         .exec_async(&mut conn)
         .await
         .map_err(|e| anyhow::anyhow!("redis SET failed: {e}"))
+}
+
+#[derive(serde::Deserialize)]
+struct InstallationRepositoriesPage {
+    total_count: u64,
+    repositories: Vec<GithubRepositoryResponse>,
+}
+
+/// Installation token で参照できるリポジトリを全ページ取得する。
+///
+/// GitHub API は 1 ページ最大 100 件なので、Organization 選択後の検索を UI 側で
+/// 完結できるよう、空ページまたは `total_count` 到達までページングする。
+pub async fn list_installation_repositories(
+    redis: &RedisConnection,
+    http: &reqwest::Client,
+    settings: &Settings,
+    installation_id: i64,
+) -> Result<Vec<GithubRepositoryResponse>, GithubApiError> {
+    let app = github_app(settings, http)
+        .ok_or_else(|| GithubApiError::Permanent("github app is not configured".to_string()))?;
+    let token = installation_token(redis, &app, installation_id).await?;
+    let mut repositories = Vec::new();
+
+    for page in 1..=100_u32 {
+        let url = format!(
+            "{}/installation/repositories?per_page=100&page={page}",
+            settings.github_api_base_url()
+        );
+        let response = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| {
+                GithubApiError::Transient(anyhow::anyhow!("list installation repositories: {e}"))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(500)
+                .collect();
+            if status.is_client_error() {
+                return Err(GithubApiError::Permanent(format!(
+                    "list installation repositories failed: {status} {body}"
+                )));
+            }
+            return Err(GithubApiError::Transient(anyhow::anyhow!(
+                "list installation repositories failed: {status} {body}"
+            )));
+        }
+
+        let body: InstallationRepositoriesPage = response.json().await.map_err(|e| {
+            GithubApiError::Transient(anyhow::anyhow!("decode installation repositories: {e}"))
+        })?;
+        let page_len = body.repositories.len();
+        repositories.extend(body.repositories);
+        if page_len == 0 || repositories.len() as u64 >= body.total_count {
+            break;
+        }
+    }
+
+    repositories.sort_unstable_by(|left, right| {
+        left.full_name
+            .to_ascii_lowercase()
+            .cmp(&right.full_name.to_ascii_lowercase())
+    });
+    Ok(repositories)
 }
 
 /// `owner/name` 形式のリポジトリ指定を検証する。
@@ -562,6 +638,7 @@ mod tests {
             gitlab_instance_url: None,
             github_app_id: None,
             github_app_private_key_pem: None,
+            github_app_install_url: None,
             github_webhook_secret: None,
             github_api_base_url: None,
             storage_backend: "local".into(),
@@ -604,6 +681,7 @@ mod tests {
             gitlab_instance_url: None,
             github_app_id: None,
             github_app_private_key_pem: None,
+            github_app_install_url: None,
             github_webhook_secret: None,
             github_api_base_url: None,
             storage_backend: "local".into(),
