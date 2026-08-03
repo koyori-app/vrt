@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
+use vrt_cli::test_support::{git_in, git_output, init_test_repo};
 
 fn vrt() -> Command {
     Command::new(env!("CARGO_BIN_EXE_vrt"))
@@ -22,43 +23,11 @@ fn graph_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph")
 }
 
-fn git_in(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .status()
-        .expect("spawn git");
-    assert!(
-        status.success(),
-        "`git {}` failed in {}",
-        args.join(" "),
-        dir.display()
-    );
-}
-
-fn git_output(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .expect("spawn git");
-    assert!(
-        output.status.success(),
-        "`git {}` failed in {}",
-        args.join(" "),
-        dir.display()
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
 /// 3 段の線形履歴を持つ一時 git リポジトリ。
 fn init_linear_repo() -> (TempDir, String, String, String) {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
-    git_in(root, &["init", "-b", "main"]);
-    git_in(root, &["config", "commit.gpgsign", "false"]);
-    git_in(root, &["config", "user.email", "vrt@test.local"]);
-    git_in(root, &["config", "user.name", "vrt test"]);
+    init_test_repo(root);
 
     fs::write(root.join("README.md"), "base\n").expect("write README");
     git_in(root, &["add", "README.md"]);
@@ -83,10 +52,7 @@ fn init_linear_repo() -> (TempDir, String, String, String) {
 fn init_story_diff_repo() -> (TempDir, String, String) {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path();
-    git_in(root, &["init", "-b", "main"]);
-    git_in(root, &["config", "commit.gpgsign", "false"]);
-    git_in(root, &["config", "user.email", "vrt@test.local"]);
-    git_in(root, &["config", "user.name", "vrt test"]);
+    init_test_repo(root);
 
     let a_path = root.join("apps/frontend/src/A.tsx");
     let b_path = root.join("apps/frontend/src/B.tsx");

@@ -873,6 +873,7 @@ fn exit_code_for(status: &str) -> u8 {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use vrt_cli::test_support::{git_in, git_output, init_test_repo};
 
     static REPO_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1015,44 +1016,13 @@ mod tests {
         }
     }
 
-    fn git_in(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("spawn git");
-        assert!(
-            status.success(),
-            "`git {}` failed in {}",
-            args.join(" "),
-            dir.display()
-        );
-    }
-
-    fn git_output(dir: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        assert!(
-            output.status.success(),
-            "`git {}` failed in {}",
-            args.join(" "),
-            dir.display()
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
-
     /// upload の only-changed 用。c2 で A.tsx、c3 で B.tsx を変更する 3 段履歴。
     fn init_story_diff_repo() -> (tempfile::TempDir, String, String, String, PathBuf) {
         use std::fs;
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let root = tmp.path();
-        git_in(root, &["init", "-b", "main"]);
-        git_in(root, &["config", "user.email", "vrt@test.local"]);
-        git_in(root, &["config", "user.name", "vrt test"]);
+        init_test_repo(root);
 
         let a_path = root.join("apps/frontend/src/A.tsx");
         let b_path = root.join("apps/frontend/src/B.tsx");

@@ -6179,6 +6179,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "vrt-cli",
  "zip",
 ]
 
