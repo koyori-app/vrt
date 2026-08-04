@@ -12,13 +12,6 @@ fn vrt() -> Command {
     Command::new(env!("CARGO_BIN_EXE_vrt"))
 }
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../..")
-        .canonicalize()
-        .expect("repo root")
-}
-
 fn graph_fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/plan/graph")
 }
@@ -71,30 +64,18 @@ fn init_story_diff_repo() -> (TempDir, String, String) {
     (tmp, c1, c2)
 }
 
-fn git_rev_parse(repo: &Path, rev: &str) -> String {
-    git_rev_parse_opt(repo, rev).unwrap_or_else(|| panic!("git rev-parse {rev} failed"))
-}
-
-fn git_rev_parse_opt(repo: &Path, rev: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn is_full_oid(sha: &str) -> bool {
     sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+// この 2 テスト（credentials 無し / baseline 不在）は開発リポジトリの HEAD に
+// 依存させず、一時リポジトリで自己完結させる。`git archive` で展開した
+// .git 無しの配布ソースでも通ることを保証するため（検証手順は
+// リポジトリ README「配布ソース（.git 無し）での検証」を参照）。
 #[test]
 fn plan_without_credentials_exits_2() {
-    let repo = repo_root();
-    let head = git_rev_parse(&repo, "HEAD");
+    let (tmp, _c1, _c2, head) = init_linear_repo();
+    let repo = tmp.path().to_path_buf();
     let output = vrt()
         .args([
             "plan",
@@ -166,8 +147,8 @@ fn plan_with_baseline_commit_writes_json_to_stdout() {
 
 #[test]
 fn plan_with_missing_baseline_commit_exits_2() {
-    let repo = repo_root();
-    let head = git_rev_parse(&repo, "HEAD");
+    let (tmp, _c1, _c2, head) = init_linear_repo();
+    let repo = tmp.path().to_path_buf();
     let output = vrt()
         .args([
             "plan",

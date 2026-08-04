@@ -63,6 +63,23 @@ cargo fmt --all
 
 Linux では `.cargo/config.toml` が mold リンカを要求するので `mold` を入れておく。
 
+#### 配布ソース（`.git` 無し）での検証
+
+`vrt-cli` のテストは、`.git` の無い配布ソース（`git archive` の展開結果）でも
+自己完結で通ることを保証する。CI は git checkout（`.git` あり）で走るため、
+この性質は CI の緑だけでは確認できない。確認は archive 展開下での実測で行う。
+
+```bash
+tmp=$(mktemp -d)
+git archive HEAD | tar -x -C "$tmp"
+cd "$tmp/apps/backend"
+cargo test -p vrt-cli
+```
+
+テストを追加するときは、開発リポジトリの HEAD や `.git` のメタデータに
+依存させず、`vrt_cli::test_support::init_test_repo` の一時リポジトリで
+自己完結させること。
+
 storybook モード（サーバーサイドレンダリング）を動かすには Chromium が要る。
 `CHROMIUM_PATH` に実行ファイルのパスを渡す（未設定なら storybook モードだけが
 無効になり、起動時に warn が出る）。`cargo test` のレンダリング系テストは
