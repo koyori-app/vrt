@@ -2877,7 +2877,7 @@
           "GitHub"
         ],
         "summary": "installation をテナントに紐付ける",
-        "description": "対象テナントの admin 以上が必要。`state` は `POST /v1/github/setup/state` で 発行した one-time state で、発行者・テナントが一致し未使用かつ期限内で なければならない（罠 URL 経由の claim を防ぐ）。既に同じテナントが claim 済みなら冪等に成功する。",
+        "description": "対象テナントの admin 以上が必要。`state` は `POST /v1/github/setup/state` で 発行した one-time state で、発行者・テナントが一致し未使用かつ期限内で なければならない（罠 URL 経由の claim を防ぐ）。state は最初に使われた installation に予約され、別の installation には使えない。既に同じ テナントが claim 済みなら冪等に成功する。",
         "operationId": "claim_installation",
         "parameters": [
           {

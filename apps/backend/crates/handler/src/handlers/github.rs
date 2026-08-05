@@ -265,8 +265,9 @@ pub async fn list_unclaimed_installations(
     summary = "installation をテナントに紐付ける",
     description = "対象テナントの admin 以上が必要。`state` は `POST /v1/github/setup/state` で \
                    発行した one-time state で、発行者・テナントが一致し未使用かつ期限内で \
-                   なければならない（罠 URL 経由の claim を防ぐ）。既に同じテナントが \
-                   claim 済みなら冪等に成功する。",
+                   なければならない（罠 URL 経由の claim を防ぐ）。state は最初に使われた \
+                   installation に予約され、別の installation には使えない。既に同じ \
+                   テナントが claim 済みなら冪等に成功する。",
     params(("installation_id" = i64, Path, description = "GitHub の installation ID")),
     request_body = ClaimInstallationRequest,
     responses(
@@ -290,20 +291,43 @@ pub async fn claim_installation(
     )
     .await?;
 
-    // 発行者とテナントが一致する state が無い限り claim しない。
-    // ここでは消費せず、claim が成功してから削除する（webhook 到着待ちのリトライを許すため）。
-    let setup_state = github_service::peek_setup_state(&state.redis_client, &payload.state)
-        .await?
-        .ok_or_else(|| {
-            AppError::BadRequestDetail("invalid or expired github setup state".into())
-        })?;
+    // state を「この installation 専用」として原子的に予約する。並行リクエストが
+    // 同じ state で別々の installation を claim することはできない。
+    // 予約はここで消さず、claim 成功後に消費する（webhook 到着待ちのリトライを許すため）。
+    let setup_state = match github_service::reserve_setup_state(
+        &state.redis_client,
+        &payload.state,
+        installation_id,
+    )
+    .await?
+    {
+        github_service::SetupStateReservation::Reserved(setup_state) => setup_state,
+        github_service::SetupStateReservation::HeldByAnotherInstallation => {
+            return Err(AppError::Forbidden);
+        }
+        github_service::SetupStateReservation::Unknown => {
+            return Err(AppError::BadRequestDetail(
+                "invalid or expired github setup state".into(),
+            ));
+        }
+    };
     if setup_state.user_id != auth.user_id || setup_state.tenant_id != payload.tenant_id {
         return Err(AppError::Forbidden);
     }
 
     let claimed =
         github_service::claim_installation(&state.db, installation_id, payload.tenant_id).await?;
-    github_service::consume_setup_state(&state.redis_client, &payload.state).await?;
+    if github_service::consume_setup_state(&state.redis_client, &payload.state)
+        .await?
+        .is_none()
+    {
+        // 予約済みなので別 installation には使われていない。claim 自体は成功しているため
+        // エラーにはせず、想定外（TTL 切れなど）として記録だけ残す。
+        tracing::warn!(
+            installation_id,
+            "github setup state vanished before consume"
+        );
+    }
     Ok(Json(claimed.into()))
 }
 

@@ -253,6 +253,19 @@ async fn cache_getdel(redis: &RedisConnection, key: &str) -> Result<Option<Strin
         .map_err(|e| anyhow::anyhow!("redis GETDEL failed: {e}"))
 }
 
+async fn cache_del(redis: &RedisConnection, key: &str) -> Result<(), anyhow::Error> {
+    let mut conn = redis
+        .conn
+        .acquire()
+        .await
+        .map_err(|e| anyhow::anyhow!("redis acquire failed: {e}"))?;
+    redis::cmd("DEL")
+        .arg(key)
+        .exec_async(&mut conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("redis DEL failed: {e}"))
+}
+
 // ── GitHub App インストール導線の one-time state ────────────────────────────
 //
 // GitHub の setup URL には任意の `installation_id` と `state` を付けて他人に踏ませられる。
@@ -291,30 +304,82 @@ pub async fn issue_setup_state(
     Ok(state)
 }
 
-/// setup state を読む。存在しない / 期限切れ / 消費済みなら `None`。
+const SETUP_STATE_HOLDER_PREFIX: &str = "github:setup_state_holder:";
+
+/// [`reserve_setup_state`] の結果。
+#[derive(Debug)]
+pub enum SetupStateReservation {
+    /// この installation 用に予約できた（初回、または同じ installation の再試行）。
+    Reserved(SetupState),
+    /// 存在しない / 期限切れ / 消費済み。
+    Unknown,
+    /// 別の installation に予約済み。並行リクエストによる使い回しを弾いた。
+    HeldByAnotherInstallation,
+}
+
+/// state を **1 つの installation に原子的に予約** してから読む。
 ///
-/// ここでは削除しない。webhook の到着待ちで claim が数回リトライされるため、
-/// 削除は claim が成功した時点（[`consume_setup_state`]）に行う。
-pub async fn peek_setup_state(
+/// GET → claim → GETDEL と分けると、予約前の state を並行リクエストが 2 本とも
+/// 読めてしまい、別々の installation を claim できる。予約と読み取りを 1 つの
+/// Lua スクリプトにまとめることで、最初に来た installation だけが使えるようにする。
+///
+/// 予約はここで消さない。webhook 到着待ちで claim は数回リトライされるため、
+/// **同じ installation なら再利用でき**、削除は claim 成功時（[`consume_setup_state`]）に行う。
+const RESERVE_SETUP_STATE_SCRIPT: &str = r#"
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  return {0, ''}
+end
+local holder = redis.call('GET', KEYS[2])
+if holder and holder ~= ARGV[1] then
+  return {2, ''}
+end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
+return {1, raw}
+"#;
+
+pub async fn reserve_setup_state(
     redis: &RedisConnection,
     state: &str,
-) -> Result<Option<SetupState>, AppError> {
-    let raw = cache_get(redis, &format!("{SETUP_STATE_PREFIX}{state}"))
+    installation_id: i64,
+) -> Result<SetupStateReservation, AppError> {
+    let mut conn = redis
+        .conn
+        .acquire()
         .await
-        .map_err(AppError::Internal)?;
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    // 壊れた値は「無効な state」と同じ扱いにする（発行形式を変えた直後など）。
-    Ok(serde_json::from_str(&raw).ok())
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("redis acquire failed: {e}")))?;
+
+    let (outcome, raw): (i64, String) = redis::Script::new(RESERVE_SETUP_STATE_SCRIPT)
+        .key(format!("{SETUP_STATE_PREFIX}{state}"))
+        .key(format!("{SETUP_STATE_HOLDER_PREFIX}{state}"))
+        .arg(installation_id)
+        .arg(SETUP_STATE_TTL_SECS)
+        .invoke_async(&mut *conn)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("reserve setup state failed: {e}")))?;
+
+    match outcome {
+        1 => match serde_json::from_str(&raw) {
+            // 壊れた値は「無効な state」と同じ扱いにする（発行形式を変えた直後など）。
+            Ok(parsed) => Ok(SetupStateReservation::Reserved(parsed)),
+            Err(_) => Ok(SetupStateReservation::Unknown),
+        },
+        2 => Ok(SetupStateReservation::HeldByAnotherInstallation),
+        _ => Ok(SetupStateReservation::Unknown),
+    }
 }
 
 /// setup state を消費する（取得と削除は原子的）。claim 成功後に呼ぶ。
+///
+/// 既に消えていれば `None`。予約キーも一緒に落として、TTL 分の残骸を残さない。
 pub async fn consume_setup_state(
     redis: &RedisConnection,
     state: &str,
 ) -> Result<Option<SetupState>, AppError> {
     let raw = cache_getdel(redis, &format!("{SETUP_STATE_PREFIX}{state}"))
+        .await
+        .map_err(AppError::Internal)?;
+    cache_del(redis, &format!("{SETUP_STATE_HOLDER_PREFIX}{state}"))
         .await
         .map_err(AppError::Internal)?;
     let Some(raw) = raw else {

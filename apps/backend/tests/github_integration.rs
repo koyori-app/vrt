@@ -720,6 +720,81 @@ async fn repository_list_keeps_plain_forbidden_permanent() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
+/// state は最初に使われた installation に予約され、別の installation には使えない。
+///
+/// 検証と消費が分かれていると、並行リクエストが予約前の state を 2 本とも読んで
+/// 別々の installation を claim できてしまう。予約は claim の成否に関わらず
+/// 最初の 1 回で確定するので、claim が失敗する installation で予約してから確かめる。
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_state_is_bound_to_the_first_installation() {
+    let app = TestApp::new_with_github().await;
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+
+    // DB に存在しない installation。claim は 404 になるが、state はここに予約される。
+    let absent_installation_id = unique_installation_id();
+    let state = issue_setup_state(&app, &project.tenant_id).await;
+
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{absent_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "claim fails, but the state is now reserved"
+    );
+
+    // 同じ installation での再試行は許す（webhook 到着待ちのリトライ経路）。
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{absent_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "retrying the same installation must not be rejected as a state conflict"
+    );
+
+    // 実在する別の installation を用意する。
+    let other_installation_id = unique_installation_id();
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", other_installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(other_installation_id, POLL_TIMEOUT)
+        .await;
+
+    // 予約済みの state は、別の installation には使えない。
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{other_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a state held by another installation must not claim"
+    );
+
+    // 新しく発行した state なら通る。
+    let fresh_state = issue_setup_state(&app, &project.tenant_id).await;
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{other_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": fresh_state }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "a fresh state claims");
+}
+
 /// claim は「発行者・テナントが一致する、未使用かつ期限内の state」でしか通らない。
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_rejects_tampered_foreign_and_reused_setup_state() {
