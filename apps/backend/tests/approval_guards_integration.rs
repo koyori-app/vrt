@@ -1000,3 +1000,107 @@ async fn existing_build_with_pre_migration_screenshot_can_be_approved_directly()
     assert_eq!(entry.content_hash.as_deref(), Some(actual_hash.as_str()));
     assert_eq!(entry.verified_content_hash, entry.content_hash);
 }
+
+// capture plan の添付は「添付時点の最新 baseline」を固定する契約を持つ。
+// 添付経路が build 行しかロックしないと、baseline を検証してから固定するまでの
+// 間に、別 build の承認（project 行をロックして新 baseline を作る）が割り込んで
+// baseline を進められる。すると添付は 409 を返さず古い baseline を固定してしまう。
+// 添付経路も承認経路と同じ build -> project の順で project 行をロックすることで、
+// この競合が直列化されることを検証する。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_approval_blocks_stale_capture_plan_pin() {
+    let fx = setup().await;
+
+    // 起点 baseline B0（source = sha-a、エントリ home/about）。
+    let first = fx
+        .run_build("sha-a", &[("home", RED), ("about", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve baseline build");
+
+    // baseline を進める承認対象 D（home が変わっている）。事前にレビューを済ませ、
+    // 承認そのものだけをレースにかける。
+    let mover = fx
+        .run_build("sha-d", &[("home", BLUE), ("about", RED)])
+        .await;
+    let mover_id = build_id_of(&mover);
+    assert_eq!(mover["status"], "changes_detected");
+    fx.review(mover_id, "home", "approve").await;
+
+    // capture plan を添付する対象 C。撮影前・アップロード前の pending。
+    let plan_build = fx.create_build("main", "sha-c", &[]).await;
+
+    // 承認の UPDATE builds（status = approved）を trigger で止め、承認 txn に
+    // project 行ロックを保持させたまま添付を競合させる。
+    let condition = format!(
+        "NEW.status::text = 'approved' AND NEW.project_id = '{}'",
+        fx.project_id
+    );
+    let (barrier, lock_key) = install_update_barrier(&fx, "builds", &condition).await;
+
+    let approve_client = fx.app.client().clone();
+    let approve_url = format!("{}/v1/builds/{mover_id}/approve", fx.app.base_url());
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("approve mover build")
+    });
+    // 承認が UPDATE builds に到達し、project 行ロックを握ったまま barrier で待つ。
+    wait_for_advisory_waiter(&fx, lock_key).await;
+
+    // 添付は承認と同じ project 行ロックを待つはずなので、この時点では完了しない。
+    let attach_client = fx.app.client().clone();
+    let attach_url = format!("{}/v1/ci/builds/{plan_build}/plan", fx.app.base_url());
+    let attach_token = fx.token.clone();
+    let attach_task = tokio::spawn(async move {
+        attach_client
+            .post(attach_url)
+            .bearer_auth(attach_token)
+            .json(&json!({
+                "selected_names": ["home"],
+                "manifest_names": ["about", "home"],
+                "baseline_commit_sha": "sha-a",
+            }))
+            .send()
+            .await
+            .expect("attach capture plan")
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !attach_task.is_finished(),
+        "capture plan attachment must wait behind an in-flight approval that moves the baseline"
+    );
+
+    // barrier を解放して承認をコミットさせる（baseline が B0 → B1(sha-d) に進む）。
+    barrier.commit().await.expect("release barrier");
+    let approved = approve_task.await.expect("approve task");
+    assert_eq!(approved.status(), StatusCode::OK, "approval succeeds");
+
+    // 添付は承認後に project ロックを取り、進んだ baseline を読むので、
+    // 計画の起点（sha-a）とずれて 409 になる。古い baseline を黙って固定しない。
+    let attached = attach_task.await.expect("attach task");
+    assert_eq!(
+        attached.status(),
+        StatusCode::CONFLICT,
+        "attachment must reject once the baseline moved instead of pinning the stale one"
+    );
+    let message = error_message(attached).await;
+    assert!(
+        message.contains("baseline moved"),
+        "unexpected conflict message: {message}"
+    );
+
+    // 計画は固定されていない（baseline_id が残っていない）。
+    let build = service::builds::get_build(&fx.app.state.db, plan_build)
+        .await
+        .expect("load plan build");
+    assert!(
+        build.baseline_id.is_none(),
+        "no baseline must be pinned when the attachment is rejected"
+    );
+}
