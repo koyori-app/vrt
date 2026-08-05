@@ -22,10 +22,20 @@ clap = { version = "4.5", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 成果物（stats / index）の内容を provenance に束縛するためのハッシュ。
+sha2 = { workspace = true }
 tokio = { version = "1.52.1", features = ["rt-multi-thread", "macros", "fs", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { workspace = true }
 
+[features]
+# テスト専用 test_support（host の Git 設定から独立した一時リポジトリ初期化）を公開する。
+# 通常ビルドでは無効。下の self dev-dependency がテストビルドでのみ有効化する。
+test-support = []
+
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = { workspace = true }
+# bin の unit test と tests/ から `vrt_cli::test_support` を使うための self dev-dependency。
+vrt-cli = { path = ".", features = ["test-support"] }

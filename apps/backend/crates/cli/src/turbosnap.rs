@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// 変更が波及したストーリーだけを撮るか、全部撮り直すかの判断結果。
@@ -93,23 +94,48 @@ pub struct StoryEntry {
 
 /// index.json の JSON からストーリー一覧を取り出す。
 ///
-/// `type == "story"`（または `type` 欠落）かつ `importPath` を持つものだけ。
-pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>, serde_json::Error> {
-    let index: StorybookIndex = serde_json::from_str(json)?;
-    let entries = index.entries.or(index.stories).unwrap_or_default();
+/// `type == "story"`（または `type` 欠落）のエントリだけを対象にする。
+/// `entries` / `stories` が無い・空、story を 1 件も抽出できない場合は
+/// 意味的に壊れているとみなしエラーにする（空集合の `plan:"only"` へ
+/// 黙って落ちる契約違反を防ぐ）。
+///
+/// story エントリに `importPath` が無い場合は、**1 件でも** index 全体を
+/// エラーにする。欠けた story を黙って捨てると、そのファイルへの変更が
+/// 選別から漏れ、`plan:"only"` が「その story は撮らなくてよい」と主張して
+/// しまう（baseline 流用に化ける）。有効なエントリが他にあっても救済しない。
+pub fn parse_index(json: &str) -> Result<Vec<StoryEntry>> {
+    let index: StorybookIndex = serde_json::from_str(json).context("failed to parse index JSON")?;
+
+    let entries = index
+        .entries
+        .or(index.stories)
+        .ok_or_else(|| anyhow!("index has neither `entries` nor `stories`"))?;
+
+    if entries.is_empty() {
+        bail!("index has no entries");
+    }
+
     let mut out = Vec::new();
     for (key, entry) in entries {
         if entry.entry_type.as_deref().unwrap_or("story") != "story" {
             continue;
         }
         let Some(import_path) = entry.import_path else {
-            continue;
+            bail!(
+                "story entry `{key}` has no `importPath`; \
+                 refusing to build a story selection from a partially broken index"
+            );
         };
         out.push(StoryEntry {
             id: entry.id.unwrap_or(key),
             import_path,
         });
     }
+
+    if out.is_empty() {
+        bail!("index has no extractable story entries");
+    }
+
     Ok(out)
 }
 
@@ -271,9 +297,14 @@ fn is_full_capture_trigger(repo_relative: &str) -> bool {
 /// ここに載らないグラフ外の変更は全撮影のトリガーになる。
 fn is_ignorable_outside_graph(repo_relative: &str) -> bool {
     let path = repo_relative.replace('\\', "/").to_ascii_lowercase();
-    let file_name = path.rsplit('/').next().unwrap_or(&path);
-    // Markdown ドキュメント（README 等）はレンダリング対象のストーリーに影響しない。
-    file_name.ends_with(".md")
+    // リポジトリ直下の既知ドキュメントだけを無視する。任意の `.md` を拡張子だけで
+    // 除外すると、`public/` のランタイムアセットまで撮影対象から漏れるためである。
+    // サブディレクトリの Markdown は同名でも判定不能として全撮影へ倒す。
+    !path.contains('/')
+        && matches!(
+            path.as_str(),
+            "readme.md" | "changelog.md" | "contributing.md" | "code_of_conduct.md" | "security.md"
+        )
 }
 
 // ── 影響ストーリー算出（本体） ─────────────────────────────────────────
@@ -434,11 +465,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_index_skips_docs_and_missing_import_path() {
+    fn parse_index_skips_docs_entries() {
         let s = stories();
         // docs エントリ intro--docs は除外され、story 3 件だけ残る。
         assert_eq!(s.len(), 3);
         assert!(s.iter().all(|e| e.id != "intro--docs"));
+    }
+
+    /// 有効な story が他にあっても、`importPath` 欠落が 1 件でもあれば index 全体を
+    /// エラーにする。欠落 story を黙って捨てると、そのファイルの変更が選別から漏れ、
+    /// `plan:"only"` が「撮らなくてよい」と誤って主張する。
+    /// positive control: 欠落を黙って捨てる旧実装では有効 1 件の Ok が返り、このテストは落ちる。
+    #[test]
+    fn parse_index_rejects_partially_missing_import_path() {
+        let err = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "a--one": { "id": "a--one", "type": "story", "importPath": "./src/A.stories.tsx" },
+                "b--one": { "id": "b--one", "type": "story" }
+              }
+            }"#,
+        )
+        .expect_err("one story without importPath must poison the whole index");
+        assert!(err.to_string().contains("importPath"), "err={err:#}");
+        assert!(err.to_string().contains("b--one"), "err={err:#}");
+    }
+
+    #[test]
+    fn parse_index_rejects_empty_object() {
+        let err = parse_index("{}").expect_err("empty object must be corrupt");
+        assert!(
+            err.to_string().contains("entries") || err.to_string().contains("stories"),
+            "err={err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_empty_entries_container() {
+        let err = parse_index(r#"{"v":5,"entries":{}}"#).expect_err("empty container");
+        assert!(
+            err.to_string().contains("no entries") || err.to_string().contains("extractable"),
+            "err={err:#}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_all_story_entries_missing_import_path() {
+        let err = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "a--one": { "id": "a--one", "type": "story" },
+                "a--two": { "id": "a--two", "type": "story" }
+              }
+            }"#,
+        )
+        .expect_err("missing importPath on all stories");
+        assert!(err.to_string().contains("importPath"), "err={err:#}");
     }
 
     #[test]
@@ -452,6 +536,52 @@ mod tests {
                 "button--primary".to_string(),
                 "button--secondary".to_string()
             ])
+        );
+    }
+
+    /// 非 ASCII（日本語）パスの変更が依存グラフのキーに一致し、story 選択まで
+    /// 到達する。壊れうるのは選択側ではなく git 側——修正前の
+    /// `git::changed_files` は C-quoted 文字列を返すためキーに一致せず
+    /// 「グラフ外 → capture_all」へ倒れていた（その退行は git.rs の
+    /// positive control が固定する）。ここは quoting を解いた生パスが
+    /// そのまま選択に効くことを、選択側の視点から固定する。
+    #[test]
+    fn non_ascii_changed_path_reaches_its_story() {
+        let stats = WebpackStats::parse(
+            r#"{
+              "modules": [
+                {
+                  "name": "./src/部品/ボタン.tsx",
+                  "reasons": [
+                    { "moduleName": "./src/部品/ボタン.stories.tsx" }
+                  ]
+                },
+                {
+                  "name": "./src/部品/ボタン.stories.tsx",
+                  "reasons": []
+                }
+              ]
+            }"#,
+        )
+        .expect("parse stats");
+        let stories = parse_index(
+            r#"{
+              "v": 5,
+              "entries": {
+                "部品-ボタン--primary": {
+                  "id": "部品-ボタン--primary",
+                  "type": "story",
+                  "importPath": "./src/部品/ボタン.stories.tsx"
+                }
+              }
+            }"#,
+        )
+        .expect("parse index");
+        let changed = vec!["apps/frontend/src/部品/ボタン.tsx".to_string()];
+        let out = compute_affected_stories(&root(), &cwd(), &changed, &stats, &stories);
+        assert_eq!(
+            out.plan,
+            Plan::Only(vec!["部品-ボタン--primary".to_string()])
         );
     }
 
@@ -506,8 +636,8 @@ mod tests {
     }
 
     #[test]
-    fn markdown_outside_graph_is_ignored() {
-        // グラフ外でも .md は無視してよい。加えて Button 変更で Button 系は撮る。
+    fn known_root_document_outside_graph_is_ignored() {
+        // allowlist 済みのルート文書は無視する。加えて Button 変更で Button 系は撮る。
         let changed = vec![
             "README.md".to_string(),
             "apps/frontend/src/Button.tsx".to_string(),
@@ -521,6 +651,15 @@ mod tests {
             ])
         );
         assert!(out.notes.iter().any(|n| n.contains("README.md")));
+    }
+
+    #[test]
+    fn public_markdown_outside_graph_forces_full_capture() {
+        // positive control: 拡張子だけで全 `.md` を無視する旧実装では seed が空になり、
+        // `Plan::Only([])` が返るため、このアサートは落ちる。
+        let changed = vec!["public/copy.md".to_string()];
+        let out = compute_affected_stories(&root(), &cwd(), &changed, &stats(), &stories());
+        assert!(matches!(out.plan, Plan::CaptureAll(_)));
     }
 
     #[test]

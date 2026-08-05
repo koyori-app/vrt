@@ -110,9 +110,12 @@ async fn setup() -> Fixture {
 impl Fixture {
     /// 指定モードのビルドをサービス層で直接作る（storybook 作成の Chromium ゲートを避ける）。
     async fn create_build(&self, mode: BuildMode, sha: &str) -> Uuid {
+        let project = service::projects::get_project(&self.app.state.db, self.project_id)
+            .await
+            .expect("load project");
         let build = service::builds::create_build(
             &self.app.state.db,
-            self.project_id,
+            &project,
             "main".to_string(),
             sha.to_string(),
             None,

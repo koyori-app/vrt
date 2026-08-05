@@ -25,7 +25,8 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
 sha2 = "0.11"
-uuid = { version = "1", features = ["serde", "v4"] }
+# v5 は carry-forward 複製の決定的スクリーンショット ID（(build_id, name) から導出）に使う。
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 redis = { version = "1.2.1", features = ["tokio-comp"] }
 redis_pool = "0.10.0"
 regex = "1"
@@ -36,6 +37,9 @@ subtle = "2.6"
 thiserror = "2.0.10"
 tracing = "0.1"
 url = "2.5"
+# スクリーンショット名の NFC 正規化（NFC/NFD 差で carry-forward / removed 判定が
+# 割れるのを防ぐ）。idna 経由で既にツリーに存在する crate なので追加コストは無い。
+unicode-normalization = "0.1"
 utoipa = { version = "5.4.0", features = ["uuid", "chrono", "time"] }
 validator = { version = "0.20.0", features = ["derive"] }
 # Storybook バンドル（storybook-static.zip）の展開用。

@@ -1,6 +1,7 @@
 //! ビルド関連の DTO。
 
 use chrono::{DateTime, Utc};
+use common::validation::ScreenshotName;
 use sea_orm::prelude::Uuid;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -32,10 +33,11 @@ pub struct BuildResponse {
     pub baseline_id: Option<Uuid>,
     /// このビルドが比較する baseline のコミット SHA。
     ///
-    /// 将来の CLI が「どのコミットとの差分か」を知り、
-    /// 撮り直しの必要なストーリーを自分で絞り込めるように公開する。
-    /// ビルド作成（`POST /v1/ci/builds`）のレスポンスでのみ埋まり、
-    /// それ以外の経路（一覧・状態ポーリング等）では常に `None`。
+    /// CLI が「どのコミットとの差分か」を知り、撮り直しの必要なストーリーを
+    /// 自分で絞り込めるように公開する。ビルド作成（`POST /v1/ci/builds`）の
+    /// レスポンス（現時点の baseline。未固定）と、capture plan 添付
+    /// （`POST /v1/ci/builds/{id}/plan`）のレスポンス（固定済み baseline）でのみ
+    /// 埋まり、それ以外の経路（一覧・状態ポーリング等）では常に `None`。
     /// baseline が無い、または昇格元ビルドが削除済みなら `None`。
     #[schema(nullable)]
     pub baseline_commit_sha: Option<String>,
@@ -126,41 +128,158 @@ pub struct FinalizeBuildRequest {
     /// ここに載っていないストーリーは baseline のスクリーンショットを流用する
     /// （baseline に該当が無い新規ストーリーは見逃さないよう撮影する）。
     /// `storybook` モードのビルドでのみ意味を持つ。`screenshots` モードで
-    /// 指定すると 400 になる（サーバーがレンダリングしないため）。
+    /// 指定すると 400 になる（サーバーがレンダリングしないため、ストーリー ID を
+    /// スクリーンショット名へ写像できない。代わりに `captured_names` を使う）。
     #[serde(default)]
     pub only_story_ids: Option<Vec<String>>,
+
+    /// `screenshots` モードの部分アップロードで、今回 CI が撮影して
+    /// アップロードしたスクリーンショット名の集合（任意のクロスチェック）。
+    ///
+    /// 部分アップロードの「撮る集合」の出所は、撮影前に
+    /// `POST /v1/ci/builds/{id}/plan` で保存された capture plan である。
+    /// このフィールドを渡した場合、サーバーは保存済み計画との完全一致を検証し、
+    /// ずれていれば 400 で拒否する。**計画が保存されていないビルドに渡すと 400**
+    /// ——finalize 時の自己申告だけの部分アップロードは、撮影が全滅したときに
+    /// 空の申告と空のアップロードが循環一致して偽 PASS になるため受け付けない。
+    /// `null`・省略で計画ありのビルドは計画どおり、計画なしのビルドは全撮影。
+    /// `storybook` モードで指定すると 400（サーバーが撮るので宣言が成立しない）。
+    #[serde(default)]
+    pub captured_names: Option<Vec<String>>,
+
+    /// クライアントが撮影計画の起点にした baseline のコミット SHA。
+    ///
+    /// `screenshots` モード: capture plan 付きビルドで渡すと、計画添付時に
+    /// 固定された baseline と照合し、一致しなければ 400。計画なしのビルドに
+    /// 渡すと 400（照合すべき固定値が無い）。
+    /// `storybook` モード: `only_story_ids` を渡すときは**必須**。サーバーは
+    /// 現在の baseline と照合してから比較 baseline を固定する。ずれていれば
+    /// 400 で拒否する（流用画像と比較対象が計画と別物になるのを防ぐ）。
+    #[serde(default)]
+    pub expected_baseline_commit_sha: Option<String>,
 }
 
-/// `only_story_ids` の要素数上限。DoS 対策の緩い上限。
+/// `POST /v1/ci/builds/{id}/plan` — screenshots モードの部分アップロード計画。
+///
+/// 撮影を始める**前**に「今回撮る名前」と「現時点で存在する全名前（現行 index）」を
+/// ビルドへ固定する。finalize と比較ジョブの選択集合はこの保存値だけを使う。
+/// 撮影後の自己申告（`captured_names`）を出所にしないのは、撮影が全滅したとき
+/// 空の申告と空のアップロードが循環一致して偽 PASS になるためである。
+/// 未知フィールドは拒否する（`deny_unknown_fields`）。`baseline_commit_sha` を
+/// `baseline_sha` などと typo すると、黙って無視されて必須フィールド欠落の
+/// エラーになる代わりに typo そのものが指摘され、安全照合のサイレント無効化を
+/// 防ぐ。本エンドポイントは本 PR 新設でクライアントは同梱 CLI のみのため、
+/// 旧クライアント互換の考慮は不要。
+/// （既設の [`FinalizeBuildRequest`] には付けない——付けると、CLI だけが先に
+/// 新フィールドを送る移行期間・新旧混在デプロイで既存 CI が一斉に 400 になる。
+/// 既存エンドポイントの未知フィールド許容は後方互換として維持する。）
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AttachCapturePlanRequest {
+    /// 今回撮影してアップロードするスクリーンショット名（`manifest_names` の部分集合）。
+    ///
+    /// 空配列は「変更の影響を受けた story は無い」という選択結果で、baseline の
+    /// 全エントリ（manifest に残っているもの）が流用される。
+    pub selected_names: Vec<String>,
+    /// 現時点で存在する全スクリーンショット名（現行 story index の写し）。
+    ///
+    /// baseline にあってここに無い名前は「story が消えた」とみなし、流用せず
+    /// `removed` として報告される。ここを実際の index より狭く申告すると
+    /// 消滅扱いが増える方向（差分が見える方向）にしか倒れない。
+    pub manifest_names: Vec<String>,
+    /// この計画の起点にした baseline のコミット SHA（ビルド作成レスポンスの
+    /// `baseline_commit_sha`）。現在の baseline と一致しなければ 409 で拒否され、
+    /// クライアントは再計画する。
+    pub baseline_commit_sha: String,
+}
+
+impl AttachCapturePlanRequest {
+    /// 各リストを名前規則で検証し、型付きの名前へ変換する。
+    /// 要素数の上限と baseline SHA の妥当性もここで検査する。
+    ///
+    /// 名前規則は [`common::validation::ScreenshotName`] の一本だけ——
+    /// アップロード・finalize の `captured_names` と同じ関数である。計画側だけ
+    /// 緩いと「計画には載るのにアップロードできない名前」ができ、そのビルドは
+    /// 永久に finalize できない。
+    pub fn parse_lists(&self) -> Result<(Vec<ScreenshotName>, Vec<ScreenshotName>), String> {
+        let selected = parse_name_list(&self.selected_names, "selected_names")?;
+        let manifest = parse_name_list(&self.manifest_names, "manifest_names")?;
+        if self.baseline_commit_sha.is_empty() || self.baseline_commit_sha.len() > 100 {
+            return Err("baseline_commit_sha must be 1..=100 characters".into());
+        }
+        Ok((selected, manifest))
+    }
+}
+
+/// `only_story_ids` / `captured_names` の要素数上限。DoS 対策の緩い上限。
 pub const MAX_ONLY_STORY_IDS: usize = 10_000;
-/// ストーリー ID 1 件あたりの最大長。
+/// storybook モードの story ID 1 件あたりの最大長。
+///
+/// story ID はスクリーンショット**名**とは別の名前空間である（storybook モードの
+/// スクリーンショット名は `{title}/{name}` で、保存時に
+/// [`common::validation::ScreenshotName`] で改めて検証される）。screenshots
+/// モードの名前リストにこの上限を使ってはならない——名前の規則は
+/// `ScreenshotName` の一本だけである。
 pub const MAX_STORY_ID_LEN: usize = 512;
 
 impl FinalizeBuildRequest {
-    /// `only_story_ids` の要素数・各 ID の長さを検証する。
+    /// `only_story_ids`（storybook モードの story ID）の要素数・各要素の長さを検証する。
     ///
     /// 違反時はエラーメッセージを返す（呼び出し側で 400 にする）。
+    /// `captured_names` はスクリーンショット名なので、こちらではなく
+    /// [`FinalizeBuildRequest::parse_captured_names`] で名前規則により検証する。
     pub fn validate_story_ids(&self) -> Result<(), String> {
-        let Some(ids) = &self.only_story_ids else {
-            return Ok(());
-        };
-        if ids.len() > MAX_ONLY_STORY_IDS {
+        validate_id_list(self.only_story_ids.as_deref(), "only_story_ids")
+    }
+
+    /// `captured_names` を名前規則（[`common::validation::ScreenshotName`]——
+    /// 計画・アップロードと同一）で検証し、型付きの名前へ変換する。
+    pub fn parse_captured_names(&self) -> Result<Option<Vec<ScreenshotName>>, String> {
+        self.captured_names
+            .as_deref()
+            .map(|list| parse_name_list(list, "captured_names"))
+            .transpose()
+    }
+}
+
+/// スクリーンショット名リストの共通検証。
+///
+/// 要素数の上限（[`MAX_ONLY_STORY_IDS`]）と、各要素の名前規則
+/// （[`ScreenshotName::parse`]——plan・アップロード・finalize で同一）を適用する。
+fn parse_name_list(list: &[String], field: &str) -> Result<Vec<ScreenshotName>, String> {
+    if list.len() > MAX_ONLY_STORY_IDS {
+        return Err(format!(
+            "{field} must contain at most {MAX_ONLY_STORY_IDS} entries"
+        ));
+    }
+    list.iter()
+        .map(|name| {
+            ScreenshotName::parse(name.clone()).map_err(|e| format!("{field}: `{name}`: {e}"))
+        })
+        .collect()
+}
+
+/// storybook モードの story ID リストの検証（要素数・空要素・長さ）。
+fn validate_id_list(list: Option<&[String]>, field: &str) -> Result<(), String> {
+    let Some(ids) = list else {
+        return Ok(());
+    };
+    if ids.len() > MAX_ONLY_STORY_IDS {
+        return Err(format!(
+            "{field} must contain at most {MAX_ONLY_STORY_IDS} entries"
+        ));
+    }
+    for id in ids {
+        if id.is_empty() {
+            return Err(format!("{field} must not contain empty entries"));
+        }
+        if id.len() > MAX_STORY_ID_LEN {
             return Err(format!(
-                "only_story_ids must contain at most {MAX_ONLY_STORY_IDS} entries"
+                "each {field} entry must be {MAX_STORY_ID_LEN} characters or fewer"
             ));
         }
-        for id in ids {
-            if id.is_empty() {
-                return Err("only_story_ids must not contain empty ids".into());
-            }
-            if id.len() > MAX_STORY_ID_LEN {
-                return Err(format!(
-                    "each story id must be {MAX_STORY_ID_LEN} characters or fewer"
-                ));
-            }
-        }
-        Ok(())
     }
+    Ok(())
 }
 
 /// Storybook バンドルのアップロード結果。
@@ -282,9 +401,50 @@ pub struct BuildLogsQuery {
 mod tests {
     use super::*;
 
+    /// 安全照合フィールドの typo が unknown field として黙殺されない。
+    /// `deny_unknown_fields` を外すと typo が黙って無視されて計画が通って
+    /// しまい、このテストは落ちる（positive control）。
+    #[test]
+    fn attach_plan_rejects_unknown_fields() {
+        let err = serde_json::from_value::<AttachCapturePlanRequest>(serde_json::json!({
+            "selected_names": ["a"],
+            "manifest_names": ["a"],
+            "baseline_commit_sha": "abc",
+            "expected_baseline_sha": "typo-of-a-safety-field"
+        }))
+        .expect_err("a typo field must be rejected, not silently dropped");
+        assert!(
+            err.to_string().contains("expected_baseline_sha"),
+            "the error should name the offending field: {err}"
+        );
+    }
+
+    /// 既設の finalize は逆に未知フィールドを**許容し続ける**（新旧混在デプロイで
+    /// 新しい CLI のフィールドを古いサーバーが 400 にしない後方互換）。
+    #[test]
+    fn finalize_request_tolerates_unknown_fields() {
+        let req: FinalizeBuildRequest = serde_json::from_value(serde_json::json!({
+            "only_story_ids": ["a--one"],
+            "some_future_field": true
+        }))
+        .expect("unknown fields must be tolerated for forward compatibility");
+        assert_eq!(
+            req.only_story_ids.as_deref(),
+            Some(&["a--one".to_string()][..])
+        );
+    }
+
     fn req(ids: Option<Vec<&str>>) -> FinalizeBuildRequest {
         FinalizeBuildRequest {
             only_story_ids: ids.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn req_names(names: Option<Vec<&str>>) -> FinalizeBuildRequest {
+        FinalizeBuildRequest {
+            captured_names: names.map(|v| v.into_iter().map(String::from).collect()),
+            ..Default::default()
         }
     }
 
@@ -321,7 +481,75 @@ mod tests {
         let ids: Vec<String> = (0..=MAX_ONLY_STORY_IDS).map(|i| i.to_string()).collect();
         let r = FinalizeBuildRequest {
             only_story_ids: Some(ids),
+            ..Default::default()
         };
         assert!(r.validate_story_ids().is_err());
+    }
+
+    #[test]
+    fn captured_names_follow_the_screenshot_name_rule() {
+        use common::validation::SCREENSHOT_NAME_MAX_BYTES;
+
+        assert!(req_names(None).parse_captured_names().is_ok());
+        // 空配列は「今回撮った名前は無い」= 全流用の宣言として有効。
+        assert!(req_names(Some(vec![])).parse_captured_names().is_ok());
+        assert!(req_names(Some(vec!["home"])).parse_captured_names().is_ok());
+        assert!(
+            req_names(Some(vec!["ok", ""]))
+                .parse_captured_names()
+                .is_err()
+        );
+        // 前後空白はアップロード経路と同じ規則で拒否（trim して受けない）。
+        assert!(
+            req_names(Some(vec!["home "]))
+                .parse_captured_names()
+                .is_err()
+        );
+        // 上限もアップロード経路と同じ 255 **バイト**。story ID の 512 ではない。
+        let long = "a".repeat(SCREENSHOT_NAME_MAX_BYTES + 1);
+        assert!(
+            req_names(Some(vec![long.as_str()]))
+                .parse_captured_names()
+                .is_err()
+        );
+        let ok = "a".repeat(SCREENSHOT_NAME_MAX_BYTES);
+        assert!(
+            req_names(Some(vec![ok.as_str()]))
+                .parse_captured_names()
+                .is_ok()
+        );
+    }
+
+    fn plan_req(selected: Vec<&str>, manifest: Vec<&str>) -> AttachCapturePlanRequest {
+        AttachCapturePlanRequest {
+            selected_names: selected.into_iter().map(String::from).collect(),
+            manifest_names: manifest.into_iter().map(String::from).collect(),
+            baseline_commit_sha: "abc123".into(),
+        }
+    }
+
+    #[test]
+    fn plan_lists_follow_the_screenshot_name_rule() {
+        use common::validation::SCREENSHOT_NAME_MAX_BYTES;
+
+        assert!(
+            plan_req(vec!["home"], vec!["home", "about"])
+                .parse_lists()
+                .is_ok()
+        );
+        // アップロードで通らない名前は計画にも載せられない（永久 finalize 不能の防止）。
+        let long = "a".repeat(SCREENSHOT_NAME_MAX_BYTES + 1);
+        assert!(
+            plan_req(vec![long.as_str()], vec![long.as_str()])
+                .parse_lists()
+                .is_err()
+        );
+        assert!(
+            plan_req(vec![" home"], vec![" home"])
+                .parse_lists()
+                .is_err()
+        );
+        assert!(plan_req(vec![], vec!["home "]).parse_lists().is_err());
+        assert!(plan_req(vec![], vec![""]).parse_lists().is_err());
     }
 }

@@ -241,6 +241,7 @@ struct Fixture {
     app: TestApp,
     tenant_slug: String,
     project_slug: String,
+    project_id: Uuid,
     token: String,
 }
 
@@ -270,7 +271,7 @@ async fn setup() -> Fixture {
         .await;
     assert_eq!(res.status(), StatusCode::CREATED, "create project");
     let project: Value = res.json().await.expect("project json");
-    let project_id = project["id"].as_str().expect("project id").to_string();
+    let project_id: Uuid = project["id"].as_str().expect("project id").parse().unwrap();
     assert_eq!(
         project["viewport_width"].as_i64(),
         Some(1280),
@@ -306,6 +307,7 @@ async fn setup() -> Fixture {
         app,
         tenant_slug,
         project_slug,
+        project_id,
         token,
     }
 }
@@ -343,16 +345,24 @@ impl Fixture {
     }
 
     /// `only_story_ids` を添えて finalize する（撮影対象を絞る）。
+    ///
+    /// 部分レンダリングは計画の起点 baseline の照合が必須になったため、
+    /// `expected_baseline_commit_sha`（= 差分計画の起点にした baseline の
+    /// 昇格元コミット）を常に添える。
     async fn finalize_with_only(
         &self,
         build_id: Uuid,
         only_story_ids: &[&str],
+        expected_baseline_commit_sha: &str,
     ) -> reqwest::Response {
         self.app
             .post_json_with_bearer(
                 &format!("/v1/ci/builds/{build_id}/finalize"),
                 &self.token,
-                json!({ "only_story_ids": only_story_ids }),
+                json!({
+                    "only_story_ids": only_story_ids,
+                    "expected_baseline_commit_sha": expected_baseline_commit_sha,
+                }),
             )
             .await
     }
@@ -419,6 +429,23 @@ impl Fixture {
             .as_array()
             .expect("comparisons array")
             .clone()
+    }
+
+    /// 最新 baseline の ID と、その `Demo/Box/Red` エントリのストレージキー。
+    async fn latest_baseline_red_entry(&self) -> (Uuid, String) {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let baseline = common::latest_baseline_of(&self.app.state.db, self.project_id).await;
+
+        let entry = entity::baseline_entries::Entity::find()
+            .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+            .filter(entity::baseline_entries::Column::Name.eq("Demo/Box/Red"))
+            .one(&self.app.state.db)
+            .await
+            .expect("query red entry")
+            .expect("red entry exists");
+
+        (baseline.id, entry.storage_key)
     }
 }
 
@@ -672,7 +699,10 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
             .status(),
         StatusCode::CREATED
     );
-    let res = fx.finalize_with_only(build_b_id, &["demo-box--red"]).await;
+    // 計画の起点 = build A から昇格した baseline（コミット only001）。
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--red"], "only001")
+        .await;
     assert_eq!(res.status(), StatusCode::OK, "finalize with only_story_ids");
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
@@ -749,8 +779,9 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
         StatusCode::CREATED
     );
     // Red だけ指定。Green は指定に入れない（新規なので撮影されるはず）。
+    // 直前に build B（コミット only002）が承認されて baseline が進んでいる。
     assert_eq!(
-        fx.finalize_with_only(build_c_id, &["demo-box--red"])
+        fx.finalize_with_only(build_c_id, &["demo-box--red"], "only002")
             .await
             .status(),
         StatusCode::OK
@@ -792,6 +823,292 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
     assert_eq!(added, vec!["Demo/Box/Green"], "only the new story is added");
 }
 
+/// storybook の流用（`only_story_ids`）は、finalize が照合のうえ固定した baseline を使う。
+///
+/// 作成〜finalize の間に別ビルドが承認されて最新 baseline が入れ替わった場合、
+/// 古い起点のままの finalize は 409 で拒否される（流用画像と比較対象が計画と
+/// 別物になる前に断つ。「baseline が動いた」は plan 添付と同じ 409）。現在の baseline へ再計画すれば、その baseline が固定され、
+/// 流用画像・比較対象・`baseline_id` のすべてが一致する。
+///
+/// positive control: 起点の照合をせず finalize 時の最新へ黙って倒す実装では、
+/// 古い起点（pin0001）の finalize が 200 で通ってしまい、最初のアサートで落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baseline() {
+    if !chromium_or_skip("stale_reuse_basis_is_rejected_and_repinning_follows_the_current_baseline")
+    {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 明るい赤で全撮影 → 承認して baseline B1 を確立 ───────────
+    let build_a = fx.create_storybook_build("pin0001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_a_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build A");
+    let (old_baseline_id, red_v1_key) = fx.latest_baseline_red_entry().await;
+
+    // ── ビルド B: この時点で作成（差分計画の起点は B1 のつもり）─────────────
+    let build_b = fx.create_storybook_build("pin0002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // ── ビルド C: 暗い赤で全撮影 → 承認して最新 baseline を B2 へ動かす ────
+    let build_c = fx.create_storybook_build("pin0003").await;
+    let build_c_id = build_id_of(&build_c);
+    assert_eq!(
+        fx.upload_bundle(build_c_id, bundle_zip("#880000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_c_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_c_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_c_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build C");
+    let (moved_baseline_id, red_v2_key) = fx.latest_baseline_red_entry().await;
+    assert_ne!(old_baseline_id, moved_baseline_id, "baseline moved");
+
+    // ── 古い起点（B1 = pin0001）のままの部分 finalize は 409 ───────────────
+    // 「baseline が動いた（再計画で解消）」は plan 添付と同じ 409 に揃えてある。
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--blue"], "pin0001")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "a partial render planned against a baseline that has since moved must be rejected"
+    );
+
+    // ── 現在の baseline（B2 = pin0003）へ再計画すれば通り、B2 が固定される ──
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--blue"], "pin0003")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let build_b = fx.wait_for_terminal(build_b_id).await;
+    assert_eq!(
+        build_b["baseline_id"].as_str().map(|s| s.parse().unwrap()),
+        Some(moved_baseline_id),
+        "the build must record the baseline verified and pinned at finalize"
+    );
+
+    // 流用された Red のバイト列は固定した現行 baseline（暗い赤）と一致し、
+    // 旧 baseline（明るい赤）とは一致しない——流用元と照合済みの起点が同一。
+    let shots = fx.screenshots(build_b_id).await;
+    let red_shot = shots
+        .iter()
+        .find(|s| s.name == "Demo/Box/Red")
+        .expect("reused red screenshot");
+    let reused = service::screenshots::read_all(&fx.app.state.storage, &red_shot.storage_key)
+        .await
+        .expect("read reused bytes");
+    let v1 = service::screenshots::read_all(&fx.app.state.storage, &red_v1_key)
+        .await
+        .expect("read old baseline bytes");
+    let v2 = service::screenshots::read_all(&fx.app.state.storage, &red_v2_key)
+        .await
+        .expect("read current baseline bytes");
+    assert_eq!(
+        reused, v2,
+        "reuse must copy from the baseline pinned at finalize (dark red)"
+    );
+    assert_ne!(
+        reused, v1,
+        "reuse must not silently keep a stale planning basis"
+    );
+}
+
+/// リトライで届いた 2 度目の部分 finalize は、固定済みの baseline を上書きできない。
+///
+/// 「pending 再確認 → SHA 照合 → pin → 遷移」が build 行ロックの 1 トランザクション
+/// になっていないと、finalize 済みビルドへ届いた 2 度目の finalize（起点 = その後
+/// 前進した現行 baseline）が SHA 照合を通過して `baseline_id` だけを先に上書きし、
+/// 本体は 409 で弾かれてもレンダリング・比較ジョブは以後 新しい baseline を読む
+/// ——計画の根拠と比較相手がずれる。
+///
+/// positive control: pin を遷移チェックの前に単独コミットしていた旧実装では、
+/// 2 度目の finalize 後の `baseline_id` が B2 に化け、最後のアサートで落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_finalize_cannot_overwrite_the_pinned_baseline() {
+    if !chromium_or_skip("a_second_finalize_cannot_overwrite_the_pinned_baseline") {
+        return;
+    }
+    let fx = setup().await;
+
+    // ── ビルド A: 全撮影 → 承認して baseline B1 を確立 ─────────────────────
+    let build_a = fx.create_storybook_build("repin001").await;
+    let build_a_id = build_id_of(&build_a);
+    assert_eq!(
+        fx.upload_bundle(build_a_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_a_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_a_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_a_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build A");
+    let (pinned_baseline_id, _) = fx.latest_baseline_red_entry().await;
+
+    // ── ビルド B: B1 を起点に部分 finalize（1 度目）→ B1 が固定される ──────
+    let build_b = fx.create_storybook_build("repin002").await;
+    let build_b_id = build_id_of(&build_b);
+    assert_eq!(
+        fx.upload_bundle(build_b_id, bundle_zip("#ff0000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fx.finalize_with_only(build_b_id, &["demo-box--blue"], "repin001")
+            .await
+            .status(),
+        StatusCode::OK,
+        "first finalize pins B1"
+    );
+    fx.wait_for_terminal(build_b_id).await;
+
+    // ── ビルド C: 暗い赤で全撮影 → 承認して最新 baseline を B2 へ動かす ────
+    let build_c = fx.create_storybook_build("repin003").await;
+    let build_c_id = build_id_of(&build_c);
+    assert_eq!(
+        fx.upload_bundle(build_c_id, bundle_zip("#880000"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_c_id).await.status(), StatusCode::OK);
+    fx.wait_for_terminal(build_c_id).await;
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/builds/{build_c_id}/approve"),
+            json!({ "force": true }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve build C");
+    let (moved_baseline_id, _) = fx.latest_baseline_red_entry().await;
+    assert_ne!(
+        pinned_baseline_id, moved_baseline_id,
+        "baseline moved to B2"
+    );
+
+    // ── 2 度目の finalize（起点 = 現行 B2）は 409 で、pin を上書きしない ────
+    // 現行 baseline の SHA を正しく持ってきても、finalize 済みビルドの pin は動かせない。
+    let res = fx
+        .finalize_with_only(build_b_id, &["demo-box--blue"], "repin003")
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "a second finalize on an already-finalized build must be rejected"
+    );
+
+    use sea_orm::EntityTrait;
+    let row = entity::builds::Entity::find_by_id(build_b_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("query build B")
+        .expect("build B exists");
+    assert_eq!(
+        row.baseline_id,
+        Some(pinned_baseline_id),
+        "the rejected second finalize must not overwrite the pinned baseline \
+         (render/compare jobs read baseline_id; silently repinning to B2 would \
+         desync the reuse basis from the comparison target)"
+    );
+}
+
+/// `only_story_ids` に `expected_baseline_commit_sha` を添えない finalize は 400。
+///
+/// 後方互換を破ってでも照合を必須にした当のガードの否定側。バンドルの有無より
+/// 前に入口で効く（照合できない部分レンダリングを開始させない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn only_story_ids_without_expected_baseline_sha_is_rejected() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("neg00001").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json_with_bearer(
+            &format!("/v1/ci/builds/{build_id}/finalize"),
+            &fx.token,
+            json!({ "only_story_ids": ["demo-box--red"] }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "a partial render without its planning basis cannot be verified or pinned"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("requires expected_baseline_commit_sha"),
+        "the error must demand the planning basis: {body}"
+    );
+}
+
+/// `storybook` モードに `captured_names` を渡すと 400（サーバーが撮るので
+/// 「CI が撮った名前」の宣言は成立しない）。
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_names_is_rejected_for_storybook_mode() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("neg00002").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json_with_bearer(
+            &format!("/v1/ci/builds/{build_id}/finalize"),
+            &fx.token,
+            json!({ "captured_names": ["Demo/Box/Red"] }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "captured_names is a screenshots-mode declaration"
+    );
+    let body = res.text().await.expect("error body");
+    assert!(
+        body.contains("not supported for storybook-mode"),
+        "the error must point at the mode mismatch: {body}"
+    );
+}
+
 /// `screenshots` モードに `only_story_ids` を渡すと 400（サーバー撮影しない）。
 #[tokio::test(flavor = "multi_thread")]
 async fn only_story_ids_is_rejected_for_screenshot_mode() {
@@ -802,7 +1119,9 @@ async fn only_story_ids_is_rejected_for_screenshot_mode() {
     let build: Value = res.json().await.expect("build json");
     let build_id = build_id_of(&build);
 
-    let res = fx.finalize_with_only(build_id, &["button--primary"]).await;
+    let res = fx
+        .finalize_with_only(build_id, &["button--primary"], "whatever")
+        .await;
     assert_eq!(
         res.status(),
         StatusCode::BAD_REQUEST,
@@ -1011,7 +1330,7 @@ async fn build_logs_capture_render_and_compare_progress() {
         StatusCode::CREATED
     );
     assert_eq!(
-        fx.finalize_with_only(build_b_id, &["demo-box--red"])
+        fx.finalize_with_only(build_b_id, &["demo-box--red"], "log0001")
             .await
             .status(),
         StatusCode::OK

@@ -209,11 +209,17 @@ async fn run(
     )
     .await?;
 
-    // `only_story_ids` が来ているときだけ baseline を解決して name→entry の
-    // 流用テーブルを作る。baseline が無ければ空になり、結果的に全撮影になる。
+    // `only_story_ids` が来ているときだけ baseline から name→entry の流用テーブルを作る。
+    // baseline は finalize が照合のうえ固定したもの（`builds.baseline_id`）を使う。
+    // ここで最新を引き直すと、finalize〜レンダリングの間に別ビルドが承認された場合に
+    // クライアントが差分計画の起点にした baseline と違うものを流用してしまう
+    // （compare_build と同じ理由）。固定が無ければ空になり、結果的に全撮影になる。
     let baseline_entries: HashMap<String, baseline_entries::Model> = match &only_story_ids {
         Some(_) => {
-            let baseline = service::baselines::latest_for(db, &project, &build.branch).await?;
+            let baseline = match build.baseline_id {
+                Some(id) => Some(service::baselines::get_baseline(db, id).await?),
+                None => None,
+            };
             let entries = match &baseline {
                 Some(b) => service::baselines::entries(db, b.id).await?,
                 None => Vec::new(),
@@ -336,11 +342,19 @@ async fn render_all(
 
     for (idx, story) in bundle.stories.iter().enumerate() {
         let position = idx + 1;
-        let screenshot_name = story.screenshot_name();
+        // 名前規則（ScreenshotName——アップロード経路と同一）。storybook の
+        // title / name から生成した名前が規則に合わない場合は、黙って加工せず
+        // ビルドを失敗させて story 側の修正を促す（加工すると baseline 名との
+        // 突き合わせがずれる）。
+        let screenshot_name = common::validation::ScreenshotName::parse(story.screenshot_name())
+            .map_err(|e| {
+                anyhow::anyhow!("screenshot name for story `{}` is invalid: {e}", story.id)
+            })?;
+        let screenshot_name_str = screenshot_name.as_str().to_string();
 
         // `only_story_ids` 無しは常に撮影（後方互換）。
         let action = match &only_set {
-            Some(ids) => decide_story_action(&story.id, &screenshot_name, ids, &baseline_names),
+            Some(ids) => decide_story_action(&story.id, &screenshot_name_str, ids, &baseline_names),
             None => StoryAction::Render,
         };
 
@@ -389,7 +403,7 @@ async fn render_all(
             }
             StoryAction::Reuse => {
                 // decide_story_action が Reuse を返す時点で必ず存在する。
-                let entry = baseline_entries.get(&screenshot_name).ok_or_else(|| {
+                let entry = baseline_entries.get(&screenshot_name_str).ok_or_else(|| {
                     anyhow::anyhow!(
                         "baseline entry for `{screenshot_name}` disappeared during reuse"
                     )

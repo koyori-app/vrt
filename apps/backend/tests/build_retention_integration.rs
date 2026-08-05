@@ -50,9 +50,12 @@ async fn make_passed_build(
     let db = &app.state.db;
     let storage = &app.state.storage;
 
+    let project = service::projects::get_project(db, project_id)
+        .await
+        .expect("load project");
     let build = service::builds::create_build(
         db,
-        project_id,
+        &project,
         "main".to_string(),
         sha.to_string(),
         None,
@@ -71,7 +74,7 @@ async fn make_passed_build(
         tenant_id,
         project_id,
         build.id,
-        "home".to_string(),
+        ::common::validation::ScreenshotName::parse("home").expect("valid name"),
         png,
     )
     .await

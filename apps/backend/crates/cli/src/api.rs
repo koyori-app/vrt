@@ -26,10 +26,38 @@ struct CreateBuildBody<'a> {
     mode: &'a str,
 }
 
+/// 作成するビルドの座標。
+///
+/// `mode` はサーバー側 `BuildMode` の serde 表現（`screenshots` / `storybook`）。
+/// `storybook` はサーバーがレンダリングし、`screenshots` は CI が PNG を送る。
+pub struct NewBuild<'a> {
+    pub tenant_slug: &'a str,
+    pub project_slug: &'a str,
+    pub branch: &'a str,
+    pub commit_sha: &'a str,
+    pub commit_message: Option<&'a str>,
+    pub pull_request_number: Option<i32>,
+    pub mode: &'a str,
+}
+
 /// finalize のリクエストボディ（payload::builds::FinalizeBuildRequest に一致）。
 #[derive(Debug, Serialize)]
-struct FinalizeBody {
-    only_story_ids: Vec<String>,
+struct FinalizeBody<'a> {
+    /// `None` は「全ストーリー撮影」（サーバーは省略・null を同義に扱う）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only_story_ids: Option<Vec<String>>,
+    /// 差分計画の起点にした baseline のコミット SHA。サーバーはビルドに
+    /// 固定された baseline と照合し、ずれていれば finalize を拒否する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_baseline_commit_sha: Option<&'a str>,
+}
+
+/// capture plan 添付のリクエストボディ（payload::builds::AttachCapturePlanRequest に一致）。
+#[derive(Debug, Serialize)]
+struct AttachPlanBody<'a> {
+    selected_names: &'a [String],
+    manifest_names: &'a [String],
+    baseline_commit_sha: &'a str,
 }
 
 /// BuildResponse のうち CLI が使うフィールドだけ受ける。
@@ -101,26 +129,21 @@ impl Client {
         serde_json::from_str(&body).with_context(|| format!("{ctx}: could not parse response body"))
     }
 
-    /// ビルドを作成する（mode=storybook）。
-    pub async fn create_build(
-        &self,
-        tenant_slug: &str,
-        project_slug: &str,
-        branch: &str,
-        commit_sha: &str,
-        commit_message: Option<&str>,
-        pull_request_number: Option<i32>,
-    ) -> Result<BuildResponse> {
+    /// ビルドを作成する。
+    ///
+    /// レスポンスの `baseline_commit_sha` は作成時にだけ載る。`screenshots` モードで
+    /// 撮影前に差分の起点を知りたいときも、この経路で受け取る。
+    pub async fn create_build(&self, new: &NewBuild<'_>) -> Result<BuildResponse> {
         let url = format!(
             "{}/v1/ci/projects/{}/{}/builds",
-            self.base_url, tenant_slug, project_slug
+            self.base_url, new.tenant_slug, new.project_slug
         );
         let body = CreateBuildBody {
-            branch,
-            commit_sha,
-            commit_message,
-            pull_request_number,
-            mode: "storybook",
+            branch: new.branch,
+            commit_sha: new.commit_sha,
+            commit_message: new.commit_message,
+            pull_request_number: new.pull_request_number,
+            mode: new.mode,
         };
         let resp = self
             .bearer(self.http.post(&url))
@@ -129,6 +152,32 @@ impl Client {
             .await
             .context("create build request failed")?;
         Self::read_json(resp, "create build").await
+    }
+
+    /// 部分アップロード計画（capture plan）をビルドへ固定する。
+    ///
+    /// 撮影を始める前に呼ぶこと。サーバーは計画の起点 `baseline_commit_sha` が
+    /// いまも最新の baseline であることを確認してから比較対象を固定する。
+    /// baseline が動いていた場合は 409 が返るので、計画を作り直す。
+    pub async fn attach_plan(
+        &self,
+        build_id: &str,
+        selected_names: &[String],
+        manifest_names: &[String],
+        baseline_commit_sha: &str,
+    ) -> Result<BuildResponse> {
+        let url = format!("{}/v1/ci/builds/{}/plan", self.base_url, build_id);
+        let resp = self
+            .bearer(self.http.post(&url))
+            .json(&AttachPlanBody {
+                selected_names,
+                manifest_names,
+                baseline_commit_sha,
+            })
+            .send()
+            .await
+            .context("attach capture plan request failed")?;
+        Self::read_json(resp, "attach capture plan").await
     }
 
     /// Storybook バンドル（zip）を multipart でアップロードする。
@@ -156,16 +205,26 @@ impl Client {
     /// finalize する。`only_story_ids` が `Some` なら差分撮影、`None` なら全撮影。
     ///
     /// 全撮影はボディ無しの POST（ci.rs は空ボディを全撮影として扱う）。
+    /// 差分撮影のときは、計画の起点にした baseline のコミット SHA を
+    /// `expected_baseline_commit_sha` として添え、サーバー側の固定値と照合させる。
     pub async fn finalize(
         &self,
         build_id: &str,
         only_story_ids: Option<Vec<String>>,
+        expected_baseline_commit_sha: Option<&str>,
     ) -> Result<BuildResponse> {
         let url = format!("{}/v1/ci/builds/{}/finalize", self.base_url, build_id);
         let mut req = self.bearer(self.http.post(&url));
-        if let Some(ids) = only_story_ids {
+        // `expected_baseline_commit_sha` は `only_story_ids` が無くても単独で
+        // 送る。以前は `only_story_ids: Some` のときしかボディを付けず、
+        // expected だけを渡した呼び出しが黙って捨てられていた——サーバーの
+        // 「screenshots モード + 計画あり + expected のみ」の照合にこの
+        // クライアントから到達できず、照合したつもりで送られていない
+        // footgun になる。
+        if only_story_ids.is_some() || expected_baseline_commit_sha.is_some() {
             req = req.json(&FinalizeBody {
-                only_story_ids: ids,
+                only_story_ids,
+                expected_baseline_commit_sha,
             });
         }
         let resp = req.send().await.context("finalize request failed")?;
@@ -195,5 +254,26 @@ impl Client {
             .await
             .context("get build logs request failed")?;
         Self::read_json(resp, "get build logs").await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// expected 単独のボディが only_story_ids 無しで送れる形になっていること。
+    /// 修正前は only_story_ids が必須フィールドの Vec で、expected 単独の
+    /// リクエストは構造的に組めなかった（呼び出し側で黙って捨てていた）。
+    #[test]
+    fn finalize_body_serializes_expected_without_story_ids() {
+        let body = FinalizeBody {
+            only_story_ids: None,
+            expected_baseline_commit_sha: Some("abc123"),
+        };
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "expected_baseline_commit_sha": "abc123" })
+        );
     }
 }

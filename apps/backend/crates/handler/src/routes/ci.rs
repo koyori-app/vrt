@@ -27,6 +27,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::handlers::ci::get_build_status))
         .routes(routes!(crate::handlers::ci::get_build_logs))
         .routes(routes!(crate::handlers::ci::finalize_build))
+        .routes(routes!(crate::handlers::ci::attach_capture_plan))
         .routes(routes!(crate::handlers::ci::upload_screenshot))
         // axum の既定ボディ上限は 2MB。スクリーンショットは 25MB まで許可する。
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + MULTIPART_OVERHEAD))

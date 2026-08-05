@@ -1,4 +1,4 @@
-//! レビュー判断を変更する経路のロック規約。
+//! レビュー判断と CI 取り込みを変更する経路のロック規約。
 //!
 //! ロック順は常に次の順序とし、後ろから前へは取得しない。
 //!
@@ -11,6 +11,26 @@
 //! 承認だけ project 行も取るのは、異なる build の承認による baseline 昇格を project
 //! 単位で直列化するため。すべて build を先に取るので、別 build の承認同士にも
 //! `build -> project` と `project -> build` の循環は生じない。
+//!
+//! ## CI 取り込み経路（screenshots / storybook 両モード）
+//!
+//! capture plan の添付（`builds::attach_capture_plan`）・スクリーンショットの
+//! DB 挿入（`screenshots::store_ci_screenshot`）・finalize
+//! （`builds::finalize_screenshots` / `builds::finalize_storybook`）も、
+//! 同じ build 行ロックを**最初かつ唯一の**排他ロックとして取る。これにより
+//!
+//! - 添付の「アップロード済みなら 409」検査と計画書き込みの間に、並行
+//!   アップロードが割り込めない（撮影結果から計画を逆算する経路の封鎖）
+//! - finalize の「計画 == アップロード」検査と `processing` 遷移の間に、
+//!   計画外ショットが紛れ込めない
+//! - storybook の部分レンダリングでは「pending 再確認 → 起点 baseline の
+//!   SHA 照合 → `baseline_id` の固定 → `rendering` 遷移」が 1 トランザクション
+//!   になり、リトライで届いた 2 度目の finalize が baseline_id だけを
+//!   先に上書きする隙間が無い
+//!
+//! を保証する。取り込み経路は 2 個目の排他ロックを取らない（project 行は
+//! 読むだけで `FOR UPDATE` しない）ため、全経路の排他ロック取得順は
+//! `build -> project -> comparison` の一方向のまま——循環は構造的に生じない。
 
 use sea_orm::{ConnectionTrait, EntityTrait, QuerySelect, prelude::Uuid};
 

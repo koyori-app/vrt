@@ -17,6 +17,8 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use validator::Validate;
 
+use common::validation::ScreenshotName;
+
 use crate::AppState;
 use crate::error::{AppError, ServerError};
 use crate::extractors::AuthUser;
@@ -118,7 +120,7 @@ pub async fn create_build(
 
     let build = build_service::create_build(
         &state.db,
-        project.id,
+        &project,
         payload.branch,
         payload.commit_sha,
         payload.commit_message,
@@ -127,9 +129,12 @@ pub async fn create_build(
     )
     .await?;
 
-    // 将来の CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
-    // 作成レスポンスにだけ baseline のコミット SHA を載せる。
-    let baseline_commit_sha = resolve_baseline_commit_sha(&state, &project, &build.branch).await?;
+    // CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
+    // 作成レスポンスにだけ現時点の baseline のコミット SHA を載せる。ここでは
+    // 固定しない——固定は部分撮影の計画が確定した時点（capture plan の添付 /
+    // storybook の only_story_ids finalize）で、この値との照合を経て行う。
+    let baseline_commit_sha =
+        build_service::current_baseline_commit_sha(&state.db, &project, &build.branch).await?;
 
     let mut response: BuildResponse = build.into();
     response.baseline_commit_sha = baseline_commit_sha;
@@ -137,26 +142,58 @@ pub async fn create_build(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// 対象ブランチの baseline の昇格元ビルドのコミット SHA を解決する。
-///
-/// baseline が無い、または昇格元ビルドが削除済み（`source_build_id` が NULL、
-/// あるいは行が消えている）なら `None`。
-async fn resolve_baseline_commit_sha(
-    state: &AppState,
-    project: &entity::projects::Model,
-    branch: &str,
-) -> Result<Option<String>, AppError> {
-    let Some(baseline) = service::baselines::latest_for(&state.db, project, branch).await? else {
-        return Ok(None);
-    };
-    let Some(source_build_id) = baseline.source_build_id else {
-        return Ok(None);
-    };
-    match build_service::get_build(&state.db, source_build_id).await {
-        Ok(source) => Ok(Some(source.commit_sha)),
-        Err(AppError::NotFound) => Ok(None),
-        Err(e) => Err(e),
-    }
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/builds/{build_id}/plan",
+    tag = "CI",
+    summary = "部分アップロード計画（capture plan）をビルドへ固定する",
+    description = "`screenshots` モード専用。撮影を始める**前**に「今回撮る名前」\
+                   （`selected_names`）と「現時点で存在する全名前」（`manifest_names`）を\
+                   ビルドへ保存し、比較に使う baseline を固定する。以降のアップロードは\
+                   `selected_names` 内の名前だけが受理され、finalize は保存された計画と\
+                   実アップロードの一致を検証する。計画の起点 `baseline_commit_sha` が\
+                   現在の baseline と一致しない場合は 409（再計画が必要）。\
+                   スクリーンショットのアップロード後には添付できない（409）。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    request_body = AttachCapturePlanRequest,
+    security(("bearerAuth" = [])),
+    responses(
+        (status = 200, description = "計画を固定したビルド（baseline_commit_sha は固定値）", body = BuildResponse),
+        (status = 400, description = "リストが不正（名前は空でなく前後空白なし・255 バイト以内） / selected が manifest の部分集合でない / 新規名（manifest にあり baseline に無い）が selected から漏れている / baseline と manifest の名前が 1 件も重ならない（命名規則の不一致とみなす） / storybook モード", body = ServerError),
+        (status = 409, description = "pending でない / 計画添付済み / アップロード済み / baseline が移動した / baseline が無い", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn attach_capture_plan(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+    Json(payload): Json<AttachCapturePlanRequest>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_scope(Scope::WriteBuild)?;
+    // 名前規則（ScreenshotName——アップロード・finalize と同一）での検証と型変換。
+    let (selected_names, manifest_names) =
+        payload.parse_lists().map_err(AppError::BadRequestDetail)?;
+
+    let (build, project) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
+
+    let build = build_service::attach_capture_plan(
+        &state.db,
+        build,
+        &project,
+        selected_names,
+        manifest_names,
+        &payload.baseline_commit_sha,
+    )
+    .await?;
+
+    // 固定した baseline のコミット SHA を返し、クライアントが照合できるようにする。
+    let baseline_commit_sha = build_service::pinned_baseline_commit_sha(&state.db, &build).await?;
+    let mut response: BuildResponse = build.into();
+    response.baseline_commit_sha = baseline_commit_sha;
+    Ok(Json(response))
 }
 
 #[axum::debug_handler]
@@ -167,7 +204,9 @@ async fn resolve_baseline_commit_sha(
     summary = "スクリーンショットをアップロードする",
     description = "multipart/form-data。`name` フィールドを `file` より**前**に送ること。\
                    PNG のみ受け付ける（最大 25MB / 10000x10000）。\
-                   `pending` 以外のビルドへのアップロードは 409、同名の重複も 409。",
+                   `pending` 以外のビルドへのアップロードは 409、同名の重複も 409。\
+                   capture plan が固定されたビルドでは、計画の `selected_names` に\
+                   無い名前のアップロードは 400 で拒否される。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
     security(("bearerAuth" = [])),
     responses(
@@ -188,6 +227,8 @@ pub async fn upload_screenshot(
     let (build, project) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
+    // 事前検査（バイト列を読む前の速い失敗）。正とするのは store_ci_screenshot が
+    // build 行ロックの中で行う再検査で、ここは並行変更に対して権威を持たない。
     // finalize 後のアップロードは受け付けない。
     if build.status != BuildStatus::Pending {
         return Err(AppError::Conflict);
@@ -233,9 +274,16 @@ pub async fn upload_screenshot(
     }
 
     let name = name.ok_or_else(|| AppError::BadRequestDetail("name field is required".into()))?;
+    // 名前規則（ScreenshotName——capture plan・finalize と同一）。空白付きを黙って
+    // trim すると、計画に載せた名前と保存された名前がずれて突き合わせが壊れる。
+    let name = ScreenshotName::parse(name)
+        .map_err(|e| AppError::BadRequestDetail(format!("name: {e}")))?;
     let file = file.ok_or_else(|| AppError::BadRequestDetail("file field is required".into()))?;
 
-    let screenshot = screenshot_service::store_screenshot(
+    // 状態・モード・capture plan（計画外の名前は 400）・重複の権威ある検査は、
+    // build 行ロックの中で DB 挿入と同時に行う。計画添付との並行競合で
+    // 「添付前の検査を通った計画外ショット」が紛れ込むのを防ぐ。
+    let screenshot = screenshot_service::store_ci_screenshot(
         &state.db,
         &state.storage,
         project.tenant_id,
@@ -343,14 +391,20 @@ pub async fn upload_storybook_bundle(
                    （レンダリングが済むと自動で `processing` に繋がる）。\
                    以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。\
                    ボディは任意。`storybook` モードで `only_story_ids` を渡すと、\
-                   そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当）。",
+                   そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当。\
+                   このとき `expected_baseline_commit_sha` は必須で、現在の baseline と\
+                   照合してから比較対象として固定する）。\
+                   `screenshots` モードの部分アップロードは、事前に\
+                   `POST /v1/ci/builds/{build_id}/plan` で固定された capture plan と\
+                   実際のアップロードの一致を検証する。`captured_names` は保存済み計画との\
+                   任意のクロスチェックで、計画なしのビルドに渡すと 400。",
     params(("build_id" = Uuid, Path, description = "ビルドID")),
     request_body(content = FinalizeBuildRequest, description = "任意。省略・空ボディ可"),
     security(("bearerAuth" = [])),
     responses(
         (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
-        (status = 400, description = "storybook バンドルが未アップロード / only_story_ids が不正 / screenshots モードで only_story_ids 指定", body = ServerError),
-        (status = 409, description = "既に finalize 済みです", body = ServerError),
+        (status = 400, description = "storybook バンドルが未アップロード / リストが不正 / モードとフィールドの組合せが不正 / captured_names とアップロードの不一致 / expected_baseline_commit_sha と固定済み baseline の不一致（screenshots モードのクロスチェック）", body = ServerError),
+        (status = 409, description = "既に finalize 済みです / baseline が計画後に動いた（expected_baseline_commit_sha と現在の baseline の不一致。現在の baseline へ再計画すれば解消）", body = ServerError),
         CrudErrors,
     )
 )]
@@ -375,19 +429,67 @@ pub async fn finalize_build(
     payload
         .validate_story_ids()
         .map_err(AppError::BadRequestDetail)?;
+    // captured_names はスクリーンショット名なので、story ID の規則ではなく
+    // 名前規則（ScreenshotName——capture plan・アップロードと同一）で検証する。
+    let captured_names = payload
+        .parse_captured_names()
+        .map_err(AppError::BadRequestDetail)?;
 
-    let (build, _) =
+    let (build, project) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Member).await?;
 
     let build = match build.mode {
         BuildMode::Screenshots => {
-            // screenshots モードはサーバーがレンダリングしないので流用制御は無意味。
+            // screenshots モードはサーバーがレンダリングしないため、ストーリー ID を
+            // スクリーンショット名へ写像できず only_story_ids は成立しない。
+            // 部分アップロードは事前に POST /plan で固定した capture plan で表す。
             if payload.only_story_ids.is_some() {
                 return Err(AppError::BadRequestDetail(
-                    "only_story_ids is not supported for screenshots-mode builds".into(),
+                    "only_story_ids is not supported for screenshots-mode builds; \
+                     attach a capture plan via POST /v1/ci/builds/{id}/plan instead"
+                        .into(),
                 ));
             }
-            let build = build_service::finalize(&state.db, build).await?;
+            // クライアントが計画に使った baseline と、計画添付時に固定された
+            // baseline の照合。計画なしのビルドには固定値が無いので、照合の
+            // しようがない（黙って通すと照合した気になるだけなので 400）。
+            if let Some(expected) = &payload.expected_baseline_commit_sha {
+                let pinned = build_service::pinned_baseline_commit_sha(&state.db, &build).await?;
+                match pinned {
+                    // 固定 SHA を解決できない理由は 2 つあり、文言を分ける:
+                    // baseline 自体が固定されていない（計画なし）のか、固定は
+                    // されているが昇格元ビルドが削除されて SHA を辿れないのか。
+                    // 後者に「requires a capture plan」を返すと、計画も pin も
+                    // あるのに無いと言われて原因に辿れない。
+                    None if build.baseline_id.is_some() => {
+                        return Err(AppError::BadRequestDetail(
+                            "expected_baseline_commit_sha cannot be verified: a baseline \
+                             is pinned to this build, but the build it was promoted from \
+                             (which carries the commit SHA) no longer exists. re-create \
+                             the build and attach a fresh capture plan, or finalize \
+                             without expected_baseline_commit_sha"
+                                .into(),
+                        ));
+                    }
+                    None => {
+                        return Err(AppError::BadRequestDetail(
+                            "expected_baseline_commit_sha requires a capture plan: \
+                             no baseline is pinned to this build, so there is nothing \
+                             to verify against"
+                                .into(),
+                        ));
+                    }
+                    Some(pinned) if pinned != *expected => {
+                        return Err(AppError::BadRequestDetail(format!(
+                            "expected_baseline_commit_sha does not match the baseline \
+                             pinned to this build (expected {expected}, pinned {pinned})"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+            }
+            let build =
+                build_service::finalize_screenshots(&state.db, build, captured_names).await?;
             job::compare_build::enqueue(
                 &state.compare_build_storage,
                 job::CompareBuildJob { build_id: build.id },
@@ -397,7 +499,51 @@ pub async fn finalize_build(
             build
         }
         BuildMode::Storybook => {
-            let build = build_service::finalize_storybook(&state.db, build).await?;
+            // storybook モードはサーバーが撮るので「CI が撮った名前」の宣言は成立しない。
+            if payload.captured_names.is_some() {
+                return Err(AppError::BadRequestDetail(
+                    "captured_names is not supported for storybook-mode builds; \
+                     use only_story_ids to narrow the capture set"
+                        .into(),
+                ));
+            }
+            // 部分レンダリングは、計画の起点 baseline の照合と固定を finalize の
+            // 行ロック 1 トランザクション内（finalize_storybook）で行う。
+            // 全撮影（only_story_ids 無し）は固定しない——比較ジョブが比較時点の
+            // 最新 baseline を解決する従来動作のまま。
+            let pin_expected = if payload.only_story_ids.is_some() {
+                let Some(expected) = &payload.expected_baseline_commit_sha else {
+                    return Err(AppError::BadRequestDetail(
+                        "only_story_ids requires expected_baseline_commit_sha so the \
+                         baseline the plan was computed against can be verified and \
+                         pinned before any reuse happens"
+                            .into(),
+                    ));
+                };
+                Some(expected.clone())
+            } else {
+                if let Some(expected) = &payload.expected_baseline_commit_sha {
+                    // 全撮影でも、渡された起点が現在の baseline とずれていれば断る
+                    // （固定はしない読み取り検査なので、finalize の行ロックの外でよい）。
+                    // 「baseline が動いた（再計画で解消）」は plan 添付と同じ 409。
+                    let current = build_service::current_baseline_commit_sha(
+                        &state.db,
+                        &project,
+                        &build.branch,
+                    )
+                    .await?;
+                    if current.as_deref() != Some(expected.as_str()) {
+                        return Err(AppError::ConflictDetail(format!(
+                            "expected_baseline_commit_sha does not match the current baseline \
+                             (expected {expected}, current {})",
+                            current.as_deref().unwrap_or("none")
+                        )));
+                    }
+                }
+                None
+            };
+            let build =
+                build_service::finalize_storybook(&state.db, build, &project, pin_expected).await?;
             job::render_build::enqueue(
                 &state.render_build_storage,
                 job::RenderBuildJob {

@@ -949,3 +949,24 @@ impl TestApp {
         (token, id)
     }
 }
+
+/// プロジェクトの最新 baseline 行を DB から直接読む（baseline 一覧 API はまだ無い）。
+///
+/// 「最新」の解決（`created_at` 降順・同時刻は `id` 降順）を各テストが
+/// 重複実装すると、順序規則が変わったときに一部のテストだけ旧規則のまま
+/// 別の baseline を掴んで緑を保ちうるため、ここに一本化する。
+pub async fn latest_baseline_of(
+    db: &DatabaseConnection,
+    project_id: Uuid,
+) -> entity::baselines::Model {
+    use sea_orm::QueryOrder;
+
+    entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::ProjectId.eq(project_id))
+        .order_by_desc(entity::baselines::Column::CreatedAt)
+        .order_by_desc(entity::baselines::Column::Id)
+        .one(db)
+        .await
+        .expect("query baseline")
+        .expect("baseline exists")
+}
