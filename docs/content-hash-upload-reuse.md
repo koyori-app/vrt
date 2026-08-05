@@ -8,17 +8,34 @@
 ビルド時間には効かない。
 アップロードは並列であり、時間の支配項は decode だからである。
 
-## 結論
+## 結論：実装見送り
 
-設計は本文書のとおり固める。
-ただし実装の着手は、`content_hash_skipped` の実運用データで PNG のバイト列一致率を確認してからとする。
-一致率がゼロに近ければ、②のヒット率もゼロであり、実装しない。
+②は現時点では実装しない。
+設計は本文書のとおり固め、文書として残す。
+
+見送りの理由は次のとおりである。
+
+- 削減できるのは転送量のみで、見積もりでも月およそ 2.8 GB にとどまる。
+- ストレージ削減はゼロである（実体コピー方式のため、新規オブジェクトは送信した場合と同じ量だけ増える）。
+- ビルド時間の削減もゼロである（アップロードは並列であり、時間の支配項は decode）。
+- この転送削減の見積もり自体が、未実証の仮定（とくにバイト一致率）に全面依存する。
+
+再検討の条件は、`content_hash_skipped_count` の実運用データで PNG のバイト列一致率が確認できたときとする。
+一致率がゼロに近ければ、②のヒット率もゼロであり、見送りのままとする。
+
+見積もりの前提とした仮定は次のとおりである（詳細は「仮定と削減量」）。
+
+- story 数 300
+- ①適用後に撮影する割合 10%（30 枚/build）
+- 撮影分のうちバイト一致する割合 70%（未実証）
+- PNG 1 枚 200 KB
+- build 頻度 30/日 × 22 日 = 660/月
 
 ## 要否の見積もり
 
 ### 効果がバイト列の再現性に全面依存すること
 
-content hash は受領した PNG のバイト列に対する sha256 である（`crates/service/src/screenshots.rs` の `compute_content_hash`）。
+content hash は受領した PNG のバイト列に対する sha256 である（`apps/backend/crates/service/src/screenshots.rs` の `content_hash`）。
 decode 後のピクセルではない。
 したがって、再撮影した PNG がバイト単位で baseline と一致しない限り、②のヒットはゼロになる。
 バイト一致するかどうかは CI 側の撮影環境と PNG encoder の決定性に依存し、現時点で実測データはない。
@@ -86,7 +103,7 @@ reuse claim の結果は、carry-forward と同じサーバー側の実体コピ
 
 storage key の共有や参照テーブルを採らない理由は寿命管理にある。
 retention（`prune_old_builds`）は「build のオブジェクトは build と共に死ぬ」前提で build 単位に削除しており、build をまたいでキーを共有すると、参照カウント相当の寿命管理を新設しない限り、参照側が生きているのに実体が消える。
-carry-forward が参照ではなく物理複製を選んだ理由として、`crates/job/src/compare_build.rs` の `materialize_carry_forward` に同じことが明文化されている。
+carry-forward が参照ではなく物理複製を選んだ理由として、`apps/backend/crates/job/src/compare_build.rs` の `materialize_carry_forward` に同じことが明文化されている。
 また、Reuse が実体コピーであるという前提には manifest 系の承認ガードと統合テストが依存している（PR #8）。
 本設計の見積もりでは、ストレージ削減はこの前提を作り直すほどの額にならない。
 
@@ -123,7 +140,7 @@ claim を送らずに省略した story は「送り損ねた」として検出�
 
 ### verified marker（昇格時の実体健全性）
 
-承認 preflight は全 shot について storage の実体を再読し、hash を照合し、full decode の成功を確認してから marker を書く（`crates/service/src/screenshots.rs` の `verify_baseline_candidate`、`crates/service/src/builds.rs` の承認経路）。
+承認 preflight は全 shot について storage の実体を再読し、hash を照合し、full decode の成功を確認してから marker を書く（`apps/backend/crates/service/src/screenshots.rs` の `verify_baseline_candidate`、`apps/backend/crates/service/src/builds.rs` の承認経路）。
 
 reuse された shot も build 所有の実体コピーを持つため、この経路は変更なしで機能する。
 参照方式であれば「実体を読む」対象が他 build のオブジェクトになり、寿命問題が preflight に波及したが、コピー方式ではその問題自体が生じない。
@@ -144,7 +161,7 @@ CI が申告した hash は照合にだけ使い、保存しない。
 
 - `compare_build.rs` の `materialize_carry_forward`：物理複製を選んだ理由の明文。
 - `builds.rs` の `prune_old_builds`：retention の保護対象が `baselines.source_build_id` だけであること。
-- `crates/service/src/screenshots.rs` のモジュール doc：storage key が build に閉じ、例外は baseline 昇格時の参照だけであること。
+- `apps/backend/crates/service/src/screenshots.rs` のモジュール doc：storage key が build に閉じ、例外は baseline 昇格時の参照だけであること。
 - `compare_build.rs` の selected 照合：`is_reused` による複製の除外。
 
 ②は同じ実体コピー機構を使うため、この前提は変わらない。
