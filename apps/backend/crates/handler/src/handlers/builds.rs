@@ -327,7 +327,9 @@ pub async fn approve_build(
             accept_revert: b.accept_revert,
         })
         .unwrap_or_default();
-    let approved = build_service::approve_build(&state.db, build, auth.user_id, options).await?;
+    let approved =
+        build_service::approve_build(&state.db, &state.storage, build, auth.user_id, options)
+            .await?;
 
     // レビュー結果を PR に反映する。job を handler に依存させないため、
     // 投入はサービス呼び出しが成功したあとのここで行う。

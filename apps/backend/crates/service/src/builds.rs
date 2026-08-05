@@ -4,10 +4,11 @@
 //! 承認 ([`approve_build`]) はプロジェクト行を `SELECT ... FOR UPDATE` で直列化してから
 //! baseline を作るため、同一プロジェクトの並行承認でも baseline が競合しない。
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use chrono::Utc;
+use futures::{StreamExt, TryStreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
@@ -28,6 +29,74 @@ use crate::storage::StorageBackend;
 /// エラーメッセージに並べる story 名の上限。超過分は件数だけ示す。
 const MAX_REPORTED_NAMES: usize = 10;
 
+/// request 内の storage read 数だけを抑える上限。decode メモリは request 数ではなく
+/// screenshots のプロセス全体 weighted semaphore が decoded bytes 単位で制御する。
+const BASELINE_STORAGE_READ_CONCURRENCY: usize = 8;
+
+static APPROVAL_PREFLIGHT_LOCKS: LazyLock<Mutex<HashMap<Uuid, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// 同じ build への並行 approve が同じ全 shot を重複 download/decode しないための
+/// process-local single-flight。build lock を待たず、重い preflight より前に取得する。
+fn approval_preflight_lock(build_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = APPROVAL_PREFLIGHT_LOCKS
+        .lock()
+        .expect("approval preflight lock registry poisoned");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&build_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(build_id, Arc::downgrade(&lock));
+    lock
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShotVerificationSnapshot {
+    id: Uuid,
+    storage_key: String,
+    content_hash: Option<String>,
+}
+
+impl From<&screenshots::Model> for ShotVerificationSnapshot {
+    fn from(shot: &screenshots::Model) -> Self {
+        Self {
+            id: shot.id,
+            storage_key: shot.storage_key.clone(),
+            content_hash: shot.content_hash.clone(),
+        }
+    }
+}
+
+fn shot_verification_snapshot(shots: &[screenshots::Model]) -> Vec<ShotVerificationSnapshot> {
+    let mut snapshot: Vec<_> = shots.iter().map(ShotVerificationSnapshot::from).collect();
+    snapshot.sort_by_key(|shot| shot.id);
+    snapshot
+}
+
+/// 重い storage I/O・SHA-256・full decode は DB transaction の外で行う。
+async fn verify_baseline_candidates(
+    storage: &Arc<dyn StorageBackend>,
+    shots: &[screenshots::Model],
+) -> Result<HashMap<Uuid, String>, AppError> {
+    futures::stream::iter(shots.iter().cloned().map(|shot| {
+        let storage = Arc::clone(storage);
+        async move {
+            let verified = crate::screenshots::verify_baseline_candidate(
+                &storage,
+                &shot.storage_key,
+                shot.content_hash.as_deref(),
+            )
+            .await
+            .map_err(AppError::Internal)?;
+            Ok::<_, AppError>((shot.id, verified))
+        }
+    }))
+    .buffer_unordered(BASELINE_STORAGE_READ_CONCURRENCY)
+    .try_collect()
+    .await
+}
+
 /// ビルド一覧のデフォルト件数。
 pub const DEFAULT_LIST_LIMIT: u64 = 30;
 /// ビルド一覧の最大件数。
@@ -41,6 +110,7 @@ pub struct BuildCounts {
     pub added: i32,
     pub removed: i32,
     pub unchanged: i32,
+    pub content_hash_skipped: i32,
 }
 
 impl BuildCounts {
@@ -129,6 +199,7 @@ pub async fn create_build<C: ConnectionTrait>(
         added_count: Set(0),
         removed_count: Set(0),
         unchanged_count: Set(0),
+        content_hash_skipped_count: Set(0),
         error_message: Set(None),
         approval_evidence: Set(None),
         approved_by: Set(None),
@@ -682,6 +753,7 @@ pub async fn apply_counts<C: ConnectionTrait>(
     active.added_count = Set(counts.added);
     active.removed_count = Set(counts.removed);
     active.unchanged_count = Set(counts.unchanged);
+    active.content_hash_skipped_count = Set(counts.content_hash_skipped);
     active.baseline_id = Set(baseline_id);
     Ok(active.update(db).await?)
 }
@@ -738,6 +810,7 @@ pub async fn pending_review_count<C: ConnectionTrait>(
 /// `(project_id, branch, created_at DESC)` 先頭が確定する。
 pub async fn approve_build(
     db: &DatabaseConnection,
+    storage: &Arc<dyn StorageBackend>,
     build: builds::Model,
     reviewer_id: Uuid,
     options: ApproveOptions,
@@ -753,14 +826,44 @@ pub async fn approve_build(
         )));
     }
 
+    let preflight_lock = approval_preflight_lock(build.id);
+    let _single_flight = preflight_lock.lock().await;
+
+    // storage I/O・SHA-256・full decode は、build/project の排他ロックを取る前に
+    // bounded parallel で済ませる。後続 transaction では、この検証が依存した
+    // build 状態・baseline ID・shot の ID/key/hash 集合を読み直して TOCTOU を閉じる。
+    let preflight_build = get_build(db, build.id).await?;
+    if !(preflight_build
+        .status
+        .can_transition_to(BuildStatus::Approved)
+        || options.accept_revert && preflight_build.status == BuildStatus::Approved)
+    {
+        return Err(AppError::Conflict);
+    }
+    let preflight_project = projects::Entity::find_by_id(preflight_build.project_id)
+        .one(db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let preflight_current =
+        crate::baselines::latest_for(db, &preflight_project, &preflight_build.branch).await?;
+    let preflight_current_id = preflight_current.as_ref().map(|baseline| baseline.id);
+    let preflight_shots = screenshots::Entity::find()
+        .filter(screenshots::Column::BuildId.eq(preflight_build.id))
+        .order_by_asc(screenshots::Column::Name)
+        .all(db)
+        .await?;
+    let preflight_shot_snapshot = shot_verification_snapshot(&preflight_shots);
+    let verified_by_shot = verify_baseline_candidates(storage, &preflight_shots).await?;
+
     with_transaction(db, move |txn| {
         Box::pin(async move {
             // 三つのレビュー判断経路で共通の順序（build -> project）を使う。
             // build は同一 build の比較レビュー/承認/却下を直列化し、project は異なる
             // build の baseline 昇格だけを直列化する。規約は review_lock に集約してある。
             let build = crate::review_lock::build(txn, build.id).await?;
-            if !(build.status.can_transition_to(BuildStatus::Approved)
-                || options.accept_revert && build.status == BuildStatus::Approved)
+            if build.status != preflight_build.status
+                || !(build.status.can_transition_to(BuildStatus::Approved)
+                    || options.accept_revert && build.status == BuildStatus::Approved)
             {
                 return Err(AppError::ConflictDetail(format!(
                     "cannot approve: build #{} now has status {:?}, which cannot transition to \
@@ -775,6 +878,14 @@ pub async fn approve_build(
             // 「いまの baseline」を引き直し、比較時点のものと一致するか確かめる。
             // ロックを取ったあとに読むので、並行承認との間に隙間は無い。
             let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
+
+            if current.as_ref().map(|baseline| baseline.id) != preflight_current_id {
+                return Err(AppError::ConflictDetail(
+                    "cannot approve: the baseline moved while screenshot integrity was being \
+                     verified. retry approval against the current baseline."
+                        .to_string(),
+                ));
+            }
 
             let mut reverted_from_build = None;
             let mut baseline_source_missing = false;
@@ -907,6 +1018,14 @@ pub async fn approve_build(
                 .all(txn)
                 .await?;
 
+            if shot_verification_snapshot(&shots) != preflight_shot_snapshot {
+                return Err(AppError::ConflictDetail(
+                    "cannot approve: the screenshot set changed while its stored objects were \
+                     being verified. retry approval."
+                        .to_string(),
+                ));
+            }
+
             // 現行 baseline から予期せず欠落した story を検出する。
             // 「消えてよい」と承認された story 以外が今回のビルドから欠けていたら、
             // 撮影漏れ・アップロード失敗と区別がつかないので承認しない。
@@ -960,6 +1079,17 @@ pub async fn approve_build(
             .await?;
 
             for shot in shots {
+                // marker は transaction 外で検証した時点の健全性だけを示す。
+                // 上の snapshot 再確認により、検証対象と挿入対象の取り違えを防ぐ。
+                // marker 後の欠損・破損は比較時の実体 hash 再照合で検出する。
+                let verified_content_hash = verified_by_shot.get(&shot.id).cloned().ok_or_else(
+                    || {
+                        AppError::Internal(anyhow::anyhow!(
+                            "verified baseline candidate missing for screenshot {}",
+                            shot.id
+                        ))
+                    },
+                )?;
                 baseline_entries::ActiveModel {
                     id: Set(Uuid::new_v4()),
                     baseline_id: Set(baseline.id),
@@ -967,6 +1097,10 @@ pub async fn approve_build(
                     storage_key: Set(shot.storage_key),
                     width: Set(shot.width),
                     height: Set(shot.height),
+                    // pre-migration screenshot の NULL を新 baseline へ伝播させない。
+                    // full decode 済み実体から得た hash と marker を同じ値で保存する。
+                    content_hash: Set(Some(verified_content_hash.clone())),
+                    verified_content_hash: Set(Some(verified_content_hash)),
                 }
                 .insert(txn)
                 .await?;

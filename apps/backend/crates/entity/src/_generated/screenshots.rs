@@ -17,6 +17,9 @@ pub struct Model {
     pub storage_key: String,
     pub width: i32,
     pub height: i32,
+    /// SHA-256 等の方式を接頭辞に含む、受領 PNG バイト列の content hash。
+    #[sea_orm(column_type = "Text", nullable)]
+    pub content_hash: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<Json>,
     pub created_at: DateTimeWithTimeZone,

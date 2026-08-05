@@ -158,9 +158,15 @@ async fn prune_keeps_baseline_referenced_builds() {
     let b1 = make_passed_build(&app, tenant_id, project_id, "sha1").await;
     let reviewer = app.insert_user().await;
     let build1 = service::builds::get_build(db, b1.0).await.expect("b1");
-    service::builds::approve_build(db, build1, reviewer.id, Default::default())
-        .await
-        .expect("approve b1");
+    service::builds::approve_build(
+        db,
+        &app.state.storage,
+        build1,
+        reviewer.id,
+        Default::default(),
+    )
+    .await
+    .expect("approve b1");
 
     let b2 = make_passed_build(&app, tenant_id, project_id, "sha2").await;
     let b3 = make_passed_build(&app, tenant_id, project_id, "sha3").await;

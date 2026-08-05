@@ -292,6 +292,11 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
         "unselected baseline entries must be carried forward, not reported as removed"
     );
     assert_eq!(build["unchanged_count"].as_i64(), Some(2));
+    assert_eq!(
+        build["content_hash_skipped_count"].as_i64(),
+        Some(2),
+        "byte-identical carry-forward copies reuse the baseline hash and skip decode/diff"
+    );
 
     let cmps = fx.comparisons(build_id).await;
     for name in ["about", "pricing"] {
@@ -321,6 +326,12 @@ async fn subset_upload_carries_forward_unselected_baseline_entries() {
                 row.id,
                 service::screenshots::carry_forward_screenshot_id(build_id, name),
                 "carried-forward `{name}` must use the deterministic id so retries converge"
+            );
+            assert!(
+                row.content_hash
+                    .as_deref()
+                    .is_some_and(|hash| hash.starts_with("sha256:")),
+                "carried-forward `{name}` inherits the hash because its PNG bytes are copied unchanged"
             );
         }
     }
@@ -386,6 +397,29 @@ async fn empty_selection_plan_reuses_the_whole_baseline() {
     fx.establish_baseline("base0002", png(40, 30, [255, 255, 255, 255]))
         .await;
 
+    // migration 前の baseline を再現する。既存行は content_hash/marker が NULL の
+    // まま残るため、比較は通常 decode へ倒れなければならない。
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+    let (legacy_baseline_id, _) = fx.latest_baseline().await;
+    let legacy_entries = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(legacy_baseline_id))
+        .all(&fx.app.state.db)
+        .await
+        .expect("query legacy baseline entries");
+    assert!(
+        !legacy_entries.is_empty(),
+        "positive control needs legacy rows"
+    );
+    for entry in legacy_entries {
+        let mut active: entity::baseline_entries::ActiveModel = entry.into();
+        active.content_hash = Set(None);
+        active.verified_content_hash = Set(None);
+        active
+            .update(&fx.app.state.db)
+            .await
+            .expect("remove hashes to emulate a migrated baseline");
+    }
+
     let build = fx.create_build("subset02").await;
     let build_id = build_id_of(&build);
     fx.attach_plan_ok(build_id, &[], &FULL_MANIFEST, "base0002")
@@ -398,6 +432,29 @@ async fn empty_selection_plan_reuses_the_whole_baseline() {
     assert_eq!(build["total_count"].as_i64(), Some(3));
     assert_eq!(build["unchanged_count"].as_i64(), Some(3));
     assert_eq!(build["removed_count"].as_i64(), Some(0));
+    assert_eq!(
+        build["content_hash_skipped_count"].as_i64(),
+        Some(0),
+        "legacy baseline has no hash, so comparison must decode instead of taking the fast path"
+    );
+
+    let carried = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .all(&fx.app.state.db)
+        .await
+        .expect("query carried-forward shots");
+    assert_eq!(carried.len(), FULL_MANIFEST.len());
+    for shot in &carried {
+        assert!(
+            shot.content_hash
+                .as_deref()
+                .is_some_and(|hash| hash.starts_with("sha256:")),
+            "carry-forward must hash the PNG bytes it already downloaded"
+        );
+    }
+    fx.approve_force(build_id).await;
+    let (_, names) = fx.latest_baseline().await;
+    assert_eq!(names, vec!["about", "home", "pricing"]);
 }
 
 /// 「撮る集合」は保存済み計画からのみ来る。

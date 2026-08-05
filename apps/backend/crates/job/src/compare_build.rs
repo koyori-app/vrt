@@ -247,7 +247,13 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         let outcome = match (shot.as_ref(), entry.as_ref()) {
             (Some(_), None) => Outcome::added(),
             (None, Some(_)) => Outcome::removed(),
-            (Some(shot), Some(entry)) => compare_pair(state, &project, &build, shot, entry).await?,
+            (Some(shot), Some(entry)) => {
+                let outcome = compare_pair(state, &project, &build, shot, entry).await?;
+                if outcome.content_hash_skipped {
+                    counts.content_hash_skipped += 1;
+                }
+                outcome
+            }
             // join のキーは必ずどちらかに由来するので到達しない。
             (None, None) => unreachable!("join key without any side"),
         };
@@ -299,8 +305,9 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         build_id,
         LogLevel::Info,
         format!(
-            "compare complete: total {} changed {} added {} removed {} unchanged {}",
-            counts.total, counts.changed, counts.added, counts.removed, counts.unchanged
+            "compare complete: total {} changed {} added {} removed {} unchanged {} content_hash_skipped {}",
+            counts.total, counts.changed, counts.added, counts.removed, counts.unchanged,
+            counts.content_hash_skipped
         ),
     )
     .await?;
@@ -324,6 +331,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         added = counts.added,
         removed = counts.removed,
         unchanged = counts.unchanged,
+        content_hash_skipped = counts.content_hash_skipped,
         "compare build finished"
     );
 
@@ -339,6 +347,7 @@ struct Outcome {
     diff_storage_key: Option<String>,
     diff_pixel_count: Option<i64>,
     diff_ratio: Option<f64>,
+    content_hash_skipped: bool,
 }
 
 impl Outcome {
@@ -349,6 +358,7 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            content_hash_skipped: false,
         }
     }
 
@@ -359,6 +369,7 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            content_hash_skipped: false,
         }
     }
 }
@@ -526,6 +537,10 @@ async fn materialize_carry_forward(
             storage_key: sea_orm::ActiveValue::Set(key.clone()),
             width: sea_orm::ActiveValue::Set(entry.width),
             height: sea_orm::ActiveValue::Set(entry.height),
+            // carry-forward は上で読み込んだ PNG バイト列を無加工でコピーする。
+            // migration 前の baseline は hash が NULL なので、継承ではなく、この既読
+            // バイト列から再計算する。追加の storage 読み出しは発生しない。
+            content_hash: sea_orm::ActiveValue::Set(Some(service::screenshots::content_hash(&png))),
             metadata: sea_orm::ActiveValue::Set(Some(serde_json::json!({ "reused": true }))),
             created_at: sea_orm::ActiveValue::Set(Utc::now().fixed_offset()),
         };
@@ -627,6 +642,53 @@ async fn compare_pair(
 ) -> Result<Outcome, anyhow::Error> {
     let storage: &Arc<dyn StorageBackend> = &state.storage;
 
+    // marker は昇格時点の hash 再照合と full decode の成功だけを証明する。
+    // その後の欠損・破損は証明しないため、fast path の直前に baseline/current の
+    // 保存実体を再読して hash を照合する。読めない場合は比較ジョブを失敗させる。
+    let hashes_match = service::screenshots::content_hashes_match(
+        shot.content_hash.as_deref(),
+        entry.content_hash.as_deref(),
+    ) && service::screenshots::content_hashes_match(
+        entry.content_hash.as_deref(),
+        entry.verified_content_hash.as_deref(),
+    );
+    if hashes_match {
+        let baseline_ok = service::screenshots::verify_stored_content_hash(
+            storage,
+            &entry.storage_key,
+            entry.content_hash.as_deref(),
+        )
+        .await?;
+        let current_ok = service::screenshots::verify_stored_content_hash(
+            storage,
+            &shot.storage_key,
+            shot.content_hash.as_deref(),
+        )
+        .await?;
+        if baseline_ok && current_ok {
+            return Ok(Outcome {
+                id: Uuid::new_v4(),
+                status: ComparisonStatus::Unchanged,
+                diff_storage_key: None,
+                diff_pixel_count: Some(0),
+                diff_ratio: Some(0.0),
+                content_hash_skipped: true,
+            });
+        }
+        if !baseline_ok {
+            anyhow::bail!(
+                "baseline entry `{}` integrity check failed: \
+                 stored content does not match recorded content hash",
+                entry.name
+            );
+        }
+        anyhow::bail!(
+            "screenshot `{}` integrity check failed: \
+             stored content does not match recorded content hash",
+            shot.name
+        );
+    }
+
     let baseline_image = service::screenshots::load_rgba(storage, &entry.storage_key).await?;
     let current_image = service::screenshots::load_rgba(storage, &shot.storage_key).await?;
 
@@ -671,6 +733,7 @@ async fn compare_pair(
         diff_storage_key,
         diff_pixel_count: Some(diff_pixel_count as i64),
         diff_ratio: Some(diff_ratio),
+        content_hash_skipped: false,
     })
 }
 
@@ -686,6 +749,7 @@ mod tests {
             storage_key: format!("key/{name}"),
             width: 1,
             height: 1,
+            content_hash: None,
             metadata: None,
             created_at: Utc::now().fixed_offset(),
         }
@@ -699,6 +763,8 @@ mod tests {
             storage_key: format!("baseline/{name}"),
             width: 1,
             height: 1,
+            content_hash: None,
+            verified_content_hash: None,
         }
     }
 

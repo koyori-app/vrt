@@ -19,6 +19,7 @@ use common::TestApp;
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -93,6 +94,41 @@ fn encode(image: &RgbaImage) -> Vec<u8> {
         .write_to(&mut buf, image::ImageFormat::Png)
         .expect("encode png");
     buf.into_inner()
+}
+
+/// IEND の直前に tEXt チャンクを挿入してバイト列を変える。
+/// ピクセルは同一のままハッシュだけが変わる。
+fn inject_text_chunk(mut png: Vec<u8>) -> Vec<u8> {
+    let iend_pos = png
+        .windows(4)
+        .rposition(|w| w == b"IEND")
+        .expect("IEND chunk")
+        - 4;
+    let key_value = b"Comment\0injected";
+    let data_len = (key_value.len() as u32).to_be_bytes();
+    let mut chunk = Vec::new();
+    chunk.extend_from_slice(&data_len);
+    chunk.extend_from_slice(b"tEXt");
+    chunk.extend_from_slice(key_value);
+    let crc = crc32fast::hash(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    png.splice(iend_pos..iend_pos, chunk);
+    png
+}
+
+/// IHDR は保ったまま IDAT を壊す。寸法取得は通るが full decode は失敗する。
+fn corrupt_idat(mut png: Vec<u8>) -> Vec<u8> {
+    let mut offset = 8;
+    while offset + 12 <= png.len() {
+        let len = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &png[offset + 4..offset + 8];
+        if kind == b"IDAT" && len > 0 {
+            png[offset + 8 + len / 2] ^= 0xff;
+            return png;
+        }
+        offset += 12 + len;
+    }
+    panic!("encoded PNG has no IDAT chunk");
 }
 
 // ── フローのヘルパー ────────────────────────────────────────────────────
@@ -215,6 +251,16 @@ impl Fixture {
             .as_array()
             .expect("comparisons array")
             .clone()
+    }
+
+    async fn build_logs(&self, build_id: Uuid) -> Vec<Value> {
+        let res = self
+            .app
+            .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &self.token)
+            .await;
+        assert_eq!(res.status(), StatusCode::OK, "list build logs");
+        let body: Value = res.json().await.expect("build logs json");
+        body["entries"].as_array().expect("log entries").clone()
     }
 
     async fn approve(&self, build_id: Uuid, force: bool) -> reqwest::Response {
@@ -388,6 +434,11 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         (3, 1, 1, 0, 1),
         "expected unchanged:1 changed:1 added:1"
     );
+    assert_eq!(
+        build2["content_hash_skipped_count"].as_i64(),
+        Some(1),
+        "only the byte-identical screenshot skips decode/diff"
+    );
 
     let cmps = fx.comparisons(build2_id).await;
     assert_eq!(cmps.len(), 3);
@@ -517,6 +568,20 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         "identical build needs no review"
     );
     assert_eq!(counts(&build3), (3, 0, 0, 0, 3));
+    assert_eq!(
+        build3["content_hash_skipped_count"].as_i64(),
+        Some(3),
+        "all byte-identical screenshots skip decode/diff"
+    );
+    let logs = fx.build_logs(build3_id).await;
+    assert!(
+        logs.iter().any(|entry| {
+            entry["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("content_hash_skipped 3"))
+        }),
+        "build log records how many comparisons skipped decode/diff"
+    );
 
     let cmps = fx.comparisons(build3_id).await;
     assert!(cmps.iter().all(|c| c["status"] == "unchanged"));
@@ -537,6 +602,217 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         .map(|b| b["number"].as_i64().unwrap_or(-1))
         .collect();
     assert_eq!(numbers, vec![3, 2, 1], "builds are listed newest first");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_fast_path_rejects_dimension_readable_but_corrupt_stored_png() {
+    let fx = setup().await;
+    let original = png(12, 12, [20, 40, 60, 255]);
+    let baseline_build = fx.create_build("main", "baseline-corrupt-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    assert_eq!(
+        fx.wait_for_terminal(baseline_build_id).await["status"],
+        "changes_detected"
+    );
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "corrupt-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref()
+        ),
+        "positive control: the pre-fix metadata-only fast path would pass"
+    );
+
+    let corrupt = corrupt_idat(original);
+    assert!(
+        service::screenshots::validate_png(&corrupt).is_ok(),
+        "dimensions remain readable"
+    );
+    assert!(
+        image::load_from_memory(&corrupt).is_err(),
+        "full decode detects broken IDAT"
+    );
+    service::screenshots::upload_png(&fx.app.state.storage, &shot.storage_key, corrupt.into())
+        .await
+        .expect("replace fixture object with corrupt bytes");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "corrupt object must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_fast_path_rejects_missing_stored_object() {
+    let fx = setup().await;
+    let original = png(12, 12, [80, 100, 120, 255]);
+    let baseline_build = fx.create_build("main", "baseline-missing-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    fx.wait_for_terminal(baseline_build_id).await;
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "missing-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref()
+        ),
+        "positive control: the pre-fix metadata-only fast path would pass"
+    );
+    fx.app
+        .state
+        .storage
+        .delete(&shot.storage_key)
+        .await
+        .expect("delete fixture object");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "missing object must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_mismatch_rejects_pixel_identical_replacement_png() {
+    let fx = setup().await;
+    let original = png(12, 12, [20, 40, 60, 255]);
+    let baseline_build = fx.create_build("main", "baseline-swap-test").await;
+    let baseline_build_id = build_id_of(&baseline_build);
+    assert_eq!(
+        fx.upload(baseline_build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(baseline_build_id).await, StatusCode::OK);
+    assert_eq!(
+        fx.wait_for_terminal(baseline_build_id).await["status"],
+        "changes_detected"
+    );
+    assert_eq!(
+        fx.approve(baseline_build_id, true).await.status(),
+        StatusCode::OK
+    );
+
+    let build = fx.create_build("main", "swap-current").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload(build_id, "card", original.clone()).await,
+        StatusCode::CREATED
+    );
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query shot")
+        .expect("shot");
+    let baseline = entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::SourceBuildId.eq(baseline_build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline")
+        .expect("baseline");
+    let entry = entity::baseline_entries::Entity::find()
+        .filter(entity::baseline_entries::Column::BaselineId.eq(baseline.id))
+        .filter(entity::baseline_entries::Column::Name.eq("card"))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query baseline entry")
+        .expect("baseline entry");
+    assert!(
+        service::screenshots::content_hashes_match(
+            shot.content_hash.as_deref(),
+            entry.content_hash.as_deref(),
+        ),
+        "positive control: DB hashes match before replacement"
+    );
+
+    let reencoded = inject_text_chunk(original);
+    assert!(
+        image::load_from_memory(&reencoded).is_ok(),
+        "replacement PNG is valid"
+    );
+    service::screenshots::upload_png(&fx.app.state.storage, &shot.storage_key, reencoded.into())
+        .await
+        .expect("replace fixture object with pixel-identical but byte-different PNG");
+
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        failed["status"], "failed",
+        "pixel-identical but byte-different replacement must not become passed"
+    );
+    assert_eq!(failed["content_hash_skipped_count"], 0);
 }
 
 /// このプロジェクトの最新 baseline のエントリ数。

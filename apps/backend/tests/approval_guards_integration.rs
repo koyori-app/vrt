@@ -956,3 +956,47 @@ async fn ordinary_review_and_approval_still_promotes_the_baseline() {
     assert_eq!(names, vec!["about".to_string(), "home".to_string()]);
     assert_eq!(fx.build_status(second_id).await, "approved");
 }
+
+/// content_hash migration 前に upload 済みだった build は screenshots.content_hash が
+/// NULL のままでも、承認時の実体 hash + full decode を正準値として昇格できる。
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_build_with_pre_migration_screenshot_can_be_approved_directly() {
+    let fx = setup().await;
+    let build = fx.run_build("legacy-shot", &[("home", RED)]).await;
+    let build_id = build_id_of(&build);
+
+    let shot = entity::screenshots::Entity::find()
+        .filter(entity::screenshots::Column::BuildId.eq(build_id))
+        .one(&fx.app.state.db)
+        .await
+        .expect("query screenshot")
+        .expect("screenshot exists");
+    let actual_hash = shot.content_hash.clone().expect("new upload has hash");
+    let mut active: entity::screenshots::ActiveModel = shot.into();
+    active.content_hash = Set(None);
+    active
+        .update(&fx.app.state.db)
+        .await
+        .expect("emulate pre-migration screenshot row");
+
+    assert!(
+        !service::screenshots::content_hashes_match(Some(&actual_hash), None),
+        "positive control: the pre-fix strict expected-hash check rejected this row"
+    );
+    let res = fx.approve(build_id, json!({ "force": true })).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "legacy build approves directly"
+    );
+
+    let (baseline_id, _) = fx.current_baseline().await.expect("baseline exists");
+    let entry = service::baselines::entries(&fx.app.state.db, baseline_id)
+        .await
+        .expect("baseline entries")
+        .into_iter()
+        .find(|entry| entry.name == "home")
+        .expect("home baseline entry");
+    assert_eq!(entry.content_hash.as_deref(), Some(actual_hash.as_str()));
+    assert_eq!(entry.verified_content_hash, entry.content_hash);
+}
