@@ -11,6 +11,7 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 |---|---|
 | Homepage URL | `https://<APP_URL>` |
 | Webhook URL | `https://<APP_URL>/api/v1/github/webhook` |
+| Setup URL | `https://<APP_URL>/github/setup` |
 | Webhook secret | 任意のランダム文字列（`GITHUB_WEBHOOK_SECRET` に入れる） |
 | Repository permissions → **Commit statuses** | **Read and write** |
 | Repository permissions → Metadata | Read-only（自動で付く） |
@@ -20,7 +21,8 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 作成後の画面で:
 
 1. **App ID** を控える → `GITHUB_APP_ID`
-2. **Generate a private key** で `.pem` をダウンロード → `GITHUB_APP_PRIVATE_KEY_PEM`
+2. App の公開ページにあるインストール URL を控える → `GITHUB_APP_INSTALL_URL`
+3. **Generate a private key** で `.pem` をダウンロード → `GITHUB_APP_PRIVATE_KEY_PEM`
 
 ## 2. バックエンドの環境変数
 
@@ -28,6 +30,7 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 |---|---|---|
 | `GITHUB_APP_ID` | ○ | App ID（数値） |
 | `GITHUB_APP_PRIVATE_KEY_PEM` | ○ | 秘密鍵の PEM。環境変数に入れるときは改行を `\n` にエスケープしてよい（起動時に実改行へ戻す） |
+| `GITHUB_APP_INSTALL_URL` | UI 導線に必須 | `https://github.com/apps/<app-slug>/installations/new`。プロジェクト設定のインストールボタンに使う |
 | `GITHUB_WEBHOOK_SECRET` | ○ | Webhook secret。未設定だと `POST /v1/github/webhook` は 400 を返す |
 | `GITHUB_API_BASE_URL` | – | 既定 `https://api.github.com`。GitHub Enterprise のときだけ設定する |
 
@@ -36,13 +39,16 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 
 ## 3. インストールとテナントへの紐付け
 
-1. App を対象の Organization / ユーザーにインストールする
-2. GitHub が `installation.created` を webhook で配信 → `github_installations` に
+1. プロジェクトの **Settings → GitHub → Install GitHub App** を押す
+2. GitHub で対象の Organization / ユーザーとアクセス対象 repository を選ぶ
+3. Setup URL から元のプロジェクト設定へ戻り、installation がテナントへ自動 claim される
+4. GitHub が `installation.created` を webhook で配信 → `github_installations` に
    **未 claim（`tenant_id = NULL`）** の行ができる
-3. `GET /v1/github/installations/unclaimed` で候補を探し、
+5. API を直接使う場合は `GET /v1/github/installations/unclaimed` で候補を探し、
    `POST /v1/github/installations/{installation_id}/claim`（body: `{"tenant_id": "..."}`）で
    自分のテナントに紐付ける（テナントの **admin 以上**が必要）
-4. `PATCH /v1/projects/{project_id}/github`
+6. UI で Organization / アカウントを選ぶと GitHub API から repository 一覧が読み込まれる。
+   検索して選択すると `PATCH /v1/projects/{project_id}/github`
    （body: `{"installation_id": 123, "github_repo": "owner/name"}`）でプロジェクトと
    リポジトリを結び付ける。解除は両方を `null` にする
 

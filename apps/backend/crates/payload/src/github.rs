@@ -8,6 +8,18 @@ use utoipa::{IntoParams, ToSchema};
 use entity::github_installations;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubAppResponse {
+    /// App の資格情報が設定済みか。
+    pub enabled: bool,
+    /// GitHub のインストール画面。未設定なら `null`。
+    #[schema(nullable, example = "https://github.com/apps/vrt/installations/new")]
+    pub install_url: Option<String>,
+    /// GitHub App に設定すべき setup URL。
+    #[schema(example = "https://vrt.example.com/github/setup")]
+    pub setup_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GithubInstallationResponse {
     #[schema(value_type = String, format = "uuid")]
     pub id: Uuid,
@@ -45,6 +57,22 @@ pub struct GithubInstallationListResponse {
     pub total: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct GithubRepositoryResponse {
+    pub id: i64,
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub archived: bool,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GithubRepositoryListResponse {
+    pub repositories: Vec<GithubRepositoryResponse>,
+    pub total: u64,
+}
+
 /// `GET /v1/github/installations` のクエリ。
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -60,6 +88,26 @@ pub struct ClaimInstallationRequest {
     /// この installation を紐付けるテナント。admin 以上であることが必要。
     #[schema(value_type = String, format = "uuid")]
     pub tenant_id: Uuid,
+    /// `POST /v1/github/setup/state` で発行した one-time state。
+    /// 発行したユーザー・テナントと一致し、未使用かつ期限内である必要がある。
+    pub state: String,
+}
+
+/// `POST /v1/github/setup/state` のボディ。
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSetupStateRequest {
+    /// インストール先として想定するテナント。admin 以上であることが必要。
+    #[schema(value_type = String, format = "uuid")]
+    pub tenant_id: Uuid,
+}
+
+/// `POST /v1/github/setup/state` のレスポンス。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreateSetupStateResponse {
+    /// GitHub のインストール URL に `state` として付与する値。
+    pub state: String,
+    /// state の有効期限（秒）。
+    pub expires_in: u64,
 }
 
 /// `PATCH /v1/projects/{project_id}/github` のボディ。

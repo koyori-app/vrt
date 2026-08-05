@@ -467,6 +467,8 @@ impl TestApp {
         if let Some(github) = options.github.as_ref() {
             settings.github_app_id = Some(TEST_GITHUB_APP_ID);
             settings.github_app_private_key_pem = Some(TEST_GITHUB_APP_PRIVATE_KEY.to_string());
+            settings.github_app_install_url =
+                Some("https://github.com/apps/vrt-test/installations/new".to_string());
             settings.github_webhook_secret = Some(TEST_GITHUB_WEBHOOK_SECRET.to_string());
             settings.github_api_base_url = Some(github.uri());
         } else {

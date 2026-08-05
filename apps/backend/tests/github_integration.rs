@@ -23,6 +23,7 @@ use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wiremock::{Mock, ResponseTemplate, matchers::method, matchers::path, matchers::query_param};
 
 /// ワーカー（webhook / status / compare）の処理待ちタイムアウト。
 const POLL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -54,6 +55,60 @@ fn installation_payload(action: &str, installation_id: i64, login: &str) -> Valu
             "account": { "login": login, "type": "Organization" },
         },
     })
+}
+
+/// `/installation/repositories` の 1 ページ分のレスポンス。
+fn repository_page(start: usize, count: usize, total_count: u64) -> Value {
+    let repositories: Vec<Value> = (0..count)
+        .map(|offset| {
+            let n = start + offset;
+            json!({
+                "id": n as i64,
+                "name": format!("repo-{n:05}"),
+                "full_name": format!("acme-inc/repo-{n:05}"),
+                "private": false,
+                "archived": false,
+                "html_url": format!("https://github.com/acme-inc/repo-{n:05}"),
+            })
+        })
+        .collect();
+    json!({ "total_count": total_count, "repositories": repositories })
+}
+
+/// テナント + プロジェクト + claim 済み installation を用意する。
+async fn claimed_installation(app: &TestApp) -> (Project, i64) {
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(app).await;
+    let installation_id = unique_installation_id();
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+
+    let state = issue_setup_state(app, &project.tenant_id).await;
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "claim installation");
+    (project, installation_id)
+}
+
+/// claim に必要な one-time state を発行する（admin 以上でないと 403）。
+async fn issue_setup_state(app: &TestApp, tenant_id: &str) -> String {
+    let res = app
+        .post_json("/v1/github/setup/state", json!({ "tenant_id": tenant_id }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "issue setup state");
+    let body: Value = res.json().await.expect("setup state json");
+    body["state"].as_str().expect("state").to_string()
 }
 
 /// テナント + プロジェクトを作り、ID / slug を返す。
@@ -207,7 +262,7 @@ async fn installation_deleted_soft_deletes_row_and_unlinks_projects() {
     let res = app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": project.tenant_id }),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "claim installation");
@@ -339,7 +394,7 @@ async fn claim_flow_enforces_roles_and_single_tenant_ownership() {
     let res = member_app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": project.tenant_id }),
+            json!({ "tenant_id": project.tenant_id, "state": "not-a-real-state" }),
         )
         .await;
     assert_eq!(
@@ -352,7 +407,7 @@ async fn claim_flow_enforces_roles_and_single_tenant_ownership() {
     let res = owner_app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": project.tenant_id }),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&owner_app, &project.tenant_id).await }),
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "owner can claim");
@@ -366,7 +421,7 @@ async fn claim_flow_enforces_roles_and_single_tenant_ownership() {
     let res = owner_app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": project.tenant_id }),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&owner_app, &project.tenant_id).await }),
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "re-claim is idempotent");
@@ -389,13 +444,514 @@ async fn claim_flow_enforces_roles_and_single_tenant_ownership() {
     let res = other_app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": other.tenant_id }),
+            json!({ "tenant_id": other.tenant_id, "state": issue_setup_state(&other_app, &other.tenant_id).await }),
         )
         .await;
     assert_eq!(
         res.status(),
         StatusCode::CONFLICT,
         "installation already claimed by another tenant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claimed_installation_lists_accessible_repositories() {
+    let app = TestApp::new_with_github().await;
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let github = app.github.as_ref().expect("mock github");
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 2,
+            "repositories": [
+                {
+                    "id": 2,
+                    "name": "website",
+                    "full_name": "acme-inc/website",
+                    "private": true,
+                    "archived": false,
+                    "html_url": "https://github.com/acme-inc/website"
+                },
+                {
+                    "id": 1,
+                    "name": "design-system",
+                    "full_name": "acme-inc/design-system",
+                    "private": false,
+                    "archived": false,
+                    "html_url": "https://github.com/acme-inc/design-system"
+                }
+            ]
+        })))
+        .mount(&github.server)
+        .await;
+
+    let res = app
+        .get(&format!(
+            "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+            project.tenant_id
+        ))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = res.json().await.expect("repositories json");
+    assert_eq!(body["total"].as_u64(), Some(2));
+    assert_eq!(
+        body["repositories"][0]["full_name"].as_str(),
+        Some("acme-inc/design-system"),
+        "repositories are sorted for the selector"
+    );
+}
+
+/// repository 一覧は private repository の名前を含むので、テナントの一般メンバーには出さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_list_requires_admin() {
+    let owner_app = TestApp::new_with_github().await;
+    owner_app.login_as_new_user().await;
+    let project = create_tenant_and_project(&owner_app).await;
+    let installation_id = unique_installation_id();
+
+    owner_app
+        .post_github_webhook(
+            "installation",
+            &installation_payload("created", installation_id, "acme-inc"),
+            None,
+        )
+        .await;
+    owner_app
+        .wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    let res = owner_app
+        .post_json(
+            &format!("/v1/github/installations/{installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&owner_app, &project.tenant_id).await }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "claim");
+
+    let github = owner_app.github.as_ref().expect("mock github");
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "total_count": 1,
+            "repositories": [{
+                "id": 1,
+                "name": "secret",
+                "full_name": "acme-inc/secret",
+                "private": true,
+                "archived": false,
+                "html_url": "https://github.com/acme-inc/secret"
+            }]
+        })))
+        .mount(&github.server)
+        .await;
+
+    // member を追加する。
+    let member_app = TestApp::new_with_github().await;
+    let member = member_app.login_as_new_user().await;
+    let res = owner_app
+        .post_json(
+            &format!("/v1/tenants/{}/members", project.tenant_id),
+            json!({ "user_id": member.id, "role": "member" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "add member");
+
+    let url = format!(
+        "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+        project.tenant_id
+    );
+    let res = member_app.get(&url).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "member must not see repository names"
+    );
+
+    let res = owner_app.get(&url).await;
+    assert_eq!(res.status(), StatusCode::OK, "admin can list repositories");
+}
+
+/// `total_count` に届くまでページを辿る。
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_list_follows_pagination() {
+    let app = TestApp::new_with_github().await;
+    let (project, installation_id) = claimed_installation(&app).await;
+    let github = app.github.as_ref().expect("mock github");
+
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repository_page(1, 100, 150)))
+        .mount(&github.server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .and(query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repository_page(101, 50, 150)))
+        .mount(&github.server)
+        .await;
+
+    let res = app
+        .get(&format!(
+            "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+            project.tenant_id
+        ))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: Value = res.json().await.expect("repositories json");
+    assert_eq!(body["total"].as_u64(), Some(150), "both pages are returned");
+    assert_eq!(
+        body["repositories"][149]["full_name"].as_str(),
+        Some("acme-inc/repo-00150"),
+        "the last page is included"
+    );
+}
+
+/// ページ上限に達したら、部分結果を正常扱いせず明示的なエラーにする。
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_list_errors_instead_of_truncating_at_the_page_limit() {
+    let app = TestApp::new_with_github().await;
+    let (project, installation_id) = claimed_installation(&app).await;
+    let github = app.github.as_ref().expect("mock github");
+
+    // total_count に永遠に届かないレスポンス（= 10,000 件を超える installation）。
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(repository_page(1, 100, 50_000)))
+        .mount(&github.server)
+        .await;
+
+    let res = app
+        .get(&format!(
+            "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+            project.tenant_id
+        ))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "truncated list must not be returned as success"
+    );
+    let body: Value = res.json().await.expect("error json");
+    let message = body.to_string();
+    assert!(
+        message.contains("page limit") && message.contains("50000"),
+        "error should say how much was fetched, got {message}"
+    );
+}
+
+/// レート制限（429 / 403 + X-RateLimit-Remaining: 0）は一時エラーとして扱う。
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_list_treats_rate_limits_as_transient() {
+    for (status, headers) in [
+        (429_u16, vec![("Retry-After", "60")]),
+        (
+            403_u16,
+            vec![("X-RateLimit-Remaining", "0"), ("X-RateLimit-Reset", "1")],
+        ),
+    ] {
+        let app = TestApp::new_with_github().await;
+        let (project, installation_id) = claimed_installation(&app).await;
+        let github = app.github.as_ref().expect("mock github");
+
+        let mut response = ResponseTemplate::new(status).set_body_string("{\"message\":\"limit\"}");
+        for (name, value) in headers {
+            response = response.insert_header(name, value);
+        }
+        Mock::given(method("GET"))
+            .and(path("/installation/repositories"))
+            .respond_with(response)
+            .mount(&github.server)
+            .await;
+
+        let res = app
+            .get(&format!(
+                "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+                project.tenant_id
+            ))
+            .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rate limited response ({status}) must not become a 400"
+        );
+    }
+}
+
+/// レート制限ではない 403 は従来どおり永続エラー（400）。
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_list_keeps_plain_forbidden_permanent() {
+    let app = TestApp::new_with_github().await;
+    let (project, installation_id) = claimed_installation(&app).await;
+    let github = app.github.as_ref().expect("mock github");
+
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string("{\"message\":\"Resource not accessible\"}"),
+        )
+        .mount(&github.server)
+        .await;
+
+    let res = app
+        .get(&format!(
+            "/v1/github/installations/{installation_id}/repositories?tenant_id={}",
+            project.tenant_id
+        ))
+        .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+/// state は最初に使われた installation に予約され、別の installation には使えない。
+///
+/// 検証と消費が分かれていると、並行リクエストが予約前の state を 2 本とも読んで
+/// 別々の installation を claim できてしまう。予約は claim の成否に関わらず
+/// 最初の 1 回で確定するので、claim が失敗する installation で予約してから確かめる。
+#[tokio::test(flavor = "multi_thread")]
+async fn setup_state_is_bound_to_the_first_installation() {
+    let app = TestApp::new_with_github().await;
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+
+    // DB に存在しない installation。claim は 404 になるが、state はここに予約される。
+    let absent_installation_id = unique_installation_id();
+    let state = issue_setup_state(&app, &project.tenant_id).await;
+
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{absent_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "claim fails, but the state is now reserved"
+    );
+
+    // 同じ installation での再試行は許す（webhook 到着待ちのリトライ経路）。
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{absent_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "retrying the same installation must not be rejected as a state conflict"
+    );
+
+    // 実在する別の installation を用意する。
+    let other_installation_id = unique_installation_id();
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", other_installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(other_installation_id, POLL_TIMEOUT)
+        .await;
+
+    // 予約済みの state は、別の installation には使えない。
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{other_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a state held by another installation must not claim"
+    );
+
+    // 新しく発行した state なら通る。
+    let fresh_state = issue_setup_state(&app, &project.tenant_id).await;
+    let res = app
+        .post_json(
+            &format!("/v1/github/installations/{other_installation_id}/claim"),
+            json!({ "tenant_id": project.tenant_id, "state": fresh_state }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "a fresh state claims");
+}
+
+/// consume は state 本体と予約キーを 1 コマンドで原子的に消し、消費した値を返す。
+///
+/// claim の DB 更新が終わってから呼ばれるため、state だけ消えて予約キーが残る／
+/// あるいは値を返しそこねる、といった部分失敗があると再試行できないゴミが残る。
+/// service の `consume_setup_state` を直接叩き、両キーが消えること・2 回目が
+/// `None` になることを Valkey で確かめる。
+#[tokio::test(flavor = "multi_thread")]
+async fn consume_setup_state_atomically_clears_state_and_holder() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+
+    let redis = &app.state.redis_client;
+    let tenant_id = Uuid::parse_str(&project.tenant_id).expect("tenant uuid");
+
+    // state 本体と、reserve で作られる予約キーの両方を用意する。
+    let state = service::github::issue_setup_state(redis, user.id, tenant_id)
+        .await
+        .expect("issue setup state");
+    let installation_id = unique_installation_id();
+    match service::github::reserve_setup_state(redis, &state, installation_id)
+        .await
+        .expect("reserve setup state")
+    {
+        service::github::SetupStateReservation::Reserved(reserved) => {
+            assert_eq!(reserved.user_id, user.id);
+            assert_eq!(reserved.tenant_id, tenant_id);
+        }
+        other => panic!("expected the state to be reservable, got {other:?}"),
+    }
+
+    // これらは service 側の非公開プレフィックスと一致させる（Valkey 上のキー名の契約）。
+    let state_key = format!("github:setup_state:{state}");
+    let holder_key = format!("github:setup_state_holder:{state}");
+
+    // 消費すると、予約時に埋めた発行元がそのまま返る。
+    let consumed = service::github::consume_setup_state(redis, &state)
+        .await
+        .expect("consume setup state")
+        .expect("state is present on first consume");
+    assert_eq!(consumed.user_id, user.id);
+    assert_eq!(consumed.tenant_id, tenant_id);
+
+    // state 本体も予約キーも残さない。
+    let mut conn = redis.conn.acquire().await.expect("redis acquire");
+    let remaining: i64 = redis::cmd("EXISTS")
+        .arg(&state_key)
+        .arg(&holder_key)
+        .query_async(&mut *conn)
+        .await
+        .expect("redis exists");
+    assert_eq!(
+        remaining, 0,
+        "consume must clear both the state and holder keys"
+    );
+
+    // 2 回目は消費済みなので None。
+    let again = service::github::consume_setup_state(redis, &state)
+        .await
+        .expect("consume setup state again");
+    assert!(
+        again.is_none(),
+        "a consumed state must not be consumable twice"
+    );
+}
+
+/// claim は「発行者・テナントが一致する、未使用かつ期限内の state」でしか通らない。
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_rejects_tampered_foreign_and_reused_setup_state() {
+    let app = TestApp::new_with_github().await;
+    app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+
+    let claim_url = format!("/v1/github/installations/{installation_id}/claim");
+
+    // 1. 存在しない（＝攻撃者が捏造した / 期限切れの）state は通らない。
+    let res = app
+        .post_json(
+            &claim_url,
+            json!({ "tenant_id": project.tenant_id, "state": "forged-state-value" }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "unknown state must be rejected"
+    );
+
+    // 2. 別ユーザーが自分のテナント向けに発行した state は流用できない。
+    let other_app = TestApp::new_with_github().await;
+    other_app.login_as_new_user().await;
+    let other = create_tenant_and_project(&other_app).await;
+    let foreign_state = issue_setup_state(&other_app, &other.tenant_id).await;
+    let res = app
+        .post_json(
+            &claim_url,
+            json!({ "tenant_id": project.tenant_id, "state": foreign_state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "state issued for another user/tenant must be rejected"
+    );
+
+    // 3. member は state を発行できない。
+    let member_app = TestApp::new_with_github().await;
+    let member = member_app.login_as_new_user().await;
+    let res = app
+        .post_json(
+            &format!("/v1/tenants/{}/members", project.tenant_id),
+            json!({ "user_id": member.id, "role": "member" }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "add member");
+    let res = member_app
+        .post_json(
+            "/v1/github/setup/state",
+            json!({ "tenant_id": project.tenant_id }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "member must not issue a setup state"
+    );
+
+    // 4. 正しい state は 1 回だけ通る（成功時に消費される）。
+    let state = issue_setup_state(&app, &project.tenant_id).await;
+    let res = app
+        .post_json(
+            &claim_url,
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "valid state claims");
+
+    let res = app
+        .post_json(
+            &claim_url,
+            json!({ "tenant_id": project.tenant_id, "state": state }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "state cannot be replayed"
     );
 }
 
@@ -430,7 +986,7 @@ async fn project_cannot_be_linked_to_foreign_or_malformed_repository() {
 
     app.post_json(
         &format!("/v1/github/installations/{installation_id}/claim"),
-        json!({ "tenant_id": project.tenant_id }),
+        json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
     )
     .await;
 
@@ -497,7 +1053,7 @@ async fn build_lifecycle_posts_commit_statuses_to_github() {
     let res = app
         .post_json(
             &format!("/v1/github/installations/{installation_id}/claim"),
-            json!({ "tenant_id": project.tenant_id }),
+            json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
         )
         .await;
     assert_eq!(res.status(), StatusCode::OK, "claim");
@@ -658,7 +1214,7 @@ async fn rejecting_a_build_posts_a_failure_status() {
         .await;
     app.post_json(
         &format!("/v1/github/installations/{installation_id}/claim"),
-        json!({ "tenant_id": project.tenant_id }),
+        json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
     )
     .await;
     app.patch_json(

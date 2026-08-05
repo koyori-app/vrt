@@ -137,6 +137,7 @@ services:
       # 片方だけだと警告ログのみで無言で無効になる。PEM は改行を \n にエスケープして 1 行で渡す
       # （起動時に実改行へ戻される）。詳細は docs/github-app.md。
       - GITHUB_APP_ID
+      - GITHUB_APP_INSTALL_URL
       - GITHUB_APP_PRIVATE_KEY_PEM
       - GITHUB_WEBHOOK_SECRET
       # GitHub Enterprise のときだけ設定（既定は https://api.github.com）。

@@ -13,10 +13,15 @@ use crate::handlers::github::MAX_WEBHOOK_BODY_BYTES;
 pub fn routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::<AppState>::new()
         .routes(routes!(crate::handlers::github::github_webhook))
+        .routes(routes!(crate::handlers::github::get_github_app))
         .routes(routes!(crate::handlers::github::list_installations))
         .routes(routes!(
             crate::handlers::github::list_unclaimed_installations
         ))
         .routes(routes!(crate::handlers::github::claim_installation))
+        .routes(routes!(crate::handlers::github::create_setup_state))
+        .routes(routes!(
+            crate::handlers::github::list_installation_repositories
+        ))
         .layer(DefaultBodyLimit::max(MAX_WEBHOOK_BODY_BYTES))
 }
