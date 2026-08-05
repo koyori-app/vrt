@@ -795,6 +795,72 @@ async fn setup_state_is_bound_to_the_first_installation() {
     assert_eq!(res.status(), StatusCode::OK, "a fresh state claims");
 }
 
+/// consume は state 本体と予約キーを 1 コマンドで原子的に消し、消費した値を返す。
+///
+/// claim の DB 更新が終わってから呼ばれるため、state だけ消えて予約キーが残る／
+/// あるいは値を返しそこねる、といった部分失敗があると再試行できないゴミが残る。
+/// service の `consume_setup_state` を直接叩き、両キーが消えること・2 回目が
+/// `None` になることを Valkey で確かめる。
+#[tokio::test(flavor = "multi_thread")]
+async fn consume_setup_state_atomically_clears_state_and_holder() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+
+    let redis = &app.state.redis_client;
+    let tenant_id = Uuid::parse_str(&project.tenant_id).expect("tenant uuid");
+
+    // state 本体と、reserve で作られる予約キーの両方を用意する。
+    let state = service::github::issue_setup_state(redis, user.id, tenant_id)
+        .await
+        .expect("issue setup state");
+    let installation_id = unique_installation_id();
+    match service::github::reserve_setup_state(redis, &state, installation_id)
+        .await
+        .expect("reserve setup state")
+    {
+        service::github::SetupStateReservation::Reserved(reserved) => {
+            assert_eq!(reserved.user_id, user.id);
+            assert_eq!(reserved.tenant_id, tenant_id);
+        }
+        other => panic!("expected the state to be reservable, got {other:?}"),
+    }
+
+    // これらは service 側の非公開プレフィックスと一致させる（Valkey 上のキー名の契約）。
+    let state_key = format!("github:setup_state:{state}");
+    let holder_key = format!("github:setup_state_holder:{state}");
+
+    // 消費すると、予約時に埋めた発行元がそのまま返る。
+    let consumed = service::github::consume_setup_state(redis, &state)
+        .await
+        .expect("consume setup state")
+        .expect("state is present on first consume");
+    assert_eq!(consumed.user_id, user.id);
+    assert_eq!(consumed.tenant_id, tenant_id);
+
+    // state 本体も予約キーも残さない。
+    let mut conn = redis.conn.acquire().await.expect("redis acquire");
+    let remaining: i64 = redis::cmd("EXISTS")
+        .arg(&state_key)
+        .arg(&holder_key)
+        .query_async(&mut *conn)
+        .await
+        .expect("redis exists");
+    assert_eq!(
+        remaining, 0,
+        "consume must clear both the state and holder keys"
+    );
+
+    // 2 回目は消費済みなので None。
+    let again = service::github::consume_setup_state(redis, &state)
+        .await
+        .expect("consume setup state again");
+    assert!(
+        again.is_none(),
+        "a consumed state must not be consumable twice"
+    );
+}
+
 /// claim は「発行者・テナントが一致する、未使用かつ期限内の state」でしか通らない。
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_rejects_tampered_foreign_and_reused_setup_state() {

@@ -239,33 +239,6 @@ async fn cache_set(
         .map_err(|e| anyhow::anyhow!("redis SET failed: {e}"))
 }
 
-async fn cache_getdel(redis: &RedisConnection, key: &str) -> Result<Option<String>, anyhow::Error> {
-    let mut conn = redis
-        .conn
-        .acquire()
-        .await
-        .map_err(|e| anyhow::anyhow!("redis acquire failed: {e}"))?;
-    // GETDEL は取得と削除が原子的なので、同じ state を 2 回消費できない。
-    redis::cmd("GETDEL")
-        .arg(key)
-        .query_async(&mut conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("redis GETDEL failed: {e}"))
-}
-
-async fn cache_del(redis: &RedisConnection, key: &str) -> Result<(), anyhow::Error> {
-    let mut conn = redis
-        .conn
-        .acquire()
-        .await
-        .map_err(|e| anyhow::anyhow!("redis acquire failed: {e}"))?;
-    redis::cmd("DEL")
-        .arg(key)
-        .exec_async(&mut conn)
-        .await
-        .map_err(|e| anyhow::anyhow!("redis DEL failed: {e}"))
-}
-
 // ── GitHub App インストール導線の one-time state ────────────────────────────
 //
 // GitHub の setup URL には任意の `installation_id` と `state` を付けて他人に踏ませられる。
@@ -369,22 +342,48 @@ pub async fn reserve_setup_state(
     }
 }
 
-/// setup state を消費する（取得と削除は原子的）。claim 成功後に呼ぶ。
+/// state 本体と予約キーを **1 つのスクリプトで消費** する。claim 成功後に呼ぶ。
+///
+/// GETDEL と予約キーの DEL を別コマンドに分けると、GETDEL 成功後に DEL だけ失敗した
+/// とき「DB は claim 済み・API は 500・state は消費済みで再試行できない」という部分
+/// 失敗が起きる。取得と両キー削除を 1 本の Lua にまとめて、両方消えるか一切消えないか
+/// のどちらかにする。
+///
+/// 取得できなければ空文字列を返す（呼び出し側で `None` 扱い）。保存する値は必ず
+/// JSON なので、空文字列を「存在しない」と見なしても本物の値と衝突しない。
+const CONSUME_SETUP_STATE_SCRIPT: &str = r#"
+local raw = redis.call('GET', KEYS[1])
+redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[2])
+if not raw then
+  return ''
+end
+return raw
+"#;
+
+/// setup state を消費する（取得と両キー削除は原子的）。claim 成功後に呼ぶ。
 ///
 /// 既に消えていれば `None`。予約キーも一緒に落として、TTL 分の残骸を残さない。
 pub async fn consume_setup_state(
     redis: &RedisConnection,
     state: &str,
 ) -> Result<Option<SetupState>, AppError> {
-    let raw = cache_getdel(redis, &format!("{SETUP_STATE_PREFIX}{state}"))
+    let mut conn = redis
+        .conn
+        .acquire()
         .await
-        .map_err(AppError::Internal)?;
-    cache_del(redis, &format!("{SETUP_STATE_HOLDER_PREFIX}{state}"))
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("redis acquire failed: {e}")))?;
+
+    let raw: String = redis::Script::new(CONSUME_SETUP_STATE_SCRIPT)
+        .key(format!("{SETUP_STATE_PREFIX}{state}"))
+        .key(format!("{SETUP_STATE_HOLDER_PREFIX}{state}"))
+        .invoke_async(&mut *conn)
         .await
-        .map_err(AppError::Internal)?;
-    let Some(raw) = raw else {
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("consume setup state failed: {e}")))?;
+
+    if raw.is_empty() {
         return Ok(None);
-    };
+    }
     Ok(serde_json::from_str(&raw).ok())
 }
 
