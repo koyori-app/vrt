@@ -188,8 +188,8 @@ fn png_crate_pre_idat_conformance() {
             false,
         ),
         (
-            "PLTE length 774",
-            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 774])]),
+            "PLTE length 771",
+            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 771])]),
             false,
         ),
         (
