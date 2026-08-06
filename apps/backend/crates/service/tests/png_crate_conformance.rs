@@ -96,8 +96,16 @@ fn png_crate_pre_idat_conformance() {
     let full = fctl_data(0, 10, 10, 0, 0, 0, 0);
     let cases: Vec<(&str, Vec<u8>, bool)> = vec![
         // --- 拒絶: 署名・切断・CRC --------------------------------------------
-        ("not a png at all", b"this is text, not a png".to_vec(), false),
-        ("cut mid-IHDR (24 bytes)", png_with(&rgba(10, 10), &[])[..24].to_vec(), false),
+        (
+            "not a png at all",
+            b"this is text, not a png".to_vec(),
+            false,
+        ),
+        (
+            "cut mid-IHDR (24 bytes)",
+            png_with(&rgba(10, 10), &[])[..24].to_vec(),
+            false,
+        ),
         (
             "signature + full IHDR, no IDAT",
             {
@@ -119,35 +127,82 @@ fn png_crate_pre_idat_conformance() {
             false,
         ),
         // --- 拒絶: IHDR の意味検証 --------------------------------------------
-        ("undefined color type 5", png_with(&ihdr_data(10, 10, 8, 5, 0, 0, 0), &[]), false),
-        ("bit depth 3 for grayscale", png_with(&ihdr_data(10, 10, 3, 0, 0, 0, 0), &[]), false),
-        ("nonzero compression", png_with(&ihdr_data(10, 10, 8, 6, 1, 0, 0), &[]), false),
-        ("nonzero filter", png_with(&ihdr_data(10, 10, 8, 6, 0, 1, 0), &[]), false),
-        ("interlace method 2", png_with(&ihdr_data(10, 10, 8, 6, 0, 0, 2), &[]), false),
-        ("zero width", png_with(&ihdr_data(0, 100, 8, 6, 0, 0, 0), &[]), false),
+        (
+            "undefined color type 5",
+            png_with(&ihdr_data(10, 10, 8, 5, 0, 0, 0), &[]),
+            false,
+        ),
+        (
+            "bit depth 3 for grayscale",
+            png_with(&ihdr_data(10, 10, 3, 0, 0, 0, 0), &[]),
+            false,
+        ),
+        (
+            "nonzero compression",
+            png_with(&ihdr_data(10, 10, 8, 6, 1, 0, 0), &[]),
+            false,
+        ),
+        (
+            "nonzero filter",
+            png_with(&ihdr_data(10, 10, 8, 6, 0, 1, 0), &[]),
+            false,
+        ),
+        (
+            "interlace method 2",
+            png_with(&ihdr_data(10, 10, 8, 6, 0, 0, 2), &[]),
+            false,
+        ),
+        (
+            "zero width",
+            png_with(&ihdr_data(0, 100, 8, 6, 0, 0, 0), &[]),
+            false,
+        ),
         // 10001px は crate は通すが validate_png の MAX_DIMENSION が拒否する。
-        ("width over server limit", png_with(&ihdr_data(10001, 100, 8, 6, 0, 0, 0), &[]), false),
+        (
+            "width over server limit",
+            png_with(&ihdr_data(10001, 100, 8, 6, 0, 0, 0), &[]),
+            false,
+        ),
         // --- 拒絶: critical チャンクの構成 ------------------------------------
         (
             "duplicate IHDR",
             png_with(&rgba(10, 10), &[chunk(b"IHDR", &rgba(10, 10))]),
             false,
         ),
-        ("unknown critical chunk", png_with(&rgba(10, 10), &[chunk(b"ABCD", b"")]), false),
         (
-            "duplicate PLTE",
-            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 3]), chunk(b"PLTE", &[0; 3])]),
+            "unknown critical chunk",
+            png_with(&rgba(10, 10), &[chunk(b"ABCD", b"")]),
             false,
         ),
-        ("PLTE length 2", png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 2])]), false),
-        ("PLTE length 774", png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 774])]), false),
+        (
+            "duplicate PLTE",
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"PLTE", &[0; 3]), chunk(b"PLTE", &[0; 3])],
+            ),
+            false,
+        ),
+        (
+            "PLTE length 2",
+            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 2])]),
+            false,
+        ),
+        (
+            "PLTE length 774",
+            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 774])]),
+            false,
+        ),
         (
             "PLTE with bad CRC",
             png_with(&rgba(10, 10), &[bad_crc(chunk(b"PLTE", &[1, 2, 3]))]),
             false,
         ),
         // --- 拒絶: fcTL / fdAT ------------------------------------------------
-        ("fcTL with bad length", png_with(&rgba(10, 10), &[chunk(b"fcTL", &[0; 4])]), false),
+        (
+            "fcTL with bad length",
+            png_with(&rgba(10, 10), &[chunk(b"fcTL", &[0; 4])]),
+            false,
+        ),
         (
             "fcTL bad length and bad CRC",
             png_with(&rgba(10, 10), &[bad_crc(chunk(b"fcTL", &[0; 4]))]),
@@ -155,27 +210,42 @@ fn png_crate_pre_idat_conformance() {
         ),
         (
             "fcTL with nonzero sequence",
-            png_with(&rgba(10, 10), &[chunk(b"fcTL", &fctl_data(1, 10, 10, 0, 0, 0, 0))]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"fcTL", &fctl_data(1, 10, 10, 0, 0, 0, 0))],
+            ),
             false,
         ),
         (
             "two fcTL repeating sequence 0",
-            png_with(&rgba(10, 10), &[chunk(b"fcTL", &full), chunk(b"fcTL", &full)]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"fcTL", &full), chunk(b"fcTL", &full)],
+            ),
             false,
         ),
         (
             "fcTL frame smaller than image",
-            png_with(&rgba(10, 10), &[chunk(b"fcTL", &fctl_data(0, 5, 5, 0, 0, 0, 0))]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"fcTL", &fctl_data(0, 5, 5, 0, 0, 0, 0))],
+            ),
             false,
         ),
         (
             "fcTL frame larger than image",
-            png_with(&rgba(10, 10), &[chunk(b"fcTL", &fctl_data(0, 11, 10, 0, 0, 0, 0))]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"fcTL", &fctl_data(0, 11, 10, 0, 0, 0, 0))],
+            ),
             false,
         ),
         (
             "fcTL with invalid blend op",
-            png_with(&rgba(10, 10), &[chunk(b"fcTL", &fctl_data(0, 10, 10, 0, 0, 0, 2))]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"fcTL", &fctl_data(0, 10, 10, 0, 0, 0, 2))],
+            ),
             false,
         ),
         (
@@ -185,16 +255,30 @@ fn png_crate_pre_idat_conformance() {
         ),
         (
             "fdAT before IDAT with bad CRC",
-            png_with(&rgba(10, 10), &[bad_crc(chunk(b"fdAT", &[0, 0, 0, 0, 1, 2, 3]))]),
+            png_with(
+                &rgba(10, 10),
+                &[bad_crc(chunk(b"fdAT", &[0, 0, 0, 0, 1, 2, 3]))],
+            ),
             false,
         ),
         // --- 受理: crate が黙って許すもの(こちらが弾いてはいけない)----------
         ("plain 10x10 RGBA", png_with(&rgba(10, 10), &[]), true),
-        ("Adam7 interlace", png_with(&ihdr_data(10, 10, 8, 6, 0, 0, 1), &[]), true),
-        ("unknown ancillary chunk", png_with(&rgba(10, 10), &[chunk(b"abCD", b"")]), true),
+        (
+            "Adam7 interlace",
+            png_with(&ihdr_data(10, 10, 8, 6, 0, 0, 1), &[]),
+            true,
+        ),
+        (
+            "unknown ancillary chunk",
+            png_with(&rgba(10, 10), &[chunk(b"abCD", b"")]),
+            true,
+        ),
         (
             "single valid PLTE and fcTL",
-            png_with(&rgba(10, 10), &[chunk(b"PLTE", &[0; 3]), chunk(b"fcTL", &full)]),
+            png_with(
+                &rgba(10, 10),
+                &[chunk(b"PLTE", &[0; 3]), chunk(b"fcTL", &full)],
+            ),
             true,
         ),
         (
@@ -212,11 +296,22 @@ fn png_crate_pre_idat_conformance() {
             png_with(&ihdr_data(10, 10, 8, 0, 0, 0, 0), &[chunk(b"tRNS", &[7])]),
             true,
         ),
-        ("sBIT with wrong length", png_with(&rgba(10, 10), &[chunk(b"sBIT", &[8, 8])]), true),
-        ("acTL with zero frames", png_with(&rgba(10, 10), &[chunk(b"acTL", &[0; 8])]), true),
+        (
+            "sBIT with wrong length",
+            png_with(&rgba(10, 10), &[chunk(b"sBIT", &[8, 8])]),
+            true,
+        ),
+        (
+            "acTL with zero frames",
+            png_with(&rgba(10, 10), &[chunk(b"acTL", &[0; 8])]),
+            true,
+        ),
         (
             "ancillary chunk with bad CRC",
-            png_with(&rgba(10, 10), &[bad_crc(chunk(b"gAMA", &45455u32.to_be_bytes()))]),
+            png_with(
+                &rgba(10, 10),
+                &[bad_crc(chunk(b"gAMA", &45455u32.to_be_bytes()))],
+            ),
             true,
         ),
         (
@@ -231,7 +326,10 @@ fn png_crate_pre_idat_conformance() {
             "two fcTL in sequence order",
             png_with(
                 &rgba(10, 10),
-                &[chunk(b"fcTL", &full), chunk(b"fcTL", &fctl_data(1, 10, 10, 0, 0, 0, 0))],
+                &[
+                    chunk(b"fcTL", &full),
+                    chunk(b"fcTL", &fctl_data(1, 10, 10, 0, 0, 0, 0)),
+                ],
             ),
             true,
         ),
