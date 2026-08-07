@@ -7,7 +7,8 @@
 //! 2. [`StoryRenderer`] が chromiumoxide で Chromium を起動し、
 //!    `http://127.0.0.1:{port}/iframe.html?id={story_id}&viewMode=story` を開く
 //! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
-//!    短い settle 待ちのあとビューポートを PNG で撮る
+//!    短い settle 待ちのあと [`FREEZE_SCRIPT`] でキャレットとアニメーションを
+//!    決定的に静止させてから、ビューポートを PNG で撮る
 //!
 //! ## 描画完了の判定
 //!
@@ -165,6 +166,108 @@ JSON.stringify((() => {
 })())
 "#;
 
+/// 撮影直前にページを**決定的な静止状態**へ持ち込むスクリプト。
+///
+/// キャレットの明滅とアニメーションは「いつ撮ったか」で絵が変わる、VRT にとって
+/// 純粋な雑音である。しきい値（`diff_ratio_fail`）を緩めて誤差を許すのではなく、
+/// 撮影の入力自体から時刻依存を消す。利用者の Storybook / preview には一切
+/// 手を入れず、レンダラがナビゲーション後のページに注入する。
+///
+/// ## なぜ「決定的」といえるか
+///
+/// - **キャレット**: `caret-color: transparent !important` で明滅の位相に
+///   よらず不可視にする（Playwright の `caret: 'hide'` と同じ機構）。
+///   `caret-color` は継承プロパティなので、`*` セレクタが届かない
+///   open shadow DOM の内側へも継承で波及する
+/// - **有限アニメーション**（CSS animation / CSS transition / Web Animations API）:
+///   `currentTime = endTime` へシークして pause。終端は仕様上ただ一つに
+///   定まる状態（`fill: forwards` なら最終キーフレーム、無指定なら基底スタイル）
+///   であり、壁時計に依存しない
+/// - **無限アニメーション**: 終端が存在しないので `currentTime = 0` へ巻き戻して
+///   pause。タイムライン座標 0 の絵はこれもただ一つに定まる。
+///   「paused にするだけ」では**止まった位置**が撮影タイミング依存のままで、
+///   flaky さは消えない——座標を明示的に固定するからこそ 2 回撮って同じ絵になる
+/// - **今後始まる transition**: `transition-duration: 0s` で始まった瞬間に
+///   終値へ飛ぶ（`transitionend` は発火するので、完了を待つ実装も壊さない）
+///
+/// シーク後に rAF を 2 回待って合成済みフレームへ反映させ、1 巡目の描画で
+/// 新たに始まったアニメーションをもう一度同じ座標へ固定してから返る。
+/// open shadow DOM と同一オリジン iframe は再帰的に辿る。closed shadow root、
+/// クロスオリジン iframe、canvas / rAF 駆動の JS アニメーションには届かない
+/// （モジュール末尾のテストと README の記載を参照）。
+const FREEZE_SCRIPT: &str = r#"
+(async () => {
+  const CSS = [
+    '*, *::before, *::after {',
+    '  caret-color: transparent !important;',
+    '  transition-duration: 0s !important;',
+    '  transition-delay: 0s !important;',
+    '}',
+  ].join('\n');
+
+  const freezeDoc = (doc) => {
+    if (!doc) return;
+    try {
+      if (doc.head && !doc.getElementById('__vrt_freeze_style__')) {
+        const style = doc.createElement('style');
+        style.id = '__vrt_freeze_style__';
+        style.textContent = CSS;
+        doc.head.appendChild(style);
+      }
+    } catch (e) {}
+
+    // document.getAnimations() は shadow tree の中を返さない実装があるため、
+    // open shadow root は自前で辿って合流させる（Set で重複は消える）。
+    const animations = new Set();
+    try { for (const a of doc.getAnimations()) animations.add(a); } catch (e) {}
+    const collectShadow = (root) => {
+      let all;
+      try { all = root.querySelectorAll('*'); } catch (e) { return; }
+      for (const el of all) {
+        const sr = el.shadowRoot;
+        if (!sr) continue;
+        for (const inner of sr.querySelectorAll('*')) {
+          try { for (const a of inner.getAnimations()) animations.add(a); } catch (e) {}
+        }
+        collectShadow(sr);
+      }
+    };
+    collectShadow(doc);
+
+    for (const anim of animations) {
+      try {
+        const timing =
+          anim.effect && anim.effect.getComputedTiming
+            ? anim.effect.getComputedTiming()
+            : null;
+        const end = timing ? timing.endTime : NaN;
+        // 有限は終端へ、無限は初期（タイムライン座標 0）へ。どちらも
+        // 壁時計に依存しない一意な座標なので、2 回撮っても同じ絵になる。
+        anim.currentTime = Number.isFinite(end) ? end : 0;
+        anim.pause();
+      } catch (e) {}
+    }
+
+    // 同一オリジンの iframe の中も同じ扱い。クロスオリジンは触れないので諦める。
+    try {
+      for (const frame of doc.querySelectorAll('iframe')) {
+        try { freezeDoc(frame.contentDocument); } catch (e) {}
+      }
+    } catch (e) {}
+  };
+
+  const nextFrame = () =>
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  freezeDoc(document);
+  await nextFrame();
+  // 1 巡目の描画（スタイル適用・シーク）をきっかけに始まったアニメも同じ座標へ。
+  freezeDoc(document);
+  await nextFrame();
+  return true;
+})()
+"#;
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -241,6 +344,12 @@ pub struct RenderOptions {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub story_timeout: Duration,
+    /// 撮影直前に [`FREEZE_SCRIPT`] を注入するか。既定は `true`。
+    ///
+    /// `false` はテスト専用の裏口で、「静止させないと本当に絵が揺れる」ことを
+    /// 検証する positive control のためにある。本番経路（`render_build`）は
+    /// [`RenderOptions::new`] を通るので常に `true`。
+    pub freeze_before_capture: bool,
 }
 
 impl RenderOptions {
@@ -254,6 +363,7 @@ impl RenderOptions {
             viewport_width,
             viewport_height,
             story_timeout: DEFAULT_STORY_TIMEOUT,
+            freeze_before_capture: true,
         }
     }
 }
@@ -502,6 +612,18 @@ impl StoryRenderer {
 
         tokio::time::sleep(SETTLE_DELAY).await;
 
+        // 撮影直前にキャレットとアニメーションを決定的な座標へ固定する。
+        // 注入に失敗したまま撮ると flaky な絵が baseline に混ざるので、
+        // 黙って続行せずこのストーリーの失敗として返す。
+        if self.options.freeze_before_capture {
+            page.evaluate(FREEZE_SCRIPT)
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+        }
+
         page.screenshot(
             ScreenshotParams::builder()
                 .format(CaptureScreenshotFormat::Png)
@@ -749,6 +871,66 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// アニメーションとキャレットを持つバンドル。freeze の決定性検証用。
+    ///
+    /// - `demo-anim--spinner` : **無限** CSS アニメ（1.7s 周期の回転）。
+    ///   周期を切りの悪い値にしてあるのは、2 回の撮影間隔が偶然 1 周期の
+    ///   整数倍に一致して「未修正でも同じ絵」になる事故を避けるため
+    /// - `demo-anim--caret`   : フォーカス済み入力欄。キャレットが明滅する
+    /// - `demo-anim--slide`   : **有限** CSS アニメ（60s, `fill: forwards`）。
+    ///   初期は赤・終端は青。freeze が「終端へシークした」ことを色で検証できる
+    fn write_animated_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spinner {
+    width:120px;height:120px;margin:20px;
+    border:24px solid #dddddd;border-top-color:#ff0000;border-radius:50%;
+    animation: spin 1.7s linear infinite;
+  }
+  @keyframes to-blue { from { background:#ff0000; } to { background:#0000ff; } }
+  .slide { width:100%;height:100vh;animation: to-blue 60s linear 1 forwards; }
+  input { font:32px monospace;width:200px;margin:40px;border:1px solid #000; }
+</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var root = document.getElementById('storybook-root');
+      if (id === 'demo-anim--spinner') {
+        var el = document.createElement('div');
+        el.className = 'spinner';
+        root.appendChild(el);
+      } else if (id === 'demo-anim--caret') {
+        var input = document.createElement('input');
+        root.appendChild(input);
+        input.focus();
+      } else if (id === 'demo-anim--slide') {
+        var el = document.createElement('div');
+        el.className = 'slide';
+        root.appendChild(el);
+      }
+      channel.emit('storyRendered', id);
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
     #[test]
     fn readiness_parses_probe_results() {
         let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
@@ -949,6 +1131,137 @@ mod tests {
             message.contains("vrt-no-such-chromium-binary"),
             "the error must name the binary it tried, got {message:?}"
         );
+    }
+
+    fn decode_png(png: &[u8]) -> image::RgbaImage {
+        image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png)
+            .decode()
+            .expect("decode screenshot")
+            .to_rgba8()
+    }
+
+    /// **同じ story を 2 回撮ると PNG がバイト単位で一致する**こと（決定性の本丸）。
+    ///
+    /// - 無限アニメ（spinner）はタイムライン座標 0 に固定される
+    /// - フォーカスされた入力欄のキャレットは不可視になる
+    /// - 有限アニメ（slide）は**終端**に固定される——初期（赤）へ巻き戻したのでは
+    ///   なく終端（青）へシークしたことを、中心ピクセルの色でも検証する
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_captures_are_byte_identical_across_runs() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_captures_are_byte_identical_across_runs: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        for story in ["demo-anim--spinner", "demo-anim--caret", "demo-anim--slide"] {
+            let first = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("first frozen capture");
+            let second = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("second frozen capture");
+            assert_eq!(
+                first, second,
+                "story {story}: two frozen captures must be byte-identical"
+            );
+
+            if story == "demo-anim--slide" {
+                // 60s の有限アニメを実時間 1 秒未満で撮って終端色（青）が出るのは、
+                // freeze が endTime へシークしたときだけ。paused 止まりや初期への
+                // 巻き戻しでは赤系になる。
+                let image = decode_png(&first);
+                let center = image.get_pixel(160, 120);
+                assert_eq!(
+                    (center[0], center[1], center[2]),
+                    (0, 0, 255),
+                    "a finite animation must be frozen at its end state"
+                );
+            }
+        }
+
+        renderer.close().await;
+    }
+
+    /// **freeze を切ると絵が揺れる**こと（対照群 =「修正前は一致しない」の固定化）。
+    ///
+    /// freeze ありの決定的な絵を基準に、freeze なしの撮影が異なることを確認する。
+    ///
+    /// - spinner: 撮影は描画完了通知から最低でも SETTLE_DELAY（250ms）後なので、
+    ///   1.7s 周期の回転は 50° 以上進んでおり、座標 0 の絵と一致しえない
+    /// - caret : Chromium のキャレットはフォーカス直後は可視で、撮影は通常その
+    ///   窓内（〜500ms）に行われる。負荷で明滅の消灯位相にずれた場合に備えて
+    ///   数回リトライする
+    ///
+    /// ここで差が出ないなら freeze が効いたのではなく、fixture がそもそも
+    /// アニメ／キャレットを描いていない——計測系が死んでいるということになる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfrozen_captures_differ_from_frozen_ones() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP unfrozen_captures_differ_from_frozen_ones: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium.clone(), 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        // 基準となる決定的な絵（freeze あり）。
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch");
+        let frozen_spinner = renderer
+            .render_story(&server.base_url(), "demo-anim--spinner")
+            .await
+            .expect("frozen spinner");
+        let frozen_caret = renderer
+            .render_story(&server.base_url(), "demo-anim--caret")
+            .await
+            .expect("frozen caret");
+        renderer.close().await;
+
+        // freeze なし（= 修正前のレンダラ相当）で撮り直す。
+        options.freeze_before_capture = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch unfrozen");
+        for (story, frozen) in [
+            ("demo-anim--spinner", &frozen_spinner),
+            ("demo-anim--caret", &frozen_caret),
+        ] {
+            let mut differed = false;
+            for _attempt in 0..5 {
+                let unfrozen = renderer
+                    .render_story(&server.base_url(), story)
+                    .await
+                    .expect("unfrozen capture");
+                if &unfrozen != frozen {
+                    differed = true;
+                    break;
+                }
+            }
+            assert!(
+                differed,
+                "story {story}: captures without the freeze must differ from the \
+                 deterministic frozen capture — otherwise the fixture animates nothing \
+                 and this whole test proves nothing"
+            );
+        }
+        renderer.close().await;
     }
 
     #[tokio::test]
