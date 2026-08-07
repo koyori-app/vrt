@@ -525,14 +525,28 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 同じ story は何度撮っても同じ PNG になる。
 paused にするだけでは止まる位置がタイミング依存のままなので、そうはしていない。
 
+静止用の CSS は document だけでなく **open shadow root のそれぞれ**にも
+`<style data-vrt-freeze>` として注入する。`caret-color` の継承値は shadow 内で
+明示された宣言に負け、`transition-duration` はそもそも継承しないので、
+document への注入だけでは shadow の中に届かないためである。
+同一オリジンの iframe（shadow 内に置かれたものを含む）にも root 単位で
+再帰し、同じ注入とアニメーション静止を行う。
+
 **移行手順**: この決定化が入った版へ更新した直後の最初のビルドでは、
 アニメーションやキャレットを含む story が `changes_detected` になりうる
 （baseline は静止前の絵のままだから）。これは想定どおりの一度きりの差分で、
 UI でレビューして承認すれば静止後の絵が新しい baseline になり、以降は安定する。
 
-**届かない範囲**: closed shadow root・クロスオリジン iframe の中、および
-canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーションは
-静止できない。そうした story は動きを止めた状態を Storybook 側で用意すること。
+**届かない範囲**: 次のものは静止できない。
+
+- closed shadow root・クロスオリジン iframe の中
+- canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーション
+- 利用者側スタイルが `!important` で明示した `caret-color` / `transition`
+  （注入 CSS も `!important` だが `*` セレクタなので、`!important` 同士の
+  比較では利用者側の宣言が勝つ。adoptedStyleSheets 内の `!important` も同様）
+- 静止処理（撮影直前・2 巡）より後から JS で生成される shadow root や iframe
+
+そうした story は動きを止めた状態を Storybook 側で用意すること。
 
 なお、これが効くのは **storybook モードだけ**である。`screenshots` モード
 （既定）では撮影は CI 側のテストランナーの仕事であり、VRT は受け取った PNG を

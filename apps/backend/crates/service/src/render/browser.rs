@@ -177,8 +177,10 @@ JSON.stringify((() => {
 ///
 /// - **キャレット**: `caret-color: transparent !important` で明滅の位相に
 ///   よらず不可視にする（Playwright の `caret: 'hide'` と同じ機構）。
-///   `caret-color` は継承プロパティなので、`*` セレクタが届かない
-///   open shadow DOM の内側へも継承で波及する
+///   `caret-color` は継承プロパティだが、継承値はカスケードでは最弱で、
+///   shadow 内に `caret-color` を明示した要素には勝てない。ゆえに継承には
+///   頼らず、静止 CSS を document と各 open shadow root のそれぞれへ
+///   `<style data-vrt-freeze>` として直接注入する
 /// - **有限アニメーション**（CSS animation / CSS transition / Web Animations API）:
 ///   `currentTime = endTime` へシークして pause。終端は仕様上ただ一つに
 ///   定まる状態（`fill: forwards` なら最終キーフレーム、無指定なら基底スタイル）
@@ -188,12 +190,17 @@ JSON.stringify((() => {
 ///   「paused にするだけ」では**止まった位置**が撮影タイミング依存のままで、
 ///   flaky さは消えない——座標を明示的に固定するからこそ 2 回撮って同じ絵になる
 /// - **今後始まる transition**: `transition-duration: 0s` で始まった瞬間に
-///   終値へ飛ぶ（`transitionend` は発火するので、完了を待つ実装も壊さない）
+///   終値へ飛ぶ（`transitionend` は発火するので、完了を待つ実装も壊さない）。
+///   `transition-duration` は継承しないプロパティなので、これも root ごとの
+///   注入があって初めて shadow 内に届く
 ///
 /// シーク後に rAF を 2 回待って合成済みフレームへ反映させ、1 巡目の描画で
-/// 新たに始まったアニメーションをもう一度同じ座標へ固定してから返る。
-/// open shadow DOM と同一オリジン iframe は再帰的に辿る。closed shadow root、
-/// クロスオリジン iframe、canvas / rAF 駆動の JS アニメーションには届かない
+/// 新たに始まったアニメーション・後から生えた shadow root をもう一度同じ
+/// 手順で固定してから返る。open shadow root と同一オリジン iframe
+/// （shadow 内にあるものも含む）は root 単位で再帰的に辿り、CSS 注入と
+/// アニメーションのシークを行う。closed shadow root、クロスオリジン iframe、
+/// canvas / rAF 駆動の JS アニメーション、および利用者側が `!important` で
+/// 宣言した `caret-color` / `transition` には届かない
 /// （モジュール末尾のテストと README の記載を参照）。
 const FREEZE_SCRIPT: &str = r#"
 (async () => {
@@ -205,34 +212,38 @@ const FREEZE_SCRIPT: &str = r#"
     '}',
   ].join('\n');
 
-  const freezeDoc = (doc) => {
-    if (!doc) return;
+  // root は Document または ShadowRoot。どちらも同じ手順で静止させる。
+  // caret-color は継承プロパティだが、継承値は shadow 内で明示された宣言に
+  // 勝てず、transition-duration はそもそも継承しない。ゆえに静止 CSS は
+  // 継承に頼らず root ごとに <style data-vrt-freeze> として注入する。
+  const freezeRoot = (root) => {
+    if (!root) return;
+
     try {
-      if (doc.head && !doc.getElementById('__vrt_freeze_style__')) {
+      if (!root.querySelector('style[data-vrt-freeze]')) {
+        const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
         const style = doc.createElement('style');
-        style.id = '__vrt_freeze_style__';
+        style.setAttribute('data-vrt-freeze', '');
         style.textContent = CSS;
-        doc.head.appendChild(style);
+        // Document なら <head>、ShadowRoot なら root 直下へ。
+        (root.head || root.documentElement || root).appendChild(style);
       }
     } catch (e) {}
 
     // document.getAnimations() は shadow tree の中を返さない実装があるため、
-    // open shadow root は自前で辿って合流させる（Set で重複は消える）。
+    // root 自身の getAnimations()（擬似要素のアニメも返す）に加えて、root 内の
+    // 各要素からも直接集める（Set で重複は消える）。
     const animations = new Set();
-    try { for (const a of doc.getAnimations()) animations.add(a); } catch (e) {}
-    const collectShadow = (root) => {
-      let all;
-      try { all = root.querySelectorAll('*'); } catch (e) { return; }
-      for (const el of all) {
-        const sr = el.shadowRoot;
-        if (!sr) continue;
-        for (const inner of sr.querySelectorAll('*')) {
-          try { for (const a of inner.getAnimations()) animations.add(a); } catch (e) {}
-        }
-        collectShadow(sr);
+    try {
+      if (typeof root.getAnimations === 'function') {
+        for (const a of root.getAnimations()) animations.add(a);
       }
-    };
-    collectShadow(doc);
+    } catch (e) {}
+    let elements = [];
+    try { elements = root.querySelectorAll('*'); } catch (e) {}
+    for (const el of elements) {
+      try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {}
+    }
 
     for (const anim of animations) {
       try {
@@ -248,21 +259,25 @@ const FREEZE_SCRIPT: &str = r#"
       } catch (e) {}
     }
 
-    // 同一オリジンの iframe の中も同じ扱い。クロスオリジンは触れないので諦める。
-    try {
-      for (const frame of doc.querySelectorAll('iframe')) {
-        try { freezeDoc(frame.contentDocument); } catch (e) {}
+    // querySelectorAll は shadow 境界も iframe 境界も越えない。open shadow root
+    // と同一オリジン iframe（shadow 内のものも含む）には root ごとに潜る。
+    // クロスオリジンの iframe は触れないので諦める。
+    for (const el of elements) {
+      if (el.shadowRoot) freezeRoot(el.shadowRoot);
+      if (el.localName === 'iframe' || el.localName === 'frame') {
+        try { freezeRoot(el.contentDocument); } catch (e) {}
       }
-    } catch (e) {}
+    }
   };
 
   const nextFrame = () =>
     new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
-  freezeDoc(document);
+  freezeRoot(document);
   await nextFrame();
-  // 1 巡目の描画（スタイル適用・シーク）をきっかけに始まったアニメも同じ座標へ。
-  freezeDoc(document);
+  // 1 巡目の描画（スタイル適用・シーク）をきっかけに始まったアニメや、
+  // 後から生えた shadow root / iframe も同じ座標へ。
+  freezeRoot(document);
   await nextFrame();
   return true;
 })()
@@ -931,6 +946,102 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// open shadow root の内側にアニメ源を持つバンドル。root 単位の静止検証用。
+    ///
+    /// - `demo-shadow--caret` : shadow 内のスタイルが `caret-color` を**明示**した
+    ///   フォーカス済み入力欄。document からの継承（transparent）は明示宣言に
+    ///   負けるので、shadow root への直接注入がなければキャレットは明滅し続ける
+    /// - `demo-shadow--caret-hidden` : 同じ入力欄だが shadow 側の宣言が
+    ///   `caret-color: transparent`。「注入がキャレットを本当に消した」ことを
+    ///   絵の一致で証明するための対照
+    /// - `demo-shadow--transition` : shadow 内の要素が自分の computed
+    ///   `transition-duration` を毎フレーム色に変換して表示する（`0s` なら緑、
+    ///   それ以外は赤）。`transition-duration` は**非継承**なので、これも
+    ///   root への直接注入がなければ `60s` のまま（赤）になる
+    /// - `demo-shadow--frame` : shadow 内の同一オリジン iframe の中の
+    ///   フォーカス済み入力欄。`querySelectorAll('iframe')` は shadow 境界を
+    ///   越えないので、root 単位の再帰探索がなければ届かない
+    fn write_shadow_animated_bundle(root: &Path) {
+        std::fs::write(
+            root.join("frame.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  input { font:24px monospace;width:200px;margin:20px;border:1px solid #000; }
+</style></head>
+<body><input>
+<script>
+  document.querySelector('input').focus();
+</script>
+</body></html>"#,
+        )
+        .expect("write frame.html");
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  x-caret, x-trans, x-frame { display:block; }
+</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var root = document.getElementById('storybook-root');
+      if (id === 'demo-shadow--caret' || id === 'demo-shadow--caret-hidden') {
+        var host = document.createElement('x-caret');
+        var sr = host.attachShadow({ mode: 'open' });
+        var color = id === 'demo-shadow--caret' ? '#cc0000' : 'transparent';
+        sr.innerHTML =
+          '<style>input { caret-color:' + color + '; font:32px monospace; width:200px; margin:40px; border:1px solid #000; }</style>' +
+          '<input>';
+        root.appendChild(host);
+        sr.querySelector('input').focus();
+        channel.emit('storyRendered', id);
+      } else if (id === 'demo-shadow--transition') {
+        var host = document.createElement('x-trans');
+        var sr = host.attachShadow({ mode: 'open' });
+        sr.innerHTML =
+          '<style>div { width:100vw; height:100vh; transition: opacity 60s linear; }</style>' +
+          '<div></div>';
+        root.appendChild(host);
+        var el = sr.querySelector('div');
+        (function poll() {
+          var d = getComputedStyle(el).transitionDuration;
+          el.style.background = d === '0s' ? '#00ff00' : '#ff0000';
+          requestAnimationFrame(poll);
+        })();
+        channel.emit('storyRendered', id);
+      } else if (id === 'demo-shadow--frame') {
+        var host = document.createElement('x-frame');
+        var sr = host.attachShadow({ mode: 'open' });
+        sr.innerHTML =
+          '<style>iframe { width:280px; height:160px; margin:20px; border:1px solid #000; }</style>' +
+          '<iframe src="frame.html"></iframe>';
+        root.appendChild(host);
+        var frame = sr.querySelector('iframe');
+        frame.addEventListener('load', function () {
+          try { frame.contentDocument.querySelector('input').focus(); } catch (e) {}
+          channel.emit('storyRendered', id);
+        });
+      }
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
     #[test]
     fn readiness_parses_probe_results() {
         let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
@@ -1259,6 +1370,191 @@ mod tests {
                 "story {story}: captures without the freeze must differ from the \
                  deterministic frozen capture — otherwise the fixture animates nothing \
                  and this whole test proves nothing"
+            );
+        }
+        renderer.close().await;
+    }
+
+    /// open shadow root の**中**まで静止が届くこと（root 単位注入・再帰の検証）。
+    ///
+    /// 3 story とも旧実装（document.head へのみ CSS 注入）ではこのテストは落ちる:
+    /// caret は shadow 内の明示宣言が継承 transparent に勝って明滅し、
+    /// transition は非継承の duration が 60s のままで赤が出て、
+    /// frame は shadow 境界の向こうの iframe に到達すらしない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_shadow_captures_are_byte_identical_across_runs() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_shadow_captures_are_byte_identical_across_runs: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        for story in [
+            "demo-shadow--caret",
+            "demo-shadow--transition",
+            "demo-shadow--frame",
+        ] {
+            let first = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("first frozen capture");
+            let second = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("second frozen capture");
+            assert_eq!(
+                first, second,
+                "story {story}: two frozen captures must be byte-identical"
+            );
+
+            if story == "demo-shadow--transition" {
+                // shadow 内の要素は自分の computed transition-duration を色で
+                // 表示している。緑（0s）が出るのは、注入 CSS が shadow root の
+                // 中に入って非継承プロパティを上書きしたときだけ。
+                let image = decode_png(&first);
+                let center = image.get_pixel(160, 120);
+                assert_eq!(
+                    (center[0], center[1], center[2]),
+                    (0, 255, 0),
+                    "transition-duration inside the shadow root must be forced to 0s"
+                );
+            }
+        }
+
+        renderer.close().await;
+    }
+
+    /// `caret-color` が shadow の中で**本当に効いた**ことの直接証拠。
+    ///
+    /// 2 回撮って一致するだけでは「キャレットが毎回同じ位相で写っている」
+    /// 可能性を排除できない。shadow 側で `caret-color: transparent` を明示した
+    /// 対照 story と絵が一致するなら、キャレットは確かに不可視である。
+    /// 旧実装（document へのみ注入）では、shadow 内の明示 `caret-color` が
+    /// 継承の transparent に勝ち、フォーカス直後の可視位相のキャレットが
+    /// 写り込んで一致しない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_shadow_caret_matches_an_explicitly_hidden_caret() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_shadow_caret_matches_an_explicitly_hidden_caret: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let caret = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret")
+            .await
+            .expect("frozen shadow caret");
+        let hidden = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret-hidden")
+            .await
+            .expect("frozen shadow caret-hidden");
+        assert_eq!(
+            caret, hidden,
+            "a frozen caret inside a shadow root must be indistinguishable from an \
+             explicitly transparent caret — otherwise the injected caret-color did \
+             not reach the shadow root"
+        );
+
+        renderer.close().await;
+    }
+
+    /// shadow バンドルの対照群（=「静止なしでは一致しない」の固定化）。
+    ///
+    /// ここで差が出ないなら fixture がそもそも shadow の中で何も動かして
+    /// いないということであり、上の一致テストは何も証明しなくなる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfrozen_shadow_captures_differ_from_frozen_ones() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP unfrozen_shadow_captures_differ_from_frozen_ones: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium.clone(), 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch");
+        let frozen_caret = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret")
+            .await
+            .expect("frozen shadow caret");
+        let frozen_transition = renderer
+            .render_story(&server.base_url(), "demo-shadow--transition")
+            .await
+            .expect("frozen shadow transition");
+        let frozen_frame = renderer
+            .render_story(&server.base_url(), "demo-shadow--frame")
+            .await
+            .expect("frozen shadow frame");
+        renderer.close().await;
+
+        options.freeze_before_capture = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch unfrozen");
+
+        // transition: 静止なしの computed duration は 60s のままなので赤が出る。
+        // 差分の存在だけでなく「fixture が生きている」ことまで色で確認する。
+        let unfrozen_transition = renderer
+            .render_story(&server.base_url(), "demo-shadow--transition")
+            .await
+            .expect("unfrozen shadow transition");
+        assert_ne!(
+            unfrozen_transition, frozen_transition,
+            "the shadow transition story must differ without the freeze"
+        );
+        let image = decode_png(&unfrozen_transition);
+        let center = image.get_pixel(160, 120);
+        assert_eq!(
+            (center[0], center[1], center[2]),
+            (255, 0, 0),
+            "without the freeze the shadow element must still see its 60s duration"
+        );
+
+        // caret / frame: キャレットの明滅は位相依存なので、消灯位相を引いた
+        // 場合に備えて数回リトライする（既存の対照群テストと同じ扱い）。
+        for (story, frozen) in [
+            ("demo-shadow--caret", &frozen_caret),
+            ("demo-shadow--frame", &frozen_frame),
+        ] {
+            let mut differed = false;
+            for _attempt in 0..5 {
+                let unfrozen = renderer
+                    .render_story(&server.base_url(), story)
+                    .await
+                    .expect("unfrozen capture");
+                if &unfrozen != frozen {
+                    differed = true;
+                    break;
+                }
+            }
+            assert!(
+                differed,
+                "story {story}: captures without the freeze must differ from the \
+                 deterministic frozen capture — otherwise the fixture animates nothing \
+                 inside the shadow root and the identity test above proves nothing"
             );
         }
         renderer.close().await;
