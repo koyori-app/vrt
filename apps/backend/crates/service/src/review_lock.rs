@@ -3,13 +3,15 @@
 //! ロック順は常に次の順序とし、後ろから前へは取得しない。
 //!
 //! 1. 対象 `builds` 行
-//! 2. baseline を変更する承認だけ対象 `projects` 行
+//! 2. baseline を昇格・固定する経路（承認・plan 添付・部分 storybook finalize）
+//!    だけ対象 `projects` 行
 //! 3. 単一比較を変更するレビューだけ対象 `comparisons` 行
 //!
 //! build 行を三経路（比較レビュー・build 承認・build 却下）共通の mutex にすることで、
 //! 同じ build の判断は直列化する。一方、別 build の比較レビューは並行できる。
-//! 承認だけ project 行も取るのは、異なる build の承認による baseline 昇格を project
-//! 単位で直列化するため。すべて build を先に取るので、別 build の承認同士にも
+//! project 行も取るのは、baseline を昇格させる承認と、起点 baseline を検証して
+//! 固定する plan 添付・部分 storybook finalize の三経路。baseline の昇格と固定を
+//! project 単位で直列化するため。すべて build を先に取るので、これらの経路間に
 //! `build -> project` と `project -> build` の循環は生じない。
 //!
 //! ## CI 取り込み経路（screenshots / storybook 両モード）
@@ -58,7 +60,8 @@ pub async fn build<C: ConnectionTrait>(db: &C, build_id: Uuid) -> Result<builds:
         .ok_or(AppError::NotFound)
 }
 
-/// baseline を変更する承認用の project 行を取得する（ロック順 2）。
+/// baseline の昇格（承認）または固定（plan 添付・部分 storybook finalize）を
+/// project 単位で直列化する project 行を取得する（ロック順 2）。
 pub async fn project<C: ConnectionTrait>(
     db: &C,
     project_id: Uuid,
