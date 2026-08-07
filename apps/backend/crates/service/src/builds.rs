@@ -380,11 +380,13 @@ pub async fn attach_capture_plan(
     }
 
     let build_id = build.id;
-    let project = project.clone();
     let planned_baseline_commit_sha = planned_baseline_commit_sha.to_string();
+    // `project` 引数はロック外で読んだスナップショット。baseline 解決には後段で
+    // FOR UPDATE し直した行を使うので、ここでは捨てて id 参照だけ残す。
+    let _ = project;
     with_transaction(db, move |txn| {
         Box::pin(async move {
-            // ロック順 1（build のみ）。ここで取り直した行の状態が正。
+            // ロック順 1（build）。ここで取り直した行の状態が正。
             let build = crate::review_lock::build(txn, build_id).await?;
 
             if build.mode != BuildMode::Screenshots {
@@ -414,7 +416,15 @@ pub async fn attach_capture_plan(
                 ));
             }
 
-            // 計画の起点 baseline を検証してから固定する。
+            // ロック順 2（project）。承認経路（[`approve_build`]）と同じ
+            // `build -> project` の順で FOR UPDATE する。これで「baseline を進める
+            // 承認」との間に直列点ができ、下の baseline 読み取りと固定の間に
+            // 別 build の承認が新しい baseline を作れなくなる（固定後に古い
+            // baseline を掴んだまま契約を破る競合を断つ）。
+            let project = crate::review_lock::project(txn, build.project_id).await?;
+
+            // 計画の起点 baseline を検証してから固定する。ロックを取ったあとに
+            // 読むので、並行承認との間に隙間は無い。
             let Some(baseline) = crate::baselines::latest_for(txn, &project, &build.branch).await?
             else {
                 return Err(AppError::ConflictDetail(
@@ -664,10 +674,12 @@ pub async fn finalize_storybook(
     pin_expected_baseline_commit_sha: Option<String>,
 ) -> Result<builds::Model, AppError> {
     let build_id = build.id;
-    let project = project.clone();
+    // `project` 引数はロック外で読んだスナップショット。baseline 解決には後段で
+    // FOR UPDATE し直した行を使うので、ここでは捨てて id 参照だけ残す。
+    let _ = project;
     with_transaction(db, move |txn| {
         Box::pin(async move {
-            // ロック順 1（build のみ）。状態はこの取り直した行を正とする。
+            // ロック順 1（build）。状態はこの取り直した行を正とする。
             let build = crate::review_lock::build(txn, build_id).await?;
 
             if build.storybook_key.is_none() {
@@ -684,6 +696,12 @@ pub async fn finalize_storybook(
             let build = match pin_expected_baseline_commit_sha {
                 None => build,
                 Some(expected) => {
+                    // ロック順 2（project）。承認経路（[`approve_build`]）と同じ
+                    // `build -> project` の順で FOR UPDATE する。baseline を読む前に
+                    // ロックを取ることで、SHA 照合から baseline_id 固定までの間に
+                    // 別 build の承認が新しい baseline を作れなくする（流用画像と
+                    // 比較対象が計画と別の baseline になるのを断つ）。
+                    let project = crate::review_lock::project(txn, build.project_id).await?;
                     let Some(baseline) =
                         crate::baselines::latest_for(txn, &project, &build.branch).await?
                     else {

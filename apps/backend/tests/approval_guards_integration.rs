@@ -285,6 +285,62 @@ async fn wait_for_advisory_waiter(fx: &Fixture, lock_key: i64) {
     }
 }
 
+/// barrier を握った承認/レビュー側の DB セッションによって別のセッションが
+/// ブロックされるまで待つ、sleep 非依存の観測。
+///
+/// [`install_update_barrier`] の barrier は対象 UPDATE を advisory lock で止める。
+/// その UPDATE を実行している backend（= advisory lock を待っている backend）が、
+/// 直前に取った build / project 行ロックを保持したまま止まっているので、後続の
+/// 添付・finalize はその行ロック待ちに入る。ここではその「barrier 保持側に
+/// ブロックされた backend」を `pg_blocking_pids` で検出する。行ロック待ちを
+/// 固定 sleep の速さに依存せず観測でき、クエリ本文にも依存しない。
+///
+/// `task` が行ロック待ちに入る前に完了してしまった場合（＝直列化されなかった
+/// 場合）は即座に失敗させる。
+async fn wait_for_row_lock_waiter<T>(
+    fx: &Fixture,
+    lock_key: i64,
+    task: &tokio::task::JoinHandle<T>,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            !task.is_finished(),
+            "task completed before entering the row-lock wait; \
+             the guard did not serialize it behind the in-flight approval"
+        );
+        // advisory lock（objid = lock_key）を待っている backend が、この barrier で
+        // 止まっている承認/レビュー側。その backend にブロックされている backend を
+        // 数える。
+        let row = fx
+            .app
+            .state
+            .db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS count FROM pg_stat_activity w \
+                 WHERE EXISTS ( \
+                   SELECT 1 FROM pg_locks h \
+                   WHERE h.locktype = 'advisory' AND NOT h.granted \
+                     AND h.classid = 0 AND h.objid = $1 AND h.objsubid = 1 \
+                     AND h.pid = ANY(pg_blocking_pids(w.pid)) )",
+                [lock_key.into()],
+            ))
+            .await
+            .expect("query row-lock waiters")
+            .expect("count row");
+        let count: i64 = row.try_get("", "count").expect("waiter count");
+        if count > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a session blocked by the barrier holder"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 // comparison の却下が先に更新へ入った場合、承認はその却下を読み直して止まる。
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_comparison_rejection_cannot_be_promoted_to_the_baseline() {
@@ -332,11 +388,9 @@ async fn concurrent_comparison_rejection_cannot_be_promoted_to_the_baseline() {
             .await
             .expect("approve build")
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !approve_task.is_finished(),
-        "approval must wait behind an in-flight comparison review"
-    );
+    // 承認は却下側が握った build 行ロック待ちに入るはず。sleep ではなく
+    // pg_blocking_pids で「barrier 保持側にブロックされた」ことを観測する。
+    wait_for_row_lock_waiter(&fx, lock_key, &approve_task).await;
 
     barrier.commit().await.expect("release barrier");
     let reviewed = review_task.await.expect("review task");
@@ -381,11 +435,8 @@ async fn concurrent_build_rejection_prevents_baseline_creation() {
             .await
             .expect("approve build")
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !approve_task.is_finished(),
-        "approval must wait behind rejection"
-    );
+    // 承認は却下側が握った build 行ロック待ちに入るはず。
+    wait_for_row_lock_waiter(&fx, lock_key, &approve_task).await;
 
     barrier.commit().await.expect("release barrier");
     let rejected = reject_task.await.expect("reject task");
@@ -999,4 +1050,235 @@ async fn existing_build_with_pre_migration_screenshot_can_be_approved_directly()
         .expect("home baseline entry");
     assert_eq!(entry.content_hash.as_deref(), Some(actual_hash.as_str()));
     assert_eq!(entry.verified_content_hash, entry.content_hash);
+}
+
+// capture plan の添付は「添付時点の最新 baseline」を固定する契約を持つ。
+// 添付経路が build 行しかロックしないと、baseline を検証してから固定するまでの
+// 間に、別 build の承認（project 行をロックして新 baseline を作る）が割り込んで
+// baseline を進められる。すると添付は 409 を返さず古い baseline を固定してしまう。
+// 添付経路も承認経路と同じ build -> project の順で project 行をロックすることで、
+// この競合が直列化されることを検証する。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_approval_blocks_stale_capture_plan_pin() {
+    let fx = setup().await;
+
+    // 起点 baseline B0（source = sha-a、エントリ home/about）。
+    let first = fx
+        .run_build("sha-a", &[("home", RED), ("about", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve baseline build");
+
+    // baseline を進める承認対象 D（home が変わっている）。事前にレビューを済ませ、
+    // 承認そのものだけをレースにかける。
+    let mover = fx
+        .run_build("sha-d", &[("home", BLUE), ("about", RED)])
+        .await;
+    let mover_id = build_id_of(&mover);
+    assert_eq!(mover["status"], "changes_detected");
+    fx.review(mover_id, "home", "approve").await;
+
+    // capture plan を添付する対象 C。撮影前・アップロード前の pending。
+    let plan_build = fx.create_build("main", "sha-c", &[]).await;
+
+    // 承認の UPDATE builds（status = approved）を trigger で止め、承認 txn に
+    // project 行ロックを保持させたまま添付を競合させる。
+    let condition = format!(
+        "NEW.status::text = 'approved' AND NEW.project_id = '{}'",
+        fx.project_id
+    );
+    let (barrier, lock_key) = install_update_barrier(&fx, "builds", &condition).await;
+
+    let approve_client = fx.app.client().clone();
+    let approve_url = format!("{}/v1/builds/{mover_id}/approve", fx.app.base_url());
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("approve mover build")
+    });
+    // 承認が UPDATE builds に到達し、project 行ロックを握ったまま barrier で待つ。
+    wait_for_advisory_waiter(&fx, lock_key).await;
+
+    // 添付は承認と同じ project 行ロックを待つはずなので、この時点では完了しない。
+    let attach_client = fx.app.client().clone();
+    let attach_url = format!("{}/v1/ci/builds/{plan_build}/plan", fx.app.base_url());
+    let attach_token = fx.token.clone();
+    let attach_task = tokio::spawn(async move {
+        attach_client
+            .post(attach_url)
+            .bearer_auth(attach_token)
+            .json(&json!({
+                "selected_names": ["home"],
+                "manifest_names": ["about", "home"],
+                "baseline_commit_sha": "sha-a",
+            }))
+            .send()
+            .await
+            .expect("attach capture plan")
+    });
+    // 添付は承認が握った project 行ロック待ちに入るはず。sleep ではなく
+    // pg_blocking_pids で「承認にブロックされた」ことを観測してから解放する。
+    wait_for_row_lock_waiter(&fx, lock_key, &attach_task).await;
+
+    // barrier を解放して承認をコミットさせる（baseline が B0 → B1(sha-d) に進む）。
+    barrier.commit().await.expect("release barrier");
+    let approved = approve_task.await.expect("approve task");
+    assert_eq!(approved.status(), StatusCode::OK, "approval succeeds");
+
+    // 添付は承認後に project ロックを取り、進んだ baseline を読むので、
+    // 計画の起点（sha-a）とずれて 409 になる。古い baseline を黙って固定しない。
+    let attached = attach_task.await.expect("attach task");
+    assert_eq!(
+        attached.status(),
+        StatusCode::CONFLICT,
+        "attachment must reject once the baseline moved instead of pinning the stale one"
+    );
+    let message = error_message(attached).await;
+    assert!(
+        message.contains("baseline moved"),
+        "unexpected conflict message: {message}"
+    );
+
+    // 計画は固定されていない（baseline_id が残っていない）。
+    let build = service::builds::get_build(&fx.app.state.db, plan_build)
+        .await
+        .expect("load plan build");
+    assert!(
+        build.baseline_id.is_none(),
+        "no baseline must be pinned when the attachment is rejected"
+    );
+}
+
+// storybook の部分レンダリング（only_story_ids）は finalize 時に「起点 baseline を
+// 照合してから baseline_id に固定する」契約を持つ。attach_capture_plan と同じく、
+// finalize が build 行しかロックしないと照合〜固定の間に別 build の承認（project 行を
+// ロックして新 baseline を作る）が割り込み、進んだ baseline を黙って固定してしまう。
+// finalize_storybook も承認と同じ build -> project の順で project 行をロックすることで
+// この競合が直列化され、baseline が動いていれば 409 で弾かれることを検証する。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_approval_blocks_stale_storybook_finalize_pin() {
+    let fx = setup().await;
+
+    // 起点 baseline B0（source = sha-a、エントリ home/about）。
+    let first = fx
+        .run_build("sha-a", &[("home", RED), ("about", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve baseline build");
+
+    // baseline を進める承認対象 D（home が変わっている）。承認そのものだけをレースにかける。
+    let mover = fx
+        .run_build("sha-d", &[("home", BLUE), ("about", RED)])
+        .await;
+    let mover_id = build_id_of(&mover);
+    assert_eq!(mover["status"], "changes_detected");
+    fx.review(mover_id, "home", "approve").await;
+
+    // 部分レンダリング対象の storybook ビルド C。HTTP 作成は Chromium 設定ゲートに
+    // 掛かるので、サービス層で pending の storybook ビルドを直接用意する（finalize
+    // エンドポイント自体はゲートしない）。bundle 内容は検証されないのでキーだけ付ける。
+    let project_model = entity::projects::Entity::find_by_id(fx.project_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load project")
+        .expect("project exists");
+    let sb_build = service::builds::create_build(
+        &fx.app.state.db,
+        &project_model,
+        "main".to_string(),
+        "sha-c".to_string(),
+        None,
+        None,
+        entity::builds::BuildMode::Storybook,
+    )
+    .await
+    .expect("create storybook build");
+    let sb_build = service::builds::attach_storybook_bundle(
+        &fx.app.state.db,
+        sb_build,
+        "test-key".to_string(),
+    )
+    .await
+    .expect("attach storybook bundle");
+    let sb_id = sb_build.id;
+
+    // 承認の UPDATE builds（status = approved）を trigger で止め、承認 txn に
+    // project 行ロックを保持させたまま finalize を競合させる。
+    let condition = format!(
+        "NEW.status::text = 'approved' AND NEW.project_id = '{}'",
+        fx.project_id
+    );
+    let (barrier, lock_key) = install_update_barrier(&fx, "builds", &condition).await;
+
+    let approve_client = fx.app.client().clone();
+    let approve_url = format!("{}/v1/builds/{mover_id}/approve", fx.app.base_url());
+    let approve_task = tokio::spawn(async move {
+        approve_client
+            .post(approve_url)
+            .json(&json!({}))
+            .send()
+            .await
+            .expect("approve mover build")
+    });
+    // 承認が UPDATE builds に到達し、project 行ロックを握ったまま barrier で待つ。
+    wait_for_advisory_waiter(&fx, lock_key).await;
+
+    // finalize は承認と同じ project 行ロック待ちに入るはず。
+    let finalize_client = fx.app.client().clone();
+    let finalize_url = format!("{}/v1/ci/builds/{sb_id}/finalize", fx.app.base_url());
+    let finalize_token = fx.token.clone();
+    let finalize_task = tokio::spawn(async move {
+        finalize_client
+            .post(finalize_url)
+            .bearer_auth(finalize_token)
+            .json(&json!({
+                "only_story_ids": ["home--default"],
+                "expected_baseline_commit_sha": "sha-a",
+            }))
+            .send()
+            .await
+            .expect("finalize storybook build")
+    });
+    // sleep ではなく pg_blocking_pids で「承認にブロックされた」ことを観測してから解放。
+    wait_for_row_lock_waiter(&fx, lock_key, &finalize_task).await;
+
+    // barrier を解放して承認をコミットさせる（baseline が B0 → B1(sha-d) に進む）。
+    barrier.commit().await.expect("release barrier");
+    let approved = approve_task.await.expect("approve task");
+    assert_eq!(approved.status(), StatusCode::OK, "approval succeeds");
+
+    // finalize は承認後に project ロックを取り、進んだ baseline を読むので、
+    // 計画の起点（sha-a）とずれて 409 になる。古い baseline を黙って固定しない。
+    let finalized = finalize_task.await.expect("finalize task");
+    assert_eq!(
+        finalized.status(),
+        StatusCode::CONFLICT,
+        "finalize must reject once the baseline moved instead of pinning the stale one"
+    );
+    let message = error_message(finalized).await;
+    assert!(
+        message.contains("does not match the current baseline"),
+        "unexpected conflict message: {message}"
+    );
+
+    // baseline_id は固定されず、状態も pending のまま（rendering へ遷移していない）。
+    let build = service::builds::get_build(&fx.app.state.db, sb_id)
+        .await
+        .expect("load storybook build");
+    assert!(
+        build.baseline_id.is_none(),
+        "no baseline must be pinned when the finalize is rejected"
+    );
+    assert_eq!(
+        build.status,
+        entity::builds::BuildStatus::Pending,
+        "rejected finalize must leave the build pending"
+    );
 }
