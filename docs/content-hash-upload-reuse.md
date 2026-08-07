@@ -90,16 +90,19 @@ self-host 構成では、一点推定の月 2.8 GB という水準の転送削�
 
 再検討には、転送削減量を再評価できる次の実測値を用いる。
 
-- 一致率：hash 照合の対象となった比較総数（分母）と、そのうちバイト一致した数（分子）。
+- 一致率：分母は「検証済み hash を持つ baseline entry と照合できた shot 数」、分子はそのうちバイト一致した数。
 - 一致バイト総量：バイト一致した画像の合計バイト数。枚数だけでは PNG サイズの偏りを拾えないため、バイト加重で見る。
 
 `content_hash_skipped_count` 単独では判断できない。
-③ fast path のヒット「数」だけであり、分母（比較総数）も一致画像のバイト総量も持たないため、転送削減量の再評価に足りないからである。
+③ fast path のヒット「数」だけであり、分母も一致画像のバイト総量も持たないため、転送削減量の再評価に足りないからである。
+なお③の fast path が数える対象は、比較ジョブ側で shot と baseline entry の hash が一致し、entry の `verified_content_hash` 照合と保存実体の再照合まで通った組である（`compare_build.rs` の `compare_pair`）。
+②の照合は plan 添付一覧（検証済み entry のみ）に対して CI 側で行うため、③のヒット集合と②の照合対象集合は同じとは限らない。
+このずれを持ち込まないため、一致率の分母は上の定義「検証済み hash を持つ baseline entry と照合できた shot 数」一つに固定する。
 
 backend の現状と不足は次のとおりである。
 
 - ある：build ごとの `content_hash_skipped_count`（一致数。分子に相当）。
-- ない：分母。hash 照合の対象となった比較総数（hash が NULL の entry 等、照合できなかった shot を除いた数）。
+- ない：分母。検証済み hash を持つ baseline entry と照合できた shot 数（hash が NULL の entry 等、照合できなかった shot は含めない）。
 - ない：一致バイト総量。fast path で skip した shot のバイト数の合算。
 
 不足分は build 単位のカウンタ追加（照合対象総数、skip バイト総量）で足りる。
@@ -126,11 +129,12 @@ hash が NULL の entry（hash 導入前の baseline）や未検証の entry は
 
 hash が一致した story について、CI は本体の代わりに reuse claim（`{name, content_hash}` のみの POST）を送る。
 サーバーは、既存の PNG アップロード（`store_ci_screenshot`）と同じガード（build 行ロック、pending 状態、capture plan の selected 照合、同名重複拒否）の内側で次を行う。
+ただし同名重複拒否には例外を一つ設け、reuse claim では同一 claim（同じ `{name, content_hash}`）の再送を拒否せず受理済みとして返す（後述の冪等再送）。
 
 1. pin 済み baseline の該当 entry を引く。entry がない、hash が一致しない、または hash が NULL なら claim を 4xx で拒否する。
 2. entry の storage 実体を読み、バイト列から hash を再計算し、claim の hash と一致することを確認する。
 3. carry-forward と同じ機構（決定的 UUIDv5 キー、upload、`ON CONFLICT DO NOTHING`、失敗時の補償削除）で、build 所有の storage key へ実体コピーする。
-4. screenshots 行を insert する。`content_hash` はサーバーが再計算した値を保存する。metadata には `reused_by_content_hash: true`、claim された hash、参照元の baseline entry を記録する。
+4. screenshots 行を insert する。`content_hash` はサーバーが再計算した値を保存する。metadata には `reused_by_content_hash: true`、claim された hash、参照元の baseline entry を記録する。carry-forward が書く `reused` キーは書かない。
 
 どの段階の失敗も claim の拒否（4xx/5xx）として返す。
 CI は拒否されたら本体送信へフォールバックするか、build を失敗させる。
@@ -158,10 +162,12 @@ carry-forward が参照ではなく物理複製を選んだ理由として、`ap
 
 コピー完了後は build がオブジェクトを所有するため、参照元 build が retention で消えても影響を受けない。
 
-危険窓は plan 応答から claim 処理までの間に限られる。
-この間に baseline が別の build へ前進すると、旧 source build の retention 保護（`baselines.source_build_id` による保護）が外れ、prune されうる。
-その場合は claim 処理の実体読みが失敗し、claim は 5xx で拒否される。
-黙って成功する経路はなく、CI は本体送信で継続できる。
+plan 応答から claim 処理までの間に baseline が別の build へ前進しても、旧 source build が prune されることはない。
+retention（`builds.rs` の `prune_old_builds`）の保護集合は、プロジェクトの baselines 全行の `source_build_id` から作られ、最新の baseline だけを保護するのではないからである。
+baseline は昇格のたびに新しい行を insert するだけで、旧行の update / delete は存在しない（`builds.rs` の承認トランザクション）。
+したがって plan が参照した baseline 行が生きている限り、その source build は保護され続け、baseline の前進で保護が外れる窓は開かない。
+それでも claim 処理は実体読みの失敗（retention とは無関係な、storage 側の欠損・障害等）に備え、失敗を 5xx として返す。
+黙って成功する経路はなく、CI は本体送信で継続できる（fail-closed）。
 
 ## 「送らなかった」と「送り損ねた」の区別
 
@@ -178,10 +184,14 @@ claim を送らずに省略した story は「送り損ねた」として検出�
 
 比較ジョブ側にも同じ検査の多重防御がある（`compare_build.rs` の selected 照合）。
 そこでは carry-forward 複製を `is_reused` で除外している。
+`is_reused` は列や専用フラグではなく、screenshots 行の `metadata.reused == true` を読む関数である（`compare_build.rs`）。
+carry-forward の insert が metadata に `reused: true` を書き、この関数がそれを拾う。
 content-hash reuse の shot はこの除外に加えず、selected の充足として照合に含める。
 finalize が「uploaded と reused の和集合 = selected」を検査する以上、content-hash reuse は selected の一部である。
 これを比較側の照合から除外すると、finalize では selected の充足に数えた shot を比較側では数えないことになり、二つの検査が同じ集合を見なくなる。
-したがって content-hash reuse の行には carry-forward と同じ除外フラグ（`is_reused`）を立てず、識別は metadata の `reused_by_content_hash` で行う。
+したがって content-hash reuse の行には metadata に `reused: true` を書かず、`is_reused` が真にならない形で insert する。
+content-hash reuse の行が metadata に持つのは `reused_by_content_hash: true` だけであり、`reused` キー自体を持たない。
+識別は `reused_by_content_hash` で行う。
 
 carry-forward と content-hash reuse で扱いが分かれる理由は、selected に対する立場の違いにある。
 
@@ -228,8 +238,8 @@ selected 照合の除外条件も変えない。
 | 経路 | 設計の倒れ方 |
 | --- | --- |
 | sha256 の衝突 | サーバーは自身の baseline バイト列をコピーするため、衝突が成立しても保存されるのはサーバーが検証済みの画像であり、画像の置換は起きない。倒れ方は「真に変化した画像が変化なし扱いになる」見逃しだが、sha256 の衝突生成を要するため実務上は無視できる。 |
-| 照会から claim までの間に元画像が消える | claim 処理の実体読みが失敗し、claim は 5xx で拒否される。黙って成功する経路はない。CI は本体送信で継続する。 |
-| 参照先が retention で消える | 実体コピー方式のため、claim 受理後は影響を受けない。危険窓は claim 処理の内部に閉じる（前節「寿命」）。 |
+| 照会から claim までの間に元画像が消える | retention では起きない（保護集合は baselines 全行の `source_build_id` であり、baseline は insert-only。前節「寿命」）。storage 側の欠損等で起きた場合は claim 処理の実体読みが失敗し、claim は 5xx で拒否される。黙って成功する経路はない。CI は本体送信で継続する。 |
+| 参照先が retention で消える | claim 受理前は保護集合が防ぎ、claim 受理後は build 所有の実体コピーがあるため、いずれも影響を受けない（前節「寿命」）。 |
 | CI が hash を偽る | サーバーは hash を照合にしか使わず、実体は自身の baseline からコピーし、保存する hash は再計算する。偽の hash が baseline hash とたまたま一致する形で成立するのは「実際には変化した画面を、CI が変化なしと主張する」見逃しであり、これは CI が撮影自体を偽装できるという既存の信頼境界と同じ級に収まる。監査のため claim の hash と参照元は metadata に残す。 |
 
 ## 実装の前提条件
