@@ -21,6 +21,9 @@ config = "0.15.22"
 dotenvy = "0.15"
 hex = "0.4"
 hmac = "0.13"
+# image (経由の png crate) の pre-IDAT 検証挙動は、vrt-actions の事前検証が
+# bash で写している。更新時は crates/service/tests/png_crate_conformance.rs が
+# 落ちないか確認し、落ちたら vrt-actions 側を先に追随させること。
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
