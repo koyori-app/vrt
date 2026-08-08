@@ -511,6 +511,75 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 > なっていた。名前を黙って加工する経路としない経路の不整合は同種の突き合わせ
 > ずれを生み続けるので、加工はせず入口で拒否する側に一本化した。
 
+#### 撮影の決定化（キャレット・アニメーションの静止）
+
+レンダラは撮影の直前に、ページを時刻に依存しない静止状態へ固定してから撮る。
+利用者側の Storybook や preview に設定を足す必要はない。
+
+- 入力キャレットは `caret-color: transparent` で不可視にする
+  （明滅の位相で差分が出ることがなくなる）
+- 有限の CSS アニメーション・transition・Web Animations は**終端**へシークして止める
+- 無限アニメーション（スピナー等）は**先頭（進行度 0）**へ巻き戻して止める
+
+いずれも「いつ撮ったか」に依存しない一意な座標へ固定するので、
+同じ story は何度撮っても同じ PNG になる。
+paused にするだけでは止まる位置がタイミング依存のままなので、そうはしていない。
+
+静止用の CSS は document だけでなく **open shadow root のそれぞれ**にも
+`<style data-vrt-freeze>` として注入する。`caret-color` の継承値は shadow 内で
+明示された宣言に負け、`transition-duration` はそもそも継承しないので、
+document への注入だけでは shadow の中に届かないためである。
+同一オリジンの iframe（shadow 内に置かれたものを含む）にも root 単位で
+再帰し、同じ注入とアニメーション静止を行う。
+
+**移行手順**: この決定化が入った版へ更新した直後の最初のビルドでは、
+アニメーションやキャレットを含む story が `changes_detected` になりうる
+（baseline は静止前の絵のままだから）。これは想定どおりの一度きりの差分で、
+UI でレビューして承認すれば静止後の絵が新しい baseline になり、以降は安定する。
+
+**届かない範囲**: 次のものは静止できない。
+
+- closed shadow root・クロスオリジン iframe の中
+- canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーション
+- 利用者側スタイルが `!important` で明示した `caret-color` / `transition`
+  （注入 CSS も `!important` だが `*` セレクタなので、`!important` 同士の
+  比較では利用者側の宣言が勝つ。adoptedStyleSheets 内の `!important` も同様）
+- 静止処理（撮影直前・2 巡）より後から JS で生成される shadow root や iframe
+
+そうした story は動きを止めた状態を Storybook 側で用意すること。
+
+**静止後に始まる transition のイベントも届かない**: 静止は
+`transition-duration: 0s` / `transition-delay: 0s` の注入で行う。CSS Transitions
+の仕様では duration と delay の合計（combined duration）が 0s より大きいときに
+だけ transition が開始されるため、静止後にスタイルが変わっても transition は
+そもそも生成されず、プロパティ値だけが即座に終値へ変わる。生成されない以上
+`transitionrun` / `transitionstart` / `transitionend` はどれも発火しない。
+静止の時点で**すでに走っていた** transition は別で、終端へシークされて完了し、
+その `transitionend` は発火する（どちらの向きもレンダラのテストで実測して
+固定してある）。ゆえに **静止よりあとに始まる transition の `transitionend`
+を合図に見た目を変えるコンポーネント——たとえば transition の完了を待って
+クラスを付け替える、要素を取り除く、次の状態へ進めるもの——は、その更新が
+起きる前の絵で撮られる**。transition を連鎖させるコンポーネントなら、静止時に
+走っていた 1 本ぶんの完了イベントまでは届き、そこから先の transition は
+始まらない。自分の story がこの形かどうかで、撮れる絵が変わる。厳密に最終状態を撮りたい場合は、
+イベント待ちを経ずに最終状態を直接描く story を用意すること。
+
+これは意図した割り切りである。理由は二つ。
+
+1. このシステムの目的は決定的な静止画であり、ページは静止の直後に撮られて
+   それ以降の相互作用は無い。イベントを合図に進む先の状態は撮影対象ではない
+2. 仮に transition を生成させて `transitionend` を発火させると（たとえば
+   Web Animations API で終端までシークして完了させる形）、それに依存する
+   状態更新がいつ描画へ反映されるかが撮影タイミングに依存してしまい、
+   「時刻に依存しない絵を撮る」という目的そのものに反する
+
+イベント互換性より撮影の決定性を優先している。
+
+なお、これが効くのは **storybook モードだけ**である。`screenshots` モード
+（既定）では撮影は CI 側のテストランナーの仕事であり、VRT は受け取った PNG を
+比較するだけなので、キャレット隠蔽やアニメーション静止は撮影側で行うこと
+（Playwright なら `caret: 'hide'` / `animations: 'disabled'` に相当）。
+
 #### `vrt` CLI で 1 コマンド（推奨）
 
 同梱の CLI（`apps/backend/crates/cli`、バイナリ名 `vrt`）を使うと、ビルド作成 →

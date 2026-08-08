@@ -7,7 +7,8 @@
 //! 2. [`StoryRenderer`] が chromiumoxide で Chromium を起動し、
 //!    `http://127.0.0.1:{port}/iframe.html?id={story_id}&viewMode=story` を開く
 //! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
-//!    短い settle 待ちのあとビューポートを PNG で撮る
+//!    短い settle 待ちのあと [`FREEZE_SCRIPT`] でキャレットとアニメーションを
+//!    決定的に静止させてから、ビューポートを PNG で撮る
 //!
 //! ## 描画完了の判定
 //!
@@ -165,6 +166,137 @@ JSON.stringify((() => {
 })())
 "#;
 
+/// 撮影直前にページを**決定的な静止状態**へ持ち込むスクリプト。
+///
+/// キャレットの明滅とアニメーションは「いつ撮ったか」で絵が変わる、VRT にとって
+/// 純粋な雑音である。しきい値（`diff_ratio_fail`）を緩めて誤差を許すのではなく、
+/// 撮影の入力自体から時刻依存を消す。利用者の Storybook / preview には一切
+/// 手を入れず、レンダラがナビゲーション後のページに注入する。
+///
+/// ## なぜ「決定的」といえるか
+///
+/// - **キャレット**: `caret-color: transparent !important` で明滅の位相に
+///   よらず不可視にする（Playwright の `caret: 'hide'` も同じプロパティ強制で
+///   実現している。ただしあちらは編集要素へのインライン指定、こちらは
+///   スタイルシート注入）。
+///   `caret-color` は継承プロパティだが、継承値はカスケードでは最弱で、
+///   shadow 内に `caret-color` を明示した要素には勝てない。ゆえに継承には
+///   頼らず、静止 CSS を document と各 open shadow root のそれぞれへ
+///   `<style data-vrt-freeze>` として直接注入する
+/// - **有限アニメーション**（CSS animation / CSS transition / Web Animations API）:
+///   `currentTime = endTime` へシークして pause。終端は仕様上ただ一つに
+///   定まる状態（`fill: forwards` なら最終キーフレーム、無指定なら基底スタイル）
+///   であり、壁時計に依存しない
+/// - **無限アニメーション**: 終端が存在しないので `currentTime = 0` へ巻き戻して
+///   pause。タイムライン座標 0 の絵はこれもただ一つに定まる。
+///   「paused にするだけ」では**止まった位置**が撮影タイミング依存のままで、
+///   flaky さは消えない——座標を明示的に固定するからこそ 2 回撮って同じ絵になる
+/// - **今後始まる transition**: `transition-duration: 0s` と `transition-delay: 0s`
+///   の下では、スタイルが変わっても transition は**そもそも生成されない**
+///   （CSS Transitions Level 1 の開始条件は combined duration
+///   （= max(duration, 0s) + delay）が 0s より大きいことを要求する。
+///   <https://www.w3.org/TR/css-transitions-1/#starting>）。プロパティ値は
+///   即座に終値へ変わるが、transition が存在しない以上
+///   `transitionrun` / `transitionstart` / `transitionend` は**いずれも発火しない**。
+///   一方、**注入の時点ですでに走っていた transition** は上の有限アニメーションの
+///   経路で終端へシークされ、完了として `transitionend` を**発火する**（Chromium
+///   実測）。この境界はモジュール末尾の
+///   `transitions_under_freeze_fire_no_events` が両方向とも固定している。
+///   ゆえに注入後に始まる transition の `transitionend` を待って見た目を
+///   更新するコンポーネントには届かない——
+///   その代償と採否の理由は README の「届かない範囲」を参照。
+///   `transition-duration` は継承しないプロパティなので、これも root ごとの
+///   注入があって初めて shadow 内に届く
+///
+/// シーク後に rAF を 2 回待って合成済みフレームへ反映させ、1 巡目の描画で
+/// 新たに始まったアニメーション・後から生えた shadow root をもう一度同じ
+/// 手順で固定してから返る。open shadow root と同一オリジン iframe
+/// （shadow 内にあるものも含む）は root 単位で再帰的に辿り、CSS 注入と
+/// アニメーションのシークを行う。closed shadow root、クロスオリジン iframe、
+/// canvas / rAF 駆動の JS アニメーション、および利用者側が `!important` で
+/// 宣言した `caret-color` / `transition` には届かない
+/// （モジュール末尾のテストと README の記載を参照）。
+const FREEZE_SCRIPT: &str = r#"
+(async () => {
+  const CSS = [
+    '*, *::before, *::after {',
+    '  caret-color: transparent !important;',
+    '  transition-duration: 0s !important;',
+    '  transition-delay: 0s !important;',
+    '}',
+  ].join('\n');
+
+  // root は Document または ShadowRoot。どちらも同じ手順で静止させる。
+  // caret-color は継承プロパティだが、継承値は shadow 内で明示された宣言に
+  // 勝てず、transition-duration はそもそも継承しない。ゆえに静止 CSS は
+  // 継承に頼らず root ごとに <style data-vrt-freeze> として注入する。
+  const freezeRoot = (root) => {
+    if (!root) return;
+
+    try {
+      if (!root.querySelector('style[data-vrt-freeze]')) {
+        const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
+        const style = doc.createElement('style');
+        style.setAttribute('data-vrt-freeze', '');
+        style.textContent = CSS;
+        // Document なら <head>、ShadowRoot なら root 直下へ。
+        (root.head || root.documentElement || root).appendChild(style);
+      }
+    } catch (e) {}
+
+    // document.getAnimations() は shadow tree の中を返さない実装があるため、
+    // root 自身の getAnimations()（擬似要素のアニメも返す）に加えて、root 内の
+    // 各要素からも直接集める（Set で重複は消える）。
+    const animations = new Set();
+    try {
+      if (typeof root.getAnimations === 'function') {
+        for (const a of root.getAnimations()) animations.add(a);
+      }
+    } catch (e) {}
+    let elements = [];
+    try { elements = root.querySelectorAll('*'); } catch (e) {}
+    for (const el of elements) {
+      try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {}
+    }
+
+    for (const anim of animations) {
+      try {
+        const timing =
+          anim.effect && anim.effect.getComputedTiming
+            ? anim.effect.getComputedTiming()
+            : null;
+        const end = timing ? timing.endTime : NaN;
+        // 有限は終端へ、無限は初期（タイムライン座標 0）へ。どちらも
+        // 壁時計に依存しない一意な座標なので、2 回撮っても同じ絵になる。
+        anim.currentTime = Number.isFinite(end) ? end : 0;
+        anim.pause();
+      } catch (e) {}
+    }
+
+    // querySelectorAll は shadow 境界も iframe 境界も越えない。open shadow root
+    // と同一オリジン iframe（shadow 内のものも含む）には root ごとに潜る。
+    // クロスオリジンの iframe は触れないので諦める。
+    for (const el of elements) {
+      if (el.shadowRoot) freezeRoot(el.shadowRoot);
+      if (el.localName === 'iframe' || el.localName === 'frame') {
+        try { freezeRoot(el.contentDocument); } catch (e) {}
+      }
+    }
+  };
+
+  const nextFrame = () =>
+    new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+  freezeRoot(document);
+  await nextFrame();
+  // 1 巡目の描画（スタイル適用・シーク）をきっかけに始まったアニメや、
+  // 後から生えた shadow root / iframe も同じ座標へ。
+  freezeRoot(document);
+  await nextFrame();
+  return true;
+})()
+"#;
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -241,6 +373,12 @@ pub struct RenderOptions {
     pub viewport_width: u32,
     pub viewport_height: u32,
     pub story_timeout: Duration,
+    /// 撮影直前に [`FREEZE_SCRIPT`] を注入するか。既定は `true`。
+    ///
+    /// `false` はテスト専用の裏口で、「静止させないと本当に絵が揺れる」ことを
+    /// 検証する positive control のためにある。本番経路（`render_build`）は
+    /// [`RenderOptions::new`] を通るので常に `true`。
+    pub freeze_before_capture: bool,
 }
 
 impl RenderOptions {
@@ -254,6 +392,7 @@ impl RenderOptions {
             viewport_width,
             viewport_height,
             story_timeout: DEFAULT_STORY_TIMEOUT,
+            freeze_before_capture: true,
         }
     }
 }
@@ -502,6 +641,18 @@ impl StoryRenderer {
 
         tokio::time::sleep(SETTLE_DELAY).await;
 
+        // 撮影直前にキャレットとアニメーションを決定的な座標へ固定する。
+        // 注入に失敗したまま撮ると flaky な絵が baseline に混ざるので、
+        // 黙って続行せずこのストーリーの失敗として返す。
+        if self.options.freeze_before_capture {
+            page.evaluate(FREEZE_SCRIPT)
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+        }
+
         page.screenshot(
             ScreenshotParams::builder()
                 .format(CaptureScreenshotFormat::Png)
@@ -749,6 +900,200 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// アニメーションとキャレットを持つバンドル。freeze の決定性検証用。
+    ///
+    /// - `demo-anim--spinner` : **無限** CSS アニメ（1.7s 周期の回転）。
+    ///   周期を切りの悪い値にしてあるのは、2 回の撮影間隔が偶然 1 周期の
+    ///   整数倍に一致して「未修正でも同じ絵」になる事故を避けるため
+    /// - `demo-anim--caret`   : フォーカス済み入力欄。キャレットが明滅する
+    /// - `demo-anim--slide`   : **有限** CSS アニメ（60s, `fill: forwards`）。
+    ///   初期は赤・終端は青。freeze が「終端へシークした」ことを色で検証できる
+    fn write_animated_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spinner {
+    width:120px;height:120px;margin:20px;
+    border:24px solid #dddddd;border-top-color:#ff0000;border-radius:50%;
+    animation: spin 1.7s linear infinite;
+  }
+  @keyframes to-blue { from { background:#ff0000; } to { background:#0000ff; } }
+  .slide { width:100%;height:100vh;animation: to-blue 60s linear 1 forwards; }
+  input { font:32px monospace;width:200px;margin:40px;border:1px solid #000; }
+</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var root = document.getElementById('storybook-root');
+      if (id === 'demo-anim--spinner') {
+        var el = document.createElement('div');
+        el.className = 'spinner';
+        root.appendChild(el);
+      } else if (id === 'demo-anim--caret') {
+        var input = document.createElement('input');
+        root.appendChild(input);
+        input.focus();
+      } else if (id === 'demo-anim--slide') {
+        var el = document.createElement('div');
+        el.className = 'slide';
+        root.appendChild(el);
+      }
+      channel.emit('storyRendered', id);
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// open shadow root の内側にアニメ源を持つバンドル。root 単位の静止検証用。
+    ///
+    /// - `demo-shadow--caret` : shadow 内のスタイルが `caret-color` を**明示**した
+    ///   フォーカス済み入力欄。document からの継承（transparent）は明示宣言に
+    ///   負けるので、shadow root への直接注入がなければキャレットは明滅し続ける
+    /// - `demo-shadow--caret-hidden` : 同じ入力欄だが shadow 側の宣言が
+    ///   `caret-color: transparent`。「注入がキャレットを本当に消した」ことを
+    ///   絵の一致で証明するための対照
+    /// - `demo-shadow--transition` : shadow 内の要素が自分の computed
+    ///   `transition-duration` を毎フレーム色に変換して表示する（`0s` なら緑、
+    ///   それ以外は赤）。`transition-duration` は**非継承**なので、これも
+    ///   root への直接注入がなければ `60s` のまま（赤）になる
+    /// - `demo-shadow--frame` : shadow 内の同一オリジン iframe の中の
+    ///   フォーカス済み入力欄。`querySelectorAll('iframe')` は shadow 境界を
+    ///   越えないので、root 単位の再帰探索がなければ届かない
+    fn write_shadow_animated_bundle(root: &Path) {
+        std::fs::write(
+            root.join("frame.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  input { font:24px monospace;width:200px;margin:20px;border:1px solid #000; }
+</style></head>
+<body><input>
+<script>
+  document.querySelector('input').focus();
+</script>
+</body></html>"#,
+        )
+        .expect("write frame.html");
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  x-caret, x-trans, x-frame { display:block; }
+</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var root = document.getElementById('storybook-root');
+      if (id === 'demo-shadow--caret' || id === 'demo-shadow--caret-hidden') {
+        var host = document.createElement('x-caret');
+        var sr = host.attachShadow({ mode: 'open' });
+        var color = id === 'demo-shadow--caret' ? '#cc0000' : 'transparent';
+        sr.innerHTML =
+          '<style>input { caret-color:' + color + '; font:32px monospace; width:200px; margin:40px; border:1px solid #000; }</style>' +
+          '<input>';
+        root.appendChild(host);
+        sr.querySelector('input').focus();
+        channel.emit('storyRendered', id);
+      } else if (id === 'demo-shadow--transition') {
+        var host = document.createElement('x-trans');
+        var sr = host.attachShadow({ mode: 'open' });
+        sr.innerHTML =
+          '<style>div { width:100vw; height:100vh; transition: opacity 60s linear; }</style>' +
+          '<div></div>';
+        root.appendChild(host);
+        var el = sr.querySelector('div');
+        (function poll() {
+          var d = getComputedStyle(el).transitionDuration;
+          el.style.background = d === '0s' ? '#00ff00' : '#ff0000';
+          requestAnimationFrame(poll);
+        })();
+        channel.emit('storyRendered', id);
+      } else if (id === 'demo-shadow--frame') {
+        var host = document.createElement('x-frame');
+        var sr = host.attachShadow({ mode: 'open' });
+        sr.innerHTML =
+          '<style>iframe { width:280px; height:160px; margin:20px; border:1px solid #000; }</style>' +
+          '<iframe src="frame.html"></iframe>';
+        root.appendChild(host);
+        var frame = sr.querySelector('iframe');
+        frame.addEventListener('load', function () {
+          try { frame.contentDocument.querySelector('input').focus(); } catch (e) {}
+          channel.emit('storyRendered', id);
+        });
+      }
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// transition イベントの発火有無を数えるバンドル。freeze のイベント境界検証用。
+    ///
+    /// - `#fast` : `background-color 0.1s` の transition。freeze なしの
+    ///   positive control（イベントが実際に届くこと）と、freeze 下で
+    ///   **これから起こす** transition の不発火検証に使う
+    /// - `#slow` : `background-color 60s` の transition。freeze が走る時点で
+    ///   **すでに走っている** transition が、終端へシークされて完了扱いとなり
+    ///   `transitionend` を発火することの検証に使う
+    ///
+    /// 4 種の transition イベントを capture 段階で window に数え、
+    /// `JSON.stringify` で取り出す。
+    fn write_transition_event_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #fast { width:100px;height:100px;background:#ff0000;
+          transition: background-color 0.1s linear; }
+  #slow { width:100px;height:100px;background:#ff0000;
+          transition: background-color 60s linear; }
+</style></head>
+<body><div id="fast"></div><div id="slow"></div>
+<script>
+  window.__TRANSITION_EVENTS__ =
+    { transitionrun: 0, transitionstart: 0, transitionend: 0, transitioncancel: 0 };
+  ['transitionrun', 'transitionstart', 'transitionend', 'transitioncancel']
+    .forEach(function (name) {
+      window.addEventListener(name, function () {
+        window.__TRANSITION_EVENTS__[name]++;
+      }, true);
+    });
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
     #[test]
     fn readiness_parses_probe_results() {
         let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
@@ -949,6 +1294,508 @@ mod tests {
             message.contains("vrt-no-such-chromium-binary"),
             "the error must name the binary it tried, got {message:?}"
         );
+    }
+
+    fn decode_png(png: &[u8]) -> image::RgbaImage {
+        image::ImageReader::with_format(std::io::Cursor::new(png), image::ImageFormat::Png)
+            .decode()
+            .expect("decode screenshot")
+            .to_rgba8()
+    }
+
+    /// **同じ story を 2 回撮ると PNG がバイト単位で一致する**こと（決定性の本丸）。
+    ///
+    /// - 無限アニメ（spinner）はタイムライン座標 0 に固定される
+    /// - フォーカスされた入力欄のキャレットは不可視になる
+    /// - 有限アニメ（slide）は**終端**に固定される——初期（赤）へ巻き戻したのでは
+    ///   なく終端（青）へシークしたことを、中心ピクセルの色でも検証する
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_captures_are_byte_identical_across_runs() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_captures_are_byte_identical_across_runs: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        for story in ["demo-anim--spinner", "demo-anim--caret", "demo-anim--slide"] {
+            let first = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("first frozen capture");
+            let second = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("second frozen capture");
+            assert_eq!(
+                first, second,
+                "story {story}: two frozen captures must be byte-identical"
+            );
+
+            if story == "demo-anim--slide" {
+                // 60s の有限アニメを実時間 1 秒未満で撮って終端色（青）が出るのは、
+                // freeze が endTime へシークしたときだけ。paused 止まりや初期への
+                // 巻き戻しでは赤系になる。
+                let image = decode_png(&first);
+                let center = image.get_pixel(160, 120);
+                assert_eq!(
+                    (center[0], center[1], center[2]),
+                    (0, 0, 255),
+                    "a finite animation must be frozen at its end state"
+                );
+            }
+        }
+
+        renderer.close().await;
+    }
+
+    /// **freeze を切ると絵が揺れる**こと（対照群 =「修正前は一致しない」の固定化）。
+    ///
+    /// freeze ありの決定的な絵を基準に、freeze なしの撮影が異なることを確認する。
+    ///
+    /// - spinner: 撮影は描画完了通知から最低でも SETTLE_DELAY（250ms）後なので、
+    ///   1.7s 周期の回転は 50° 以上進んでおり、座標 0 の絵と一致しえない
+    /// - caret : Chromium のキャレットはフォーカス直後は可視で、撮影は通常その
+    ///   窓内（〜500ms）に行われる。負荷で明滅の消灯位相にずれた場合に備えて
+    ///   数回リトライする
+    ///
+    /// ここで差が出ないなら freeze が効いたのではなく、fixture がそもそも
+    /// アニメ／キャレットを描いていない——計測系が死んでいるということになる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfrozen_captures_differ_from_frozen_ones() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP unfrozen_captures_differ_from_frozen_ones: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium.clone(), 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        // 基準となる決定的な絵（freeze あり）。
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch");
+        let frozen_spinner = renderer
+            .render_story(&server.base_url(), "demo-anim--spinner")
+            .await
+            .expect("frozen spinner");
+        let frozen_caret = renderer
+            .render_story(&server.base_url(), "demo-anim--caret")
+            .await
+            .expect("frozen caret");
+        renderer.close().await;
+
+        // freeze なし（= 修正前のレンダラ相当）で撮り直す。
+        options.freeze_before_capture = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch unfrozen");
+        for (story, frozen) in [
+            ("demo-anim--spinner", &frozen_spinner),
+            ("demo-anim--caret", &frozen_caret),
+        ] {
+            let mut differed = false;
+            for _attempt in 0..5 {
+                let unfrozen = renderer
+                    .render_story(&server.base_url(), story)
+                    .await
+                    .expect("unfrozen capture");
+                if &unfrozen != frozen {
+                    differed = true;
+                    break;
+                }
+            }
+            assert!(
+                differed,
+                "story {story}: captures without the freeze must differ from the \
+                 deterministic frozen capture — otherwise the fixture animates nothing \
+                 and this whole test proves nothing"
+            );
+        }
+        renderer.close().await;
+    }
+
+    /// open shadow root の**中**まで静止が届くこと（root 単位注入・再帰の検証）。
+    ///
+    /// 3 story とも旧実装（document.head へのみ CSS 注入）ではこのテストは落ちる:
+    /// caret は shadow 内の明示宣言が継承 transparent に勝って明滅し、
+    /// transition は非継承の duration が 60s のままで赤が出て、
+    /// frame は shadow 境界の向こうの iframe に到達すらしない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_shadow_captures_are_byte_identical_across_runs() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_shadow_captures_are_byte_identical_across_runs: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        for story in [
+            "demo-shadow--caret",
+            "demo-shadow--transition",
+            "demo-shadow--frame",
+        ] {
+            let first = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("first frozen capture");
+            let second = renderer
+                .render_story(&server.base_url(), story)
+                .await
+                .expect("second frozen capture");
+            assert_eq!(
+                first, second,
+                "story {story}: two frozen captures must be byte-identical"
+            );
+
+            if story == "demo-shadow--transition" {
+                // shadow 内の要素は自分の computed transition-duration を色で
+                // 表示している。緑（0s）が出るのは、注入 CSS が shadow root の
+                // 中に入って非継承プロパティを上書きしたときだけ。
+                let image = decode_png(&first);
+                let center = image.get_pixel(160, 120);
+                assert_eq!(
+                    (center[0], center[1], center[2]),
+                    (0, 255, 0),
+                    "transition-duration inside the shadow root must be forced to 0s"
+                );
+            }
+        }
+
+        renderer.close().await;
+    }
+
+    /// `caret-color` が shadow の中で**本当に効いた**ことの直接証拠。
+    ///
+    /// 2 回撮って一致するだけでは「キャレットが毎回同じ位相で写っている」
+    /// 可能性を排除できない。shadow 側で `caret-color: transparent` を明示した
+    /// 対照 story と絵が一致するなら、キャレットは確かに不可視である。
+    /// 旧実装（document へのみ注入）では、shadow 内の明示 `caret-color` が
+    /// 継承の transparent に勝ち、フォーカス直後の可視位相のキャレットが
+    /// 写り込んで一致しない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_shadow_caret_matches_an_explicitly_hidden_caret() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP frozen_shadow_caret_matches_an_explicitly_hidden_caret: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let caret = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret")
+            .await
+            .expect("frozen shadow caret");
+        let hidden = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret-hidden")
+            .await
+            .expect("frozen shadow caret-hidden");
+        assert_eq!(
+            caret, hidden,
+            "a frozen caret inside a shadow root must be indistinguishable from an \
+             explicitly transparent caret — otherwise the injected caret-color did \
+             not reach the shadow root"
+        );
+
+        renderer.close().await;
+    }
+
+    /// shadow バンドルの対照群（=「静止なしでは一致しない」の固定化）。
+    ///
+    /// ここで差が出ないなら fixture がそもそも shadow の中で何も動かして
+    /// いないということであり、上の一致テストは何も証明しなくなる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfrozen_shadow_captures_differ_from_frozen_ones() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP unfrozen_shadow_captures_differ_from_frozen_ones: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium.clone(), 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch");
+        let frozen_caret = renderer
+            .render_story(&server.base_url(), "demo-shadow--caret")
+            .await
+            .expect("frozen shadow caret");
+        let frozen_transition = renderer
+            .render_story(&server.base_url(), "demo-shadow--transition")
+            .await
+            .expect("frozen shadow transition");
+        let frozen_frame = renderer
+            .render_story(&server.base_url(), "demo-shadow--frame")
+            .await
+            .expect("frozen shadow frame");
+        renderer.close().await;
+
+        options.freeze_before_capture = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch unfrozen");
+
+        // transition: 静止なしの computed duration は 60s のままなので赤が出る。
+        // 差分の存在だけでなく「fixture が生きている」ことまで色で確認する。
+        let unfrozen_transition = renderer
+            .render_story(&server.base_url(), "demo-shadow--transition")
+            .await
+            .expect("unfrozen shadow transition");
+        assert_ne!(
+            unfrozen_transition, frozen_transition,
+            "the shadow transition story must differ without the freeze"
+        );
+        let image = decode_png(&unfrozen_transition);
+        let center = image.get_pixel(160, 120);
+        assert_eq!(
+            (center[0], center[1], center[2]),
+            (255, 0, 0),
+            "without the freeze the shadow element must still see its 60s duration"
+        );
+
+        // caret / frame: キャレットの明滅は位相依存なので、消灯位相を引いた
+        // 場合に備えて数回リトライする（既存の対照群テストと同じ扱い）。
+        for (story, frozen) in [
+            ("demo-shadow--caret", &frozen_caret),
+            ("demo-shadow--frame", &frozen_frame),
+        ] {
+            let mut differed = false;
+            for _attempt in 0..5 {
+                let unfrozen = renderer
+                    .render_story(&server.base_url(), story)
+                    .await
+                    .expect("unfrozen capture");
+                if &unfrozen != frozen {
+                    differed = true;
+                    break;
+                }
+            }
+            assert!(
+                differed,
+                "story {story}: captures without the freeze must differ from the \
+                 deterministic frozen capture — otherwise the fixture animates nothing \
+                 inside the shadow root and the identity test above proves nothing"
+            );
+        }
+        renderer.close().await;
+    }
+
+    /// [`write_transition_event_bundle`] のページを開き、イベントカウンタが
+    /// 載るまで待つ。
+    async fn open_transition_page(
+        renderer: &StoryRenderer,
+        url: &str,
+    ) -> chromiumoxide::page::Page {
+        let page = renderer.browser.new_page(url).await.expect("open page");
+        for _ in 0..100 {
+            if let Ok(result) = page
+                .evaluate("document.readyState !== 'loading' && !!window.__TRANSITION_EVENTS__")
+                .await
+                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                return page;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("transition fixture page did not become ready");
+    }
+
+    /// 現在のイベントカウンタを取り出す。
+    async fn transition_event_counts(page: &chromiumoxide::page::Page) -> serde_json::Value {
+        let raw = page
+            .evaluate("JSON.stringify(window.__TRANSITION_EVENTS__)")
+            .await
+            .expect("read event counters");
+        serde_json::from_str(raw.value().and_then(|v| v.as_str()).expect("counter json"))
+            .expect("parse counter json")
+    }
+
+    /// **freeze 後に始まる transition はイベントを発火しない**こと（両方向の証拠）。
+    ///
+    /// FREEZE_SCRIPT は `transition-duration: 0s` / `transition-delay: 0s` を
+    /// 注入する。CSS Transitions Level 1 §3 は combined duration
+    /// （= max(duration, 0s) + delay）が 0s より大きいときだけ transition を
+    /// 開始すると定めるので、freeze 後のスタイル変化は transition を生成せず、
+    /// `transitionrun` / `transitionstart` / `transitionend` は一切発火しない。
+    /// これは「無いことの確認」なので、判定窓 [`EVENT_WAIT`] の十分性を
+    /// 思い込みにしないため、次の 3 段で確かめる。
+    ///
+    /// 1. **positive control（freeze なし）**: 同じ fixture・同じ環境で
+    ///    transition を起こし、`transitionend` が EVENT_WAIT 内に届くことを実測する。
+    ///    ここが通らなければ fixture かカウンタが死んでおり、以降の 0 は無意味
+    /// 2. **freeze 後に起こす transition**: freeze → スタイル変更 → EVENT_WAIT
+    ///    待って全イベント 0 を確認。値そのものは即座に終値へ変わっていることも見る
+    /// 3. **freeze 時点で走っている transition**: 60s の transition を開始させ
+    ///    （`transitionrun` の実測で開始を確認）、freeze が終端へシークすると
+    ///    その transition は**完了として `transitionend` を発火する**ことを確認。
+    ///    発火しないのは手順 2 の「freeze 後に始まるはずだった transition」であり、
+    ///    走行中のものは完了イベントつきで終端に確定する——という境界を固定する
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transitions_under_freeze_fire_no_events() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP transitions_under_freeze_fire_no_events: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        // 「発火しなかった」と判定するまでの待ち時間。fixture の速い transition は
+        // duration 0.1s・delay 0s なので、transition が生成されていれば
+        // `transitionend` は開始から約 100ms 後に届く。その 20 倍を窓に取り、
+        // さらに手順 1 の positive control が**同じ窓・同じ環境**で実際に
+        // 発火することを測って、窓の長さを推測でなく実測で裏づける。
+        const EVENT_WAIT: Duration = Duration::from_secs(2);
+        const POLL: Duration = Duration::from_millis(50);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_transition_event_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let url = format!("{}/iframe.html", server.base_url());
+
+        let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 320, 240))
+            .await
+            .expect("launch");
+
+        // ── 1. positive control: freeze なしなら transitionend は EVENT_WAIT 内に届く
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate("document.getElementById('fast').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger fast transition");
+        let started = std::time::Instant::now();
+        let mut fired = false;
+        while started.elapsed() < EVENT_WAIT {
+            let counts = transition_event_counts(&page).await;
+            if counts["transitionend"].as_u64().unwrap_or(0) >= 1 {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        assert!(
+            fired,
+            "positive control: without the freeze, transitionend must arrive within \
+             {EVENT_WAIT:?} — otherwise the fixture or the counters are broken and \
+             the zero counts below would prove nothing"
+        );
+        let _ = page.close().await;
+
+        // ── 2. freeze 後に起こした transition はイベントを一切出さない
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate(FREEZE_SCRIPT).await.expect("freeze");
+        // 注入が効いたこと（computed が 0s）を先に確認する。ここが 0s でないなら
+        // 「イベント 0」は freeze の証明ではなくただの取りこぼしになる。
+        let duration = page
+            .evaluate("getComputedStyle(document.getElementById('fast')).transitionDuration")
+            .await
+            .expect("read computed duration");
+        assert_eq!(
+            duration.value().and_then(|v| v.as_str()),
+            Some("0s"),
+            "the injected freeze CSS must zero out transition-duration first"
+        );
+        page.evaluate("document.getElementById('fast').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger fast transition under freeze");
+        tokio::time::sleep(EVENT_WAIT).await;
+        let counts = transition_event_counts(&page).await;
+        for event in [
+            "transitionrun",
+            "transitionstart",
+            "transitionend",
+            "transitioncancel",
+        ] {
+            assert_eq!(
+                counts[event].as_u64(),
+                Some(0),
+                "no transition is created under the freeze, so `{event}` must never fire"
+            );
+        }
+        // transition が生成されないだけで、値そのものは即座に終値へ変わる。
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('fast')).backgroundColor")
+            .await
+            .expect("read computed color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(0, 0, 255)"),
+            "the property change itself must still apply instantly"
+        );
+        let _ = page.close().await;
+
+        // ── 3. freeze 時点で走っていた transition は終端へシークされ transitionend を出す
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate("document.getElementById('slow').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger slow transition");
+        // transition が実際に生成・開始されたことを実測してから freeze する。
+        let started = std::time::Instant::now();
+        loop {
+            let counts = transition_event_counts(&page).await;
+            if counts["transitionrun"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                started.elapsed() < EVENT_WAIT,
+                "the 60s transition must actually start (transitionrun) before the freeze"
+            );
+            tokio::time::sleep(POLL).await;
+        }
+        page.evaluate(FREEZE_SCRIPT).await.expect("freeze");
+        // freeze は走行中の transition を終端へシークして pause する。
+        // 終端の絵（青）が出ていることを確認した上で、この完了に伴い
+        // `transitionend` が発火する（Chromium 実測）ことを固定する。
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('slow')).backgroundColor")
+            .await
+            .expect("read computed color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(0, 0, 255)"),
+            "the freeze must seek the running transition to its end state"
+        );
+        tokio::time::sleep(EVENT_WAIT).await;
+        let counts = transition_event_counts(&page).await;
+        assert_eq!(
+            counts["transitionend"].as_u64(),
+            Some(1),
+            "a transition already running when the freeze hits completes at its end \
+             state and does fire transitionend — only transitions that would start \
+             after the freeze fire nothing"
+        );
+        let _ = page.close().await;
+
+        renderer.close().await;
     }
 
     #[tokio::test]
