@@ -176,7 +176,9 @@ JSON.stringify((() => {
 /// ## なぜ「決定的」といえるか
 ///
 /// - **キャレット**: `caret-color: transparent !important` で明滅の位相に
-///   よらず不可視にする（Playwright の `caret: 'hide'` と同じ機構）。
+///   よらず不可視にする（Playwright の `caret: 'hide'` も同じプロパティ強制で
+///   実現している。ただしあちらは編集要素へのインライン指定、こちらは
+///   スタイルシート注入）。
 ///   `caret-color` は継承プロパティだが、継承値はカスケードでは最弱で、
 ///   shadow 内に `caret-color` を明示した要素には勝てない。ゆえに継承には
 ///   頼らず、静止 CSS を document と各 open shadow root のそれぞれへ
@@ -189,8 +191,20 @@ JSON.stringify((() => {
 ///   pause。タイムライン座標 0 の絵はこれもただ一つに定まる。
 ///   「paused にするだけ」では**止まった位置**が撮影タイミング依存のままで、
 ///   flaky さは消えない——座標を明示的に固定するからこそ 2 回撮って同じ絵になる
-/// - **今後始まる transition**: `transition-duration: 0s` で始まった瞬間に
-///   終値へ飛ぶ（`transitionend` は発火するので、完了を待つ実装も壊さない）。
+/// - **今後始まる transition**: `transition-duration: 0s` と `transition-delay: 0s`
+///   の下では、スタイルが変わっても transition は**そもそも生成されない**
+///   （CSS Transitions Level 1 の開始条件は combined duration
+///   （= max(duration, 0s) + delay）が 0s より大きいことを要求する。
+///   <https://www.w3.org/TR/css-transitions-1/#starting>）。プロパティ値は
+///   即座に終値へ変わるが、transition が存在しない以上
+///   `transitionrun` / `transitionstart` / `transitionend` は**いずれも発火しない**。
+///   一方、**注入の時点ですでに走っていた transition** は上の有限アニメーションの
+///   経路で終端へシークされ、完了として `transitionend` を**発火する**（Chromium
+///   実測）。この境界はモジュール末尾の
+///   `transitions_under_freeze_fire_no_events` が両方向とも固定している。
+///   ゆえに注入後に始まる transition の `transitionend` を待って見た目を
+///   更新するコンポーネントには届かない——
+///   その代償と採否の理由は README の「届かない範囲」を参照。
 ///   `transition-duration` は継承しないプロパティなので、これも root ごとの
 ///   注入があって初めて shadow 内に届く
 ///
@@ -1042,6 +1056,44 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// transition イベントの発火有無を数えるバンドル。freeze の不発火検証用。
+    ///
+    /// - `#fast` : `background-color 0.1s` の transition。freeze なしの
+    ///   positive control（イベントが実際に届くこと）と、freeze 下で
+    ///   **これから起こす** transition の不発火検証に使う
+    /// - `#slow` : `background-color 60s` の transition。freeze が走る時点で
+    ///   **すでに走っている** transition が、終端へシーク＋pause されたあとも
+    ///   `transitionend` を出さないことの検証に使う
+    ///
+    /// 4 種の transition イベントを capture 段階で window に数え、
+    /// `JSON.stringify` で取り出す。
+    fn write_transition_event_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #fast { width:100px;height:100px;background:#ff0000;
+          transition: background-color 0.1s linear; }
+  #slow { width:100px;height:100px;background:#ff0000;
+          transition: background-color 60s linear; }
+</style></head>
+<body><div id="fast"></div><div id="slow"></div>
+<script>
+  window.__TRANSITION_EVENTS__ =
+    { transitionrun: 0, transitionstart: 0, transitionend: 0, transitioncancel: 0 };
+  ['transitionrun', 'transitionstart', 'transitionend', 'transitioncancel']
+    .forEach(function (name) {
+      window.addEventListener(name, function () {
+        window.__TRANSITION_EVENTS__[name]++;
+      }, true);
+    });
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
     #[test]
     fn readiness_parses_probe_results() {
         let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
@@ -1557,6 +1609,192 @@ mod tests {
                  inside the shadow root and the identity test above proves nothing"
             );
         }
+        renderer.close().await;
+    }
+
+    /// [`write_transition_event_bundle`] のページを開き、イベントカウンタが
+    /// 載るまで待つ。
+    async fn open_transition_page(
+        renderer: &StoryRenderer,
+        url: &str,
+    ) -> chromiumoxide::page::Page {
+        let page = renderer.browser.new_page(url).await.expect("open page");
+        for _ in 0..100 {
+            if let Ok(result) = page
+                .evaluate("document.readyState !== 'loading' && !!window.__TRANSITION_EVENTS__")
+                .await
+                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                return page;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("transition fixture page did not become ready");
+    }
+
+    /// 現在のイベントカウンタを取り出す。
+    async fn transition_event_counts(page: &chromiumoxide::page::Page) -> serde_json::Value {
+        let raw = page
+            .evaluate("JSON.stringify(window.__TRANSITION_EVENTS__)")
+            .await
+            .expect("read event counters");
+        serde_json::from_str(raw.value().and_then(|v| v.as_str()).expect("counter json"))
+            .expect("parse counter json")
+    }
+
+    /// **freeze 下では transition イベントが発火しない**こと（両方向の証拠）。
+    ///
+    /// FREEZE_SCRIPT は `transition-duration: 0s` / `transition-delay: 0s` を
+    /// 注入する。CSS Transitions Level 1 §3 は combined duration
+    /// （= max(duration, 0s) + delay）が 0s より大きいときだけ transition を
+    /// 開始すると定めるので、freeze 後のスタイル変化は transition を生成せず、
+    /// `transitionrun` / `transitionstart` / `transitionend` は一切発火しない。
+    /// これは「無いことの確認」なので、判定窓 [`EVENT_WAIT`] の十分性を
+    /// 思い込みにしないため、次の 3 段で確かめる。
+    ///
+    /// 1. **positive control（freeze なし）**: 同じ fixture・同じ環境で
+    ///    transition を起こし、`transitionend` が EVENT_WAIT 内に届くことを実測する。
+    ///    ここが通らなければ fixture かカウンタが死んでおり、以降の 0 は無意味
+    /// 2. **freeze 後に起こす transition**: freeze → スタイル変更 → EVENT_WAIT
+    ///    待って全イベント 0 を確認。値そのものは即座に終値へ変わっていることも見る
+    /// 3. **freeze 時点で走っている transition**: 60s の transition を開始させ
+    ///    （`transitionrun` の実測で開始を確認）、freeze が終端へシークすると
+    ///    その transition は**完了として `transitionend` を発火する**ことを確認。
+    ///    発火しないのは手順 2 の「freeze 後に始まるはずだった transition」であり、
+    ///    走行中のものは完了イベントつきで終端に確定する——という境界を固定する
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transitions_under_freeze_fire_no_events() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP transitions_under_freeze_fire_no_events: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        // 「発火しなかった」と判定するまでの待ち時間。fixture の速い transition は
+        // duration 0.1s・delay 0s なので、transition が生成されていれば
+        // `transitionend` は開始から約 100ms 後に届く。その 20 倍を窓に取り、
+        // さらに手順 1 の positive control が**同じ窓・同じ環境**で実際に
+        // 発火することを測って、窓の長さを推測でなく実測で裏づける。
+        const EVENT_WAIT: Duration = Duration::from_secs(2);
+        const POLL: Duration = Duration::from_millis(50);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_transition_event_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let url = format!("{}/iframe.html", server.base_url());
+
+        let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 320, 240))
+            .await
+            .expect("launch");
+
+        // ── 1. positive control: freeze なしなら transitionend は EVENT_WAIT 内に届く
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate("document.getElementById('fast').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger fast transition");
+        let started = std::time::Instant::now();
+        let mut fired = false;
+        while started.elapsed() < EVENT_WAIT {
+            let counts = transition_event_counts(&page).await;
+            if counts["transitionend"].as_u64().unwrap_or(0) >= 1 {
+                fired = true;
+                break;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        assert!(
+            fired,
+            "positive control: without the freeze, transitionend must arrive within \
+             {EVENT_WAIT:?} — otherwise the fixture or the counters are broken and \
+             the zero counts below would prove nothing"
+        );
+        let _ = page.close().await;
+
+        // ── 2. freeze 後に起こした transition はイベントを一切出さない
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate(FREEZE_SCRIPT).await.expect("freeze");
+        // 注入が効いたこと（computed が 0s）を先に確認する。ここが 0s でないなら
+        // 「イベント 0」は freeze の証明ではなくただの取りこぼしになる。
+        let duration = page
+            .evaluate("getComputedStyle(document.getElementById('fast')).transitionDuration")
+            .await
+            .expect("read computed duration");
+        assert_eq!(
+            duration.value().and_then(|v| v.as_str()),
+            Some("0s"),
+            "the injected freeze CSS must zero out transition-duration first"
+        );
+        page.evaluate("document.getElementById('fast').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger fast transition under freeze");
+        tokio::time::sleep(EVENT_WAIT).await;
+        let counts = transition_event_counts(&page).await;
+        for event in [
+            "transitionrun",
+            "transitionstart",
+            "transitionend",
+            "transitioncancel",
+        ] {
+            assert_eq!(
+                counts[event].as_u64(),
+                Some(0),
+                "no transition is created under the freeze, so `{event}` must never fire"
+            );
+        }
+        // transition が生成されないだけで、値そのものは即座に終値へ変わる。
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('fast')).backgroundColor")
+            .await
+            .expect("read computed color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(0, 0, 255)"),
+            "the property change itself must still apply instantly"
+        );
+        let _ = page.close().await;
+
+        // ── 3. freeze 時点で走っていた transition も transitionend を出さない
+        let page = open_transition_page(&renderer, &url).await;
+        page.evaluate("document.getElementById('slow').style.backgroundColor = '#0000ff'")
+            .await
+            .expect("trigger slow transition");
+        // transition が実際に生成・開始されたことを実測してから freeze する。
+        let started = std::time::Instant::now();
+        loop {
+            let counts = transition_event_counts(&page).await;
+            if counts["transitionrun"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                started.elapsed() < EVENT_WAIT,
+                "the 60s transition must actually start (transitionrun) before the freeze"
+            );
+            tokio::time::sleep(POLL).await;
+        }
+        page.evaluate(FREEZE_SCRIPT).await.expect("freeze");
+        // freeze は走行中の transition を終端へシークして pause する。
+        // 終端の絵（青）が出ていることを確認した上で、この完了に伴い
+        // `transitionend` が発火する（Chromium 実測）ことを固定する。
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('slow')).backgroundColor")
+            .await
+            .expect("read computed color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(0, 0, 255)"),
+            "the freeze must seek the running transition to its end state"
+        );
+        tokio::time::sleep(EVENT_WAIT).await;
+        let counts = transition_event_counts(&page).await;
+        assert_eq!(
+            counts["transitionend"].as_u64(),
+            Some(1),
+            "a transition already running when the freeze hits completes at its end \
+             state and does fire transitionend — only transitions that would start \
+             after the freeze fire nothing"
+        );
+        let _ = page.close().await;
+
         renderer.close().await;
     }
 
