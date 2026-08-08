@@ -1056,14 +1056,14 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// transition イベントの発火有無を数えるバンドル。freeze の不発火検証用。
+    /// transition イベントの発火有無を数えるバンドル。freeze のイベント境界検証用。
     ///
     /// - `#fast` : `background-color 0.1s` の transition。freeze なしの
     ///   positive control（イベントが実際に届くこと）と、freeze 下で
     ///   **これから起こす** transition の不発火検証に使う
     /// - `#slow` : `background-color 60s` の transition。freeze が走る時点で
-    ///   **すでに走っている** transition が、終端へシーク＋pause されたあとも
-    ///   `transitionend` を出さないことの検証に使う
+    ///   **すでに走っている** transition が、終端へシークされて完了扱いとなり
+    ///   `transitionend` を発火することの検証に使う
     ///
     /// 4 種の transition イベントを capture 段階で window に数え、
     /// `JSON.stringify` で取り出す。
@@ -1642,7 +1642,7 @@ mod tests {
             .expect("parse counter json")
     }
 
-    /// **freeze 下では transition イベントが発火しない**こと（両方向の証拠）。
+    /// **freeze 後に始まる transition はイベントを発火しない**こと（両方向の証拠）。
     ///
     /// FREEZE_SCRIPT は `transition-duration: 0s` / `transition-delay: 0s` を
     /// 注入する。CSS Transitions Level 1 §3 は combined duration
@@ -1753,7 +1753,7 @@ mod tests {
         );
         let _ = page.close().await;
 
-        // ── 3. freeze 時点で走っていた transition も transitionend を出さない
+        // ── 3. freeze 時点で走っていた transition は終端へシークされ transitionend を出す
         let page = open_transition_page(&renderer, &url).await;
         page.evaluate("document.getElementById('slow').style.backgroundColor = '#0000ff'")
             .await
