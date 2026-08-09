@@ -695,6 +695,19 @@ impl StoryRenderer {
             })?;
 
         let result = async {
+            // CSP style-src 'self' のページでは注入した inline style が
+            // 拒否されるが例外は出ない。ナビゲーション前に CDP で CSP を
+            // 迂回しておく（読み込み後では meta CSP が既に適用済み）。
+            if self.options.freeze_before_capture {
+                page.execute(
+                    chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams::new(true),
+                )
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+            }
             page.evaluate_on_new_document(READY_HOOK_SCRIPT)
                 .await
                 .map_err(|source| RenderError::Cdp {
@@ -771,16 +784,9 @@ impl StoryRenderer {
         // 静止に失敗したまま撮ると flaky な絵が baseline に混ざるので、
         // 黙って続行せず失敗として返す（fail-closed）。
         if self.options.freeze_before_capture {
-            // CSP style-src 'self' のページでは注入した inline style が
-            // 拒否されるが例外は出ない。CDP で CSP を迂回してから注入する。
-            // FREEZE_SCRIPT 側でも適用を検証するので、迂回できない環境でも
-            // fail-closed になる（両方を掛ける理由）。
-            page.execute(chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams::new(true))
-                .await
-                .map_err(|source| RenderError::Cdp {
-                    story_id: story_id.to_string(),
-                    source,
-                })?;
+            // CSP 迂回は render_story でナビゲーション前に済ませてある。
+            // FREEZE_SCRIPT 側でも getComputedStyle で適用を検証するので、
+            // 迂回できない環境でも fail-closed になる。
             let freeze_result =
                 page.evaluate(FREEZE_SCRIPT)
                     .await
