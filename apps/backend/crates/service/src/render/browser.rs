@@ -744,39 +744,10 @@ impl StoryRenderer {
                         source,
                     })?;
 
-            // FREEZE_SCRIPT は JSON 文字列を返す。ok: false なら running な
-            // animation が残っている——静止に失敗したのに撮ると flaky になるので
-            // このストーリーの失敗として返す。既存の storyErrored 等と同じ
-            // RenderError::Story 経路を使う。利用者は「なぜか差分が出続ける」
-            // ではなく「この story は静止できなかった」と原因に辿り着ける。
-            if let Some(raw) = freeze_result.value().and_then(|v| v.as_str())
-                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
-                && parsed.get("ok").and_then(|v| v.as_bool()) == Some(false)
-            {
-                let running = parsed
-                    .get("running")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .unwrap_or_default();
-                let sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0);
-                return Err(RenderError::Story {
-                    story_id: story_id.to_string(),
-                    message: format!(
-                        "freeze failed: {count} animation(s) still running \
-                         after {sweeps} sweep(s): [{running}]",
-                        count = parsed
-                            .get("running")
-                            .and_then(|v| v.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0),
-                    ),
-                });
-            }
+            // FREEZE_SCRIPT は JSON 文字列を返す。`ok === true` と確かめられた
+            // 場合にだけ撮影へ進む（fail-closed）。ok: false（静止に失敗）も、
+            // 解析できない応答（静止できたか不明）も撮らずに失敗として返す。
+            freeze_verdict(freeze_result.value(), story_id)?;
         }
 
         page.screenshot(
@@ -808,6 +779,64 @@ impl Drop for StoryRenderer {
         // `close()` を通らずに落ちた経路（panic / early return）でも
         // handler タスクを残さない。子プロセスは Browser の Drop が始末する。
         self.handler_task.abort();
+    }
+}
+
+/// [`FREEZE_SCRIPT`] の返り値を検分し、撮影へ進んでよいか判定する。
+///
+/// `ok` が `true` であると確かめられた場合にだけ `Ok(())` を返す。
+/// それ以外はすべて失敗（fail-closed）だが、原因の異なる二種類を
+/// メッセージで区別する:
+///
+/// - `ok: false` — **静止に失敗した**。running な animation が残っている
+///   （`freeze failed: ... still running ...`）。
+/// - 値が文字列でない／JSON として読めない／`ok` キーが無い・bool でない —
+///   **静止結果を解析できなかった**。静止できたかどうか自体が不明
+///   （`freeze result was unparseable: ...`）。
+///
+/// parse 失敗や `ok` 欠落を暗黙に成功へ倒すと、静止に失敗した絵が
+/// baseline に混ざる事故が沈黙して通る。判定できなかったら撮らない。
+/// どちらも既存の storyErrored と同じ [`RenderError::Story`] 経路を使う。
+fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(), RenderError> {
+    let unparseable = |detail: String| RenderError::Story {
+        story_id: story_id.to_string(),
+        message: format!("freeze result was unparseable: {detail}"),
+    };
+    let Some(raw) = value.and_then(|v| v.as_str()) else {
+        return Err(unparseable(format!(
+            "expected a JSON string, got {value:?}"
+        )));
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| unparseable(format!("{e} (raw: {raw})")))?;
+    match parsed.get("ok").and_then(|v| v.as_bool()) {
+        // 静止を確かめられた。撮影へ進む。`ok` 以外のキーは検査しない
+        // （将来 FREEZE_SCRIPT が返すものを増やしても正当な応答を弾かない）。
+        Some(true) => Ok(()),
+        // 静止に失敗した（running が残った）。どの animation かまで示す。
+        Some(false) => {
+            let running = parsed.get("running").and_then(|v| v.as_array());
+            let names = running
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            Err(RenderError::Story {
+                story_id: story_id.to_string(),
+                message: format!(
+                    "freeze failed: {count} animation(s) still running \
+                     after {sweeps} sweep(s): [{names}]",
+                    count = running.map(|a| a.len()).unwrap_or(0),
+                    sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0),
+                ),
+            })
+        }
+        None => Err(unparseable(format!(
+            "missing or non-boolean `ok` key (raw: {raw})"
+        ))),
     }
 }
 
@@ -1240,6 +1269,78 @@ mod tests {
         // 壊れた値は「まだ待つ」。誤って白紙を撮らない。
         assert_eq!(probe("not json"), Readiness::Pending);
         assert_eq!(Readiness::parse(None), Readiness::Pending);
+    }
+
+    /// `ok === true` と確かめられたときだけ成功。`ok` 以外のキーが
+    /// 増えても正当な応答を弾かないこと（受理を狭めすぎない）。
+    #[test]
+    fn freeze_verdict_accepts_only_a_verified_ok_true() {
+        let json = |raw: &str| serde_json::Value::String(raw.to_string());
+
+        assert!(freeze_verdict(Some(&json(r#"{"ok":true}"#)), "s").is_ok());
+        // 将来 FREEZE_SCRIPT の戻り値を拡張しても ok:true なら通る。
+        assert!(
+            freeze_verdict(
+                Some(&json(
+                    r#"{"ok":true,"sweeps":3,"running":[],"errors":[],"extra":1}"#
+                )),
+                "s"
+            )
+            .is_ok()
+        );
+    }
+
+    /// `ok: false` は「静止に失敗した」。running の中身と sweep 数まで
+    /// メッセージに出て、利用者が原因へ辿り着ける。
+    #[test]
+    fn freeze_verdict_reports_remaining_animations_as_a_freeze_failure() {
+        let raw = serde_json::Value::String(
+            r#"{"ok":false,"sweeps":10,"running":["blink-a","blink-b"]}"#.to_string(),
+        );
+        let message = freeze_verdict(Some(&raw), "s")
+            .expect_err("ok:false must fail")
+            .to_string();
+        assert!(
+            message.contains("freeze failed")
+                && message.contains("2 animation(s) still running")
+                && message.contains("10 sweep(s)")
+                && message.contains("blink-a, blink-b"),
+            "freeze failure must name the surviving animations, got {message:?}"
+        );
+        // 「解析できなかった」とは違う失敗として区別されること。
+        assert!(!message.contains("unparseable"));
+    }
+
+    /// **positive control**: 解析できない応答——文字列でない・JSON でない・
+    /// `ok` が無い・bool でない——はすべて「静止結果を解析できなかった」
+    /// 失敗になる。修正前のコード（`ok == Some(false)` のときだけ失敗）は
+    /// これら全部を暗黙に成功として撮影へ通していた。
+    #[test]
+    fn freeze_verdict_rejects_a_response_it_cannot_interpret() {
+        let json = |raw: &str| serde_json::Value::String(raw.to_string());
+        let cases: Vec<(&str, Option<serde_json::Value>)> = vec![
+            ("evaluate returned no value", None),
+            ("non-string value", Some(serde_json::json!(42))),
+            ("non-JSON string", Some(json("not json"))),
+            ("missing ok key", Some(json(r#"{"sweeps":2,"running":[]}"#))),
+            ("non-boolean ok", Some(json(r#"{"ok":"true"}"#))),
+            ("null ok", Some(json(r#"{"ok":null}"#))),
+        ];
+        for (label, value) in &cases {
+            let err = freeze_verdict(value.as_ref(), "s").expect_err(&format!(
+                "{label}: an uninterpretable freeze result must fail"
+            ));
+            let message = err.to_string();
+            assert!(
+                message.contains("freeze result was unparseable"),
+                "{label}: the error must say the result could not be parsed, got {message:?}"
+            );
+            // 「静止に失敗した」とは違う失敗として区別されること。
+            assert!(
+                !message.contains("freeze failed"),
+                "{label}: a parse failure must not be reported as a freeze failure"
+            );
+        }
     }
 
     /// Chromium を実際に起動する煙テスト。実行ファイルが無ければスキップする。
@@ -2195,6 +2296,86 @@ mod tests {
             .render_story(&server.base_url(), "unfreezable")
             .await
             .expect("without the freeze, the unfreezable page must succeed (old behavior)");
+
+        renderer.close().await;
+    }
+
+    /// 静止は問題なく済むが、FREEZE_SCRIPT の返り値が JSON にならないページ。
+    ///
+    /// ページ側で `JSON.stringify` を「`ok` キーを持つオブジェクトのときだけ」
+    /// 壊す。FREEZE_SCRIPT は結果全体を `JSON.stringify({ok: ...})` で返すので
+    /// 解析不能な文字列になる一方、READY_PROBE の `{state: ...}` は無傷で
+    /// 描画完了の検知はそのまま通る。
+    fn write_garbled_freeze_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#00ff00; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  var origStringify = JSON.stringify.bind(JSON);
+  JSON.stringify = function (value) {
+    if (value && typeof value === 'object' && 'ok' in value) { return 'not json'; }
+    return origStringify.apply(JSON, arguments);
+  };
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () { channel.emit('storyRendered', 'garbled'); }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **positive control（解析不能応答）**: FREEZE_SCRIPT の返り値を読めない
+    /// とき、レンダラは撮影せず「解析できなかった」失敗を返すこと。
+    ///
+    /// 修正前のコード（`ok == Some(false)` のときだけ失敗）では、この
+    /// ページは黙って成功として撮影まで通っていた。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn garbled_freeze_result_fails_instead_of_silently_succeeding() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP garbled_freeze_result_fails_instead_of_silently_succeeding: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_garbled_freeze_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "garbled")
+            .await
+            .expect_err("an unreadable freeze result must fail — not silently succeed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze result was unparseable"),
+            "the error must say the freeze result could not be parsed, got {message:?}"
+        );
+        // 「静止に失敗した」とは別の失敗として届くこと。
+        assert!(
+            !message.contains("freeze failed"),
+            "a parse failure must not masquerade as a freeze failure, got {message:?}"
+        );
 
         renderer.close().await;
     }
