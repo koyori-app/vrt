@@ -401,7 +401,8 @@ const FREEZE_SCRIPT: &str = r#"
       const el = root.querySelector('*');
       if (!el) continue;
       const cs = getComputedStyle(el);
-      if (cs.caretColor !== 'transparent' || cs.transitionDuration !== '0s') {
+      const caretOk = cs.caretColor === 'transparent' || cs.caretColor === 'rgba(0, 0, 0, 0)';
+      if (!caretOk || cs.transitionDuration !== '0s') {
         return JSON.stringify({
           ok: false,
           sweeps: sweeps,
@@ -774,14 +775,12 @@ impl StoryRenderer {
             // 拒否されるが例外は出ない。CDP で CSP を迂回してから注入する。
             // FREEZE_SCRIPT 側でも適用を検証するので、迂回できない環境でも
             // fail-closed になる（両方を掛ける理由）。
-            page.execute(
-                chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams::new(true),
-            )
-            .await
-            .map_err(|source| RenderError::Cdp {
-                story_id: story_id.to_string(),
-                source,
-            })?;
+            page.execute(chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams::new(true))
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
             let freeze_result =
                 page.evaluate(FREEZE_SCRIPT)
                     .await
@@ -2558,9 +2557,7 @@ mod tests {
         );
         let page = renderer.browser.new_page(&url).await.expect("open page");
         for _ in 0..100 {
-            if let Ok(result) = page
-                .evaluate("document.readyState !== 'loading'")
-                .await
+            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
                 && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
             {
                 break;
