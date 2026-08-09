@@ -219,10 +219,11 @@ JSON.stringify((() => {
 /// 連鎖でも、連鎖の長さがページ内の要素数を超えることはないため 10 巡は
 /// 十分な余裕。連鎖が 10 段を超えるなら Storybook 側で止めるべきである）。
 ///
-/// 収束の判定は running な animation の**集合の実体**（animation 名と
-/// 対象要素の組み）で行う。件数だけでは p1→p2→p3→p4 のように各巡で
-/// 残数は 1 のまま identity が入れ替わる有限連鎖を「進捗なし」と誤判定する。
-/// 前巡と同一の集合が残っていれば停滞、別の集合なら進行と判じる。
+/// 収束の判定は running な animation が**ゼロになったか**で行う。
+/// ゼロになれば即座に抜け、残っていれば MAX_SWEEPS まで反復を続ける。
+/// identity（animation 名と対象要素の組み）による早期停止は行わない——
+/// proxy（tagName 等）では要素の同一性を表せず、異なる要素への順移動
+/// （同一 keyframes が el1→el2→el3→el4）を誤判定するためである。
 ///
 /// 最終巡回後、全 root の running な animation を数え、1 つでも残っていれば
 /// **失敗の JSON を返す**——何が凍らせられなかったかを含む形で上へ伝える。
@@ -230,8 +231,9 @@ JSON.stringify((() => {
 /// `getComputedStyle` で検証してから成功の JSON を返す。`<style>` の
 /// `appendChild` が成功しても CSP `style-src 'self'` 下では CSS が
 /// 適用されないため、操作の成功ではなく効果の実測を以て判定する。
-/// Rust 側は `Page.setBypassCSP` で CSP を迂回するが、迂回できない
-/// 環境でも検証で fail-closed になる（両方を掛ける理由）。
+/// CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮ることに
+/// なるため、迂回は行わない。CSP が静止 CSS を拒否するページでは
+/// 検証が fail-closed で失敗し、利用者に原因が伝わる。
 ///
 /// open shadow root と同一オリジン iframe（shadow 内にあるものも含む）は
 /// root 単位で再帰的に辿り、CSS 注入とアニメーションのシークを行う。
@@ -371,17 +373,13 @@ const FREEZE_SCRIPT: &str = r#"
     new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   let sweeps = 0;
-  let prevRunningKey = '';
   for (sweeps = 1; sweeps <= MAX_SWEEPS; sweeps++) {
     freezeRoot(document);
     await nextFrame();
     const still = collectRunning(document);
+    // 最低 2 巡は回す。1 巡目の freeze で CSS が注入されると、それ自体が
+    // 新たな animation を誘発しうる。2 巡目でそれらも捕捉してから判定する。
     if (still.length === 0 && sweeps >= 2) break;
-    // 進捗の判定は集合の実体で行う。件数だけでは p1→p2→p3→p4 のように
-    // 残数が横ばいでも identity が入れ替わる有限連鎖を誤って打ち切る。
-    const key = still.slice().sort().join('\0');
-    if (key === prevRunningKey && sweeps > 2) break;
-    prevRunningKey = key;
   }
 
   const remaining = collectRunning(document);
@@ -695,19 +693,6 @@ impl StoryRenderer {
             })?;
 
         let result = async {
-            // CSP style-src 'self' のページでは注入した inline style が
-            // 拒否されるが例外は出ない。ナビゲーション前に CDP で CSP を
-            // 迂回しておく（読み込み後では meta CSP が既に適用済み）。
-            if self.options.freeze_before_capture {
-                page.execute(
-                    chromiumoxide::cdp::browser_protocol::page::SetBypassCspParams::new(true),
-                )
-                .await
-                .map_err(|source| RenderError::Cdp {
-                    story_id: story_id.to_string(),
-                    source,
-                })?;
-            }
             page.evaluate_on_new_document(READY_HOOK_SCRIPT)
                 .await
                 .map_err(|source| RenderError::Cdp {
@@ -784,9 +769,9 @@ impl StoryRenderer {
         // 静止に失敗したまま撮ると flaky な絵が baseline に混ざるので、
         // 黙って続行せず失敗として返す（fail-closed）。
         if self.options.freeze_before_capture {
-            // CSP 迂回は render_story でナビゲーション前に済ませてある。
-            // FREEZE_SCRIPT 側でも getComputedStyle で適用を検証するので、
-            // 迂回できない環境でも fail-closed になる。
+            // CSP は迂回しない（本番と同じ条件で撮る）。FREEZE_SCRIPT は
+            // getComputedStyle で CSS 適用を検証し、CSP が静止 CSS を
+            // 拒否するページでは fail-closed で失敗を返す。
             let freeze_result =
                 page.evaluate(FREEZE_SCRIPT)
                     .await
@@ -2287,6 +2272,138 @@ mod tests {
         .expect("write iframe.html");
     }
 
+    /// CSP `script-src 'none'` を持つバンドル。
+    ///
+    /// `setBypassCSP` を使っていた頃は、CSP 全体が迂回されるため
+    /// `script-src 'none'` でも inline script が実行されてしまっていた。
+    /// bypass を外した現在は、CSP がそのまま効くので inline script は
+    /// 実行されないことを検証する。
+    fn write_script_csp_bundle(root: &Path) {
+        std::fs::write(
+            root.join("styles.css"),
+            "html,body{margin:0;padding:0;background:#fff}\n\
+             #box{width:100%;height:100vh;background:#00ff00}\n",
+        )
+        .expect("write styles.css");
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head>
+<meta http-equiv="Content-Security-Policy" content="script-src 'none'; style-src 'self'">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  document.getElementById('box').style.background = '#ff0000';
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// 同一 keyframes が 4 つの**別要素**へ順移動するバンドル（各 60s）。
+    ///
+    /// el1 の animationend で el2 へ、el2 → el3、el3 → el4。
+    /// identity proxy（animation 名 + tagName）は全巡で同一文字列になるため、
+    /// 修正前の identity ベース早期停止では 3 巡目で「停滞」と誤判定していた。
+    /// MAX_SWEEPS まで回す現行コードでは全段を止めきって成功する。
+    fn write_roaming_keyframes_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  @keyframes pulse { from { background:#ff0000; } to { background:#0000ff; } }
+  .target { width:80px;height:80px;display:inline-block;background:#cccccc; }
+</style></head>
+<body><div id="storybook-root">
+  <div class="target" id="el1"></div>
+  <div class="target" id="el2"></div>
+  <div class="target" id="el3"></div>
+  <div class="target" id="el4"></div>
+</div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var els = [
+        document.getElementById('el1'),
+        document.getElementById('el2'),
+        document.getElementById('el3'),
+        document.getElementById('el4')
+      ];
+      var current = 0;
+      function startOn(idx) {
+        els[idx].style.animation = 'pulse 60s linear 1 forwards';
+        els[idx].addEventListener('animationend', function handler() {
+          els[idx].removeEventListener('animationend', handler);
+          if (idx + 1 < els.length) startOn(idx + 1);
+        });
+      }
+      startOn(0);
+      channel.emit('storyRendered', 'roaming');
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// Web Animations API で id を持たない animation を連鎖するバンドル。
+    ///
+    /// `el.animate()` が返す Animation には `animationName` も `id` も無い。
+    /// collectRunning が `''` を出す generic なケースの回帰テスト。
+    fn write_waapi_chain_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#ff0000; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      var box = document.getElementById('box');
+      var phases = [
+        [{ background: '#ff0000' }, { background: '#00ff00' }],
+        [{ background: '#00ff00' }, { background: '#0000ff' }],
+        [{ background: '#0000ff' }, { background: '#ffff00' }],
+      ];
+      var i = 0;
+      function runNext() {
+        if (i >= phases.length) return;
+        var anim = box.animate(phases[i], { duration: 60000, fill: 'forwards' });
+        i++;
+        anim.onfinish = function () { runNext(); };
+      }
+      runNext();
+      channel.emit('storyRendered', 'waapi-chain');
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
     /// **わざと凍らせられないページ**。`animationend` で無限に連鎖し続ける。
     ///
     /// 静止の反復上限を超えて running が残り続けるため、fail-closed な
@@ -2471,12 +2588,10 @@ mod tests {
         renderer.close().await;
     }
 
-    /// 4 段の長い連鎖が打ち切られず収束すること（集合ベース判定の回帰テスト）。
+    /// 4 段の長い連鎖が打ち切られず収束すること（MAX_SWEEPS 反復の回帰テスト）。
     ///
-    /// p1→p2→p3→p4（各 60s）の animationend 連鎖は、各巡で残数が 1 のまま
-    /// identity が入れ替わる。修正前の件数ベース判定では 3 巡目で「進捗なし」と
-    /// 誤判定して打ち切り、`freeze failed` を返していた。集合ベースでは各巡の
-    /// animation 名が変わるため進行と判じ、全段を止めきって成功する。
+    /// p1→p2→p3→p4（各 60s）の animationend 連鎖。MAX_SWEEPS まで
+    /// 反復を続け、全段を止めきって成功する。
     #[tokio::test(flavor = "multi_thread")]
     async fn long_animation_chain_converges_without_being_cut_short() {
         let Some(chromium) = discover_chromium() else {
@@ -2509,14 +2624,93 @@ mod tests {
         renderer.close().await;
     }
 
-    /// **strict-CSP のページでも bypass + 検証で静止が成立する**こと。
+    /// 同一 keyframes が 4 つの別要素へ順移動する連鎖が収束すること。
     ///
-    /// `Page.setBypassCSP` で CSP を迂回するため、inline style の注入が通り、
-    /// CSS 適用の検証（`getComputedStyle`）も成功する。
+    /// el1→el2→el3→el4 で animation 名（pulse）と tagName（DIV）は全巡同一。
+    /// 修正前の identity proxy（名前+tagName）ベースの早期停止では、全巡で
+    /// 同一文字列になるため 3 巡目で「停滞」と誤判定していた。
+    /// MAX_SWEEPS まで回す現行コードでは全段を止めきって成功する。
     #[tokio::test(flavor = "multi_thread")]
-    async fn strict_csp_page_freezes_successfully_with_bypass() {
+    async fn roaming_keyframes_across_elements_converge() {
         let Some(chromium) = discover_chromium() else {
-            eprintln!("SKIP strict_csp_page_freezes_successfully_with_bypass: no chromium");
+            eprintln!("SKIP roaming_keyframes_across_elements_converge: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_roaming_keyframes_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(15);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let first = renderer
+            .render_story(&server.base_url(), "roaming")
+            .await
+            .expect(
+                "same keyframes roaming across 4 elements must converge \
+                 — identity proxy would have cut this short at sweep 3",
+            );
+        let second = renderer
+            .render_story(&server.base_url(), "roaming")
+            .await
+            .expect("second roaming capture");
+        assert_eq!(
+            first, second,
+            "roaming keyframes: two frozen captures must be byte-identical"
+        );
+
+        renderer.close().await;
+    }
+
+    /// WAAPI（Web Animations API）の id 無し連鎖が収束すること。
+    ///
+    /// `el.animate()` が返す Animation は `animationName` も `id` も空文字列。
+    /// collectRunning は `'':DIV` を出し、全巡で同一文字列になる generic なケース。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waapi_chain_without_ids_converges() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP waapi_chain_without_ids_converges: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_waapi_chain_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(15);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let first = renderer
+            .render_story(&server.base_url(), "waapi-chain")
+            .await
+            .expect("a WAAPI chain with no ids must converge");
+        let second = renderer
+            .render_story(&server.base_url(), "waapi-chain")
+            .await
+            .expect("second waapi-chain capture");
+        assert_eq!(
+            first, second,
+            "waapi-chain: two frozen captures must be byte-identical"
+        );
+
+        renderer.close().await;
+    }
+
+    /// **strict-CSP のページでは静止 CSS が拒否され fail-closed になる**こと。
+    ///
+    /// CSP `style-src 'self'` は注入した inline style を拒否する。
+    /// `Page.setBypassCSP` による迂回は本番と異なる絵を撮ることになるため
+    /// 行わない。FREEZE_SCRIPT は `getComputedStyle` で適用を検証し、
+    /// 適用されていなければ `ok: false` を返して撮影を阻止する。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_csp_page_fails_closed_without_bypass() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP strict_csp_page_fails_closed_without_bypass: no chromium");
             return;
         };
         let _guard = BROWSER_LOCK.lock().await;
@@ -2529,10 +2723,19 @@ mod tests {
         options.story_timeout = Duration::from_secs(10);
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
-        renderer
+        let err = renderer
             .render_story(&server.base_url(), "strict-csp")
             .await
-            .expect("a strict-CSP page must freeze successfully with bypass");
+            .expect_err(
+                "a strict-CSP page must fail — CSP blocks the injected CSS \
+                 and the computed-style check catches it",
+            );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze failed") && message.contains("CSS not applied"),
+            "the error must describe the CSS verification failure, got {message:?}"
+        );
 
         renderer.close().await;
     }
@@ -2591,6 +2794,111 @@ mod tests {
             Some("transparent"),
             "without bypass, CSP must block the injected caret-color — \
              if this fails, the CSP fixture is broken and the freeze test proves nothing"
+        );
+
+        let _ = page.close().await;
+        renderer.close().await;
+    }
+
+    /// **script-src 'none' のページでは inline script が実行されない**こと。
+    ///
+    /// `setBypassCSP` は CSP 全体を迂回するため、`script-src 'none'` も
+    /// 無効化されて inline script が実行されてしまっていた。bypass を外した
+    /// 現在は CSP がそのまま効くため、inline script は実行されない。
+    /// fixture は script 実行時に背景を赤に変えるので、緑のままなら不実行。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn script_csp_blocks_inline_scripts_with_freeze_enabled() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP script_csp_blocks_inline_scripts_with_freeze_enabled: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_script_csp_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 320, 240))
+            .await
+            .expect("launch");
+
+        let url = format!("{}/iframe.html", server.base_url());
+        let page = renderer.browser.new_page(&url).await.expect("open page");
+        for _ in 0..100 {
+            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
+                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('box')).backgroundColor")
+            .await
+            .expect("read background-color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(0, 255, 0)"),
+            "with script-src 'none', the inline script must not execute — \
+             the box must stay green. If it turned red, CSP was bypassed"
+        );
+
+        let _ = page.close().await;
+        renderer.close().await;
+    }
+
+    /// **positive control（script-src 'none' の逆方向）**: CSP がなければ
+    /// 同じ fixture の inline script は実行されて背景が赤になること。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inline_script_runs_without_csp() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP inline_script_runs_without_csp: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // CSP meta タグなしの同等ページを書く
+        std::fs::write(
+            dir.path().join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box{width:100%;height:100vh;background:#00ff00}
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  document.getElementById('box').style.background = '#ff0000';
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 320, 240))
+            .await
+            .expect("launch");
+
+        let url = format!("{}/iframe.html", server.base_url());
+        let page = renderer.browser.new_page(&url).await.expect("open page");
+        for _ in 0..100 {
+            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
+                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let color = page
+            .evaluate("getComputedStyle(document.getElementById('box')).backgroundColor")
+            .await
+            .expect("read background-color");
+        assert_eq!(
+            color.value().and_then(|v| v.as_str()),
+            Some("rgb(255, 0, 0)"),
+            "positive control: without CSP the inline script must run and turn the box red"
         );
 
         let _ = page.close().await;

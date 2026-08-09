@@ -556,10 +556,11 @@ after M sweep(s): [...]` の形式でエラーを返す。これは既存の `st
 ビルドの結果には「この story は静止できなかった」という理由が表示される。
 「なぜか差分が出続ける」よりも原因に辿り着きやすい。静止処理は安定状態まで
 反復し（上限 10 巡）、有限の `animationend` 連鎖であれば収束して成功する。
-収束の判定は running な animation の**集合の実体**（animation 名と対象要素の
-組み）で行う。件数だけでは、各巡で残数が横ばいでも identity が入れ替わる
-連鎖（例: p1→p2→p3→p4）を「進捗なし」と誤判定してしまう。前巡と同一の
-集合が残っていれば停滞、別の集合なら進行と判じる。
+収束の判定は running な animation が**ゼロになったか**で行う。ゼロになれば
+即座に抜け、残っていれば上限まで反復を続ける。identity（animation 名と
+対象要素の proxy）による早期停止は行わない——proxy では要素の同一性を表せず、
+同一 keyframes が異なる要素へ順移動する連鎖（el1→el2→el3→el4）を
+誤判定するためである。
 無限に連鎖し続けるアニメーションは上限を超えて失敗になるので、Storybook 側で
 止めた状態の story を用意すること。progress-based timeline
 （`animation-timeline: scroll()` 等）の `endTime` は `CSSNumericValue`
@@ -567,10 +568,12 @@ after M sweep(s): [...]` の形式でエラーを返す。これは既存の `st
 
 **注入した CSS の適用も検証する**: `<style>` の `appendChild` が成功しても、
 CSP `style-src 'self'` のページでは inline style が拒否されて適用されない
-ことがある（例外は出ないため黙って通る）。レンダラは CDP の
-`Page.setBypassCSP` で CSP を迂回したうえで、`getComputedStyle` により
+ことがある（例外は出ないため黙って通る）。レンダラは `getComputedStyle` により
 `caret-color` と `transition-duration` が期待値に変わっていることを検証する。
-迂回が効かない環境でも検証で fail-closed になる。
+適用されていなければ fail-closed で失敗を返す。CSP を `Page.setBypassCSP` で
+迂回すると本番と異なる絵を撮ることになるため、迂回は行わない。
+Storybook の CSP が `style-src 'self'` で inline style を拒否する場合は、
+静止 CSS の nonce を許可するか、`style-src 'unsafe-inline'` を追加すること。
 
 **静止後に始まる transition のイベントも届かない**: 静止は
 `transition-duration: 0s` / `transition-delay: 0s` の注入で行う。CSS Transitions
