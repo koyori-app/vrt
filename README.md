@@ -544,9 +544,22 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
 - 利用者側スタイルが `!important` で明示した `caret-color` / `transition`
   （注入 CSS も `!important` だが `*` セレクタなので、`!important` 同士の
   比較では利用者側の宣言が勝つ。adoptedStyleSheets 内の `!important` も同様）
-- 静止処理（撮影直前・2 巡）より後から JS で生成される shadow root や iframe
+- 静止処理より後から JS で生成される shadow root や iframe
 
 そうした story は動きを止めた状態を Storybook 側で用意すること。
+
+**静止に失敗した story はエラーになる**: 静止処理は最終巡回後に running な
+animation が残っていないことを検証する。残っていれば、そのストーリーの
+スクリーンショットは撮らず、`freeze failed: N animation(s) still running
+after M sweep(s): [...]` の形式でエラーを返す。これは既存の `storyErrored` /
+`storyThrewException` と同じエラー経路（`RenderError::Story`）を通るので、
+ビルドの結果には「この story は静止できなかった」という理由が表示される。
+「なぜか差分が出続ける」よりも原因に辿り着きやすい。静止処理は安定状態まで
+反復し（上限 10 巡）、有限の `animationend` 連鎖であれば収束して成功する。
+無限に連鎖し続けるアニメーションは上限を超えて失敗になるので、Storybook 側で
+止めた状態の story を用意すること。progress-based timeline
+（`animation-timeline: scroll()` 等）の `endTime` は `CSSNumericValue`
+（percent）であり、型を保って `currentTime` に渡すことで正しく静止する。
 
 **静止後に始まる transition のイベントも届かない**: 静止は
 `transition-duration: 0s` / `transition-delay: 0s` の注入で行う。CSS Transitions
