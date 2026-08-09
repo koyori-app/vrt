@@ -1316,6 +1316,9 @@ mod tests {
 
     /// `ok === true` と確かめられたときだけ成功。`ok` 以外のキーが
     /// 増えても正当な応答を弾かないこと（受理を狭めすぎない）。
+    ///
+    /// 証明する: `freeze_verdict` の受理条件のみ。証明しない: 実ブラウザで
+    /// FREEZE_SCRIPT がこの形の JSON を返すこと（実ブラウザ系テストが担う）。
     #[test]
     fn freeze_verdict_accepts_only_a_verified_ok_true() {
         let json = |raw: &str| serde_json::Value::String(raw.to_string());
@@ -1335,6 +1338,8 @@ mod tests {
 
     /// `ok: false` は「静止に失敗した」。running の中身と sweep 数まで
     /// メッセージに出て、利用者が原因へ辿り着ける。
+    ///
+    /// 証明する: `freeze_verdict` の失敗メッセージ整形のみ（実ブラウザ不使用）。
     #[test]
     fn freeze_verdict_reports_remaining_animations_as_a_freeze_failure() {
         let raw = serde_json::Value::String(
@@ -1356,6 +1361,8 @@ mod tests {
 
     /// `ok: false` + `reason` は CSS 適用失敗。`running` ではなく `reason` が
     /// メッセージに出ること。
+    ///
+    /// 証明する: `freeze_verdict` の失敗種別の区別のみ（実ブラウザ不使用）。
     #[test]
     fn freeze_verdict_reports_css_verification_failure() {
         let raw = serde_json::Value::String(
@@ -1379,6 +1386,9 @@ mod tests {
     /// `ok` が無い・bool でない——はすべて「静止結果を解析できなかった」
     /// 失敗になる。修正前のコード（`ok == Some(false)` のときだけ失敗）は
     /// これら全部を暗黙に成功として撮影へ通していた。
+    ///
+    /// 証明する: `freeze_verdict` が解析不能応答を拒むこと（実ブラウザ不使用。
+    /// 実経路での同じ性質は `garbled_freeze_result_fails_instead_of_silently_succeeding` が担う）。
     #[test]
     fn freeze_verdict_rejects_a_response_it_cannot_interpret() {
         let json = |raw: &str| serde_json::Value::String(raw.to_string());
@@ -1600,6 +1610,9 @@ mod tests {
     /// - フォーカスされた入力欄のキャレットは不可視になる
     /// - 有限アニメ（slide）は**終端**に固定される——初期（赤）へ巻き戻したのでは
     ///   なく終端（青）へシークしたことを、中心ピクセルの色でも検証する
+    ///
+    /// 証明する: `render_story`（freeze 込み）の二回撮り決定性。証明しない:
+    /// freeze なしなら揺れること（対照は `unfrozen_captures_differ_from_frozen_ones`）。
     #[tokio::test(flavor = "multi_thread")]
     async fn frozen_captures_are_byte_identical_across_runs() {
         let Some(chromium) = discover_chromium() else {
@@ -1659,6 +1672,9 @@ mod tests {
     ///
     /// ここで差が出ないなら freeze が効いたのではなく、fixture がそもそも
     /// アニメ／キャレットを描いていない——計測系が死んでいるということになる。
+    ///
+    /// 証明する: fixture が実際に動いていること（freeze なしの `render_story` で
+    /// 絵が揺れる）。証明しない: freeze の決定性そのもの（上のテストが担う）。
     #[tokio::test(flavor = "multi_thread")]
     async fn unfrozen_captures_differ_from_frozen_ones() {
         let Some(chromium) = discover_chromium() else {
@@ -1724,6 +1740,9 @@ mod tests {
     /// caret は shadow 内の明示宣言が継承 transparent に勝って明滅し、
     /// transition は非継承の duration が 60s のままで赤が出て、
     /// frame は shadow 境界の向こうの iframe に到達すらしない。
+    ///
+    /// 証明する: `render_story`（freeze 込み）の静止が shadow root の中まで
+    /// 届くこと。証明しない: closed shadow root への到達（原理的に不可）。
     #[tokio::test(flavor = "multi_thread")]
     async fn frozen_shadow_captures_are_byte_identical_across_runs() {
         let Some(chromium) = discover_chromium() else {
@@ -1783,6 +1802,9 @@ mod tests {
     /// 旧実装（document へのみ注入）では、shadow 内の明示 `caret-color` が
     /// 継承の transparent に勝ち、フォーカス直後の可視位相のキャレットが
     /// 写り込んで一致しない。
+    ///
+    /// 証明する: `render_story`（freeze 込み）で shadow 内キャレットが本当に
+    /// 不可視になること。証明しない: fixture が動いていること（対照群が担う）。
     #[tokio::test(flavor = "multi_thread")]
     async fn frozen_shadow_caret_matches_an_explicitly_hidden_caret() {
         let Some(chromium) = discover_chromium() else {
@@ -1821,6 +1843,9 @@ mod tests {
     ///
     /// ここで差が出ないなら fixture がそもそも shadow の中で何も動かして
     /// いないということであり、上の一致テストは何も証明しなくなる。
+    ///
+    /// 証明する: shadow fixture が実際に動いていること（freeze なしの
+    /// `render_story` で絵が揺れる）。証明しない: freeze の決定性そのもの。
     #[tokio::test(flavor = "multi_thread")]
     async fn unfrozen_shadow_captures_differ_from_frozen_ones() {
         let Some(chromium) = discover_chromium() else {
@@ -1953,6 +1978,10 @@ mod tests {
     ///    その transition は**完了として `transitionend` を発火する**ことを確認。
     ///    発火しないのは手順 2 の「freeze 後に始まるはずだった transition」であり、
     ///    走行中のものは完了イベントつきで終端に確定する——という境界を固定する
+    ///
+    /// 証明する: FREEZE_SCRIPT **単体**のイベント境界（`new_page` 上で直接
+    /// evaluate）。証明しない: `render_story` 経路・`freeze_verdict` の判定——
+    /// このテストはどちらも通っていない（そちらは frozen_* 系が担う）。
     #[tokio::test(flavor = "multi_thread")]
     async fn transitions_under_freeze_fire_no_events() {
         let Some(chromium) = discover_chromium() else {
@@ -2454,6 +2483,9 @@ mod tests {
     /// `endTime` が `CSSUnitValue(100, "percent")` のとき、型を保って
     /// `currentTime` へ渡すことで `TypeError` を回避し、pause まで到達する。
     /// 修正前は catch 握りつぶしで running のまま成功扱いになっていた。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が progress-based timeline でも
+    /// 決定的に撮れること。証明しない: freeze なしで揺れること（対照が別にある）。
     #[tokio::test(flavor = "multi_thread")]
     async fn frozen_scroll_timeline_captures_are_byte_identical() {
         let Some(chromium) = discover_chromium() else {
@@ -2490,6 +2522,9 @@ mod tests {
     ///
     /// 2 巡固定では p3 が running のまま残り得る。収束ループが全段を
     /// 止めきることで、決定的な絵が得られる。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が短い連鎖を収束させること。
+    /// 証明しない: 収束不能ページの fail-closed（unfreezable 系が担う）。
     #[tokio::test(flavor = "multi_thread")]
     async fn frozen_animationend_chain_captures_are_byte_identical() {
         let Some(chromium) = discover_chromium() else {
@@ -2528,6 +2563,9 @@ mod tests {
     /// `animationend` で無限に連鎖し続けるページは、収束反復の上限を
     /// 超えても running が残るため、fail-closed なレンダラは `RenderError::Story`
     /// を返さなければならない。修正前のコードでは `true` を返して成功扱いになる。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が凍結不能ページで失敗を返すこと。
+    /// 証明しない: この失敗が freeze 由来であること単体——それは下の対照が担う。
     #[tokio::test(flavor = "multi_thread")]
     async fn unfreezable_page_fails_instead_of_silently_succeeding() {
         let Some(chromium) = discover_chromium() else {
@@ -2563,6 +2601,9 @@ mod tests {
     ///
     /// 上の `unfreezable_page_fails` と対で、修正前のコードでは成功として
     /// 返ってしまう（= fail-open だった）ことを証明する。
+    ///
+    /// 証明する: 上の失敗が freeze 由来であること（freeze を切れば同じページで
+    /// 成功する）。証明しない: freeze なしの撮影が決定的であること。
     #[tokio::test(flavor = "multi_thread")]
     async fn unfreezable_page_succeeds_without_freeze() {
         let Some(chromium) = discover_chromium() else {
@@ -2592,6 +2633,9 @@ mod tests {
     ///
     /// p1→p2→p3→p4（各 60s）の animationend 連鎖。MAX_SWEEPS まで
     /// 反復を続け、全段を止めきって成功する。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が旧・件数ベース判定で打ち切られた
+    /// 長さの連鎖も収束させること。証明しない: MAX_SWEEPS 超の連鎖の挙動。
     #[tokio::test(flavor = "multi_thread")]
     async fn long_animation_chain_converges_without_being_cut_short() {
         let Some(chromium) = discover_chromium() else {
@@ -2630,6 +2674,9 @@ mod tests {
     /// 修正前の identity proxy（名前+tagName）ベースの早期停止では、全巡で
     /// 同一文字列になるため 3 巡目で「停滞」と誤判定していた。
     /// MAX_SWEEPS まで回す現行コードでは全段を止めきって成功する。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が要素間を移る同名アニメでも
+    /// 収束すること。証明しない: freeze なしで揺れること（対照が別にある）。
     #[tokio::test(flavor = "multi_thread")]
     async fn roaming_keyframes_across_elements_converge() {
         let Some(chromium) = discover_chromium() else {
@@ -2669,6 +2716,9 @@ mod tests {
     ///
     /// `el.animate()` が返す Animation は `animationName` も `id` も空文字列。
     /// collectRunning は `'':DIV` を出し、全巡で同一文字列になる generic なケース。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が WAAPI の無名連鎖でも収束する
+    /// こと。証明しない: freeze なしで揺れること（対照が別にある）。
     #[tokio::test(flavor = "multi_thread")]
     async fn waapi_chain_without_ids_converges() {
         let Some(chromium) = discover_chromium() else {
@@ -2707,6 +2757,10 @@ mod tests {
     /// `Page.setBypassCSP` による迂回は本番と異なる絵を撮ることになるため
     /// 行わない。FREEZE_SCRIPT は `getComputedStyle` で適用を検証し、
     /// 適用されていなければ `ok: false` を返して撮影を阻止する。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が style CSP に拒まれたとき
+    /// fail-closed で失敗すること。証明しない: CSP が本当に注入を拒むこと
+    /// 単体——それは下の positive control が担う。
     #[tokio::test(flavor = "multi_thread")]
     async fn strict_csp_page_fails_closed_without_bypass() {
         let Some(chromium) = discover_chromium() else {
@@ -2745,6 +2799,10 @@ mod tests {
     /// `Page.setBypassCSP` を呼ばずに inline style を注入し、
     /// `getComputedStyle` で CSS が効いていないことを確認する。
     /// 修正前のコードではこのページで `ok: true` が返り、fail-open になっていた。
+    ///
+    /// 証明する: fixture の CSP が手動注入の style を本当に拒むこと（`new_page`
+    /// 直・手動 evaluate）。証明しない: freeze・`render_story` 経路——この
+    /// テストはどちらも通っていない（そちらは上の fail-closed テストが担う）。
     #[tokio::test(flavor = "multi_thread")]
     async fn strict_csp_blocks_injection_without_bypass() {
         let Some(chromium) = discover_chromium() else {
@@ -2806,10 +2864,17 @@ mod tests {
     /// 無効化されて inline script が実行されてしまっていた。bypass を外した
     /// 現在は CSP がそのまま効くため、inline script は実行されない。
     /// fixture は script 実行時に背景を赤に変えるので、緑のままなら不実行。
+    ///
+    /// 証明する: `new_page` で直接開いたページに bypass 副作用が無いこと。
+    /// 証明しない: freeze・`render_story` 経路での CSP 維持——このテストは
+    /// どちらも通っていない（旧名 `..._with_freeze_enabled` は虚偽だった）。
+    /// そちらは `render_story_with_freeze_keeps_script_csp_enforced` が担う。
     #[tokio::test(flavor = "multi_thread")]
-    async fn script_csp_blocks_inline_scripts_with_freeze_enabled() {
+    async fn script_csp_blocks_inline_scripts_on_a_directly_opened_page() {
         let Some(chromium) = discover_chromium() else {
-            eprintln!("SKIP script_csp_blocks_inline_scripts_with_freeze_enabled: no chromium");
+            eprintln!(
+                "SKIP script_csp_blocks_inline_scripts_on_a_directly_opened_page: no chromium"
+            );
             return;
         };
         let _guard = BROWSER_LOCK.lock().await;
@@ -2850,6 +2915,9 @@ mod tests {
 
     /// **positive control（script-src 'none' の逆方向）**: CSP がなければ
     /// 同じ fixture の inline script は実行されて背景が赤になること。
+    ///
+    /// 証明する: fixture が「script が動けば赤になる」形で生きていること
+    /// （`new_page` 直——freeze は通っていない）。証明しない: CSP の維持。
     #[tokio::test(flavor = "multi_thread")]
     async fn inline_script_runs_without_csp() {
         let Some(chromium) = discover_chromium() else {
@@ -2905,6 +2973,126 @@ mod tests {
         renderer.close().await;
     }
 
+    /// `script-src 'none'` **のみ**（style-src 制約なし）のバンドル。
+    ///
+    /// [`write_script_csp_bundle`] と違い style-src を課さないのは、freeze の
+    /// 静止 CSS 注入を通して**本番経路（`render_story` → FREEZE_SCRIPT →
+    /// `freeze_verdict` → 撮影）を最後まで到達させる**ため。script CSP の
+    /// 維持だけを分離して観測する。静的 CSS で `#box` は緑、inline script は
+    /// 実行されると `#box` を赤へ書き換える。撮った絵が緑のままなら
+    /// script は実行されていない（DOM は不変）。
+    fn write_script_csp_render_bundle(root: &Path, with_csp: bool) {
+        let csp_meta = if with_csp {
+            "<meta http-equiv=\"Content-Security-Policy\" content=\"script-src 'none'\">\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join("iframe.html"),
+            format!(
+                r#"<!doctype html>
+<html><head>
+{csp_meta}<style>
+  html,body{{margin:0;padding:0;background:#fff}}
+  #box{{width:100%;height:100vh;background:#00ff00}}
+</style>
+</head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  document.getElementById('box').style.background = '#ff0000';
+</script>
+</body></html>"#
+            ),
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **freeze を通した script CSP 維持の担保（レビュアーが求めた本丸）**。
+    ///
+    /// `render_story` は本番と同じく READY 判定 → FREEZE_SCRIPT 注入 →
+    /// `freeze_verdict` → 撮影まで進む。その全経路を通ってなお
+    /// `script-src 'none'` が効き続け、inline script は実行されない
+    /// （DOM は書き換わらず、絵は緑のまま）——`setBypassCSP` のような
+    /// CSP を殺す副作用がレンダラのどこにも無いことの直接証拠。
+    ///
+    /// 証明する: 本番撮影経路（freeze 込み）が script CSP を維持すること。
+    /// 証明しない: CSP なしでも緑になる可能性——それは下の positive control が潰す。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn render_story_with_freeze_keeps_script_csp_enforced() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP render_story_with_freeze_keeps_script_csp_enforced: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_script_csp_render_bundle(dir.path(), true);
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        // script-src 'none' では Storybook ランタイムの script も動かないため、
+        // READY 判定は DOM フォールバック経路（SIGNAL_GRACE 後）で成立する。
+        let png = renderer
+            .render_story(&server.base_url(), "script-csp")
+            .await
+            .expect(
+                "the freeze injects only CSS (style is not restricted here), \
+                 so the full production path must reach the screenshot",
+            );
+        renderer.close().await;
+
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!(
+            (center[0], center[1], center[2]),
+            (0, 255, 0),
+            "through the full render_story + freeze path, script-src 'none' must \
+             keep the inline script from running — the box must stay green. \
+             Red means the renderer bypassed CSP somewhere"
+        );
+    }
+
+    /// **positive control（上の逆方向）**: CSP を外した同一 fixture を同じ
+    /// `render_story` 経路で撮ると、inline script が実行されて赤が出ること。
+    ///
+    /// 証明する: fixture と撮影経路が「script が動けば赤になる」形で生きている
+    /// こと——上の緑が「script が動けない」ことの証拠として成立する前提。
+    /// 証明しない: CSP の維持そのもの——それは上のテストが担う。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn render_story_executes_inline_scripts_without_csp() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP render_story_executes_inline_scripts_without_csp: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_script_csp_render_bundle(dir.path(), false);
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let png = renderer
+            .render_story(&server.base_url(), "script-csp")
+            .await
+            .expect("without CSP the same path must also reach the screenshot");
+        renderer.close().await;
+
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!(
+            (center[0], center[1], center[2]),
+            (255, 0, 0),
+            "positive control: without CSP the inline script must run and turn \
+             the box red — otherwise the green above proves nothing"
+        );
+    }
+
     /// 静止は問題なく済むが、FREEZE_SCRIPT の返り値が JSON にならないページ。
     ///
     /// ページ側で `JSON.stringify` を「`ok` キーを持つオブジェクトのときだけ」
@@ -2948,6 +3136,9 @@ mod tests {
     ///
     /// 修正前のコード（`ok == Some(false)` のときだけ失敗）では、この
     /// ページは黙って成功として撮影まで通っていた。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が解析不能な freeze 応答で
+    /// 撮らずに失敗すること。証明しない: 静止そのものの成否。
     #[tokio::test(flavor = "multi_thread")]
     async fn garbled_freeze_result_fails_instead_of_silently_succeeding() {
         let Some(chromium) = discover_chromium() else {
@@ -2989,6 +3180,9 @@ mod tests {
     ///
     /// scroll timeline のアニメーションが running のまま残っている場合、
     /// 撮影タイミングで絵が変わり得る。
+    ///
+    /// 証明する: freeze の有無どちらの `render_story` 経路も撮影まで通ること。
+    /// 証明しない: 差分の存在（末尾コメントの通り、主証拠は一致テスト側）。
     #[tokio::test(flavor = "multi_thread")]
     async fn unfrozen_scroll_timeline_captures_may_differ() {
         let Some(chromium) = discover_chromium() else {
