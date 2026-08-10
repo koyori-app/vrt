@@ -526,24 +526,45 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 paused にするだけでは止まる位置がタイミング依存のままなので、そうはしていない。
 
 静止用の CSS は document だけでなく **open shadow root のそれぞれ**にも
-`<style data-vrt-freeze>` として注入する。`caret-color` の継承値は shadow 内で
-明示された宣言に負け、`transition-duration` はそもそも継承しないので、
-document への注入だけでは shadow の中に届かないためである。
-同一オリジンの iframe（shadow 内に置かれたものを含む）にも root 単位で
-再帰し、同じ注入とアニメーション静止を行う。
+constructed stylesheet（`new CSSStyleSheet()` + `adoptedStyleSheets`）として
+注入する。`caret-color` の継承値は shadow 内で明示された宣言に負け、
+`transition-duration` はそもそも継承しないので、document への注入だけでは
+shadow の中に届かないためである。同一オリジンの iframe（shadow 内に
+置かれたものを含む）にも root 単位で再帰し、同じ注入とアニメーション静止を
+行う。CSSOM 経由の注入は CSP `style-src` の管轄外なので、
+`style-src 'self'` のような厳しい CSP を持つページでもそのまま効く
+（CSP 側の設定変更は不要）。
 
 **移行手順**: この決定化が入った版へ更新した直後の最初のビルドでは、
 アニメーションやキャレットを含む story が `changes_detected` になりうる
 （baseline は静止前の絵のままだから）。これは想定どおりの一度きりの差分で、
 UI でレビューして承認すれば静止後の絵が新しい baseline になり、以降は安定する。
 
+**この版から新しい失敗クラスが増える**: 従来は「揺れる絵のまま成功」して
+いた story——静止しきれないアニメーション連鎖を持つもの、静止処理を時間内に
+終えられないもの、静止 CSS の適用を検証できなかったもの——が、この版からは
+**エラーとして表面化する**。緑だったビルドが更新後に失敗へ転じたら、
+まずビルドログの `story failed ...` 行を見ること。失敗は story 単位で報告され、
+**残りの story の撮影は最後まで続行される**——エラーメッセージとログには
+失敗した story が一度に列挙されるので、1 ビルドごとに 1 件ずつしか
+発見できない形にはならない（ただし失敗が 1 件でもあればビルド自体は
+`failed` になる。撮れなかった story を欠いたまま比較へ進めると、
+差分ゼロに見える偽の成功を作るためである）。
+
+なお、静止を story 単位で無効化する opt-out の口は意図的に設けていない。
+静止できない story は「揺れる絵を黙って baseline に混ぜる」のではなく
+エラーとして表面化させ、Storybook 側で動きを止めた状態の story を用意するのが
+正しい対処である——opt-out はその場しのぎに使われた瞬間から、差分が出ても
+不思議でない絵を緑として通し続ける偽 PASS の口になる。
+
 **届かない範囲**: 次のものは静止できない。
 
 - closed shadow root・クロスオリジン iframe の中
 - canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーション
-- 利用者側スタイルが `!important` で明示した `caret-color` / `transition`
-  （注入 CSS も `!important` だが `*` セレクタなので、`!important` 同士の
-  比較では利用者側の宣言が勝つ。adoptedStyleSheets 内の `!important` も同様）
+- 利用者側スタイルが要素セレクタ等で `!important` 明示した `caret-color` /
+  `transition`（注入 CSS も `!important` だが `*` セレクタ＝specificity 0
+  なので、`!important` 同士の比較では specificity の高い利用者側の宣言が勝つ。
+  これは best-effort であり、個別要素の上書きまでは検出しない）
 - 静止処理より後から JS で生成される shadow root や iframe
 
 そうした story は動きを止めた状態を Storybook 側で用意すること。
@@ -572,17 +593,23 @@ after M sweep(s): [...]` の形式でエラーを返す。これは既存の `st
 **静止処理そのものにも時間上限がある**: 静止は `requestAnimationFrame` を
 待って収束を確かめるため、rAF が発火しないページ（差し替え・停止した
 レンダリングパイプライン等）では静止処理が終わらない。この場合も
-ハングはせず、story ごとの描画タイムアウト（`story_timeout`）を超えた
-時点で `freeze did not finish within ...` の形式のエラーとして返る。
+ハングはしない。描画完了待ちと静止処理は **story ごとの時間予算
+（`story_timeout`）を分け合う**——静止処理には予算の残り時間だけが渡され、
+1 story の所要は最悪でもおよそ `story_timeout` に収まる。予算を使い切ると
+`did not complete within ...: the freeze did not finish ...` の形式の
+タイムアウトエラーとして返る（描画完了待ちの時間切れと同じ分類）。
 
-**注入した CSS の適用も検証する**: `<style>` の `appendChild` が成功しても、
-CSP `style-src 'self'` のページでは inline style が拒否されて適用されない
-ことがある（例外は出ないため黙って通る）。レンダラは `getComputedStyle` により
-`caret-color` と `transition-duration` が期待値に変わっていることを検証する。
-適用されていなければ fail-closed で失敗を返す。CSP を `Page.setBypassCSP` で
-迂回すると本番と異なる絵を撮ることになるため、迂回は行わない。
-Storybook の CSP が `style-src 'self'` で inline style を拒否する場合は、
-静止 CSS の nonce を許可するか、`style-src 'unsafe-inline'` を追加すること。
+**注入した CSS の適用も検証する**: 注入は constructed stylesheet で行うため
+CSP に拒否されることはないが、「adopt の操作が成功した」ことと「CSS が
+実際にカスケードへ入った」ことは別である。レンダラは `getComputedStyle` で
+静止 CSS 専用のプローブ（`--vrt-frozen`）が root ごとに効いていることを
+実測し、効いていなければ fail-closed で失敗を返す。プローブは既定値を
+持たないので、既定値との偶然の一致で検証が素通りすることもない。
+検証の対象はあくまで「注入 sheet が root に効いているか」であり、利用者側の
+`!important` による個別要素の上書き（上記「届かない範囲」）は検証では
+落とさない——それを落とすと best-effort の契約と食い違うためである。
+CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮ることになるため、
+迂回は行わない（CSSOM 経由の注入は CSP の管轄外なので迂回する理由もない）。
 
 **検証層自身の失敗も fail-closed である**: `getComputedStyle` が throw する
 （ページ側スクリプトによる差し替え・切り離された document 等）など、静止処理の

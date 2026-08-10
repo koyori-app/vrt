@@ -45,11 +45,11 @@
 //! |----|----|----|
 //! | [`READY_HOOK_SCRIPT`] 注入 | CDP エラーは検知 | Rust 側 `Err`（fail-closed）。`defineProperty` 失敗は JS 内で握るが、`storyRenders` 保険が外れれば pending のままタイムアウトへ倒れる（fail-closed） |
 //! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない） |
-//! | style 注入（`freezeRoot`） | throw は検知 | `errors` に積まれ最終判定で `ok: false`（fail-closed）。CSP による黙殺は**例外が出ず検知不能**——だから次の「CSS 適用検証」層がある |
+//! | 静止 CSS 注入（`freezeRoot`） | throw・API 欠落を検知 | constructed stylesheet（CSSOM）で注入する。構築・`replaceSync`・`adoptedStyleSheets` 代入の throw、`CSSStyleSheet` コンストラクタの欠落は `errors` → `ok: false`（fail-closed）。CSSOM 操作は CSP `style-src` の管轄外なので、旧 `<style>` 注入が持っていた「CSP による例外なしの黙殺」という検知不能経路は**構造ごと消えている** |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
-//! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を `story_timeout` の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
+//! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を READY 待ちと共有の deadline（`started + story_timeout`）の残余の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
 //! | running 収集（`collectRunning`） | throw・API 欠落を検知 | 収集は `freezeRoot` と共通の `collectAnimations` を通る。`getAnimations`・走査の失敗、および root 側 `getAnimations` API の欠落（擬似要素アニメを数える口が無い）は `errors` → `ok: false`（fail-closed。空 `[]` へ黙って倒さない）。クロスオリジン iframe の中は**原理的に数えられぬ**（`contentDocument` が null）——README「届かない範囲」に契約として明記 |
-//! | CSS 適用検証 | 検知 | 値の不一致は `ok: false`。検証呼び出し自体の throw も `errors` → `ok: false`（fail-closed）。検証は root ごとに最初の要素 1 点のサンプルであり全要素ではない（個別要素の `!important` 上書きは「届かない範囲」）。切り離された root は描画に影響しないため対象外 |
+//! | CSS 適用検証 | 検知 | 注入 sheet が root のカスケードに入ったかを、root ごとに 1 要素の `--vrt-frozen` プローブで実測する（sheet の存在は root 単位の性質なので 1 点で足りる。既定値と偶然一致して素通しする値でもない）。プローブ欠落は `ok: false`、検証呼び出し自体の throw も `errors` → `ok: false`（fail-closed）。個別要素の `!important` 上書きは検証対象に**しない**——README「届かない範囲」の best-effort 契約であり、ハード失敗させると契約と食い違う。切り離された root は描画に影響しないため対象外 |
 //! | 結果の JSON 化 | 間接的に検知 | `JSON.stringify` の差し替え・失敗は文字列でない/読めない応答となり、Rust 側 [`freeze_verdict`] が unparseable として失敗（fail-closed） |
 //! | Rust 側の解析（[`freeze_verdict`]） | 検知 | `ok === true` と確かめられた場合のみ撮影へ進む。欠落・型違い・parse 失敗はすべて unparseable（fail-closed） |
 //! | iframe・shadow 走査（`freezeRoot` 再帰） | 部分的 | open shadow root と同一オリジン iframe には到達。closed shadow root は**列挙する API が存在せず検知不能**、静止処理より後から生成される root にも届かない——いずれも README「届かない範囲」でページ側の責務と定めてある |
@@ -74,7 +74,7 @@
 //! |----|----|----|----|
 //! | Chromium 起動 | `LAUNCH_TIMEOUT` ×最大 `LAUNCH_MAX_ATTEMPTS` 回 | [`RenderError::Launch`] | `launching_a_missing_chromium_fails_fast` |
 //! | READY 待ち（probe ポーリング） | `story_timeout` の deadline | [`RenderError::Timeout`] / [`RenderError::Story`] | `a_story_that_renders_nothing_still_produces_a_screenshot`・`a_story_error_signal_fails_fast_with_the_reason` |
-//! | FREEZE evaluate | `story_timeout` の `tokio::time::timeout` | [`RenderError::Story`]（時間切れ）/ [`RenderError::Cdp`] | `raf_suppressed_page_fails_within_the_story_timeout` |
+//! | FREEZE evaluate | READY 待ちと**共有**の deadline（`started + story_timeout`）の残余。1 story の最悪所要は約 `story_timeout` + `SETTLE_DELAY` に収まる | [`RenderError::Timeout`]（時間切れ。READY 側と同じ分類）/ [`RenderError::Cdp`] | `raf_suppressed_page_fails_within_the_story_timeout`・`freeze_timeout_shares_the_story_deadline_with_the_ready_wait` |
 //! | FREEZE 結果の解析 | 即時（待ちなし） | [`RenderError::Story`]（`freeze_verdict`） | `freeze_verdict_*` 単体群・`garbled_freeze_result_fails_instead_of_silently_succeeding` |
 //! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
 //!
@@ -230,7 +230,13 @@ JSON.stringify((() => {
 ///   `caret-color` は継承プロパティだが、継承値はカスケードでは最弱で、
 ///   shadow 内に `caret-color` を明示した要素には勝てない。ゆえに継承には
 ///   頼らず、静止 CSS を document と各 open shadow root のそれぞれへ
-///   `<style data-vrt-freeze>` として直接注入する
+///   constructed stylesheet（`new CSSStyleSheet()` + `replaceSync` +
+///   `adoptedStyleSheets`）として直接注入する。CSSOM 操作は CSP `style-src`
+///   の管轄外なので、`<style>` の appendChild と違い CSP 起因の適用失敗が
+///   そもそも起きない（sheet は document 単位に 1 つ構築し、同一 document の
+///   全 root で共有する。別 document——same-origin iframe——には
+///   その realm の `CSSStyleSheet` で構築し直す。cross-document 共有は
+///   `NotAllowedError` になるためである）
 /// - **有限アニメーション**（CSS animation / CSS transition / Web Animations API）:
 ///   `currentTime = endTime` へシークして pause。終端は仕様上ただ一つに
 ///   定まる状態（`fill: forwards` なら最終キーフレーム、無指定なら基底スタイル）
@@ -279,13 +285,16 @@ JSON.stringify((() => {
 ///
 /// 最終巡回後、全 root の running な animation を数え、1 つでも残っていれば
 /// **失敗の JSON を返す**——何が凍らせられなかったかを含む形で上へ伝える。
-/// 全て止まっていれば、注入した CSS が実際に適用されているかを
-/// `getComputedStyle` で検証してから成功の JSON を返す。`<style>` の
-/// `appendChild` が成功しても CSP `style-src 'self'` 下では CSS が
-/// 適用されないため、操作の成功ではなく効果の実測を以て判定する。
-/// CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮ることに
-/// なるため、迂回は行わない。CSP が静止 CSS を拒否するページでは
-/// 検証が fail-closed で失敗し、利用者に原因が伝わる。
+/// 全て止まっていれば、注入 sheet が実際に各 root のカスケードへ入ったかを
+/// `getComputedStyle` の `--vrt-frozen` プローブで検証してから成功の JSON を
+/// 返す。「代入できた」は「効いた」の証明ではないため、操作の成功ではなく
+/// 効果の実測を以て判定する（root ごとに 1 要素で足りる——sheet の存在は
+/// root 単位の性質であり、`--vrt-frozen: 1` は既定値と偶然一致しえない。
+/// 個別要素の `!important` 上書きはここで検証**しない**——それは README
+/// 「届かない範囲」の best-effort 契約であり、ハード失敗させると契約と
+/// 食い違う）。CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮る
+/// ことになるため、迂回は行わない——そもそも CSSOM 経由の注入は CSP の
+/// 管轄外なので、迂回する理由も無い。
 ///
 /// **検証層自身の失敗も fail-closed である**。`getComputedStyle` が throw
 /// する（ページ側の差し替え・壊れた環境）など、注入・シーク・収集・検証の
@@ -305,11 +314,15 @@ JSON.stringify((() => {
 const FREEZE_SCRIPT: &str = r#"
 (async () => {
   const MAX_SWEEPS = 10;
+  // --vrt-frozen は静止 CSS の適用検証プローブ。caret-color や
+  // transition-duration と違い既定値が '1' になることはないため、
+  // 「偶然その値だった」による検証の素通しが起きない。
   const CSS = [
     '*, *::before, *::after {',
     '  caret-color: transparent !important;',
     '  transition-duration: 0s !important;',
     '  transition-delay: 0s !important;',
+    '  --vrt-frozen: 1 !important;',
     '}',
   ].join('\n');
   const errors = [];
@@ -317,6 +330,11 @@ const FREEZE_SCRIPT: &str = r#"
   // 原因が読みにくくなる。判定に効くのは件数でなく有無なので、同文は 1 回だけ積む。
   const pushError = (msg) => { if (!errors.includes(msg)) errors.push(msg); };
   const frozenRoots = [];
+  // 静止 sheet は document 単位に 1 つ構築し、同一 document の全 root
+  //（document 自身と open shadow root）で共有する。constructed stylesheet は
+  // 構築元の document に紐づき、別 document への adopt は NotAllowedError に
+  // なるため、same-origin iframe にはその realm の CSSStyleSheet で作り直す。
+  const sheetByDoc = new Map();
 
   // endTime が CSSNumericValue（progress-based timeline 等）か数値かを判定し、
   // 有限なら終端値を、無限なら null を返す。
@@ -334,30 +352,38 @@ const FREEZE_SCRIPT: &str = r#"
   // collectRunning（残りを数える側）の両方がここを通ることで、視野の非対称
   // ——凍らせた範囲と数えた範囲のずれ——を構造的に消す。
   //
-  // root.getAnimations()（擬似要素のアニメも返す唯一の口）と各要素の
-  // getAnimations() の和集合を取る。root 側の API が無い環境（ページによる
-  // prototype の削除・改変等）では擬似要素のアニメを数える手段が無く、網羅を
-  // 保証できない——黙って空へ倒すと「running 無し」と区別できず偽の成功に
-  // なるので、errors に積んで判定へ反映する（fail-closed）。
+  // Chromium の root.getAnimations()（Document / ShadowRoot）はその root の
+  // subtree 全体の animation を擬似要素ぶんも含めて返すので、root 側が
+  // 成功したら per-element の getAnimations() は全要素ぶんの no-op になる
+  //（2000 ノードのページで walk ごと約 2000 回、freezeRoot と collectRunning
+  // の両方が通るゆえ sweep あたりその倍）。per-element の走査は root 側の
+  // API が欠落・throw した場合だけのフォールバックとする。その場合は
+  // 擬似要素のアニメを数える口が無く網羅を保証できない——黙って倒すと
+  // 「running 無し」と区別できず偽の成功になるので、errors に積んで判定へ
+  // 反映した上で（fail-closed）、数えられる範囲は診断のために集める。
   const collectAnimations = (root) => {
     const animations = new Set();
     let elements = [];
     if (!root) return { animations, elements };
+    try { elements = root.querySelectorAll('*'); } catch (e) {
+      pushError('querySelectorAll failed: ' + String(e && e.message || e));
+    }
+    let rootEnumerated = false;
     if (typeof root.getAnimations === 'function') {
       try {
         for (const a of root.getAnimations()) animations.add(a);
+        rootEnumerated = true;
       } catch (e) {
         pushError('getAnimations failed on root: ' + String(e && e.message || e));
       }
     } else {
       pushError('getAnimations API missing on a root: pseudo-element animations cannot be enumerated');
     }
-    try { elements = root.querySelectorAll('*'); } catch (e) {
-      pushError('querySelectorAll failed: ' + String(e && e.message || e));
-    }
-    for (const el of elements) {
-      try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {
-        pushError('getAnimations failed on element: ' + String(e && e.message || e));
+    if (!rootEnumerated) {
+      for (const el of elements) {
+        try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {
+          pushError('getAnimations failed on element: ' + String(e && e.message || e));
+        }
       }
     }
     return { animations, elements };
@@ -366,19 +392,37 @@ const FREEZE_SCRIPT: &str = r#"
   // root は Document または ShadowRoot。どちらも同じ手順で静止させる。
   // caret-color は継承プロパティだが、継承値は shadow 内で明示された宣言に
   // 勝てず、transition-duration はそもそも継承しない。ゆえに静止 CSS は
-  // 継承に頼らず root ごとに <style data-vrt-freeze> として注入する。
+  // 継承に頼らず root ごとに constructed stylesheet として adopt する。
+  // CSSOM 操作は CSP style-src の管轄外なので、<style> の appendChild と
+  // 違い CSP に黙殺される経路が存在しない。adopted sheet は同 root の
+  // <style>/<link> より後の順序に置かれるため、同 specificity の !important
+  // 同士なら注入側が勝つ——利用者側がより高い specificity で !important を
+  // 宣言した場合に負けるのは <style> 注入と同じ（README「届かない範囲」）。
   const freezeRoot = (root) => {
     if (!root) return;
 
     try {
-      if (!root.querySelector('style[data-vrt-freeze]')) {
-        const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
-        const style = doc.createElement('style');
-        style.setAttribute('data-vrt-freeze', '');
-        style.textContent = CSS;
-        // Document なら <head>、ShadowRoot なら root 直下へ。
-        (root.head || root.documentElement || root).appendChild(style);
-        frozenRoots.push(root);
+      const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
+      const win = doc && doc.defaultView;
+      // browsing context を持たない document（切り離された iframe 等）は
+      // 描画されないので注入も検証も対象外（検証側の disconnected スキップと同じ扱い）。
+      if (win) {
+        let sheet = sheetByDoc.get(doc);
+        if (!sheet) {
+          if (typeof win.CSSStyleSheet !== 'function') {
+            // 注入層自身の失敗も fail-closed——構築できないまま黙って進むと
+            // 「注入できたか不明」の絵を成功として撮ることになる。
+            pushError('CSSStyleSheet constructor missing: the freeze CSS cannot be injected');
+          } else {
+            sheet = new win.CSSStyleSheet();
+            sheet.replaceSync(CSS);
+            sheetByDoc.set(doc, sheet);
+          }
+        }
+        if (sheet && !root.adoptedStyleSheets.includes(sheet)) {
+          root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+          frozenRoots.push(root);
+        }
       }
     } catch (e) {
       // CSS 注入の失敗は静止の前提を崩すので記録する。
@@ -472,8 +516,13 @@ const FREEZE_SCRIPT: &str = r#"
     freezeRoot(document);
     await nextFrame();
     still = collectRunning(document);
-    // 最低 2 巡は回す。1 巡目の freeze で CSS が注入されると、それ自体が
-    // 新たな animation を誘発しうる。2 巡目でそれらも捕捉してから判定する。
+    // 最低 2 巡は回す。注入 CSS は caret-color と transition-duration/delay
+    // しか設定しないため、それ自体が新しい animation を誘発することはない
+    //（combined duration 0 の transition はそもそも生成されない）。2 巡目の
+    // 価値は別にある: 1 巡目の seek が発火させる animationend / transitionend
+    // ハンドラが開始する連鎖と、double-rAF の待ちの間に遅延開始した animation
+    // の捕捉である。ゆえに「1 巡目が 0 件なら 2 巡目を省ける」は成り立たない
+    // ——0 件の巡でもイベント由来の新規開始は次の巡でしか見えない。
     if (still.length === 0 && sweeps >= 2) break;
   }
 
@@ -489,9 +538,15 @@ const FREEZE_SCRIPT: &str = r#"
       errors: errors.length > 0 ? errors : undefined,
     });
   }
-  // CSS が実際に適用されているか検証する。appendChild の成功は
-  // CSS の適用を意味しない（CSP style-src 'self' では注入した inline
-  // style が拒否されるが例外は発生しない）。
+  // 注入 sheet が実際に各 root のカスケードへ入ったか検証する。
+  // 「adoptedStyleSheets へ代入できた」は「効いた」の証明ではないため、
+  // 効果を実測する。見るのは --vrt-frozen プローブだけ:
+  // - caret-color / transition-duration を見ないのは、利用者側の !important
+  //   上書き（README「届かない範囲」の best-effort 契約）をハード失敗に
+  //   格上げしないため。sheet がカスケードに入っているか——検証したい命題
+  //   ——は root 単位の性質なので、root ごとに 1 要素のサンプルで足りる
+  // - プローブは既定値を持たないので、「たまたま期待値だった」ことによる
+  //   検証の素通し（旧実装の fail-open）も起きない
   for (const root of frozenRoots) {
     try {
       // 検証時点で切り離された root（除去された iframe の document・
@@ -500,14 +555,13 @@ const FREEZE_SCRIPT: &str = r#"
       if (root.nodeType === Node.DOCUMENT_NODE ? !root.defaultView : !root.isConnected) continue;
       const el = root.querySelector('*');
       if (!el) continue;
-      const cs = getComputedStyle(el);
-      const caretOk = cs.caretColor === 'transparent' || cs.caretColor === 'rgba(0, 0, 0, 0)';
-      if (!caretOk || cs.transitionDuration !== '0s') {
+      const probe = getComputedStyle(el).getPropertyValue('--vrt-frozen').trim();
+      if (probe !== '1') {
         return JSON.stringify({
           ok: false,
           sweeps: sweeps,
-          reason: 'CSS not applied: caret-color=' + cs.caretColor
-            + ' transition-duration=' + cs.transitionDuration,
+          reason: 'CSS not applied: the freeze probe --vrt-frozen is missing on a sampled element'
+            + ' (got: ' + JSON.stringify(probe) + ')',
           errors: errors.length > 0 ? errors : undefined,
         });
       }
@@ -543,8 +597,16 @@ pub enum RenderError {
     },
     #[error("failed to start the bundle static server: {0}")]
     Server(String),
-    #[error("story `{story_id}` did not render within {timeout:?}")]
-    Timeout { story_id: String, timeout: Duration },
+    /// story ごとの時間予算（`story_timeout`）を使い切った。READY 待ちと
+    /// FREEZE evaluate は**同じ deadline を分け合う**ので、どちらの段で
+    /// 時間切れになってもこの分類で報告する（`phase` が段を示す）。
+    #[error("story `{story_id}` did not complete within {timeout:?}: {phase}")]
+    Timeout {
+        story_id: String,
+        timeout: Duration,
+        /// どの段で時間切れになったか（人間向けの説明文）。
+        phase: &'static str,
+    },
     /// Storybook 自身が「このストーリーは失敗した」と言ってきた場合。
     /// タイムアウトより遥かに早く、理由つきで返せる。
     #[error("story `{story_id}` reported a render error: {message}")]
@@ -870,6 +932,7 @@ impl StoryRenderer {
                 return Err(RenderError::Timeout {
                     story_id: story_id.to_string(),
                     timeout: self.options.story_timeout,
+                    phase: "no render-completion signal arrived",
                 });
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -881,31 +944,33 @@ impl StoryRenderer {
         // 静止に失敗したまま撮ると flaky な絵が baseline に混ざるので、
         // 黙って続行せず失敗として返す（fail-closed）。
         if self.options.freeze_before_capture {
-            // CSP は迂回しない（本番と同じ条件で撮る）。FREEZE_SCRIPT は
-            // getComputedStyle で CSS 適用を検証し、CSP が静止 CSS を
-            // 拒否するページでは fail-closed で失敗を返す。
+            // CSP は迂回しない（本番と同じ条件で撮る）。静止 CSS の注入は
+            // constructed stylesheet（CSSOM）経由で CSP style-src の管轄外
+            // なので、CSP 起因の適用失敗はそもそも起きない。FREEZE_SCRIPT は
+            // --vrt-frozen プローブで適用を実測し、効いていなければ
+            // fail-closed で失敗を返す。
             //
             // 停止性: FREEZE_SCRIPT は rAF を 2 回待つ promise を返すため、
             // ページが requestAnimationFrame を発火させない（差し替え・
             // 停止したレンダリングパイプライン等）と evaluate は永遠に
-            // 返らない。story_timeout の時間上限に載せ、時間内に静止が
-            // 終わらなければ失敗として返す（fail-closed。READY 待ちの
-            // deadline と同じ手当てを、後から足したこの層にも与える）。
-            let freeze_result =
-                tokio::time::timeout(self.options.story_timeout, page.evaluate(FREEZE_SCRIPT))
-                    .await
-                    .map_err(|_| RenderError::Story {
-                        story_id: story_id.to_string(),
-                        message: format!(
-                            "freeze did not finish within {:?}: the page never yielded a verdict \
+            // 返らない。READY 待ちと**同じ deadline**（started +
+            // story_timeout）の残余に載せ、時間内に静止が終わらなければ
+            // 失敗として返す（fail-closed）。独立予算にすると 1 story の
+            // 最悪所要が約 2×story_timeout になり、「story ごとの描画
+            // タイムアウト」という README の契約を裏切るためである。
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let freeze_result = tokio::time::timeout(remaining, page.evaluate(FREEZE_SCRIPT))
+                .await
+                .map_err(|_| RenderError::Timeout {
+                    story_id: story_id.to_string(),
+                    timeout: self.options.story_timeout,
+                    phase: "the freeze did not finish: the page never yielded a verdict \
                      (requestAnimationFrame may not be firing)",
-                            self.options.story_timeout
-                        ),
-                    })?
-                    .map_err(|source| RenderError::Cdp {
-                        story_id: story_id.to_string(),
-                        source,
-                    })?;
+                })?
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
 
             // FREEZE_SCRIPT は JSON 文字列を返す。`ok === true` と確かめられた
             // 場合にだけ撮影へ進む（fail-closed）。ok: false（静止に失敗）も、
@@ -1171,6 +1236,24 @@ mod tests {
     /// テストの本題ではないので、起動を跨がないように 1 本ずつ動かす。
     static BROWSER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// `expr`（bool を返す JS 式）が true になるまでポーリングする。
+    ///
+    /// 予算は 100 回 × 50ms = 5 秒。時間内に成立しなければ**その場で panic**
+    /// する——旧来の同型コピー 4 箇所のうち 3 箇所はタイムアウト時に `break`
+    /// で素通りし、後段の assert が「準備待ちの失敗」を別の失敗として誤解を
+    /// 招くメッセージで報告していた。予算の調整もここ 1 箇所で済む。
+    async fn wait_until(page: &chromiumoxide::page::Page, expr: &str) {
+        for _ in 0..100 {
+            if let Ok(result) = page.evaluate(expr).await
+                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition `{expr}` did not become true within the 5s polling budget");
+    }
+
     fn write_fixture_bundle(root: &Path) {
         std::fs::write(
             root.join("iframe.html"),
@@ -1192,34 +1275,67 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// Storybook のアドオンチャンネルを模したバンドル。
+    /// fake アドオンチャンネルのスキャフォールドつき story fixture を書き出す。
     ///
-    /// 本物と同じく `window.__STORYBOOK_ADDONS_CHANNEL__` を**後から**代入し、
-    /// `storyRendered` / `storyErrored` を撃つ。id で挙動を変える。
+    /// 本物のプレビューランタイムと同じく `window.__STORYBOOK_ADDONS_CHANNEL__`
+    /// を**後から**代入する形を再現する。以前は 10 個超の `write_*_bundle` が
+    /// この約 12 行のスキャフォールドを各自で埋め込んでいた——差し替えるときに
+    /// 直し漏れが出る形だったので 1 箇所へ寄せた。
+    ///
+    /// - `css`: `<style>` の中身
+    /// - `root_html`: `#storybook-root` の**中**に置く初期 HTML（JS で組む fixture は空）
+    /// - `on_channel_js`: チャンネル代入後（20ms 後）に実行される JS。描画を
+    ///   済ませて自分で `channel.emit('storyRendered', ...)` を呼ぶ責務を持つ
+    ///   （`storyErrored` や iframe load 後の emit が要る fixture もあるため
+    ///   emit はスキャフォールド側で肩代わりしない）。URL の `?id=` は
+    ///   `id` 変数として参照できる
+    ///
+    /// プロトコルや環境を意図的に壊す fixture（CSP 系 3 個・garbled・
+    /// throwing・rAF 抑止）は、壊し方そのもの——CSP meta の位置や
+    /// スキャフォールドより先に走る差し替え——が本題なので手書きのまま残す。
+    fn write_story_html(root: &Path, css: &str, root_html: &str, on_channel_js: &str) {
+        std::fs::write(
+            root.join("iframe.html"),
+            format!(
+                r#"<!doctype html>
+<html><head><style>
+{css}
+</style></head>
+<body><div id="storybook-root">{root_html}</div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {{}};
+  var channel = {{
+    on: function (event, cb) {{ (listeners[event] = listeners[event] || []).push(cb); }},
+    emit: function (event, payload) {{
+      (listeners[event] || []).forEach(function (cb) {{ cb(payload); }});
+    }}
+  }};
+  // 本物のプレビューランタイムと同じく「あとから代入」する。
+  setTimeout(function () {{
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {{
+{on_channel_js}
+    }}, 20);
+  }}, 20);
+</script>
+</body></html>"#
+            ),
+        )
+        .expect("write iframe.html");
+    }
+
+    /// Storybook のアドオンチャンネルを模したバンドル。
     ///
     /// - `demo-box--red`   : 塗ってから storyRendered
     /// - `demo-box--empty` : **何も描かずに** storyRendered（空ストーリーは正当）
     /// - `demo-box--boom`  : storyErrored
     fn write_storybook_runtime_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>html,body{margin:0;padding:0;background:#fff}</style></head>
-<body><div id="storybook-root"></div>
-<script>
-  var id = new URLSearchParams(location.search).get('id') || '';
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  // 本物のプレビューランタイムと同じく「あとから代入」する。
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      if (id === 'demo-box--boom') {
+        write_story_html(
+            root,
+            "html,body{margin:0;padding:0;background:#fff}",
+            "",
+            r#"      if (id === 'demo-box--boom') {
         channel.emit('storyErrored', { message: 'kaboom in the play function' });
         return;
       }
@@ -1230,13 +1346,8 @@ mod tests {
         el.style.background = '#ff0000';
         document.getElementById('storybook-root').appendChild(el);
       }
-      channel.emit('storyRendered', id);
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', id);"#,
+        );
     }
 
     /// アニメーションとキャレットを持つバンドル。freeze の決定性検証用。
@@ -1248,11 +1359,9 @@ mod tests {
     /// - `demo-anim--slide`   : **有限** CSS アニメ（60s, `fill: forwards`）。
     ///   初期は赤・終端は青。freeze が「終端へシークした」ことを色で検証できる
     fn write_animated_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   .spinner {
     width:120px;height:120px;margin:20px;
@@ -1261,22 +1370,9 @@ mod tests {
   }
   @keyframes to-blue { from { background:#ff0000; } to { background:#0000ff; } }
   .slide { width:100%;height:100vh;animation: to-blue 60s linear 1 forwards; }
-  input { font:32px monospace;width:200px;margin:40px;border:1px solid #000; }
-</style></head>
-<body><div id="storybook-root"></div>
-<script>
-  var id = new URLSearchParams(location.search).get('id') || '';
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var root = document.getElementById('storybook-root');
+  input { font:32px monospace;width:200px;margin:40px;border:1px solid #000; }"#,
+            "",
+            r#"      var root = document.getElementById('storybook-root');
       if (id === 'demo-anim--spinner') {
         var el = document.createElement('div');
         el.className = 'spinner';
@@ -1290,13 +1386,8 @@ mod tests {
         el.className = 'slide';
         root.appendChild(el);
       }
-      channel.emit('storyRendered', id);
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', id);"#,
+        );
     }
 
     /// open shadow root の内側にアニメ源を持つバンドル。root 単位の静止検証用。
@@ -1329,27 +1420,12 @@ mod tests {
 </body></html>"#,
         )
         .expect("write frame.html");
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
-  x-caret, x-trans, x-frame { display:block; }
-</style></head>
-<body><div id="storybook-root"></div>
-<script>
-  var id = new URLSearchParams(location.search).get('id') || '';
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var root = document.getElementById('storybook-root');
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  x-caret, x-trans, x-frame { display:block; }"#,
+            "",
+            r#"      var root = document.getElementById('storybook-root');
       if (id === 'demo-shadow--caret' || id === 'demo-shadow--caret-hidden') {
         var host = document.createElement('x-caret');
         var sr = host.attachShadow({ mode: 'open' });
@@ -1386,13 +1462,8 @@ mod tests {
           try { frame.contentDocument.querySelector('input').focus(); } catch (e) {}
           channel.emit('storyRendered', id);
         });
-      }
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      }"#,
+        );
     }
 
     /// transition イベントの発火有無を数えるバンドル。freeze のイベント境界検証用。
@@ -2076,17 +2147,12 @@ mod tests {
         url: &str,
     ) -> chromiumoxide::page::Page {
         let page = renderer.browser.new_page(url).await.expect("open page");
-        for _ in 0..100 {
-            if let Ok(result) = page
-                .evaluate("document.readyState !== 'loading' && !!window.__TRANSITION_EVENTS__")
-                .await
-                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
-            {
-                return page;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        panic!("transition fixture page did not become ready");
+        wait_until(
+            &page,
+            "document.readyState !== 'loading' && !!window.__TRANSITION_EVENTS__",
+        )
+        .await;
+        page
     }
 
     /// 現在のイベントカウンタを取り出す。
@@ -2265,11 +2331,9 @@ mod tests {
     /// `Number.isFinite` では false と判定されて数値 0 を代入しようとし
     /// `TypeError` になる。修正前は catch で握りつぶされ running のまま成功扱い。
     fn write_scroll_timeline_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   #scroller { width:100%;height:200px;overflow-y:scroll; }
   #content { height:1000px; }
   @keyframes scroll-fade { from { opacity:1; } to { opacity:0; } }
@@ -2277,32 +2341,15 @@ mod tests {
     width:100px;height:100px;background:#ff0000;
     animation: scroll-fade linear;
     animation-timeline: scroll(nearest block);
-  }
-</style></head>
-<body><div id="storybook-root">
+  }"#,
+            r#"
   <div id="scroller">
     <div id="target"></div>
     <div id="content"></div>
   </div>
-</div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      channel.emit('storyRendered', 'scroll-timeline');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+"#,
+            "      channel.emit('storyRendered', 'scroll-timeline');",
+        );
     }
 
     /// `animationend` で次のアニメーションを連鎖的に開始するバンドル。
@@ -2310,29 +2357,15 @@ mod tests {
     /// p1(50ms) → animationend → p2(50ms) → animationend → p3(50ms)。
     /// 2 巡固定の sweep では p3 が running のまま残り得る。
     fn write_animationend_chain_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   @keyframes phase1 { from { background:#ff0000; } to { background:#cc0000; } }
   @keyframes phase2 { from { background:#00ff00; } to { background:#00cc00; } }
   @keyframes phase3 { from { background:#0000ff; } to { background:#0000cc; } }
-  #box { width:100%;height:100vh; }
-</style></head>
-<body><div id="storybook-root"><div id="box"></div></div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var box = document.getElementById('box');
+  #box { width:100%;height:100vh; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var box = document.getElementById('box');
       box.addEventListener('animationend', function handler(e) {
         if (e.animationName === 'phase1') {
           box.style.animation = 'phase2 0.05s linear 1 forwards';
@@ -2341,13 +2374,8 @@ mod tests {
         }
       });
       box.style.animation = 'phase1 0.05s linear 1 forwards';
-      channel.emit('storyRendered', 'chain');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', 'chain');"#,
+        );
     }
 
     /// `animationend` で 4 段連鎖（p1→p2→p3→p4, 各 60s）するバンドル。
@@ -2357,30 +2385,16 @@ mod tests {
     /// 各巡で animation 名が変わる（p1→p2→p3→p4）ため進行と判じ、全段を
     /// 止めきって成功する。
     fn write_long_chain_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   @keyframes p1 { from { background:#ff0000; } to { background:#cc0000; } }
   @keyframes p2 { from { background:#00ff00; } to { background:#00cc00; } }
   @keyframes p3 { from { background:#0000ff; } to { background:#0000cc; } }
   @keyframes p4 { from { background:#ffff00; } to { background:#cccc00; } }
-  #box { width:100%;height:100vh; }
-</style></head>
-<body><div id="storybook-root"><div id="box"></div></div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var box = document.getElementById('box');
+  #box { width:100%;height:100vh; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var box = document.getElementById('box');
       box.addEventListener('animationend', function handler(e) {
         if (e.animationName === 'p1') {
           box.style.animation = 'p2 60s linear 1 forwards';
@@ -2391,26 +2405,25 @@ mod tests {
         }
       });
       box.style.animation = 'p1 60s linear 1 forwards';
-      channel.emit('storyRendered', 'long-chain');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', 'long-chain');"#,
+        );
     }
 
     /// CSP `style-src 'self'` を持つバンドル。
     ///
-    /// inline style の注入は CSP に拒否されるが例外は出ない。
-    /// `Page.setBypassCSP` で迂回しなければ、注入した CSS は適用されず
-    /// `caret-color` と `transition-duration` は外部 CSS の値のまま残る。
-    fn write_strict_csp_bundle(root: &Path) {
+    /// `<style>` 要素の注入は CSP に拒否されるが例外は出ない（この検知不能な
+    /// 黙殺が、注入を constructed stylesheet へ移した理由である——CSSOM 操作は
+    /// CSP style-src の管轄外なので拒否されない）。`caret` で入力欄の
+    /// `caret-color` を変えられる: 可視色と `transparent` の対照を同じ CSP 下で
+    /// 撮り比べることで、「静止 CSS が CSP を越えて効いた」ことを絵で証明する。
+    fn write_strict_csp_bundle(root: &Path, caret: &str) {
         std::fs::write(
             root.join("styles.css"),
-            "html,body{margin:0;padding:0;background:#fff}\n\
-             input{font:32px monospace;width:200px;margin:40px;border:1px solid #000;\
-             caret-color:#cc0000;transition:opacity 60s linear}\n",
+            format!(
+                "html,body{{margin:0;padding:0;background:#fff}}\n\
+                 input{{font:32px monospace;width:200px;margin:40px;border:1px solid #000;\
+                 caret-color:{caret};transition:opacity 60s linear}}\n"
+            ),
         )
         .expect("write styles.css");
         std::fs::write(
@@ -2478,38 +2491,23 @@ mod tests {
     /// 修正前の identity ベース早期停止では 3 巡目で「停滞」と誤判定していた。
     /// MAX_SWEEPS まで回す現行コードでは全段を止めきって成功する。
     fn write_roaming_keyframes_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   @keyframes pulse { from { background:#ff0000; } to { background:#0000ff; } }
-  .target { width:80px;height:80px;display:inline-block;background:#cccccc; }
-</style></head>
-<body><div id="storybook-root">
+  .target { width:80px;height:80px;display:inline-block;background:#cccccc; }"#,
+            r#"
   <div class="target" id="el1"></div>
   <div class="target" id="el2"></div>
   <div class="target" id="el3"></div>
   <div class="target" id="el4"></div>
-</div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var els = [
+"#,
+            r#"      var els = [
         document.getElementById('el1'),
         document.getElementById('el2'),
         document.getElementById('el3'),
         document.getElementById('el4')
       ];
-      var current = 0;
       function startOn(idx) {
         els[idx].style.animation = 'pulse 60s linear 1 forwards';
         els[idx].addEventListener('animationend', function handler() {
@@ -2518,13 +2516,8 @@ mod tests {
         });
       }
       startOn(0);
-      channel.emit('storyRendered', 'roaming');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', 'roaming');"#,
+        );
     }
 
     /// Web Animations API で id を持たない animation を連鎖するバンドル。
@@ -2532,26 +2525,12 @@ mod tests {
     /// `el.animate()` が返す Animation には `animationName` も `id` も無い。
     /// collectRunning が `''` を出す generic なケースの回帰テスト。
     fn write_waapi_chain_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
-  #box { width:100%;height:100vh;background:#ff0000; }
-</style></head>
-<body><div id="storybook-root"><div id="box"></div></div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var box = document.getElementById('box');
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#ff0000; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var box = document.getElementById('box');
       var phases = [
         [{ background: '#ff0000' }, { background: '#00ff00' }],
         [{ background: '#00ff00' }, { background: '#0000ff' }],
@@ -2565,13 +2544,8 @@ mod tests {
         anim.onfinish = function () { runNext(); };
       }
       runNext();
-      channel.emit('storyRendered', 'waapi-chain');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', 'waapi-chain');"#,
+        );
     }
 
     /// **わざと凍らせられないページ**。`animationend` で無限に連鎖し続ける。
@@ -2579,28 +2553,14 @@ mod tests {
     /// 静止の反復上限を超えて running が残り続けるため、fail-closed な
     /// レンダラは失敗を返さなければならない。修正前のコードでは成功扱いになる。
     fn write_unfreezable_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   @keyframes blink-a { from { opacity:1; } to { opacity:0.5; } }
   @keyframes blink-b { from { opacity:0.5; } to { opacity:1; } }
-  #box { width:100%;height:100vh;background:#ff0000; }
-</style></head>
-<body><div id="storybook-root"><div id="box"></div></div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      var box = document.getElementById('box');
+  #box { width:100%;height:100vh;background:#ff0000; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var box = document.getElementById('box');
       box.addEventListener('animationend', function handler(e) {
         // 無限連鎖: 一方が終わったら他方を開始する。
         if (e.animationName === 'blink-a') {
@@ -2610,13 +2570,8 @@ mod tests {
         }
       });
       box.style.animation = 'blink-a 0.03s linear 1 forwards';
-      channel.emit('storyRendered', 'unfreezable');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+      channel.emit('storyRendered', 'unfreezable');"#,
+        );
     }
 
     /// scroll timeline の二回撮り一致（progress-based timeline の回帰テスト）。
@@ -2892,68 +2847,97 @@ mod tests {
         renderer.close().await;
     }
 
-    /// **strict-CSP のページでは静止 CSS が拒否され fail-closed になる**こと。
+    /// **strict-CSP のページでも静止が成立する**こと（constructed stylesheet の本丸）。
     ///
-    /// CSP `style-src 'self'` は注入した inline style を拒否する。
-    /// `Page.setBypassCSP` による迂回は本番と異なる絵を撮ることになるため
-    /// 行わない。FREEZE_SCRIPT は `getComputedStyle` で適用を検証し、
-    /// 適用されていなければ `ok: false` を返して撮影を阻止する。
+    /// 旧実装（`<style>` の appendChild）は CSP `style-src 'self'` に例外なく
+    /// 黙殺され、検証層が fail-closed で落とすしかなかった——正当な story が
+    /// CSP という理由だけで撮れず、README は利用者へ `unsafe-inline` の追加を
+    /// 求めていた。注入を constructed stylesheet（CSSOM）へ移した現在、CSSOM
+    /// 操作は CSP style-src の管轄外なので、適用失敗そのものが構造的に起きない。
     ///
-    /// 証明する: `render_story`（freeze 込み）が style CSP に拒まれたとき
-    /// fail-closed で失敗すること。証明しない: CSP が本当に注入を拒むこと
+    /// 「撮れた」を「効いた」の証明にしないため、二段で確かめる:
+    /// 1. 可視キャレット（`caret-color:#cc0000`）の story を 2 回撮って一致
+    /// 2. その絵が、同じ CSP 下で `caret-color:transparent` を明示した対照と
+    ///    一致する——注入がキャレットを本当に不可視にしたときだけ成立する
+    ///
+    /// 証明する: `render_story`（freeze 込み）が style CSP 下でも静止 CSS を
+    /// 適用し決定的に撮れること。証明しない: CSP が `<style>` 注入を拒むこと
     /// 単体——それは下の positive control が担う。
     #[tokio::test(flavor = "multi_thread")]
-    async fn strict_csp_page_fails_closed_without_bypass() {
+    async fn strict_csp_page_freezes_via_the_constructed_stylesheet() {
         let Some(chromium) = discover_chromium() else {
-            eprintln!("SKIP strict_csp_page_fails_closed_without_bypass: no chromium");
+            eprintln!("SKIP strict_csp_page_freezes_via_the_constructed_stylesheet: no chromium");
             return;
         };
         let _guard = BROWSER_LOCK.lock().await;
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_strict_csp_bundle(dir.path());
-        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let visible_dir = tempfile::tempdir().expect("tempdir");
+        write_strict_csp_bundle(visible_dir.path(), "#cc0000");
+        let visible_server = StaticServer::start(visible_dir.path())
+            .await
+            .expect("start server");
+
+        let hidden_dir = tempfile::tempdir().expect("tempdir");
+        write_strict_csp_bundle(hidden_dir.path(), "transparent");
+        let hidden_server = StaticServer::start(hidden_dir.path())
+            .await
+            .expect("start server");
 
         let mut options = RenderOptions::new(chromium, 320, 240);
         options.story_timeout = Duration::from_secs(10);
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
-        let err = renderer
-            .render_story(&server.base_url(), "strict-csp")
+        let first = renderer
+            .render_story(&visible_server.base_url(), "strict-csp")
             .await
-            .expect_err(
-                "a strict-CSP page must fail — CSP blocks the injected CSS \
-                 and the computed-style check catches it",
+            .expect(
+                "a strict-CSP page is a legitimate story — the constructed \
+                 stylesheet must apply the freeze CSS despite style-src 'self'",
             );
+        let second = renderer
+            .render_story(&visible_server.base_url(), "strict-csp")
+            .await
+            .expect("second strict-csp capture");
+        assert_eq!(
+            first, second,
+            "strict-csp: two frozen captures must be byte-identical"
+        );
 
-        let message = err.to_string();
-        assert!(
-            message.contains("freeze failed") && message.contains("CSS not applied"),
-            "the error must describe the CSS verification failure, got {message:?}"
+        let hidden = renderer
+            .render_story(&hidden_server.base_url(), "strict-csp")
+            .await
+            .expect("strict-csp capture with an explicitly transparent caret");
+        assert_eq!(
+            first, hidden,
+            "under CSP the frozen caret must be indistinguishable from an \
+             explicitly transparent caret — otherwise the constructed stylesheet \
+             did not actually apply and the identity above proves nothing"
         );
 
         renderer.close().await;
     }
 
-    /// **positive control（CSP）**: bypass なしでは CSS が適用されないことの直接証拠。
+    /// **positive control（CSP）**: `<style>` の appendChild による注入は CSP に
+    /// 拒否されることの直接証拠——注入を constructed stylesheet へ移した理由の固定。
     ///
-    /// `Page.setBypassCSP` を呼ばずに inline style を注入し、
-    /// `getComputedStyle` で CSS が効いていないことを確認する。
-    /// 修正前のコードではこのページで `ok: true` が返り、fail-open になっていた。
+    /// `Page.setBypassCSP` を呼ばずに `<style>` を注入し、`getComputedStyle` で
+    /// CSS が効いていないことを確認する。ここが通らなくなったら（= CSP が
+    /// `<style>` 注入を拒まなくなったら）、constructed stylesheet を選んだ根拠が
+    /// 崩れているということであり、上の CSP 下静止テストの意味も変わる。
     ///
-    /// 証明する: fixture の CSP が手動注入の style を本当に拒むこと（`new_page`
+    /// 証明する: fixture の CSP が `<style>` 注入を本当に拒むこと（`new_page`
     /// 直・手動 evaluate）。証明しない: freeze・`render_story` 経路——この
-    /// テストはどちらも通っていない（そちらは上の fail-closed テストが担う）。
+    /// テストはどちらも通っていない（そちらは上の CSP 下静止テストが担う）。
     #[tokio::test(flavor = "multi_thread")]
-    async fn strict_csp_blocks_injection_without_bypass() {
+    async fn strict_csp_blocks_style_element_injection() {
         let Some(chromium) = discover_chromium() else {
-            eprintln!("SKIP strict_csp_blocks_injection_without_bypass: no chromium");
+            eprintln!("SKIP strict_csp_blocks_style_element_injection: no chromium");
             return;
         };
         let _guard = BROWSER_LOCK.lock().await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        write_strict_csp_bundle(dir.path());
+        write_strict_csp_bundle(dir.path(), "#cc0000");
         let server = StaticServer::start(dir.path()).await.expect("start server");
 
         let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 320, 240))
@@ -2964,14 +2948,7 @@ mod tests {
             server.base_url()
         );
         let page = renderer.browser.new_page(&url).await.expect("open page");
-        for _ in 0..100 {
-            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
-                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_until(&page, "document.readyState !== 'loading'").await;
 
         // bypass なし: inline style を注入しても CSP に拒否される
         page.evaluate(
@@ -3030,14 +3007,7 @@ mod tests {
 
         let url = format!("{}/iframe.html", server.base_url());
         let page = renderer.browser.new_page(&url).await.expect("open page");
-        for _ in 0..100 {
-            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
-                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_until(&page, "document.readyState !== 'loading'").await;
 
         let color = page
             .evaluate("getComputedStyle(document.getElementById('box')).backgroundColor")
@@ -3091,14 +3061,7 @@ mod tests {
 
         let url = format!("{}/iframe.html", server.base_url());
         let page = renderer.browser.new_page(&url).await.expect("open page");
-        for _ in 0..100 {
-            if let Ok(result) = page.evaluate("document.readyState !== 'loading'").await
-                && result.value().and_then(|v| v.as_bool()).unwrap_or(false)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_until(&page, "document.readyState !== 'loading'").await;
 
         let color = page
             .evaluate("getComputedStyle(document.getElementById('box')).backgroundColor")
@@ -3456,35 +3419,41 @@ mod tests {
     /// 約 30 秒後に `Error -32000: Promise was collected` という CDP エラーで
     /// 返ってきてしまう（実測）。保持すれば promise は生き続け、evaluate は
     /// 本当に永遠に返らない——ポーズ中の rAF をキューに積む実ページと同型。
-    fn write_raf_suppressed_bundle(root: &Path) {
+    ///
+    /// `ready_delay_ms` は `storyRendered` を撃つまでの遅延。READY 待ちに
+    /// story 予算の一部を意図的に消費させ、FREEZE evaluate へ渡る残余が
+    /// 縮むこと（deadline の共有）を実測するために使う。
+    fn write_raf_suppressed_bundle(root: &Path, ready_delay_ms: u64) {
         std::fs::write(
             root.join("iframe.html"),
-            r#"<!doctype html>
+            format!(
+                r#"<!doctype html>
 <html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
-  #box { width:100%;height:100vh;background:#00ff00; }
+  html,body{{margin:0;padding:0;background:#fff}}
+  #box {{ width:100%;height:100vh;background:#00ff00; }}
 </style></head>
 <body><div id="storybook-root"><div id="box"></div></div>
 <script>
   // rAF を握りつぶす。コールバックは保持するが永遠に呼ばない。
   window.__rafCallbacks = [];
-  window.requestAnimationFrame = function (cb) {
+  window.requestAnimationFrame = function (cb) {{
     window.__rafCallbacks.push(cb);
     return window.__rafCallbacks.length;
-  };
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
+  }};
+  var listeners = {{}};
+  var channel = {{
+    on: function (event, cb) {{ (listeners[event] = listeners[event] || []).push(cb); }},
+    emit: function (event, payload) {{
+      (listeners[event] || []).forEach(function (cb) {{ cb(payload); }});
+    }}
+  }};
+  setTimeout(function () {{
     window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () { channel.emit('storyRendered', 'raf-suppressed'); }, 20);
-  }, 20);
+    setTimeout(function () {{ channel.emit('storyRendered', 'raf-suppressed'); }}, {ready_delay_ms});
+  }}, 20);
 </script>
-</body></html>"#,
+</body></html>"#
+            ),
         )
         .expect("write iframe.html");
     }
@@ -3509,7 +3478,7 @@ mod tests {
         let _guard = BROWSER_LOCK.lock().await;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        write_raf_suppressed_bundle(dir.path());
+        write_raf_suppressed_bundle(dir.path(), 20);
         let server = StaticServer::start(dir.path()).await.expect("start server");
 
         let mut options = RenderOptions::new(chromium, 320, 240);
@@ -3538,6 +3507,121 @@ mod tests {
         renderer.close().await;
     }
 
+    /// **FREEZE evaluate は READY 待ちと同じ deadline を分け合う**こと
+    /// （独立予算による timeout 二重取りの回帰テスト）。
+    ///
+    /// READY まで約 5 秒かかり、かつ rAF を発火させないページ。story_timeout
+    /// = 10 秒のとき、freeze へ渡るのは残余（約 5 秒 − SETTLE_DELAY）であり、
+    /// 1 story の総所要は約 story_timeout + SETTLE_DELAY に収まる。修正前
+    /// （freeze に story_timeout をフル予算で与え直す）は約 5 + 10 = 15 秒超
+    /// かかっていた——13 秒の上限 assert がその再発を検知する。
+    ///
+    /// 証明する: freeze の時間上限が `started + story_timeout` の残余である
+    /// こと、および時間切れが READY 側と同じ [`RenderError::Timeout`] 分類で
+    /// 報告されること。証明しない: freeze の停止性そのもの（上の
+    /// `raf_suppressed_page_fails_within_the_story_timeout` が担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn freeze_timeout_shares_the_story_deadline_with_the_ready_wait() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP freeze_timeout_shares_the_story_deadline_with_the_ready_wait: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_raf_suppressed_bundle(dir.path(), 5000);
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let started = std::time::Instant::now();
+        let err = renderer
+            .render_story(&server.base_url(), "raf-suppressed")
+            .await
+            .expect_err("the freeze cannot finish on this page, so the story must fail");
+        let elapsed = started.elapsed();
+        renderer.close().await;
+
+        // 実測の要: 独立予算なら約 15 秒超（5s READY + 10s freeze）、残余なら
+        // 約 10 秒強で返る。CI のゆらぎぶんの余裕を見て 13 秒を境にする。
+        assert!(
+            elapsed < Duration::from_secs(13),
+            "the story must fail within roughly one story_timeout — \
+             {elapsed:?} suggests the freeze was given a fresh full budget \
+             instead of the remainder of the shared deadline"
+        );
+        assert!(
+            matches!(err, RenderError::Timeout { .. }),
+            "running out of the story budget must be classified as a timeout \
+             (same as the READY wait), got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze did not finish"),
+            "the timeout must still say which phase ran out, got {message:?}"
+        );
+    }
+
+    /// **注入層自身の失敗の fail-closed**: `CSSStyleSheet` コンストラクタが
+    /// 無い環境では、静止 CSS を注入する口が無く「注入できたか不明」のまま
+    /// 進むことになるため、黙って成功へ倒さず失敗が返ること。
+    ///
+    /// constructed stylesheet への移行で生まれた新しい層（sheet 構築・adopt）
+    /// にも、他の層と同じく「その層自身が失敗したときどう倒れるか」を数えて
+    /// おく——構築不能は errors → `ok: false`（モジュール先頭の
+    /// 「層ごとの失敗経路」表の静止 CSS 注入行）。
+    ///
+    /// 証明する: sheet を構築できない環境で `render_story` が撮らずに失敗する
+    /// こと。証明しない: 通常環境で sheet が効くこと（CSP 下静止テストと
+    /// frozen_* 系が担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_constructed_stylesheet_api_fails_instead_of_silently_succeeding() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP missing_constructed_stylesheet_api_fails_instead_of_silently_succeeding: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // FREEZE_SCRIPT は main world で評価されるので、同じ realm の
+        // コンストラクタを消せば「構築の口が無い環境」を再現できる。
+        write_story_html(
+            dir.path(),
+            "  html,body{margin:0;padding:0;background:#fff}\n  #box { width:100%;height:100vh;background:#00ff00; }",
+            r#"<div id="box"></div>"#,
+            r#"      delete window.CSSStyleSheet;
+      channel.emit('storyRendered', 'no-constructed-stylesheet');"#,
+        );
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "no-constructed-stylesheet")
+            .await
+            .expect_err(
+                "with no way to construct the freeze stylesheet, the story must \
+                 fail — not silently capture an unfrozen page",
+            );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("CSSStyleSheet constructor missing"),
+            "the error must name the missing injection API, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
     /// open shadow root の中の**擬似要素**に無限アニメを持つバンドル。
     ///
     /// `::before` のアニメは `Element.getAnimations()`（オプション無し）では
@@ -3547,32 +3631,20 @@ mod tests {
     /// 旧 collectRunning はこれを黙って `[]` へ倒し、走り続ける ::before の
     /// アニメを見逃して成功として撮っていた（fail-open）。
     fn write_shadow_pseudo_animation_bundle(root: &Path, break_api: bool) {
+        // sabotage は FREEZE_SCRIPT の evaluate（storyRendered 後）より前に
+        // 走ればよいので、チャンネル代入後のフックで消して同じ状況を作れる。
         let sabotage = if break_api {
-            "delete Document.prototype.getAnimations;\n  delete ShadowRoot.prototype.getAnimations;\n"
+            "      delete Document.prototype.getAnimations;\n      delete ShadowRoot.prototype.getAnimations;\n"
         } else {
             ""
         };
-        std::fs::write(
-            root.join("iframe.html"),
-            format!(
-                r#"<!doctype html>
-<html><head><style>
-  html,body{{margin:0;padding:0;background:#fff}}
-  x-pseudo {{ display:block; }}
-</style></head>
-<body><div id="storybook-root"></div>
-<script>
-  {sabotage}var listeners = {{}};
-  var channel = {{
-    on: function (event, cb) {{ (listeners[event] = listeners[event] || []).push(cb); }},
-    emit: function (event, payload) {{
-      (listeners[event] || []).forEach(function (cb) {{ cb(payload); }});
-    }}
-  }};
-  setTimeout(function () {{
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {{
-      var host = document.createElement('x-pseudo');
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  x-pseudo { display:block; }"#,
+            "",
+            &format!(
+                r#"{sabotage}      var host = document.createElement('x-pseudo');
       var sr = host.attachShadow({{ mode: 'open' }});
       sr.innerHTML =
         '<style>' +
@@ -3581,14 +3653,9 @@ mod tests {
         ' background:#ff0000; animation: sh-pulse 1.3s linear infinite; }}' +
         '</style><div class="pulse"></div>';
       document.getElementById('storybook-root').appendChild(host);
-      channel.emit('storyRendered', 'shadow-pseudo');
-    }}, 20);
-  }}, 20);
-</script>
-</body></html>"#
+      channel.emit('storyRendered', 'shadow-pseudo');"#
             ),
-        )
-        .expect("write iframe.html");
+        );
     }
 
     /// **positive control（shadow 内 running 見逃し）**: root 側の
@@ -3682,11 +3749,9 @@ mod tests {
     /// `currentTime` は `CSSNumericValue` のみ受理）——修正前は errors 経由で
     /// `ok: false` となり、この**正当な** story を落としていた（過剰拒否）。
     fn write_infinite_scroll_timeline_bundle(root: &Path) {
-        std::fs::write(
-            root.join("iframe.html"),
-            r#"<!doctype html>
-<html><head><style>
-  html,body{margin:0;padding:0;background:#fff}
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
   #scroller { width:100%;height:200px;overflow-y:scroll; }
   #content { height:1000px; }
   @keyframes scroll-fade { from { opacity:1; } to { opacity:0; } }
@@ -3694,32 +3759,15 @@ mod tests {
     width:100px;height:100px;background:#ff0000;
     animation: scroll-fade linear infinite;
     animation-timeline: scroll(nearest block);
-  }
-</style></head>
-<body><div id="storybook-root">
+  }"#,
+            r#"
   <div id="scroller">
     <div id="target"></div>
     <div id="content"></div>
   </div>
-</div>
-<script>
-  var listeners = {};
-  var channel = {
-    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
-    emit: function (event, payload) {
-      (listeners[event] || []).forEach(function (cb) { cb(payload); });
-    }
-  };
-  setTimeout(function () {
-    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
-    setTimeout(function () {
-      channel.emit('storyRendered', 'infinite-scroll-timeline');
-    }, 20);
-  }, 20);
-</script>
-</body></html>"#,
-        )
-        .expect("write iframe.html");
+"#,
+            "      channel.emit('storyRendered', 'infinite-scroll-timeline');",
+        );
     }
 
     /// infinite + progress-based timeline の正当な story が落とされないこと

@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
 use service::build_logs::LogLevel;
-use service::render::{RenderOptions, StaticServer, StoryRenderer};
+use service::render::{RenderError, RenderOptions, StaticServer, StoryRenderer};
 
 use crate::JobState;
 
@@ -317,9 +317,29 @@ fn decide_story_action(
 /// metadata に `reused` は付けない）。`Some` のときは [`decide_story_action`]
 /// に従い、撮影対象外のストーリーを baseline のスクリーンショットで流用する。
 ///
-/// MVP では 1 件でも失敗したらビルドごと失敗にする。
-/// （代替案: 失敗したストーリーだけ `comparisons` に error 行を作って残りは通す。
-/// レビュー UI に「撮れなかった」を出す設計が必要なので、そこは後続で扱う。）
+/// ## 失敗の粒度（story 単位の隔離）
+///
+/// story に固有の失敗（[`is_story_scoped`] — `storyErrored` 等の
+/// [`RenderError::Story`] と、静止不能・READY 不達の [`RenderError::Timeout`]）
+/// では**その story だけをエラーとし、残りの story は撮り続ける**。
+/// 全 story を処理し終えてから、失敗した story を列挙してビルドを失敗させる。
+/// 最初の 1 件で `?` 中断すると、静止できない story が 1 つあるだけで他の
+/// 全 story のスクリーンショットとログまで巻き添えで失われ、利用者は
+/// 「1 回のビルドで 1 件ずつ」しか失敗を発見できない。
+///
+/// ビルド自体は fail-closed のまま `failed` に落とす——失敗した story の
+/// スクリーンショットが欠けたまま `processing` へ進めると、比較結果が
+/// 「全 story 緑」に見えて偽 PASS の口になる（撮れなかった story を
+/// `comparisons` の error 行としてレビュー UI に出す形は後続で扱う）。
+///
+/// 環境・インフラ側の失敗（Chromium/CDP の異常 [`RenderError::Cdp`]、
+/// ストレージ・DB の失敗、スクリーンショット名の規則違反）は従来どおり
+/// 即中断する——次の story も同じ理由で落ちる公算が大きく、続行は
+/// 同じエラーの羅列に story_timeout×N の時間を費やすだけである。
+///
+/// 停止性: 隔離によって所要時間の上限は変わらない——成功する story も
+/// もともと 1 件あたり最大 `story_timeout` かけてよい契約であり、上限は
+/// 従来と同じ `stories × story_timeout` のままである。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
     state: &JobState,
@@ -338,6 +358,7 @@ async fn render_all(
 
     let mut rendered = 0usize;
     let mut reused = 0usize;
+    let mut story_failures: Vec<StoryFailure> = Vec::new();
     let total = bundle.stories.len();
 
     for (idx, story) in bundle.stories.iter().enumerate() {
@@ -360,10 +381,29 @@ async fn render_all(
 
         match action {
             StoryAction::Render => {
-                let png = renderer
-                    .render_story(base_url, &story.id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("render story `{}`: {e}", story.id))?;
+                let png = match renderer.render_story(base_url, &story.id).await {
+                    Ok(png) => png,
+                    // story 固有の失敗はその story だけをエラーにし、残りを
+                    // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
+                    Err(e) if is_story_scoped(&e) => {
+                        service::build_logs::append(
+                            &state.db,
+                            build.id,
+                            LogLevel::Error,
+                            format!("story failed {position}/{total} {}: {e}", story.id),
+                        )
+                        .await?;
+                        story_failures.push(StoryFailure {
+                            story_id: story.id.clone(),
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
+                    // 環境側の失敗は従来どおり即中断（続けても同じ理由で落ちる）。
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
+                    }
+                };
 
                 // `only_story_ids` モードのときだけ reused を明示する
                 // （`None` の従来経路は metadata を変えない）。
@@ -449,12 +489,15 @@ async fn render_all(
         }
     }
 
-    // 完了サマリ。撮影と流用の内訳を 1 行で残す。
+    // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
         &state.db,
         build.id,
         LogLevel::Info,
-        format!("render complete: rendered {rendered} reused {reused}"),
+        format!(
+            "render complete: rendered {rendered} reused {reused} failed {}",
+            story_failures.len()
+        ),
     )
     .await?;
 
@@ -462,10 +505,68 @@ async fn render_all(
         build_id = %build.id,
         rendered,
         reused,
+        failed = story_failures.len(),
         "storybook stories processed"
     );
 
+    // 失敗した story があればビルドは fail-closed で失敗させる。ここまで
+    // 残りの story は撮り終えているので、error_message とログには全失敗
+    // story が一度に列挙される——「1 回のビルドで 1 件ずつ」にならない。
+    if !story_failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{}",
+            summarize_story_failures(&story_failures, total)
+        ));
+    }
+
     Ok(())
+}
+
+/// 撮影に失敗した 1 story の記録。
+struct StoryFailure {
+    story_id: String,
+    message: String,
+}
+
+/// この失敗は story に固有か（= 他の story は撮り続けてよいか）。
+///
+/// - [`RenderError::Story`]: Storybook 自身のエラー通知（`storyErrored` 等）、
+///   静止の失敗・静止結果の解析不能——いずれもその story の内容に起因する
+/// - [`RenderError::Timeout`]: その story の描画・静止が時間予算内に
+///   終わらなかった——これも story の内容に起因する
+/// - [`RenderError::Cdp`] / [`RenderError::Launch`] / [`RenderError::Server`]:
+///   ブラウザ・配信側の異常。次の story も同じ理由で落ちる公算が大きく、
+///   隔離せず即中断する
+fn is_story_scoped(err: &RenderError) -> bool {
+    matches!(err, RenderError::Story { .. } | RenderError::Timeout { .. })
+}
+
+/// 失敗 story の一覧をビルドの `error_message` 用に 1 行へまとめる。
+///
+/// 呼び出し側（`process`）が 2000 文字へ truncate するため、詳細は先頭
+/// 10 件までにして残りは件数だけ伝える（10 件を超える失敗で先頭が
+/// 切り落とされて「何件失敗したか」まで消えるのを防ぐ）。
+fn summarize_story_failures(failures: &[StoryFailure], total: usize) -> String {
+    const DETAIL_LIMIT: usize = 10;
+    let details = failures
+        .iter()
+        .take(DETAIL_LIMIT)
+        .map(|f| format!("story `{}`: {}", f.story_id, f.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = if failures.len() > DETAIL_LIMIT {
+        format!(
+            " (and {} more, see the build log)",
+            failures.len() - DETAIL_LIMIT
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} of {} stories failed to render; the remaining stories were captured: {details}{more}",
+        failures.len(),
+        total
+    )
 }
 
 #[cfg(test)]
@@ -529,6 +630,75 @@ mod tests {
         assert_eq!(
             decide_story_action("card--default", "Card/Default", &only, &baseline),
             StoryAction::Render
+        );
+    }
+
+    /// story 固有の失敗（Story / Timeout）だけが隔離され、環境側の失敗
+    /// （Launch / Server / Cdp）は即中断のままであること。
+    ///
+    /// 証明する: [`is_story_scoped`] の分類のみ。証明しない: render_all の
+    /// ループが実際に continue すること（DB を要する統合経路。分類を通る
+    /// 分岐は match の構造で保証される）。
+    #[test]
+    fn story_scoped_failures_are_isolated_and_infrastructure_failures_are_not() {
+        use std::time::Duration;
+
+        let story = RenderError::Story {
+            story_id: "a--b".into(),
+            message: "freeze failed: 1 animation(s) still running".into(),
+        };
+        assert!(is_story_scoped(&story));
+
+        let timeout = RenderError::Timeout {
+            story_id: "a--b".into(),
+            timeout: Duration::from_secs(30),
+            phase: "the freeze did not finish",
+        };
+        assert!(is_story_scoped(&timeout));
+
+        let server = RenderError::Server("bind failed".into());
+        assert!(!is_story_scoped(&server));
+        // Launch / Cdp は chromiumoxide のエラー値が要るためここでは構築しない。
+        // is_story_scoped は Story / Timeout を列挙するホワイトリストなので、
+        // 新しい variant が増えても既定は「中断」側へ倒れる（fail-closed）。
+    }
+
+    /// 失敗一覧の要約が「何件中何件か」「残りは撮れたこと」「各 story の理由」を
+    /// 含み、11 件以上では先頭 10 件 + 残数へ丸められること。
+    #[test]
+    fn story_failure_summary_names_each_story_and_caps_the_details() {
+        let failures = vec![
+            StoryFailure {
+                story_id: "a--x".into(),
+                message: "freeze failed: 2 animation(s) still running".into(),
+            },
+            StoryFailure {
+                story_id: "b--y".into(),
+                message: "storyErrored: kaboom".into(),
+            },
+        ];
+        let summary = summarize_story_failures(&failures, 40);
+        assert!(
+            summary.contains("2 of 40 stories failed")
+                && summary.contains("the remaining stories were captured")
+                && summary.contains("story `a--x`: freeze failed")
+                && summary.contains("story `b--y`: storyErrored"),
+            "summary must name every failed story with its reason, got {summary:?}"
+        );
+
+        let many: Vec<StoryFailure> = (0..12)
+            .map(|i| StoryFailure {
+                story_id: format!("s--{i}"),
+                message: "freeze failed".into(),
+            })
+            .collect();
+        let summary = summarize_story_failures(&many, 50);
+        assert!(
+            summary.contains("12 of 50 stories failed")
+                && summary.contains("s--9")
+                && !summary.contains("s--10")
+                && summary.contains("and 2 more"),
+            "past 10 failures the summary must keep the count and drop the tail, got {summary:?}"
         );
     }
 }
