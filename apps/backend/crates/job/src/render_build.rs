@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
 use service::build_logs::LogLevel;
-use service::render::{RenderOptions, StaticServer, StoryRenderer};
+use service::render::{RenderError, RenderOptions, StaticServer, StoryRenderer};
 
 use crate::JobState;
 
@@ -317,9 +317,35 @@ fn decide_story_action(
 /// metadata に `reused` は付けない）。`Some` のときは [`decide_story_action`]
 /// に従い、撮影対象外のストーリーを baseline のスクリーンショットで流用する。
 ///
-/// MVP では 1 件でも失敗したらビルドごと失敗にする。
-/// （代替案: 失敗したストーリーだけ `comparisons` に error 行を作って残りは通す。
-/// レビュー UI に「撮れなかった」を出す設計が必要なので、そこは後続で扱う。）
+/// ## 失敗の粒度（story 単位の隔離）
+///
+/// story に固有の失敗では**その story だけをエラーとし、残りの story は
+/// 撮り続ける**。全 story を処理し終えてから、失敗した story を列挙して
+/// ビルドを失敗させる。最初の 1 件で `?` 中断すると、静止できない story が
+/// 1 つあるだけで他の全 story のスクリーンショットとログまで巻き添えで
+/// 失われ、利用者は「1 回のビルドで 1 件ずつ」しか失敗を発見できない。
+/// story 固有と分類するのは:
+///
+/// - レンダリングの失敗（[`is_story_scoped`] — `storyErrored` 等の
+///   [`RenderError::Story`] と、静止不能・READY 不達・freeze evaluate の
+///   CDP エラー期限切れの [`RenderError::Timeout`]）
+/// - スクリーンショット名の規則違反（[`parse_screenshot_name`] — story の
+///   title / name に起因し、他の story の名前とは独立）
+///
+/// ビルド自体は fail-closed のまま `failed` に落とす——失敗した story の
+/// スクリーンショットが欠けたまま `processing` へ進めると、比較結果が
+/// 「全 story 緑」に見えて偽 PASS の口になる（撮れなかった story を
+/// `comparisons` の error 行としてレビュー UI に出す形は後続で扱う）。
+///
+/// 環境・インフラ側の失敗（Chromium/CDP の異常 [`RenderError::Cdp`]、
+/// ストレージ・DB の失敗）は従来どおり即中断する——次の story も同じ理由で
+/// 落ちる公算が大きく、続行は同じエラーの羅列に story_timeout×N の時間を
+/// 費やすだけである。分類の全経路は `service::render::browser` モジュール
+/// 先頭の「story 固有の失敗と環境の失敗」表を参照。
+///
+/// 停止性: 隔離によって所要時間の上限は変わらない——成功する story も
+/// もともと 1 件あたり最大 `story_timeout` かけてよい契約であり、上限は
+/// 従来と同じ `stories × story_timeout` のままである。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
     state: &JobState,
@@ -338,18 +364,36 @@ async fn render_all(
 
     let mut rendered = 0usize;
     let mut reused = 0usize;
+    let mut story_failures: Vec<StoryFailure> = Vec::new();
     let total = bundle.stories.len();
 
     for (idx, story) in bundle.stories.iter().enumerate() {
         let position = idx + 1;
         // 名前規則（ScreenshotName——アップロード経路と同一）。storybook の
         // title / name から生成した名前が規則に合わない場合は、黙って加工せず
-        // ビルドを失敗させて story 側の修正を促す（加工すると baseline 名との
-        // 突き合わせがずれる）。
-        let screenshot_name = common::validation::ScreenshotName::parse(story.screenshot_name())
-            .map_err(|e| {
-                anyhow::anyhow!("screenshot name for story `{}` is invalid: {e}", story.id)
-            })?;
+        // 失敗させて story 側の修正を促す（加工すると baseline 名との
+        // 突き合わせがずれる）。違反は story の title / name に起因する
+        // **story 固有の失敗**なので、レンダリング失敗と同じく story 単位で
+        // 隔離する——複数 story が違反していても 1 回のビルドで全件が
+        // 列挙され、「直しては次の 1 件」の反復にならない。名前は撮影にも
+        // baseline 流用にも要るため、隔離は Render / Reuse の分岐より前で行う。
+        let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
+            Ok(name) => name,
+            Err(failure) => {
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Error,
+                    format!(
+                        "story failed {position}/{total} {}: {}",
+                        story.id, failure.message
+                    ),
+                )
+                .await?;
+                story_failures.push(failure);
+                continue;
+            }
+        };
         let screenshot_name_str = screenshot_name.as_str().to_string();
 
         // `only_story_ids` 無しは常に撮影（後方互換）。
@@ -360,10 +404,29 @@ async fn render_all(
 
         match action {
             StoryAction::Render => {
-                let png = renderer
-                    .render_story(base_url, &story.id)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("render story `{}`: {e}", story.id))?;
+                let png = match renderer.render_story(base_url, &story.id).await {
+                    Ok(png) => png,
+                    // story 固有の失敗はその story だけをエラーにし、残りを
+                    // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
+                    Err(e) if is_story_scoped(&e) => {
+                        service::build_logs::append(
+                            &state.db,
+                            build.id,
+                            LogLevel::Error,
+                            format!("story failed {position}/{total} {}: {e}", story.id),
+                        )
+                        .await?;
+                        story_failures.push(StoryFailure {
+                            story_id: story.id.clone(),
+                            message: e.to_string(),
+                        });
+                        continue;
+                    }
+                    // 環境側の失敗は従来どおり即中断（続けても同じ理由で落ちる）。
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
+                    }
+                };
 
                 // `only_story_ids` モードのときだけ reused を明示する
                 // （`None` の従来経路は metadata を変えない）。
@@ -449,12 +512,15 @@ async fn render_all(
         }
     }
 
-    // 完了サマリ。撮影と流用の内訳を 1 行で残す。
+    // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
         &state.db,
         build.id,
         LogLevel::Info,
-        format!("render complete: rendered {rendered} reused {reused}"),
+        format!(
+            "render complete: rendered {rendered} reused {reused} failed {}",
+            story_failures.len()
+        ),
     )
     .await?;
 
@@ -462,10 +528,90 @@ async fn render_all(
         build_id = %build.id,
         rendered,
         reused,
+        failed = story_failures.len(),
         "storybook stories processed"
     );
 
+    // 失敗した story があればビルドは fail-closed で失敗させる。ここまで
+    // 残りの story は撮り終えているので、error_message とログには全失敗
+    // story が一度に列挙される——「1 回のビルドで 1 件ずつ」にならない。
+    if !story_failures.is_empty() {
+        return Err(anyhow::anyhow!(
+            "{}",
+            summarize_story_failures(&story_failures, total)
+        ));
+    }
+
     Ok(())
+}
+
+/// 撮影に失敗した 1 story の記録。
+struct StoryFailure {
+    story_id: String,
+    message: String,
+}
+
+/// storybook の title / name から生成したスクリーンショット名を検証する。
+///
+/// 違反は story の内容（title / name）に起因する **story 固有の失敗**として
+/// [`StoryFailure`] で返す——呼び出し側（`render_all`）はレンダリング失敗と
+/// 同じく隔離して残りの story を処理し続け、ループ後にまとめてビルドを
+/// 失敗させる。修正前はここの `?` 相当の即中断が「1 ビルドで違反 1 件ずつ」
+/// しか報告できなかった。
+fn parse_screenshot_name(
+    story_id: &str,
+    raw: &str,
+) -> Result<common::validation::ScreenshotName, StoryFailure> {
+    common::validation::ScreenshotName::parse(raw).map_err(|e| StoryFailure {
+        story_id: story_id.to_string(),
+        message: format!("screenshot name {raw:?} is invalid: {e}"),
+    })
+}
+
+/// この失敗は story に固有か（= 他の story は撮り続けてよいか）。
+///
+/// - [`RenderError::Story`]: Storybook 自身のエラー通知（`storyErrored` 等）、
+///   静止の失敗・静止結果の解析不能——いずれもその story の内容に起因する
+/// - [`RenderError::Timeout`]: その story の描画・静止が時間予算内に
+///   終わらなかった——これも story の内容に起因する。freeze evaluate の
+///   CDP エラー（story 側の navigation / reload・rAF コールバック捨てによる
+///   pending promise の GC 回収）もレンダラが deadline までリトライした上で
+///   この分類に倒れてくる
+/// - [`RenderError::Cdp`] / [`RenderError::Launch`] / [`RenderError::Server`]:
+///   ブラウザ・配信側の異常。次の story も同じ理由で落ちる公算が大きく、
+///   隔離せず即中断する（Cdp がここへ届くのは `new_page` / hook 注入 /
+///   `goto` / スクリーンショットの、story のスクリプトを待たない CDP 往復
+///   だけ——分類の全経路は `service::render::browser` モジュール先頭の表）
+fn is_story_scoped(err: &RenderError) -> bool {
+    matches!(err, RenderError::Story { .. } | RenderError::Timeout { .. })
+}
+
+/// 失敗 story の一覧をビルドの `error_message` 用に 1 行へまとめる。
+///
+/// 呼び出し側（`process`）が 2000 文字へ truncate するため、詳細は先頭
+/// 10 件までにして残りは件数だけ伝える（10 件を超える失敗で先頭が
+/// 切り落とされて「何件失敗したか」まで消えるのを防ぐ）。
+fn summarize_story_failures(failures: &[StoryFailure], total: usize) -> String {
+    const DETAIL_LIMIT: usize = 10;
+    let details = failures
+        .iter()
+        .take(DETAIL_LIMIT)
+        .map(|f| format!("story `{}`: {}", f.story_id, f.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let more = if failures.len() > DETAIL_LIMIT {
+        format!(
+            " (and {} more, see the build log)",
+            failures.len() - DETAIL_LIMIT
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{} of {} stories failed to render; the remaining stories were captured: {details}{more}",
+        failures.len(),
+        total
+    )
 }
 
 #[cfg(test)]
@@ -529,6 +675,136 @@ mod tests {
         assert_eq!(
             decide_story_action("card--default", "Card/Default", &only, &baseline),
             StoryAction::Render
+        );
+    }
+
+    /// story 固有の失敗（Story / Timeout）だけが隔離され、環境側の失敗
+    /// （Launch / Server / Cdp）は即中断のままであること。
+    ///
+    /// 証明する: [`is_story_scoped`] の分類のみ。証明しない: render_all の
+    /// ループが実際に continue すること（DB を要する統合経路。分類を通る
+    /// 分岐は match の構造で保証される）。
+    #[test]
+    fn story_scoped_failures_are_isolated_and_infrastructure_failures_are_not() {
+        use std::time::Duration;
+
+        let story = RenderError::Story {
+            story_id: "a--b".into(),
+            message: "freeze failed: 1 animation(s) still running".into(),
+        };
+        assert!(is_story_scoped(&story));
+
+        let timeout = RenderError::Timeout {
+            story_id: "a--b".into(),
+            timeout: Duration::from_secs(30),
+            phase: "the freeze did not finish",
+        };
+        assert!(is_story_scoped(&timeout));
+
+        let server = RenderError::Server("bind failed".into());
+        assert!(!is_story_scoped(&server));
+        // Launch / Cdp は chromiumoxide のエラー値が要るためここでは構築しない。
+        // is_story_scoped は Story / Timeout を列挙するホワイトリストなので、
+        // 新しい variant が増えても既定は「中断」側へ倒れる（fail-closed）。
+    }
+
+    /// 名前規則違反が story 固有の失敗（[`StoryFailure`]）として返り、
+    /// 正当な名前は通ること。
+    #[test]
+    fn screenshot_name_violation_becomes_a_story_failure() {
+        let ok = parse_screenshot_name("button--primary", "Button/Primary");
+        assert!(ok.is_ok(), "a rule-abiding name must parse");
+
+        let failure = parse_screenshot_name("button--primary", "Button/Primary ")
+            .expect_err("a name with trailing whitespace violates the rule");
+        assert_eq!(failure.story_id, "button--primary");
+        assert!(
+            failure.message.contains("invalid") && failure.message.contains("Button/Primary "),
+            "the failure must name the offending screenshot name and say it is \
+             invalid, got {:?}",
+            failure.message
+        );
+    }
+
+    /// **複数の名前規則違反が 1 回のビルドで全件報告される**こと。
+    ///
+    /// 修正前は最初の違反で `?` 即中断し（`anyhow!("screenshot name for story
+    /// `{}` is invalid: ...")` を return）、違反が 3 件あっても利用者は
+    /// 「直しては次の 1 件」を 3 ビルド繰り返すしかなかった。修正後は
+    /// [`parse_screenshot_name`] が違反を [`StoryFailure`] として返し、
+    /// `render_all` がレンダリング失敗と同じ経路で収集する——ここでは
+    /// その収集と要約の合成を、違反 2 件 + 正当 1 件で固定する。
+    ///
+    /// 証明する: 違反の全件が [`StoryFailure`] として集まり、要約に両方の
+    /// story と理由が載ること。証明しない: `render_all` のループが実際に
+    /// continue すること（DB を要する統合経路。分岐は match の構造で保証——
+    /// 上の `story_scoped_failures_are_isolated_...` の但し書きと同じ）。
+    #[test]
+    fn multiple_name_violations_are_all_reported_in_one_build() {
+        let stories = [
+            ("a--bad-tail", "Bad/Tail "),
+            ("b--good", "Good/Name"),
+            ("c--bad-control", "Bad/Con\ttrol"),
+        ];
+        let mut failures = Vec::new();
+        let mut parsed = 0usize;
+        for (story_id, raw) in stories {
+            match parse_screenshot_name(story_id, raw) {
+                Ok(_) => parsed += 1,
+                Err(failure) => failures.push(failure),
+            }
+        }
+        assert_eq!(parsed, 1, "the valid story must still be processed");
+        assert_eq!(
+            failures.len(),
+            2,
+            "every violation must be collected instead of stopping at the first"
+        );
+        let summary = summarize_story_failures(&failures, stories.len());
+        assert!(
+            summary.contains("2 of 3 stories failed")
+                && summary.contains("a--bad-tail")
+                && summary.contains("c--bad-control"),
+            "one build must report every violating story at once, got {summary:?}"
+        );
+    }
+
+    /// 失敗一覧の要約が「何件中何件か」「残りは撮れたこと」「各 story の理由」を
+    /// 含み、11 件以上では先頭 10 件 + 残数へ丸められること。
+    #[test]
+    fn story_failure_summary_names_each_story_and_caps_the_details() {
+        let failures = vec![
+            StoryFailure {
+                story_id: "a--x".into(),
+                message: "freeze failed: 2 animation(s) still running".into(),
+            },
+            StoryFailure {
+                story_id: "b--y".into(),
+                message: "storyErrored: kaboom".into(),
+            },
+        ];
+        let summary = summarize_story_failures(&failures, 40);
+        assert!(
+            summary.contains("2 of 40 stories failed")
+                && summary.contains("the remaining stories were captured")
+                && summary.contains("story `a--x`: freeze failed")
+                && summary.contains("story `b--y`: storyErrored"),
+            "summary must name every failed story with its reason, got {summary:?}"
+        );
+
+        let many: Vec<StoryFailure> = (0..12)
+            .map(|i| StoryFailure {
+                story_id: format!("s--{i}"),
+                message: "freeze failed".into(),
+            })
+            .collect();
+        let summary = summarize_story_failures(&many, 50);
+        assert!(
+            summary.contains("12 of 50 stories failed")
+                && summary.contains("s--9")
+                && !summary.contains("s--10")
+                && summary.contains("and 2 more"),
+            "past 10 failures the summary must keep the count and drop the tail, got {summary:?}"
         );
     }
 }

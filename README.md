@@ -511,6 +511,183 @@ VRT がバンドルを展開してローカルに配信し、ヘッドレス Chr
 > なっていた。名前を黙って加工する経路としない経路の不整合は同種の突き合わせ
 > ずれを生み続けるので、加工はせず入口で拒否する側に一本化した。
 
+#### 撮影の決定化（キャレット・アニメーションの静止）
+
+レンダラは撮影の直前に、ページを時刻に依存しない静止状態へ固定してから撮る。
+利用者側の Storybook や preview に設定を足す必要はない。
+
+- 入力キャレットは `caret-color: transparent` で不可視にする
+  （明滅の位相で差分が出ることがなくなる）
+- 有限の CSS アニメーション・transition・Web Animations は**終端**へシークして止める
+- 無限アニメーション（スピナー等）は**先頭（進行度 0）**へ巻き戻して止める
+
+いずれも「いつ撮ったか」に依存しない一意な座標へ固定するので、
+同じ story は何度撮っても同じ PNG になる。
+paused にするだけでは止まる位置がタイミング依存のままなので、そうはしていない。
+
+静止用の CSS は document だけでなく **open shadow root のそれぞれ**にも
+constructed stylesheet（`new CSSStyleSheet()` + `adoptedStyleSheets`）として
+注入する。`caret-color` の継承値は shadow 内で明示された宣言に負け、
+`transition-duration` はそもそも継承しないので、document への注入だけでは
+shadow の中に届かないためである。同一オリジンの iframe（shadow 内に
+置かれたものを含む）にも root 単位で再帰し、同じ注入とアニメーション静止を
+行う。CSSOM 経由の注入は CSP `style-src` の管轄外なので、
+`style-src 'self'` のような厳しい CSP を持つページでもそのまま効く
+（CSP 側の設定変更は不要）。
+
+**移行手順**: この決定化が入った版へ更新した直後の最初のビルドでは、
+アニメーションやキャレットを含む story が `changes_detected` になりうる
+（baseline は静止前の絵のままだから）。これは想定どおりの一度きりの差分で、
+UI でレビューして承認すれば静止後の絵が新しい baseline になり、以降は安定する。
+
+**この版から新しい失敗クラスが増える**: 従来は「揺れる絵のまま成功」して
+いた story——静止しきれないアニメーション連鎖を持つもの、静止処理を時間内に
+終えられないもの、静止 CSS の適用を検証できなかったもの——が、この版からは
+**エラーとして表面化する**。緑だったビルドが更新後に失敗へ転じたら、
+まずビルドログの `story failed ...` 行を見ること。失敗は story 単位で報告され、
+**残りの story の撮影は最後まで続行される**（storybook の title / name から
+生成したスクリーンショット名が名前規則に合わない場合も、同じく story 単位で
+報告される）——エラーメッセージとログには
+失敗した story が一度に列挙されるので、1 ビルドごとに 1 件ずつしか
+発見できない形にはならない（ただし失敗が 1 件でもあればビルド自体は
+`failed` になる。撮れなかった story を欠いたまま比較へ進めると、
+差分ゼロに見える偽の成功を作るためである）。
+
+なお、静止を story 単位で無効化する opt-out の口は意図的に設けていない。
+静止できない story は「揺れる絵を黙って baseline に混ぜる」のではなく
+エラーとして表面化させ、Storybook 側で動きを止めた状態の story を用意するのが
+正しい対処である——opt-out はその場しのぎに使われた瞬間から、差分が出ても
+不思議でない絵を緑として通し続ける偽 PASS の口になる。
+
+**届かない範囲**: 次のものは静止できない。
+
+- closed shadow root・クロスオリジン iframe の中
+- canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーション
+  （Worker からの `OffscreenCanvas` 描画・WebGL / WebGPU を含む——メインスレッドの
+  外で進むものは rAF の差し替えにも掛からない）
+- **ブラウザが Web Animations のタイムラインの外で進める時間変化**。静止処理は
+  running なアニメーションを `getAnimations()` で数えてシーク・pause するが、
+  次のものはそこに**載らない**（Chromium 実測で `document.getAnimations()` が
+  返さないことを確認済み）ため、シークも pause もできず、**残っていても検知
+  できない**——静止は成功と報告されるが、撮った絵はタイミング依存でありうる:
+  - アニメーション画像（GIF / APNG / アニメーション WebP・AVIF）のフレーム送り
+  - `<video>` / `<audio>` の再生（自動再生の映像フレーム、ネイティブコントロールの
+    進行表示を含む）
+  - SVG SMIL アニメーション（`<animate>` / `<animateTransform>` /
+    `<animateMotion>`）
+  - 進行中の smooth scroll（`scroll-behavior: smooth` や
+    `scrollTo({ behavior: 'smooth' })` によるスクロール位置の遷移）
+  - `<marquee>` のスクロール
+  - UA シャドウ内の組み込みアニメーション（不確定状態の `<progress>` 等——
+    closed shadow root と同じく外から列挙する口が無い）
+- 読み込み・描画の進行に伴う**一度きり**の見た目変化: 遅延読み込み画像
+  （`loading="lazy"`）・画像のデコード完了・Web Font の適用（FOUT / FOIT）・
+  `content-visibility: auto` の遅延描画。アニメーションではないので静止の
+  対象にならず、描画完了シグナル後の settle 待ちが吸収する best-effort
+- 利用者側スタイルが要素セレクタ等で `!important` 明示した `caret-color` /
+  `transition`（注入 CSS も `!important` だが `*` セレクタ＝specificity 0
+  なので、`!important` 同士の比較では specificity の高い利用者側の宣言が勝つ。
+  これは best-effort であり、個別要素の上書きまでは検出しない）
+- 静止処理より後から JS で生成される shadow root や iframe
+
+逆に、`@property` で登録したカスタムプロパティの animation / transition と、
+同一 document の View Transitions（`::view-transition-*` 擬似要素の
+`CSSAnimation`）は `getAnimations()` に**載る**（Chromium 実測）ので、
+通常のアニメーションと同じく静止の対象になる。
+
+そうした story は動きを止めた状態を Storybook 側で用意すること
+（動画はポスターフレーム、GIF は静止画への差し替え、SMIL は
+`<svg>` 側で `animate` を外した story を使う、等）。
+
+**静止に失敗した story はエラーになる**: 静止処理は最終巡回後に running な
+animation が残っていないことを検証する。残っていれば、そのストーリーの
+スクリーンショットは撮らず、`freeze failed: N animation(s) still running
+after M sweep(s): [...]` の形式でエラーを返す。これは既存の `storyErrored` /
+`storyThrewException` と同じエラー経路（`RenderError::Story`）を通るので、
+ビルドの結果には「この story は静止できなかった」という理由が表示される。
+「なぜか差分が出続ける」よりも原因に辿り着きやすい。静止処理は安定状態まで
+反復し（上限 10 巡）、有限の `animationend` 連鎖であれば収束して成功する。
+収束の判定は running な animation が**ゼロになったか**で行う。ゼロになれば
+即座に抜け、残っていれば上限まで反復を続ける。identity（animation 名と
+対象要素の proxy）による早期停止は行わない——proxy では要素の同一性を表せず、
+同一 keyframes が異なる要素へ順移動する連鎖（el1→el2→el3→el4）を
+誤判定するためである。
+無限に連鎖し続けるアニメーションは上限を超えて失敗になるので、Storybook 側で
+止めた状態の story を用意すること。progress-based timeline
+（`animation-timeline: scroll()` 等）の `endTime` は `CSSNumericValue`
+（percent）であり、型を保って `currentTime` に渡すことで正しく静止する。
+これは無限（`infinite`）の progress-based アニメーションでも同じで、
+巻き戻し先の進行度 0 も `CSSUnitValue(0, "percent")` として型を保って渡す
+（数値 0 の代入は `TypeError` になるため）。
+
+**静止処理そのものにも時間上限がある**: 静止は `requestAnimationFrame` を
+待って収束を確かめるため、rAF が発火しないページ（差し替え・停止した
+レンダリングパイプライン等）では静止処理が終わらない。この場合も
+ハングはしない。描画完了待ちと静止処理は **story ごとの時間予算
+（`story_timeout`）を分け合う**——静止処理には予算の残り時間だけが渡され、
+1 story の所要は最悪でもおよそ `story_timeout` に収まる。予算を使い切ると
+`did not complete within ...: the freeze did not finish ...` の形式の
+タイムアウトエラーとして返る（描画完了待ちの時間切れと同じ分類）。
+
+**注入した CSS の適用も検証する**: 注入は constructed stylesheet で行うため
+CSP に拒否されることはないが、「adopt の操作が成功した」ことと「CSS が
+実際にカスケードへ入った」ことは別である。レンダラは `getComputedStyle` で
+静止 CSS 専用のプローブ（`--vrt-frozen`）が root ごとに効いていることを
+実測し、効いていなければ fail-closed で失敗を返す。プローブは既定値を
+持たないので、既定値との偶然の一致で検証が素通りすることもない。
+検証の対象はあくまで「注入 sheet が root に効いているか」であり、利用者側の
+`!important` による個別要素の上書き（上記「届かない範囲」）は検証では
+落とさない——それを落とすと best-effort の契約と食い違うためである。
+CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮ることになるため、
+迂回は行わない（CSSOM 経由の注入は CSP の管轄外なので迂回する理由もない）。
+
+**検証層自身の失敗も fail-closed である**: `getComputedStyle` が throw する
+（ページ側スクリプトによる差し替え・切り離された document 等）など、静止処理の
+どの層でも内部エラーが 1 件でもあれば、撮影せず失敗を返す。「静止できたと
+確かめられていない」状態で撮った絵を baseline に混ぜないためである。
+これは**セキュリティ境界ではない**——脅威モデルは一貫して「事故」であり、
+悪意あるページへの防御ではない（成功の応答そのものを偽造するページは
+原理的に検出できない）。main world の組み込み関数（`JSON.stringify` /
+`getComputedStyle` / `getAnimations` 等）の差し替え・欠落を失敗として扱うのは、
+悪意の検出のためではなく、polyfill や計測コードの事故・壊れた環境を
+沈黙させないためである（root 側の `getAnimations` が無いと擬似要素の
+アニメーションを数える口が無く、「残っていない」と「数えられなかった」を
+区別できないまま撮ることになる）。
+各層の失敗経路の一覧はレンダラのモジュールコメント
+（`crates/service/src/render/browser.rs` の「層ごとの失敗経路」）を参照。
+
+**静止後に始まる transition のイベントも届かない**: 静止は
+`transition-duration: 0s` / `transition-delay: 0s` の注入で行う。CSS Transitions
+の仕様では duration と delay の合計（combined duration）が 0s より大きいときに
+だけ transition が開始されるため、静止後にスタイルが変わっても transition は
+そもそも生成されず、プロパティ値だけが即座に終値へ変わる。生成されない以上
+`transitionrun` / `transitionstart` / `transitionend` はどれも発火しない。
+静止の時点で**すでに走っていた** transition は別で、終端へシークされて完了し、
+その `transitionend` は発火する（どちらの向きもレンダラのテストで実測して
+固定してある）。ゆえに **静止よりあとに始まる transition の `transitionend`
+を合図に見た目を変えるコンポーネント——たとえば transition の完了を待って
+クラスを付け替える、要素を取り除く、次の状態へ進めるもの——は、その更新が
+起きる前の絵で撮られる**。transition を連鎖させるコンポーネントなら、静止時に
+走っていた 1 本ぶんの完了イベントまでは届き、そこから先の transition は
+始まらない。自分の story がこの形かどうかで、撮れる絵が変わる。厳密に最終状態を撮りたい場合は、
+イベント待ちを経ずに最終状態を直接描く story を用意すること。
+
+これは意図した割り切りである。理由は二つ。
+
+1. このシステムの目的は決定的な静止画であり、ページは静止の直後に撮られて
+   それ以降の相互作用は無い。イベントを合図に進む先の状態は撮影対象ではない
+2. 仮に transition を生成させて `transitionend` を発火させると（たとえば
+   Web Animations API で終端までシークして完了させる形）、それに依存する
+   状態更新がいつ描画へ反映されるかが撮影タイミングに依存してしまい、
+   「時刻に依存しない絵を撮る」という目的そのものに反する
+
+イベント互換性より撮影の決定性を優先している。
+
+なお、これが効くのは **storybook モードだけ**である。`screenshots` モード
+（既定）では撮影は CI 側のテストランナーの仕事であり、VRT は受け取った PNG を
+比較するだけなので、キャレット隠蔽やアニメーション静止は撮影側で行うこと
+（Playwright なら `caret: 'hide'` / `animations: 'disabled'` に相当）。
+
 #### `vrt` CLI で 1 コマンド（推奨）
 
 同梱の CLI（`apps/backend/crates/cli`、バイナリ名 `vrt`）を使うと、ビルド作成 →
