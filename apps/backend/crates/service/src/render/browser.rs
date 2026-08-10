@@ -6,6 +6,9 @@
 //!    ループバック限定なので外部からは触れない
 //! 2. [`StoryRenderer`] が chromiumoxide で Chromium を起動し、
 //!    `http://127.0.0.1:{port}/iframe.html?id={story_id}&viewMode=story` を開く
+//!    （project 設定で有効な場合は、ナビゲーション前に
+//!    `Emulation.setEmulatedMedia` で `prefers-reduced-motion: reduce` を
+//!    エミュレートし、撮影直前に適用を実測する——効いていなければ撮らない）
 //! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
 //!    短い settle 待ちのあと [`FREEZE_SCRIPT`] でキャレットとアニメーションを
 //!    決定的に静止させてから、ビューポートを PNG で撮る
@@ -139,6 +142,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
@@ -633,6 +637,61 @@ const FREEZE_SCRIPT: &str = r#"
 })()
 "#;
 
+/// reduced-motion エミュレーションが実際に効いているかを撮影直前に実測するプローブ。
+///
+/// `Emulation.setEmulatedMedia` の応答が成功でも、「メディアクエリが実際に
+/// 変わった」ことの証明にはならない——できたことは効いたことの証明ではない。
+/// 二輪で実測する:
+///
+/// 1. **CSS 輪**: constructed stylesheet の `@media (prefers-reduced-motion:
+///    reduce)` 内でだけ立つカスタムプロパティ（`--vrt-reduced-motion`）を
+///    `getComputedStyle` で読む。CSS カスケードの実評価であり、
+///    `matchMedia` 関数オブジェクトには依存しない
+/// 2. **matchMedia 輪**: `window.matchMedia('(prefers-reduced-motion:
+///    reduce)').matches === true`。JS 実装が実際に参照する観測面であり、
+///    reduce を返さない壊れた/モックされた `matchMedia`（polyfill・テスト
+///    ダブルの事故）をここで検出する——CSS 輪だけでは「CSS には効いたが
+///    JS には見えない」ページを素通ししてしまう
+///
+/// どちらか一方でも不成立なら `ok: false`（fail-closed）。プローブ自体の
+/// throw も `errors` → `ok: false` で、集めた診断は判定にも表示にも使う。
+/// 両輪とも偽装するページは原理的に検出できない（モジュール doc の表を参照）。
+const REDUCED_MOTION_PROBE: &str = r#"
+(() => {
+  const errors = [];
+  let cssApplied = false;
+  let mmMatches = false;
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(
+      '@media (prefers-reduced-motion: reduce) { :root { --vrt-reduced-motion: on; } }'
+    );
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+    cssApplied =
+      getComputedStyle(document.documentElement)
+        .getPropertyValue('--vrt-reduced-motion')
+        .trim() === 'on';
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((s) => s !== sheet);
+    if (!cssApplied) {
+      errors.push('the reduce media query did not apply to the CSS cascade');
+    }
+  } catch (e) {
+    errors.push('css probe: ' + String(e));
+  }
+  try {
+    mmMatches = window.matchMedia('(prefers-reduced-motion: reduce)').matches === true;
+    if (!mmMatches) {
+      errors.push(
+        'matchMedia does not report reduce (the emulation was not applied, or matchMedia is broken or mocked)'
+      );
+    }
+  } catch (e) {
+    errors.push('matchMedia probe: ' + String(e));
+  }
+  return JSON.stringify({ ok: cssApplied && mmMatches, errors: errors });
+})()
+"#;
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -723,6 +782,13 @@ pub struct RenderOptions {
     /// 検証する positive control のためにある。本番経路（`render_build`）は
     /// [`RenderOptions::new`] を通るので常に `true`。
     pub freeze_before_capture: bool,
+    /// `prefers-reduced-motion: reduce` をエミュレートして撮るか。
+    /// 既定は `false`（project 設定の既定 OFF と一致）。
+    ///
+    /// `true` のときはナビゲーション前に `Emulation.setEmulatedMedia` を
+    /// 一度設定し、撮影直前に [`REDUCED_MOTION_PROBE`] で「実際に効いている」
+    /// ことを実測する。効いていると確かめられなければ撮らない（fail-closed）。
+    pub emulate_reduced_motion: bool,
 }
 
 impl RenderOptions {
@@ -737,6 +803,7 @@ impl RenderOptions {
             viewport_height,
             story_timeout: DEFAULT_STORY_TIMEOUT,
             freeze_before_capture: true,
+            emulate_reduced_motion: false,
         }
     }
 }
@@ -913,6 +980,29 @@ impl StoryRenderer {
             })?;
 
         let result = async {
+            // reduced-motion のエミュレーションは**ナビゲーション前**に一度
+            // 設定する。撮影直前に設定すると、初期化時に一度だけ
+            // `matchMedia` を読む実装（この層の主対象である rAF / canvas
+            // 実装の最頻形）には見えない——OS で reduce を設定した実利用者は
+            // ページ読み込みの最初から reduce で描画されるのであり、それと
+            // 同じ条件で撮る。`Emulation.setEmulatedMedia` はセッション状態
+            // なのでナビゲーションを跨いで効き続け、「実際に効いているか」は
+            // 撮影直前に [`REDUCED_MOTION_PROBE`] で実測する（fail-closed）。
+            // story のスクリプトを待たない一往復の CDP コマンドなので、
+            // 失敗は `new_page` と同じ環境分類（無応答は chromiumoxide の
+            // request timeout（既定 30 秒）が拾う——モジュール doc の表を参照）。
+            if self.options.emulate_reduced_motion {
+                page.execute(
+                    SetEmulatedMediaParams::builder()
+                        .feature(MediaFeature::new("prefers-reduced-motion", "reduce"))
+                        .build(),
+                )
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+            }
             page.evaluate_on_new_document(READY_HOOK_SCRIPT)
                 .await
                 .map_err(|source| RenderError::Cdp {
@@ -985,6 +1075,44 @@ impl StoryRenderer {
         }
 
         tokio::time::sleep(SETTLE_DELAY).await;
+
+        // reduced-motion を要求した project では、撮影直前に「実際に効いて
+        // いる」ことを実測する。setEmulatedMedia の応答が成功でも効いた
+        // 証明にはならず、「reduce を要求したのに適用されなかった」が
+        // 黙って通れば、静止させたと信じたまま動く絵を撮る（fail-closed）。
+        // evaluate の CDP エラーは READY probe / FREEZE evaluate と同じ扱いで
+        // deadline までリトライし、期限で story 分類の Timeout に倒す。
+        if self.options.emulate_reduced_motion {
+            let probe_result = loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, page.evaluate(REDUCED_MOTION_PROBE)).await {
+                    Ok(Ok(result)) => break result,
+                    Err(_) => {
+                        return Err(RenderError::Timeout {
+                            story_id: story_id.to_string(),
+                            timeout: self.options.story_timeout,
+                            phase: "the reduced-motion verification never returned a verdict",
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        tracing::trace!(
+                            %story_id, error = %e,
+                            "reduced-motion probe evaluate failed; retrying"
+                        );
+                        if std::time::Instant::now() + POLL_INTERVAL >= deadline {
+                            return Err(RenderError::Timeout {
+                                story_id: story_id.to_string(),
+                                timeout: self.options.story_timeout,
+                                phase: "the reduced-motion verification evaluate kept \
+                                 failing until the story deadline",
+                            });
+                        }
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                }
+            };
+            reduced_motion_verdict(probe_result.value(), story_id)?;
+        }
 
         // 撮影直前にキャレットとアニメーションを決定的な座標へ固定する。
         // 静止に失敗したまま撮ると flaky な絵が baseline に混ざるので、
@@ -1154,6 +1282,64 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
                      after {sweeps} sweep(s): [{names}]{errors_note}",
                     count = running.map(|a| a.len()).unwrap_or(0),
                     sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0),
+                ),
+            })
+        }
+        None => Err(unparseable(format!(
+            "missing or non-boolean `ok` key (raw: {raw})"
+        ))),
+    }
+}
+
+/// [`REDUCED_MOTION_PROBE`] の返り値を検分し、撮影へ進んでよいか判定する。
+///
+/// [`freeze_verdict`] と同じ受理条件——`ok` が `true` であると確かめられた
+/// 場合にだけ `Ok(())` を返し、それ以外はすべて失敗（fail-closed）:
+///
+/// - `ok: false` — **エミュレーションが効いていると確かめられなかった**。
+///   `errors` にどちらの輪（CSS / matchMedia）が不成立だったかが載る
+/// - 値が文字列でない／JSON として読めない／`ok` が無い・bool でない —
+///   **検証結果を解析できなかった**。効いているかどうか自体が不明
+///
+/// どちらも既存の freeze 失敗と同じ [`RenderError::Story`] 経路を使う
+/// （story 単位に隔離され、残りの story は撮り続けられる）。
+fn reduced_motion_verdict(
+    value: Option<&serde_json::Value>,
+    story_id: &str,
+) -> Result<(), RenderError> {
+    let unparseable = |detail: String| RenderError::Story {
+        story_id: story_id.to_string(),
+        message: format!("reduced-motion verification result was unparseable: {detail}"),
+    };
+    let Some(raw) = value.and_then(|v| v.as_str()) else {
+        return Err(unparseable(format!(
+            "expected a JSON string, got {value:?}"
+        )));
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| unparseable(format!("{e} (raw: {raw})")))?;
+    match parsed.get("ok").and_then(|v| v.as_bool()) {
+        // 効いていると確かめられた。撮影へ進む。`ok` 以外のキーは検査しない
+        // （将来プローブが返すものを増やしても正当な応答を弾かない）。
+        Some(true) => Ok(()),
+        Some(false) => {
+            let errors_note = parsed
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(" (errors: {joined})")
+                })
+                .unwrap_or_default();
+            Err(RenderError::Story {
+                story_id: story_id.to_string(),
+                message: format!(
+                    "reduced-motion emulation was requested but could not be \
+                     verified as applied{errors_note}"
                 ),
             })
         }
@@ -4088,6 +4274,259 @@ mod tests {
             "infinite scroll timeline: two frozen captures must be byte-identical"
         );
 
+        renderer.close().await;
+    }
+
+    /// reduced-motion を尊重して見た目が変わるバンドル。エミュレーション検証用。
+    ///
+    /// - `demo-rm--box` : 上半分は **CSS メディアクエリ**で色が変わる
+    ///   （通常 赤 / reduce 青）。下半分は **JS が描画時に一度だけ
+    ///   `matchMedia` を読んで**色を決める（通常 黄 / reduce 緑）。
+    ///   JS 側はエミュレーションが**ナビゲーション前に**効いていることの
+    ///   証明になる——撮影直前に設定したのでは、描画時に読んだ値は
+    ///   通常のままで黄が出る
+    /// - `demo-rm--mocked` : `window.matchMedia` を「常に matches: false」の
+    ///   モックへ差し替えるページ（polyfill / テストダブルの事故を模す）。
+    ///   エミュレーション有効時は検証の matchMedia 輪が不成立になり、
+    ///   fail-closed で落ちるべき対象
+    fn write_reduced_motion_bundle(root: &Path) {
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  .css-box { width:100%; height:50vh; background:#ff0000; }
+  @media (prefers-reduced-motion: reduce) { .css-box { background:#0000ff; } }"#,
+            "",
+            r#"      var root = document.getElementById('storybook-root');
+      if (id === 'demo-rm--mocked') {
+        window.matchMedia = function () {
+          return { matches: false, media: '',
+                   addEventListener: function () {}, removeEventListener: function () {} };
+        };
+      }
+      var cssBox = document.createElement('div');
+      cssBox.className = 'css-box';
+      root.appendChild(cssBox);
+      var jsBox = document.createElement('div');
+      jsBox.style.width = '100%';
+      jsBox.style.height = '50vh';
+      jsBox.style.background =
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches
+          ? '#00ff00' : '#ffff00';
+      root.appendChild(jsBox);
+      channel.emit('storyRendered', id);"#,
+        );
+    }
+
+    /// `ok === true` と確かめられたときだけ成功。それ以外——`ok: false`・
+    /// 解析不能——はすべて失敗（fail-closed）。[`freeze_verdict`] と同じ
+    /// 受理条件を reduced-motion 検証にも要求する。
+    ///
+    /// 証明する: `reduced_motion_verdict` の受理条件のみ。証明しない:
+    /// 実ブラウザでプローブがこの形の JSON を返すこと（実ブラウザ系が担う）。
+    #[test]
+    fn reduced_motion_verdict_accepts_only_a_verified_ok_true() {
+        let json = |raw: &str| serde_json::Value::String(raw.to_string());
+
+        assert!(reduced_motion_verdict(Some(&json(r#"{"ok":true}"#)), "s").is_ok());
+        // 将来プローブの戻り値を拡張しても ok:true なら通る。
+        assert!(
+            reduced_motion_verdict(Some(&json(r#"{"ok":true,"errors":[],"extra":1}"#)), "s")
+                .is_ok()
+        );
+
+        // ok:false は「効いていると確かめられなかった」。errors が原因ごと載る。
+        let message = reduced_motion_verdict(
+            Some(&json(
+                r#"{"ok":false,"errors":["matchMedia does not report reduce"]}"#,
+            )),
+            "s",
+        )
+        .expect_err("ok:false must fail")
+        .to_string();
+        assert!(
+            message.contains("could not be verified")
+                && message.contains("matchMedia does not report reduce"),
+            "the failure must carry the probe's diagnostics, got {message:?}"
+        );
+
+        // 解析不能はすべて「効いているか不明」の失敗。成功へ倒さない。
+        let unparseable: Vec<(&str, Option<serde_json::Value>)> = vec![
+            ("evaluate returned no value", None),
+            ("non-string value", Some(serde_json::json!(42))),
+            ("non-JSON string", Some(json("not json"))),
+            ("missing ok key", Some(json(r#"{"errors":[]}"#))),
+            ("non-boolean ok", Some(json(r#"{"ok":"true"}"#))),
+        ];
+        for (label, value) in &unparseable {
+            let message = reduced_motion_verdict(value.as_ref(), "s")
+                .expect_err(&format!("{label}: must fail"))
+                .to_string();
+            assert!(
+                message.contains("unparseable"),
+                "{label}: the error must say the result could not be parsed, got {message:?}"
+            );
+        }
+    }
+
+    /// **positive control**: reduced-motion エミュレーションが絵を実際に
+    /// 変えること、そして決定的であること。
+    ///
+    /// - OFF: CSS 輪は赤・JS 輪は黄（fixture が動いていることの対照——
+    ///   ここで色が出なければ、ON の検証は何も証明しない）
+    /// - ON: CSS 輪は青（メディアクエリが CSS カスケードに効いた）・
+    ///   JS 輪は緑（**描画時に一度だけ読む** `matchMedia` にも見えた =
+    ///   ナビゲーション前の適用が効いている）
+    /// - ON の二回撮りはバイト一致（決定性）・ON と OFF の絵は異なる
+    ///
+    /// 証明する: エミュレーションの適用・検証・配線が経路全体として効くこと
+    /// （「設定が有効なのに呼び出しが漏れる」経路をこのテストが貫通して固定）。
+    /// 証明しない: 適用に失敗したとき落ちること（下の mocked テストが担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reduced_motion_emulation_changes_the_picture_and_is_deterministic() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP reduced_motion_emulation_changes_the_picture_and_is_deterministic: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        // OFF（既定）: 通常の絵。fixture が本当に分岐を描いていることの対照。
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch (emulation off)");
+        let off = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("capture without emulation");
+        renderer.close().await;
+
+        let image = decode_png(&off);
+        let css = image.get_pixel(160, 60);
+        let js = image.get_pixel(160, 180);
+        assert_eq!(
+            (css[0], css[1], css[2]),
+            (255, 0, 0),
+            "without emulation the CSS branch must be the no-preference color"
+        );
+        assert_eq!(
+            (js[0], js[1], js[2]),
+            (255, 255, 0),
+            "without emulation the render-time matchMedia read must be no-preference"
+        );
+
+        // ON: reduce の絵。二回撮って決定性も確かめる。
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch (emulation on)");
+        let first = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("first capture with emulation");
+        let second = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("second capture with emulation");
+        renderer.close().await;
+
+        assert_eq!(
+            first, second,
+            "two captures under reduced-motion emulation must be byte-identical"
+        );
+        assert_ne!(
+            first, off,
+            "the emulated capture must differ from the non-emulated one — \
+             otherwise the emulation changed nothing and the switch is a no-op"
+        );
+
+        let image = decode_png(&first);
+        let css = image.get_pixel(160, 60);
+        let js = image.get_pixel(160, 180);
+        assert_eq!(
+            (css[0], css[1], css[2]),
+            (0, 0, 255),
+            "the reduce media query must reach the CSS cascade"
+        );
+        assert_eq!(
+            (js[0], js[1], js[2]),
+            (0, 255, 0),
+            "a render-time matchMedia read must see reduce — the emulation must be \
+             applied before navigation, not right before the capture"
+        );
+    }
+
+    /// **fail-closed**: エミュレーションを要求したのに「効いている」と
+    /// 確かめられないページでは、撮らずに失敗すること。
+    ///
+    /// fixture は `window.matchMedia` を「常に matches: false」のモックへ
+    /// 差し替える（polyfill / テストダブルの事故を模す）。CSS 輪は効いて
+    /// いるが matchMedia 輪が不成立——JS 実装には reduce が見えないまま
+    /// 撮ることになるので、fail-closed で落とす。**検証を入れる前の実装
+    /// （setEmulatedMedia を呼ぶだけ）はこのページを成功として撮っていた**
+    /// ——このテストが落ちなくなったら、検証が判定から外れている。
+    ///
+    /// 対照: エミュレーションを**要求していない** project では、同じページが
+    /// 成功する——モックされた matchMedia は「reduce を要求した」ときにだけ
+    /// 失敗になる（検証は要求の裏取りであり、ページの行儀の監査ではない）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch (emulation on)");
+        let err = renderer
+            .render_story(&server.base_url(), "demo-rm--mocked")
+            .await
+            .expect_err(
+                "a page whose matchMedia cannot confirm the emulation must fail \
+                 instead of being captured",
+            );
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be verified") && message.contains("matchMedia"),
+            "the error must say the emulation could not be verified and name the \
+             failing probe, got {message:?}"
+        );
+        assert!(
+            matches!(err, RenderError::Story { .. }),
+            "the failure must be story-scoped so the remaining stories keep rendering"
+        );
+
+        // 対照: 要求していなければ同じページでも成功する。
+        options.emulate_reduced_motion = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch (emulation off)");
+        renderer
+            .render_story(&server.base_url(), "demo-rm--mocked")
+            .await
+            .expect("without the request the mocked page is a legitimate story");
         renderer.close().await;
     }
 

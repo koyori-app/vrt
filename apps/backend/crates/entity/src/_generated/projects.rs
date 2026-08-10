@@ -27,6 +27,10 @@ pub struct Model {
     /// プロジェクトごとに保持する完了ビルド数の上限。NULL は無制限（既定）。
     /// 超過した古い完了ビルドは自動削除される（現行 baseline の参照元は残す）。
     pub build_retention_limit: Option<i32>,
+    /// storybook モードの撮影時に `prefers-reduced-motion: reduce` を
+    /// エミュレートするか。既定 false——有効にすると撮る絵が変わり、
+    /// baseline が一度入れ替わるため。
+    pub emulate_reduced_motion: bool,
     /// GitHub App のインストール ID。Phase 6 で `github_installations` への FK にする。
     pub github_installation_id: Option<i64>,
     #[sea_orm(column_type = "Text", nullable)]

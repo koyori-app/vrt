@@ -240,11 +240,7 @@ async fn run(
     let server = StaticServer::start(&bundle.root).await?;
     let base_url = server.base_url();
 
-    let options = RenderOptions::new(
-        chromium_path,
-        project.viewport_width.max(1) as u32,
-        project.viewport_height.max(1) as u32,
-    );
+    let options = render_options_for_project(chromium_path, &project);
     let renderer = StoryRenderer::launch(options).await?;
 
     // ブラウザは成功・失敗どちらでも必ず閉じる（`?` で早期 return しない）。
@@ -277,6 +273,26 @@ async fn run(
     tracing::info!(%build_id, number = build.number, "storybook render finished; compare job enqueued");
 
     Ok(())
+}
+
+/// project 設定から [`RenderOptions`] を組む。
+///
+/// ここが project 列とレンダラをつなぐ**唯一の配線**である。
+/// `emulate_reduced_motion` の「設定が有効な project なのに呼び出し自体が
+/// 漏れる」経路は実行時には検知できない（検知器の不在そのものがこの失敗）
+/// ため、配線を 1 箇所に寄せて単体テストで固定する
+/// （`service::render::browser` モジュール先頭の失敗経路表を参照）。
+fn render_options_for_project(
+    chromium_path: String,
+    project: &entity::projects::Model,
+) -> RenderOptions {
+    let mut options = RenderOptions::new(
+        chromium_path,
+        project.viewport_width.max(1) as u32,
+        project.viewport_height.max(1) as u32,
+    );
+    options.emulate_reduced_motion = project.emulate_reduced_motion;
+    options
 }
 
 /// ストーリー 1 件をどう処理するか。
@@ -622,6 +638,44 @@ mod tests {
     fn truncate_limits_error_messages() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate(&"x".repeat(50), 10).len(), 10);
+    }
+
+    fn project_fixture(emulate_reduced_motion: bool) -> entity::projects::Model {
+        let now = chrono::Utc::now().fixed_offset();
+        entity::projects::Model {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            name: "p".into(),
+            slug: "p".into(),
+            default_branch: "main".into(),
+            diff_threshold: 0.1,
+            diff_ratio_fail: 0.0,
+            viewport_width: 1280,
+            viewport_height: 720,
+            build_retention_limit: None,
+            emulate_reduced_motion,
+            github_installation_id: None,
+            github_repo: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// **project 列 `emulate_reduced_motion` がレンダラのオプションへ届く**こと。
+    ///
+    /// 「設定が有効な project なのに呼び出し自体が漏れる」経路は実行時には
+    /// 検知できないため、唯一の配線であるこの関数をテストで固定する。
+    /// 両方向を見る——ON が届くことだけでなく、OFF の project が ON に
+    /// 化けないことも（既定 OFF の契約）。
+    #[test]
+    fn reduced_motion_setting_reaches_the_render_options() {
+        let on = render_options_for_project("chromium".into(), &project_fixture(true));
+        assert!(on.emulate_reduced_motion);
+        let off = render_options_for_project("chromium".into(), &project_fixture(false));
+        assert!(!off.emulate_reduced_motion);
+        // 既存の配線が壊れていないこと（viewport・freeze 既定）。
+        assert_eq!((on.viewport_width, on.viewport_height), (1280, 720));
+        assert!(on.freeze_before_capture);
     }
 
     #[test]
