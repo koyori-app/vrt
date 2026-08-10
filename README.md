@@ -545,7 +545,9 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
 終えられないもの、静止 CSS の適用を検証できなかったもの——が、この版からは
 **エラーとして表面化する**。緑だったビルドが更新後に失敗へ転じたら、
 まずビルドログの `story failed ...` 行を見ること。失敗は story 単位で報告され、
-**残りの story の撮影は最後まで続行される**——エラーメッセージとログには
+**残りの story の撮影は最後まで続行される**（storybook の title / name から
+生成したスクリーンショット名が名前規則に合わない場合も、同じく story 単位で
+報告される）——エラーメッセージとログには
 失敗した story が一度に列挙されるので、1 ビルドごとに 1 件ずつしか
 発見できない形にはならない（ただし失敗が 1 件でもあればビルド自体は
 `failed` になる。撮れなかった story を欠いたまま比較へ進めると、
@@ -561,13 +563,41 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
 
 - closed shadow root・クロスオリジン iframe の中
 - canvas / `requestAnimationFrame` など JS が毎フレーム描き直すアニメーション
+  （Worker からの `OffscreenCanvas` 描画・WebGL / WebGPU を含む——メインスレッドの
+  外で進むものは rAF の差し替えにも掛からない）
+- **ブラウザが Web Animations のタイムラインの外で進める時間変化**。静止処理は
+  running なアニメーションを `getAnimations()` で数えてシーク・pause するが、
+  次のものはそこに**載らない**（Chromium 実測で `document.getAnimations()` が
+  返さないことを確認済み）ため、シークも pause もできず、**残っていても検知
+  できない**——静止は成功と報告されるが、撮った絵はタイミング依存でありうる:
+  - アニメーション画像（GIF / APNG / アニメーション WebP・AVIF）のフレーム送り
+  - `<video>` / `<audio>` の再生（自動再生の映像フレーム、ネイティブコントロールの
+    進行表示を含む）
+  - SVG SMIL アニメーション（`<animate>` / `<animateTransform>` /
+    `<animateMotion>`）
+  - 進行中の smooth scroll（`scroll-behavior: smooth` や
+    `scrollTo({ behavior: 'smooth' })` によるスクロール位置の遷移）
+  - `<marquee>` のスクロール
+  - UA シャドウ内の組み込みアニメーション（不確定状態の `<progress>` 等——
+    closed shadow root と同じく外から列挙する口が無い）
+- 読み込み・描画の進行に伴う**一度きり**の見た目変化: 遅延読み込み画像
+  （`loading="lazy"`）・画像のデコード完了・Web Font の適用（FOUT / FOIT）・
+  `content-visibility: auto` の遅延描画。アニメーションではないので静止の
+  対象にならず、描画完了シグナル後の settle 待ちが吸収する best-effort
 - 利用者側スタイルが要素セレクタ等で `!important` 明示した `caret-color` /
   `transition`（注入 CSS も `!important` だが `*` セレクタ＝specificity 0
   なので、`!important` 同士の比較では specificity の高い利用者側の宣言が勝つ。
   これは best-effort であり、個別要素の上書きまでは検出しない）
 - 静止処理より後から JS で生成される shadow root や iframe
 
-そうした story は動きを止めた状態を Storybook 側で用意すること。
+逆に、`@property` で登録したカスタムプロパティの animation / transition と、
+同一 document の View Transitions（`::view-transition-*` 擬似要素の
+`CSSAnimation`）は `getAnimations()` に**載る**（Chromium 実測）ので、
+通常のアニメーションと同じく静止の対象になる。
+
+そうした story は動きを止めた状態を Storybook 側で用意すること
+（動画はポスターフレーム、GIF は静止画への差し替え、SMIL は
+`<svg>` 側で `animate` を外した story を使う、等）。
 
 **静止に失敗した story はエラーになる**: 静止処理は最終巡回後に running な
 animation が残っていないことを検証する。残っていれば、そのストーリーの

@@ -48,6 +48,7 @@
 //! | 静止 CSS 注入（`freezeRoot`） | throw・API 欠落を検知 | constructed stylesheet（CSSOM）で注入する。構築・`replaceSync`・`adoptedStyleSheets` 代入の throw、`CSSStyleSheet` コンストラクタの欠落は `errors` → `ok: false`（fail-closed）。CSSOM 操作は CSP `style-src` の管轄外なので、旧 `<style>` 注入が持っていた「CSP による例外なしの黙殺」という検知不能経路は**構造ごと消えている** |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
 //! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を READY 待ちと共有の deadline（`started + story_timeout`）の残余の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
+//! | FREEZE evaluate の CDP 往復 | 検知 | evaluate 自体のエラー——story 側の navigation / reload による「Inspected target navigated or closed」、rAF コールバックを捨てるページでの pending promise GC 回収「Promise was collected」（いずれも -32000・実測）——は READY probe と同様 deadline までリトライし、期限で [`RenderError::Timeout`]（story 単位に隔離。即中断の [`RenderError::Cdp`] へは倒さない） |
 //! | running 収集（`collectRunning`） | throw・API 欠落を検知 | 収集は `freezeRoot` と共通の `collectAnimations` を通る。`getAnimations`・走査の失敗、および root 側 `getAnimations` API の欠落（擬似要素アニメを数える口が無い）は `errors` → `ok: false`（fail-closed。空 `[]` へ黙って倒さない）。クロスオリジン iframe の中は**原理的に数えられぬ**（`contentDocument` が null）——README「届かない範囲」に契約として明記 |
 //! | CSS 適用検証 | 検知 | 注入 sheet が root のカスケードに入ったかを、root ごとに 1 要素の `--vrt-frozen` プローブで実測する（sheet の存在は root 単位の性質なので 1 点で足りる。既定値と偶然一致して素通しする値でもない）。プローブ欠落は `ok: false`、検証呼び出し自体の throw も `errors` → `ok: false`（fail-closed）。個別要素の `!important` 上書きは検証対象に**しない**——README「届かない範囲」の best-effort 契約であり、ハード失敗させると契約と食い違う。切り離された root は描画に影響しないため対象外 |
 //! | 結果の JSON 化 | 間接的に検知 | `JSON.stringify` の差し替え・失敗は文字列でない/読めない応答となり、Rust 側 [`freeze_verdict`] が unparseable として失敗（fail-closed） |
@@ -74,9 +75,43 @@
 //! |----|----|----|----|
 //! | Chromium 起動 | `LAUNCH_TIMEOUT` ×最大 `LAUNCH_MAX_ATTEMPTS` 回 | [`RenderError::Launch`] | `launching_a_missing_chromium_fails_fast` |
 //! | READY 待ち（probe ポーリング） | `story_timeout` の deadline | [`RenderError::Timeout`] / [`RenderError::Story`] | `a_story_that_renders_nothing_still_produces_a_screenshot`・`a_story_error_signal_fails_fast_with_the_reason` |
-//! | FREEZE evaluate | READY 待ちと**共有**の deadline（`started + story_timeout`）の残余。1 story の最悪所要は約 `story_timeout` + `SETTLE_DELAY` に収まる | [`RenderError::Timeout`]（時間切れ。READY 側と同じ分類）/ [`RenderError::Cdp`] | `raf_suppressed_page_fails_within_the_story_timeout`・`freeze_timeout_shares_the_story_deadline_with_the_ready_wait` |
+//! | FREEZE evaluate | READY 待ちと**共有**の deadline（`started + story_timeout`）の残余。1 story の最悪所要は約 `story_timeout` + `SETTLE_DELAY` に収まる | [`RenderError::Timeout`]（時間切れ。READY 側と同じ分類。evaluate の CDP エラーも READY probe と同様 deadline までリトライし、期限で同じ Timeout——即 [`RenderError::Cdp`] へは倒さない） | `raf_suppressed_page_fails_within_the_story_timeout`・`freeze_timeout_shares_the_story_deadline_with_the_ready_wait`・`reloading_page_during_freeze_fails_story_scoped`・`collected_freeze_promise_fails_story_scoped` |
 //! | FREEZE 結果の解析 | 即時（待ちなし） | [`RenderError::Story`]（`freeze_verdict`） | `freeze_verdict_*` 単体群・`garbled_freeze_result_fails_instead_of_silently_succeeding` |
 //! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
+//!
+//! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
+//!
+//! **経路を足したら、その失敗が story 固有か環境かを決めてこの表に行を足す
+//! こと。** 分類基準は「次の story も同じ理由で落ちるか」——story の内容に
+//! 起因する失敗はその story だけをエラーにして残りを撮り続け（発見性）、
+//! 環境の失敗は即中断する（続行は同じエラーの羅列に story_timeout×N を
+//! 費やすだけ）。判定の実装は `render_build::is_story_scoped`（[`RenderError`]
+//! のホワイトリスト——新 variant の既定は中断側）と、名前検証の隔離
+//! （`render_build::render_all`）。**隔離してもビルドは fail-closed のまま**
+//! ——story_failures が 1 件でもあればビルドは `failed` になり、緑には
+//! ならない。
+//!
+//! | 経路 | エラー | 分類 | 根拠 |
+//! |----|----|----|----|
+//! | Chromium 起動 | [`RenderError::Launch`] | 環境（ループ前に中断） | story を 1 つも処理できない |
+//! | 静的サーバー起動 | [`RenderError::Server`] | 環境（ループ前に中断） | 同上 |
+//! | `new_page` / READY hook 注入 / `goto` | [`RenderError::Cdp`] | 環境（即中断） | story のスクリプトはまだ実行されていない——失敗の原因にブラウザ側しかいない |
+//! | READY probe の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | ナビゲーション中の一時的な context 差し替えが主因 |
+//! | READY 待ち時間切れ | [`RenderError::Timeout`] | story | その story が描画完了シグナルを出さない |
+//! | `storyErrored` 等のシグナル | [`RenderError::Story`] | story | Storybook 自身による story 単位の失敗通知 |
+//! | FREEZE evaluate のエラー・ハング | リトライ→期限で [`RenderError::Timeout`] | story | navigation / reload・rAF 捨ては story のスクリプトの挙動（実測経路は上表） |
+//! | FREEZE verdict（静止失敗・解析不能） | [`RenderError::Story`] | story | その story のアニメーション・応答の内容に起因 |
+//! | スクリーンショット | [`RenderError::Cdp`] | 環境（即中断） | JS を待たない一往復の CDP コマンド——失敗はブラウザ側 |
+//! | スクリーンショット名の規則違反 | `StoryFailure` 直行（`render_build`） | story | story の title / name に起因。全違反を 1 ビルドで列挙する |
+//! | ストレージ・DB・baseline 流用の失敗 | `anyhow`（`render_build`） | 環境（即中断） | 保存経路の異常は次の story でも再現する |
+//! | バンドル展開・stories 空 | `anyhow`（`render_build`） | ビルド全体（ループ前に中断） | story 以前の前提が壊れている |
+//!
+//! 誤分類の非対称性（自己点検）: 環境の失敗を story と誤分類しても、ビルドは
+//! story_failures 非空で `failed` のまま（fail-open にならない）、続く story は
+//! 同じ環境異常なら `new_page` の環境分類で中断する——失う最大は 1 story 分の
+//! 時間予算。逆に story の失敗を環境と誤分類すると「1 ビルドで 1 件ずつ」しか
+//! 発見できない劣化になる（cmd_631/632 が潰した形）。どちらの向きも
+//! 「環境起因をビルド緑で通す」経路にはならない。
 //!
 //! ## 後始末
 //!
@@ -308,9 +343,11 @@ JSON.stringify((() => {
 /// open shadow root と同一オリジン iframe（shadow 内にあるものも含む）は
 /// root 単位で再帰的に辿り、CSS 注入とアニメーションのシークを行う。
 /// closed shadow root、クロスオリジン iframe、canvas / rAF 駆動の JS
-/// アニメーション、および利用者側が `!important` で宣言した
+/// アニメーション、`getAnimations()` に載らないブラウザネイティブの時間変化
+/// （アニメーション画像・メディア再生・SVG SMIL・smooth scroll 等——Chromium
+/// 実測で不可視を確認）、および利用者側が `!important` で宣言した
 /// `caret-color` / `transition` には届かない
-/// （モジュール末尾のテストと README の記載を参照）。
+/// （モジュール末尾のテストと README「届かない範囲」を参照）。
 const FREEZE_SCRIPT: &str = r#"
 (async () => {
   const MAX_SWEEPS = 10;
@@ -958,19 +995,47 @@ impl StoryRenderer {
             // 失敗として返す（fail-closed）。独立予算にすると 1 story の
             // 最悪所要が約 2×story_timeout になり、「story ごとの描画
             // タイムアウト」という README の契約を裏切るためである。
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let freeze_result = tokio::time::timeout(remaining, page.evaluate(FREEZE_SCRIPT))
-                .await
-                .map_err(|_| RenderError::Timeout {
-                    story_id: story_id.to_string(),
-                    timeout: self.options.story_timeout,
-                    phase: "the freeze did not finish: the page never yielded a verdict \
-                     (requestAnimationFrame may not be firing)",
-                })?
-                .map_err(|source| RenderError::Cdp {
-                    story_id: story_id.to_string(),
-                    source,
-                })?;
+            //
+            // evaluate の CDP エラーは READY probe と**同じ扱い**でリトライする。
+            // 実測で確認済みの経路が二つある（cmd_632）: story 側スクリプトの
+            // navigation / reload が pending evaluate の実行コンテキストを壊す
+            // 「Inspected target navigated or closed」（-32000。context 破棄系）
+            // と、rAF コールバックを捨てるページで pending promise が GC に
+            // 回収される「Promise was collected」（-32000）。どちらも撮影対象ページの内容に起因する story 固有の
+            // 失敗であり、ここで即 [`RenderError::Cdp`]（環境分類→ビルド即中断）
+            // へ倒すと、その story 1 件がビルド全体を巻き添えにする——READY 側は
+            // リトライして期限で Timeout（story 分類）に倒れるのに、freeze 側
+            // だけ即中断という非対称だった。期限まで直らなければ READY 側と
+            // 同じ [`RenderError::Timeout`] で返す。本物の環境異常（ブラウザ死）
+            // でも失うのは最大 1 story ぶんの予算で、次の story の `new_page` が
+            // 環境分類の Cdp で中断する（分類表はモジュール先頭を参照）。
+            let freeze_result = loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, page.evaluate(FREEZE_SCRIPT)).await {
+                    Ok(Ok(result)) => break result,
+                    Err(_) => {
+                        return Err(RenderError::Timeout {
+                            story_id: story_id.to_string(),
+                            timeout: self.options.story_timeout,
+                            phase: "the freeze did not finish: the page never yielded a verdict \
+                             (requestAnimationFrame may not be firing)",
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        tracing::trace!(%story_id, error = %e, "freeze evaluate failed; retrying");
+                        if std::time::Instant::now() + POLL_INTERVAL >= deadline {
+                            return Err(RenderError::Timeout {
+                                story_id: story_id.to_string(),
+                                timeout: self.options.story_timeout,
+                                phase: "the freeze evaluate kept failing until the story \
+                                 deadline (the page may be navigating or reloading, or its \
+                                 pending callbacks were collected)",
+                            });
+                        }
+                        tokio::time::sleep(POLL_INTERVAL).await;
+                    }
+                }
+            };
 
             // FREEZE_SCRIPT は JSON 文字列を返す。`ok === true` と確かめられた
             // 場合にだけ撮影へ進む（fail-closed）。ok: false（静止に失敗）も、
@@ -3563,6 +3628,206 @@ mod tests {
         assert!(
             message.contains("freeze did not finish"),
             "the timeout must still say which phase ran out, got {message:?}"
+        );
+    }
+
+    /// rAF を握りつぶし（コールバック保持）、かつ一定周期で `location.reload()`
+    /// するバンドル。freeze evaluate は rAF 待ちで pending のまま reload を
+    /// 迎え、「Inspected target navigated or closed」（-32000。context 破棄系）
+    /// の CDP エラーで返る（本モジュールのテストを旧実装に当てた実測）。
+    /// reload は毎回同じページを読み直すので、リトライしても freeze は
+    /// 完了できず、story の deadline まで同じ形が繰り返される。
+    ///
+    /// rAF 抑止はインライン `<head>` スクリプトで行う——リトライの evaluate が
+    /// 新しい document に入る時点では必ず実行済みであり、「抑止前の一瞬に
+    /// freeze が滑り込んで成功する」窓を実質的に残さない（リトライは CDP
+    /// エラー後に [`POLL_INTERVAL`] 眠ってから入るため、この小ページの
+    /// head 解析より遅い）。
+    fn write_reloading_freeze_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head>
+<script>
+  // rAF を握りつぶす（コールバックは保持——捨てると Promise ごと GC され
+  // 「Promise was collected」という別経路になる。そちらは
+  // write_collected_freeze_bundle が担う）。
+  window.__rafCallbacks = [];
+  window.requestAnimationFrame = function (cb) {
+    window.__rafCallbacks.push(cb);
+    return window.__rafCallbacks.length;
+  };
+</script>
+<style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#00ff00; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () { channel.emit('storyRendered', 'reloading'); }, 20);
+  }, 20);
+  // READY → settle(250ms) → freeze evaluate（rAF 待ちで pending）の後に
+  // 実行コンテキストごと破壊する。reload 後も同じページなので周期的に繰り返す。
+  setTimeout(function () { location.reload(); }, 800);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **freeze 中の navigation / reload は story 単位の失敗である**こと
+    /// （cmd_632 ①経路 1。実測のエラーは
+    /// 「Inspected target navigated or closed」）。
+    ///
+    /// 修正前は freeze evaluate の CDP エラーを即 [`RenderError::Cdp`] に
+    /// 倒していた——`render_build::is_story_scoped` は Cdp を環境分類とする
+    /// ため、reload する story が 1 件あるだけで `render_all` の `?` 相当の
+    /// 即中断となり、残り全 story の撮影が巻き添えで失われた。READY probe は
+    /// 同種のエラーを deadline までリトライするのに freeze だけ即中断という
+    /// 非対称でもあった。修正後は deadline までリトライし、期限で READY 側と
+    /// 同じ [`RenderError::Timeout`]——`is_story_scoped` が story 分類とする
+    /// variant——で返る（分類は render_build 側の
+    /// `story_scoped_failures_are_isolated_and_infrastructure_failures_are_not`
+    /// が固定している）。
+    ///
+    /// 証明する: reload し続けるページで `render_story` が [`RenderError::Timeout`]
+    /// （story 分類）を返し、[`RenderError::Cdp`]（環境分類＝ビルド即中断）に
+    /// ならないこと。証明しない: `render_all` のループが実際に continue する
+    /// こと（分類の match 構造が保証。render_build 側テストの但し書きと同じ）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reloading_page_during_freeze_fails_story_scoped() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP reloading_page_during_freeze_fails_story_scoped: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reloading_freeze_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        // 外周上限: ここで落ちたらリトライが deadline を見ていない（無限リトライ）。
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            renderer.render_story(&server.base_url(), "reloading"),
+        )
+        .await
+        .expect("render_story must return within the outer bound");
+        renderer.close().await;
+
+        let err = result.expect_err("a page that reloads during the freeze must fail");
+        assert!(
+            matches!(err, RenderError::Timeout { .. }),
+            "a story that destroys the freeze evaluate by navigating must be \
+             classified story-scoped (Timeout), not as an infrastructure Cdp \
+             error that aborts the whole build, got {err:?}"
+        );
+    }
+
+    /// rAF コールバックを**捨てる**（保持しない）バンドル。freeze の pending
+    /// promise は resolve 関数がどこからも参照されなくなり、V8 の GC が
+    /// promise ごと回収して evaluate が「Error -32000: Promise was collected」
+    /// で返る（cmd_630 の実測）。素の状態では回収まで約 30 秒かかるので、
+    /// 大きな割り当てを捨て続けるループで GC を意図的に急がせる。
+    fn write_collected_freeze_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head>
+<script>
+  // rAF コールバックを捨てる——resolve への参照が消え、pending promise が
+  // GC 対象になる（保持する write_raf_suppressed_bundle との違いがこの一点）。
+  window.requestAnimationFrame = function (cb) { return 0; };
+</script>
+<style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#00ff00; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () { channel.emit('storyRendered', 'collected'); }, 20);
+  }, 20);
+  // GC 圧: 参照を残さない大きな割り当てを繰り返し、major GC を数秒内に誘発
+  // させる（pending promise の回収を約 30 秒から数秒へ縮める）。
+  setInterval(function () {
+    var garbage = [];
+    for (var i = 0; i < 50; i++) garbage.push(new Array(100000).fill(Math.random()));
+    window.__gcTicks = (window.__gcTicks || 0) + 1;
+  }, 100);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **pending promise の GC 回収も story 単位の失敗である**こと
+    /// （cmd_632 ①経路 2: 「Promise was collected」——cmd_630 で
+    /// `write_raf_suppressed_bundle` に実測として書き残した挙動が、
+    /// そのまま「freeze evaluate の CDP エラー＝ビルド即中断」の穴を指した）。
+    ///
+    /// 修正前はこの CDP エラーが即 [`RenderError::Cdp`]（環境分類）となり
+    /// ビルド全体を中断した。修正後はリトライして deadline で
+    /// [`RenderError::Timeout`]（story 分類）に倒れる。
+    ///
+    /// 証明する: rAF コールバックを捨てるページで `render_story` が
+    /// [`RenderError::Timeout`] を返し [`RenderError::Cdp`] にならないこと。
+    /// 但し書き: 回収のタイミングは GC 依存で、GC 圧をかけても deadline 内に
+    /// 回収が起きない可能性は残る——その場合は共有 deadline の時間切れで同じ
+    /// Timeout に落ち、テストは通る（CDP エラー経路の決定的な固定は
+    /// `reloading_page_during_freeze_fails_story_scoped` が担う。こちらは
+    /// cmd_630 実測のエラー文言まで含めた第二経路の記録である）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collected_freeze_promise_fails_story_scoped() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP collected_freeze_promise_fails_story_scoped: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_collected_freeze_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(8);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            renderer.render_story(&server.base_url(), "collected"),
+        )
+        .await
+        .expect("render_story must return within the outer bound");
+        renderer.close().await;
+
+        let err = result.expect_err("a page that discards rAF callbacks must fail");
+        assert!(
+            matches!(err, RenderError::Timeout { .. }),
+            "a story whose freeze promise is garbage-collected must be \
+             classified story-scoped (Timeout), not as an infrastructure Cdp \
+             error that aborts the whole build, got {err:?}"
         );
     }
 
