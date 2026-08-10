@@ -47,8 +47,8 @@
 //! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない） |
 //! | style 注入（`freezeRoot`） | throw は検知 | `errors` に積まれ最終判定で `ok: false`（fail-closed）。CSP による黙殺は**例外が出ず検知不能**——だから次の「CSS 適用検証」層がある |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
-//! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは**検知できぬ**——promise が解決せず evaluate が返らないため撮影に到達しない（誤った絵は出ない）。停止性は上位の CI ジョブタイムアウト頼み |
-//! | running 収集（`collectRunning`） | throw は検知 | `getAnimations`・走査の失敗は `errors` → `ok: false`（fail-closed）。クロスオリジン iframe の中は**原理的に数えられぬ**（`contentDocument` が null）——README「届かない範囲」に契約として明記 |
+//! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を `story_timeout` の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
+//! | running 収集（`collectRunning`） | throw・API 欠落を検知 | 収集は `freezeRoot` と共通の `collectAnimations` を通る。`getAnimations`・走査の失敗、および root 側 `getAnimations` API の欠落（擬似要素アニメを数える口が無い）は `errors` → `ok: false`（fail-closed。空 `[]` へ黙って倒さない）。クロスオリジン iframe の中は**原理的に数えられぬ**（`contentDocument` が null）——README「届かない範囲」に契約として明記 |
 //! | CSS 適用検証 | 検知 | 値の不一致は `ok: false`。検証呼び出し自体の throw も `errors` → `ok: false`（fail-closed）。検証は root ごとに最初の要素 1 点のサンプルであり全要素ではない（個別要素の `!important` 上書きは「届かない範囲」）。切り離された root は描画に影響しないため対象外 |
 //! | 結果の JSON 化 | 間接的に検知 | `JSON.stringify` の差し替え・失敗は文字列でない/読めない応答となり、Rust 側 [`freeze_verdict`] が unparseable として失敗（fail-closed） |
 //! | Rust 側の解析（[`freeze_verdict`]） | 検知 | `ok === true` と確かめられた場合のみ撮影へ進む。欠落・型違い・parse 失敗はすべて unparseable（fail-closed） |
@@ -59,6 +59,24 @@
 //! クロスオリジン iframe・後から生成される root）だけであり、これらは
 //! 検知不能な理由とともに README の「届かない範囲」で利用者との契約に
 //! 昇格させてある。観測できるのに判定に使っていない失敗は残さないこと。
+//!
+//! ## 層ごとの手当て（横並び）
+//!
+//! **層を足したら、先にある層が持つ手当てをその層へも移すこと。** 層は時間差で
+//! 積まれるため、後から足した層は先の層が当然に持つ手当て（時間上限・判定への
+//! 反映・テストでの固定）を欠いたまま生まれやすい。実例: READY 待ちには最初から
+//! deadline があったが、後から足した FREEZE evaluate には時間上限が無く、rAF を
+//! 発火させないページで render がハングした（cmd_630 で story_timeout を移した）。
+//! この表は各層の手当てを横に並べ、欠けを目視できるようにする——空欄を見つけたら
+//! 埋めるか、埋められぬ理由を書くこと。
+//!
+//! | 層 | 時間上限（停止性） | 失敗の届き先 | 固定するテスト |
+//! |----|----|----|----|
+//! | Chromium 起動 | `LAUNCH_TIMEOUT` ×最大 `LAUNCH_MAX_ATTEMPTS` 回 | [`RenderError::Launch`] | `launching_a_missing_chromium_fails_fast` |
+//! | READY 待ち（probe ポーリング） | `story_timeout` の deadline | [`RenderError::Timeout`] / [`RenderError::Story`] | `a_story_that_renders_nothing_still_produces_a_screenshot`・`a_story_error_signal_fails_fast_with_the_reason` |
+//! | FREEZE evaluate | `story_timeout` の `tokio::time::timeout` | [`RenderError::Story`]（時間切れ）/ [`RenderError::Cdp`] | `raf_suppressed_page_fails_within_the_story_timeout` |
+//! | FREEZE 結果の解析 | 即時（待ちなし） | [`RenderError::Story`]（`freeze_verdict`） | `freeze_verdict_*` 単体群・`garbled_freeze_result_fails_instead_of_silently_succeeding` |
+//! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
 //!
 //! ## 後始末
 //!
@@ -220,7 +238,11 @@ JSON.stringify((() => {
 ///   場合は同じ型のまま `currentTime` へ渡す——数値変換すると progress-based
 ///   timeline で `TypeError` になる
 /// - **無限アニメーション**: 終端が存在しないので `currentTime = 0` へ巻き戻して
-///   pause。タイムライン座標 0 の絵はこれもただ一つに定まる。
+///   pause。タイムライン座標 0 の絵はこれもただ一つに定まる。ここでも型は保つ
+///   ——progress-based timeline の `currentTime` は `CSSNumericValue` しか
+///   受け付けないため、`endTime` かタイムライン現在値が単位つきなら
+///   `CSSUnitValue(0, unit)` を渡す（infinite + scroll timeline の正当な
+///   story を数値 0 の `TypeError` で落とさない）。
 ///   「paused にするだけ」では**止まった位置**が撮影タイミング依存のままで、
 ///   flaky さは消えない——座標を明示的に固定するからこそ 2 回撮って同じ絵になる
 /// - **今後始まる transition**: `transition-duration: 0s` と `transition-delay: 0s`
@@ -291,6 +313,9 @@ const FREEZE_SCRIPT: &str = r#"
     '}',
   ].join('\n');
   const errors = [];
+  // 収束の反復で同じ層が同じ失敗を繰り返すと、errors が巡回数ぶん水増しされて
+  // 原因が読みにくくなる。判定に効くのは件数でなく有無なので、同文は 1 回だけ積む。
+  const pushError = (msg) => { if (!errors.includes(msg)) errors.push(msg); };
   const frozenRoots = [];
 
   // endTime が CSSNumericValue（progress-based timeline 等）か数値かを判定し、
@@ -303,6 +328,39 @@ const FREEZE_SCRIPT: &str = r#"
       return Number.isFinite(end.value) ? end : null;
     }
     return null;
+  };
+
+  // 1 つの root の中の animation と要素を数える共通収集。freezeRoot（凍らせる側）と
+  // collectRunning（残りを数える側）の両方がここを通ることで、視野の非対称
+  // ——凍らせた範囲と数えた範囲のずれ——を構造的に消す。
+  //
+  // root.getAnimations()（擬似要素のアニメも返す唯一の口）と各要素の
+  // getAnimations() の和集合を取る。root 側の API が無い環境（ページによる
+  // prototype の削除・改変等）では擬似要素のアニメを数える手段が無く、網羅を
+  // 保証できない——黙って空へ倒すと「running 無し」と区別できず偽の成功に
+  // なるので、errors に積んで判定へ反映する（fail-closed）。
+  const collectAnimations = (root) => {
+    const animations = new Set();
+    let elements = [];
+    if (!root) return { animations, elements };
+    if (typeof root.getAnimations === 'function') {
+      try {
+        for (const a of root.getAnimations()) animations.add(a);
+      } catch (e) {
+        pushError('getAnimations failed on root: ' + String(e && e.message || e));
+      }
+    } else {
+      pushError('getAnimations API missing on a root: pseudo-element animations cannot be enumerated');
+    }
+    try { elements = root.querySelectorAll('*'); } catch (e) {
+      pushError('querySelectorAll failed: ' + String(e && e.message || e));
+    }
+    for (const el of elements) {
+      try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {
+        pushError('getAnimations failed on element: ' + String(e && e.message || e));
+      }
+    }
+    return { animations, elements };
   };
 
   // root は Document または ShadowRoot。どちらも同じ手順で静止させる。
@@ -324,31 +382,12 @@ const FREEZE_SCRIPT: &str = r#"
       }
     } catch (e) {
       // CSS 注入の失敗は静止の前提を崩すので記録する。
-      errors.push('CSS injection failed: ' + String(e && e.message || e));
+      pushError('CSS injection failed: ' + String(e && e.message || e));
     }
 
     // document.getAnimations() は shadow tree の中を返さない実装があるため、
-    // root 自身の getAnimations()（擬似要素のアニメも返す）に加えて、root 内の
-    // 各要素からも直接集める（Set で重複は消える）。
-    const animations = new Set();
-    try {
-      if (typeof root.getAnimations === 'function') {
-        for (const a of root.getAnimations()) animations.add(a);
-      }
-    } catch (e) {
-      // getAnimations の失敗は running を見逃す可能性がある。
-      errors.push('getAnimations failed on root: ' + String(e && e.message || e));
-    }
-    let elements = [];
-    try { elements = root.querySelectorAll('*'); } catch (e) {
-      errors.push('querySelectorAll failed: ' + String(e && e.message || e));
-    }
-    for (const el of elements) {
-      try { for (const a of el.getAnimations()) animations.add(a); } catch (e) {
-        // 個別要素の getAnimations 失敗は致命ではないが記録する。
-        errors.push('getAnimations failed on element: ' + String(e && e.message || e));
-      }
-    }
+    // root 単位で collectRunning と同じ共通収集を通す（Set で重複は消える）。
+    const { animations, elements } = collectAnimations(root);
 
     for (const anim of animations) {
       try {
@@ -360,10 +399,23 @@ const FREEZE_SCRIPT: &str = r#"
         // 有限は終端へ、無限は初期（タイムライン座標 0）へ。どちらも
         // 壁時計に依存しない一意な座標なので、2 回撮っても同じ絵になる。
         // end が CSSNumericValue の場合はそのまま渡す（型を保って seek）。
-        anim.currentTime = end != null ? end : 0;
+        if (end != null) {
+          anim.currentTime = end;
+        } else {
+          // 無限アニメの 0 も型を保つ。progress-based timeline（scroll() 等）の
+          // currentTime は CSSNumericValue しか受け付けず、数値 0 の代入は
+          // TypeError になる——endTime か timeline の現在値が単位つきなら
+          // 同じ単位の 0 を作って渡す（infinite + scroll timeline の正当な
+          // story を落とさないため）。
+          const unitOf = (v) =>
+            v && typeof v === 'object' && typeof v.unit === 'string' ? v.unit : null;
+          const unit = unitOf(timing && timing.endTime)
+            || unitOf(anim.timeline && anim.timeline.currentTime);
+          anim.currentTime = unit != null ? new CSSUnitValue(0, unit) : 0;
+        }
         anim.pause();
       } catch (e) {
-        errors.push('seek/pause failed: ' + String(e && e.message || e));
+        pushError('seek/pause failed: ' + String(e && e.message || e));
       }
     }
 
@@ -379,39 +431,28 @@ const FREEZE_SCRIPT: &str = r#"
     }
   };
 
-  // 全 root から running な animation を集める。
+  // 全 root から running な animation を集める。収集の視野は freezeRoot と
+  // 同じ collectAnimations——収集失敗・API 欠落はそこで errors に積まれ、
+  // 「残っていない」と「数えられなかった」が混ざらない（fail-closed）。
   const collectRunning = (root) => {
     const running = [];
-    if (!root) return running;
     const collect = (r) => {
       if (!r) return;
-      try {
-        const anims = typeof r.getAnimations === 'function' ? r.getAnimations() : [];
-        for (const a of anims) {
-          if (a.playState === 'running') {
-            const name = a.animationName || a.transitionProperty || a.id || '';
-            const target = (a.effect && a.effect.target && a.effect.target.tagName) || 'unknown';
-            running.push(name + ':' + target);
-          }
+      const { animations, elements } = collectAnimations(r);
+      for (const a of animations) {
+        if (a.playState === 'running') {
+          const name = a.animationName || a.transitionProperty || a.id || '';
+          const target = (a.effect && a.effect.target && a.effect.target.tagName) || 'unknown';
+          running.push(name + ':' + target);
         }
-      } catch (e) {
-        // running の収集に失敗すると「残っていない」と区別できず、
-        // 収束判定が偽の成功へ倒れる。errors に積んで判定へ反映する。
-        errors.push('collectRunning: getAnimations failed: ' + String(e && e.message || e));
       }
-      try {
-        for (const el of r.querySelectorAll('*')) {
-          if (el.shadowRoot) collect(el.shadowRoot);
-          if ((el.localName === 'iframe' || el.localName === 'frame')) {
-            // クロスオリジン iframe には原理的に触れない（contentDocument は
-            // null を返す）。ここの握りつぶしは意図的で、errors に積まない。
-            try { collect(el.contentDocument); } catch (e) {}
-          }
+      for (const el of elements) {
+        if (el.shadowRoot) collect(el.shadowRoot);
+        if (el.localName === 'iframe' || el.localName === 'frame') {
+          // クロスオリジン iframe には原理的に触れない（contentDocument は
+          // null を返す）。ここの握りつぶしは意図的で、errors に積まない。
+          try { collect(el.contentDocument); } catch (e) {}
         }
-      } catch (e) {
-        // 走査に失敗した root の中は数えられていない。偽の成功を防ぐため
-        // errors に積んで判定へ反映する。
-        errors.push('collectRunning: traversal failed: ' + String(e && e.message || e));
       }
     };
     collect(root);
@@ -421,22 +462,30 @@ const FREEZE_SCRIPT: &str = r#"
   const nextFrame = () =>
     new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
+  // sweeps は「実際に回した巡回数」。while の頭で加算するため、上限で抜けた
+  // ときも MAX_SWEEPS を超えない（旧 for 形は脱出後に 11 となり、失敗
+  // メッセージが実際の 10 巡と食い違う off-by-one を持っていた）。
   let sweeps = 0;
-  for (sweeps = 1; sweeps <= MAX_SWEEPS; sweeps++) {
+  let still = [];
+  while (sweeps < MAX_SWEEPS) {
+    sweeps++;
     freezeRoot(document);
     await nextFrame();
-    const still = collectRunning(document);
+    still = collectRunning(document);
     // 最低 2 巡は回す。1 巡目の freeze で CSS が注入されると、それ自体が
     // 新たな animation を誘発しうる。2 巡目でそれらも捕捉してから判定する。
     if (still.length === 0 && sweeps >= 2) break;
   }
 
-  const remaining = collectRunning(document);
-  if (remaining.length > 0) {
+  // 最終巡の collectRunning からここまで await が無く、イベントループへ戻って
+  // いない。タイムラインの現在時刻はタスク内で固定され（Web Animations 仕様）、
+  // 新しい animation の開始もスクリプト実行を要するため、ここで再収集しても
+  // 同じ集合が返る——still をそのまま最終判定に使い、二重の全ツリー走査を省く。
+  if (still.length > 0) {
     return JSON.stringify({
       ok: false,
       sweeps: sweeps,
-      running: remaining,
+      running: still,
       errors: errors.length > 0 ? errors : undefined,
     });
   }
@@ -465,7 +514,7 @@ const FREEZE_SCRIPT: &str = r#"
     } catch (e) {
       // 検証自体の失敗。ここで積んだエラーは下の errors 判定で
       // 失敗として返る——「検証できなかった」を成功へ倒さない。
-      errors.push('CSS verification failed: ' + String(e && e.message || e));
+      pushError('CSS verification failed: ' + String(e && e.message || e));
     }
   }
   // errors は診断の置き場ではなく判定の入力である。1 件でも積まれていれば
@@ -835,9 +884,24 @@ impl StoryRenderer {
             // CSP は迂回しない（本番と同じ条件で撮る）。FREEZE_SCRIPT は
             // getComputedStyle で CSS 適用を検証し、CSP が静止 CSS を
             // 拒否するページでは fail-closed で失敗を返す。
+            //
+            // 停止性: FREEZE_SCRIPT は rAF を 2 回待つ promise を返すため、
+            // ページが requestAnimationFrame を発火させない（差し替え・
+            // 停止したレンダリングパイプライン等）と evaluate は永遠に
+            // 返らない。story_timeout の時間上限に載せ、時間内に静止が
+            // 終わらなければ失敗として返す（fail-closed。READY 待ちの
+            // deadline と同じ手当てを、後から足したこの層にも与える）。
             let freeze_result =
-                page.evaluate(FREEZE_SCRIPT)
+                tokio::time::timeout(self.options.story_timeout, page.evaluate(FREEZE_SCRIPT))
                     .await
+                    .map_err(|_| RenderError::Story {
+                        story_id: story_id.to_string(),
+                        message: format!(
+                            "freeze did not finish within {:?}: the page never yielded a verdict \
+                     (requestAnimationFrame may not be firing)",
+                            self.options.story_timeout
+                        ),
+                    })?
                     .map_err(|source| RenderError::Cdp {
                         story_id: story_id.to_string(),
                         source,
@@ -3380,6 +3444,329 @@ mod tests {
         // この対照テストは「freeze が何かをしている」ことの確認であり、
         // 主証拠は二回撮り一致テスト側にある。
         let _ = (frozen, unfrozen); // 使用済みの証拠
+    }
+
+    /// rAF を不発火にするバンドル。FREEZE_SCRIPT の `nextFrame` は
+    /// `requestAnimationFrame` を 2 回待つ promise なので、これが永遠に
+    /// 解決せず `page.evaluate(FREEZE_SCRIPT)` 自体が返らなくなる。
+    /// READY 判定はチャンネル経由（rAF 不使用）なので通常どおり通る。
+    ///
+    /// コールバックは**保持する**（呼ばないだけ）。捨てると resolve 関数が
+    /// どこからも参照されず、V8 が pending promise ごと GC で回収して
+    /// 約 30 秒後に `Error -32000: Promise was collected` という CDP エラーで
+    /// 返ってきてしまう（実測）。保持すれば promise は生き続け、evaluate は
+    /// 本当に永遠に返らない——ポーズ中の rAF をキューに積む実ページと同型。
+    fn write_raf_suppressed_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#00ff00; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  // rAF を握りつぶす。コールバックは保持するが永遠に呼ばない。
+  window.__rafCallbacks = [];
+  window.requestAnimationFrame = function (cb) {
+    window.__rafCallbacks.push(cb);
+    return window.__rafCallbacks.length;
+  };
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () { channel.emit('storyRendered', 'raf-suppressed'); }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **freeze の停止性**: rAF が発火しないページでもハングせず、
+    /// `story_timeout` 内に失敗が返ること。
+    ///
+    /// 修正前は `page.evaluate(FREEZE_SCRIPT)` の promise が解決せず
+    /// `render_story` が返らなかった（停止性が上位の CI ジョブタイムアウト
+    /// 頼みだった——層ごとの失敗経路表「収束反復」行の穴）。テスト自身にも
+    /// 外周の時間上限を置き、修正が外れた場合はハングでなくこの上限で
+    /// 落ちるようにする。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が rAF 不発火ページで
+    /// `story_timeout` 内に失敗を返すこと。証明しない: 静止そのものの成否。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn raf_suppressed_page_fails_within_the_story_timeout() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP raf_suppressed_page_fails_within_the_story_timeout: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_raf_suppressed_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        // 外周上限は story_timeout より十分大きく取る。ここで落ちたら
+        // freeze に時間上限が無い（= render_story がハングする）ということ。
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            renderer.render_story(&server.base_url(), "raf-suppressed"),
+        )
+        .await
+        .expect(
+            "render_story must return within the outer bound — hanging here means \
+             the freeze evaluate has no timeout of its own",
+        );
+
+        let err = result.expect_err("a page that never fires rAF must fail — not hang or succeed");
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze did not finish"),
+            "the error must say the freeze timed out, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// open shadow root の中の**擬似要素**に無限アニメを持つバンドル。
+    ///
+    /// `::before` のアニメは `Element.getAnimations()`（オプション無し）では
+    /// 返らず、root 側の `DocumentOrShadowRoot.getAnimations()` だけが数えられる。
+    /// `break_api: true` は `Document` / `ShadowRoot` 両 prototype から
+    /// `getAnimations` を消し、「root 側 API が存在しない環境」を再現する——
+    /// 旧 collectRunning はこれを黙って `[]` へ倒し、走り続ける ::before の
+    /// アニメを見逃して成功として撮っていた（fail-open）。
+    fn write_shadow_pseudo_animation_bundle(root: &Path, break_api: bool) {
+        let sabotage = if break_api {
+            "delete Document.prototype.getAnimations;\n  delete ShadowRoot.prototype.getAnimations;\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            root.join("iframe.html"),
+            format!(
+                r#"<!doctype html>
+<html><head><style>
+  html,body{{margin:0;padding:0;background:#fff}}
+  x-pseudo {{ display:block; }}
+</style></head>
+<body><div id="storybook-root"></div>
+<script>
+  {sabotage}var listeners = {{}};
+  var channel = {{
+    on: function (event, cb) {{ (listeners[event] = listeners[event] || []).push(cb); }},
+    emit: function (event, payload) {{
+      (listeners[event] || []).forEach(function (cb) {{ cb(payload); }});
+    }}
+  }};
+  setTimeout(function () {{
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {{
+      var host = document.createElement('x-pseudo');
+      var sr = host.attachShadow({{ mode: 'open' }});
+      sr.innerHTML =
+        '<style>' +
+        '@keyframes sh-pulse {{ from {{ opacity:1; }} to {{ opacity:0.2; }} }}' +
+        '.pulse::before {{ content:""; display:block; width:80px; height:80px;' +
+        ' background:#ff0000; animation: sh-pulse 1.3s linear infinite; }}' +
+        '</style><div class="pulse"></div>';
+      document.getElementById('storybook-root').appendChild(host);
+      channel.emit('storyRendered', 'shadow-pseudo');
+    }}, 20);
+  }}, 20);
+</script>
+</body></html>"#
+            ),
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **positive control（shadow 内 running 見逃し）**: root 側の
+    /// `getAnimations` API が無い環境では、擬似要素のアニメを数える口が無く
+    /// 網羅を保証できないため、黙って成功へ倒さず失敗が返ること。
+    ///
+    /// 修正前の collectRunning は `typeof r.getAnimations === 'function'` で
+    /// なければ黙って `[]` を返し、shadow 内で走り続ける `::before` の無限
+    /// アニメを「残っていない」と誤認して flaky な絵を成功として撮っていた。
+    ///
+    /// 証明する: 収集 API の欠落が errors → `ok: false` へ倒れること。
+    /// 証明しない: この fixture のアニメが通常環境で凍ること（下の対が担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_root_getanimations_fails_instead_of_silently_succeeding() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP missing_root_getanimations_fails_instead_of_silently_succeeding: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_pseudo_animation_bundle(dir.path(), true);
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "shadow-pseudo")
+            .await
+            .expect_err(
+                "with the root-level getAnimations API missing, coverage cannot be \
+                 verified — the freeze must fail, not silently succeed",
+            );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("getAnimations API missing"),
+            "the error must name the missing collection API, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// **上の対（API が揃った通常環境）**: 同じ shadow 内擬似要素の無限アニメが
+    /// root 側 `getAnimations` 経由で数えられ、凍って二回撮り一致すること。
+    ///
+    /// 証明する: fixture のアニメが「root 側 API でしか数えられない形」で
+    /// 生きており、API があれば通常どおり静止できること——上の失敗が
+    /// 「API 欠落の検知」であって fixture の壊れではないことの裏づけ。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shadow_pseudo_animation_freezes_when_the_api_is_present() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP shadow_pseudo_animation_freezes_when_the_api_is_present: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shadow_pseudo_animation_bundle(dir.path(), false);
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let first = renderer
+            .render_story(&server.base_url(), "shadow-pseudo")
+            .await
+            .expect("with the API present, the shadow pseudo-element animation must freeze");
+        let second = renderer
+            .render_story(&server.base_url(), "shadow-pseudo")
+            .await
+            .expect("second shadow-pseudo capture");
+        assert_eq!(
+            first, second,
+            "shadow-pseudo: two frozen captures must be byte-identical"
+        );
+
+        renderer.close().await;
+    }
+
+    /// **無限** iteration の progress-based timeline を持つバンドル。
+    ///
+    /// `animation: ... infinite` + `animation-timeline: scroll()` では
+    /// `endTime` が無限になり [`FREEZE_SCRIPT`] の `finiteEnd` は null を返す。
+    /// 巻き戻し先の 0 も数値のままでは `TypeError`（progress-based timeline の
+    /// `currentTime` は `CSSNumericValue` のみ受理）——修正前は errors 経由で
+    /// `ok: false` となり、この**正当な** story を落としていた（過剰拒否）。
+    fn write_infinite_scroll_timeline_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #scroller { width:100%;height:200px;overflow-y:scroll; }
+  #content { height:1000px; }
+  @keyframes scroll-fade { from { opacity:1; } to { opacity:0; } }
+  #target {
+    width:100px;height:100px;background:#ff0000;
+    animation: scroll-fade linear infinite;
+    animation-timeline: scroll(nearest block);
+  }
+</style></head>
+<body><div id="storybook-root">
+  <div id="scroller">
+    <div id="target"></div>
+    <div id="content"></div>
+  </div>
+</div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () {
+      channel.emit('storyRendered', 'infinite-scroll-timeline');
+    }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// infinite + progress-based timeline の正当な story が落とされないこと
+    /// （型を保った 0 巻き戻しの回帰テスト）。
+    ///
+    /// 修正前は数値 0 の代入が `TypeError` → errors → `ok: false` で、
+    /// この正当な story を撮れなかった。`CSSUnitValue(0, unit)` で型を
+    /// 保って巻き戻すことで pause まで到達し、二回撮りが一致する。
+    ///
+    /// 証明する: `render_story`（freeze 込み）が infinite な progress-based
+    /// timeline でも成功し決定的に撮れること。証明しない: 有限 progress-based
+    /// の終端シーク（`frozen_scroll_timeline_captures_are_byte_identical` が担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frozen_infinite_scroll_timeline_captures_are_byte_identical() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP frozen_infinite_scroll_timeline_captures_are_byte_identical: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_infinite_scroll_timeline_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let first = renderer
+            .render_story(&server.base_url(), "infinite-scroll-timeline")
+            .await
+            .expect(
+                "an infinite progress-based animation is a legitimate story — \
+                 the typed zero rewind must let it freeze instead of TypeError-ing",
+            );
+        let second = renderer
+            .render_story(&server.base_url(), "infinite-scroll-timeline")
+            .await
+            .expect("second infinite-scroll-timeline capture");
+        assert_eq!(
+            first, second,
+            "infinite scroll timeline: two frozen captures must be byte-identical"
+        );
+
+        renderer.close().await;
     }
 
     #[tokio::test]

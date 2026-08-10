@@ -565,6 +565,15 @@ after M sweep(s): [...]` の形式でエラーを返す。これは既存の `st
 止めた状態の story を用意すること。progress-based timeline
 （`animation-timeline: scroll()` 等）の `endTime` は `CSSNumericValue`
 （percent）であり、型を保って `currentTime` に渡すことで正しく静止する。
+これは無限（`infinite`）の progress-based アニメーションでも同じで、
+巻き戻し先の進行度 0 も `CSSUnitValue(0, "percent")` として型を保って渡す
+（数値 0 の代入は `TypeError` になるため）。
+
+**静止処理そのものにも時間上限がある**: 静止は `requestAnimationFrame` を
+待って収束を確かめるため、rAF が発火しないページ（差し替え・停止した
+レンダリングパイプライン等）では静止処理が終わらない。この場合も
+ハングはせず、story ごとの描画タイムアウト（`story_timeout`）を超えた
+時点で `freeze did not finish within ...` の形式のエラーとして返る。
 
 **注入した CSS の適用も検証する**: `<style>` の `appendChild` が成功しても、
 CSP `style-src 'self'` のページでは inline style が拒否されて適用されない
@@ -582,8 +591,11 @@ Storybook の CSP が `style-src 'self'` で inline style を拒否する場合�
 これは**セキュリティ境界ではない**——脅威モデルは一貫して「事故」であり、
 悪意あるページへの防御ではない（成功の応答そのものを偽造するページは
 原理的に検出できない）。main world の組み込み関数（`JSON.stringify` /
-`getComputedStyle` 等）の差し替えを失敗として扱うのは、悪意の検出のため
-ではなく、polyfill や計測コードの事故・壊れた環境を沈黙させないためである。
+`getComputedStyle` / `getAnimations` 等）の差し替え・欠落を失敗として扱うのは、
+悪意の検出のためではなく、polyfill や計測コードの事故・壊れた環境を
+沈黙させないためである（root 側の `getAnimations` が無いと擬似要素の
+アニメーションを数える口が無く、「残っていない」と「数えられなかった」を
+区別できないまま撮ることになる）。
 各層の失敗経路の一覧はレンダラのモジュールコメント
 （`crates/service/src/render/browser.rs` の「層ごとの失敗経路」）を参照。
 
