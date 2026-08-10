@@ -55,9 +55,13 @@
 //! | Rust 側の解析（[`freeze_verdict`]） | 検知 | `ok === true` と確かめられた場合のみ撮影へ進む。欠落・型違い・parse 失敗はすべて unparseable（fail-closed） |
 //! | iframe・shadow 走査（`freezeRoot` 再帰） | 部分的 | open shadow root と同一オリジン iframe には到達。closed shadow root は**列挙する API が存在せず検知不能**、静止処理より後から生成される root にも届かない——いずれも README「届かない範囲」でページ側の責務と定めてある |
 //! | スクリーンショット | 検知 | CDP エラーは Rust 側 `Err`（fail-closed） |
+//! | reduced-motion 適用（`Emulation.setEmulatedMedia`） | 検知（CDP エラー・無応答とも） | project 設定で有効なときだけ `new_page` 直後（ナビゲーション前）に一度呼ぶ。CDP エラーは Rust 側 `Err` → [`RenderError::Cdp`]（環境分類・即中断。story のスクリプトを待たない一往復で、失敗の原因はブラウザ側——`new_page` と同じ分類）。無応答は chromiumoxide の request timeout（既定 30 秒）が `CdpError::Timeout` を返し、同じ `Cdp` へ倒れる（fail-closed） |
+//! | reduced-motion 適用の検証（[`REDUCED_MOTION_PROBE`]） | 部分的に検知 | 「呼び出しは成功したが実際にはメディアクエリが変わっていない」を撮影直前に実測する——constructed stylesheet の `@media (prefers-reduced-motion: reduce)` が効いたかのプローブ（`--vrt-reduced-motion`）と `matchMedia().matches` の**両輪**。どちらかが不成立なら `ok: false` → [`RenderError::Story`]（fail-closed。reduce を返さない壊れた/モックされた `matchMedia`——polyfill やテストダブルの事故——はここで落ちる）。evaluate の CDP エラーは READY probe と同様 deadline までリトライし期限で [`RenderError::Timeout`]。**ページが両方の観測を偽装する積極的な偽りは原理的に検知不能**——検証はページの JS realm で走り、CDP に emulated media 状態を読み戻す API が無い。脅威モデルは一貫して事故であり悪意ではない（README「検証層自身の失敗も fail-closed である」と同じ契約） |
+//! | reduced-motion 有効なのに呼び出し自体が漏れる | 実行時には検知不能 | 検知器の不在そのものがこの失敗であり、実行時観測では塞げない（「呼ばれなかったこと」を観測する層は、それ自身も呼ばれない）。構造で塞ぐ——適用は [`StoryRenderer::render_story`] の単一チョークポイントにだけ置き、分岐は `RenderOptions::emulate_reduced_motion` の一つ、project 列からの配線は `render_build` の単体テストで固定、経路全体は「ON で絵が変わる」positive control テスト（`reduced_motion_emulation_changes_the_picture_and_is_deterministic`）が貫通して固定する |
 //!
 //! 残る fail-open は「原理的に観測できない」もの（closed shadow root・
-//! クロスオリジン iframe・後から生成される root）だけであり、これらは
+//! クロスオリジン iframe・後から生成される root・reduced-motion 検証の
+//! 観測を両輪とも偽装するページ）だけであり、これらは
 //! 検知不能な理由とともに README の「届かない範囲」で利用者との契約に
 //! 昇格させてある。観測できるのに判定に使っていない失敗は残さないこと。
 //!
@@ -78,6 +82,8 @@
 //! | FREEZE evaluate | READY 待ちと**共有**の deadline（`started + story_timeout`）の残余。1 story の最悪所要は約 `story_timeout` + `SETTLE_DELAY` に収まる | [`RenderError::Timeout`]（時間切れ。READY 側と同じ分類。evaluate の CDP エラーも READY probe と同様 deadline までリトライし、期限で同じ Timeout——即 [`RenderError::Cdp`] へは倒さない） | `raf_suppressed_page_fails_within_the_story_timeout`・`freeze_timeout_shares_the_story_deadline_with_the_ready_wait`・`reloading_page_during_freeze_fails_story_scoped`・`collected_freeze_promise_fails_story_scoped` |
 //! | FREEZE 結果の解析 | 即時（待ちなし） | [`RenderError::Story`]（`freeze_verdict`） | `freeze_verdict_*` 単体群・`garbled_freeze_result_fails_instead_of_silently_succeeding` |
 //! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
+//! | reduced-motion 適用 | chromiumoxide の request timeout（既定 30 秒。一往復コマンド共通の機構） | [`RenderError::Cdp`] | `reduced_motion_emulation_changes_the_picture_and_is_deterministic` |
+//! | reduced-motion 検証 | evaluate リトライは READY 待ちと共有の deadline 残余。判定自体は即時 | [`RenderError::Story`]（[`reduced_motion_verdict`]）/ リトライ期限切れは [`RenderError::Timeout`] | `a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing`・`reduced_motion_verdict_*` 単体群 |
 //!
 //! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
 //!
@@ -102,6 +108,9 @@
 //! | FREEZE evaluate のエラー・ハング | リトライ→期限で [`RenderError::Timeout`] | story | navigation / reload・rAF 捨ては story のスクリプトの挙動（実測経路は上表） |
 //! | FREEZE verdict（静止失敗・解析不能） | [`RenderError::Story`] | story | その story のアニメーション・応答の内容に起因 |
 //! | スクリーンショット | [`RenderError::Cdp`] | 環境（即中断） | JS を待たない一往復の CDP コマンド——失敗はブラウザ側 |
+//! | reduced-motion 適用（`setEmulatedMedia`） | [`RenderError::Cdp`] | 環境（即中断） | `new_page` 直後・story のスクリプトを待たない一往復——失敗はブラウザ側 |
+//! | reduced-motion 検証の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | READY probe と同じ——ナビゲーション中の一時的な context 差し替えが主因 |
+//! | reduced-motion 検証の不成立・解析不能 | [`RenderError::Story`] | story | `matchMedia` の差し替え等、そのページの内容に起因 |
 //! | スクリーンショット名の規則違反 | `StoryFailure` 直行（`render_build`） | story | story の title / name に起因。全違反を 1 ビルドで列挙する |
 //! | ストレージ・DB・baseline 流用の失敗 | `anyhow`（`render_build`） | 環境（即中断） | 保存経路の異常は次の story でも再現する |
 //! | バンドル展開・stories 空 | `anyhow`（`render_build`） | ビルド全体（ループ前に中断） | story 以前の前提が壊れている |
