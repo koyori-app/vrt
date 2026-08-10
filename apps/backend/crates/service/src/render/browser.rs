@@ -30,6 +30,36 @@
 //!    （手書きの最小 iframe.html など）でだけ効く。ランタイムの起動を待ち損ねないよう
 //!    [`SIGNAL_GRACE`] の猶予を置いてから、旧ヒューリスティックで判定する
 //!
+//! ## 層ごとの失敗経路
+//!
+//! **層を足したら、その層自身が失敗したときどう倒れるかを数え、この表に行を
+//! 足すこと。** 静止・検証の仕組みは層の積み重ねであり、層を足すたびに
+//! 「その層自身の失敗」という新しい経路が生まれる。過去に三度、これを
+//! 数え損ねて fail-open（失敗したのに成功として撮る）を作った——
+//! 静止の失敗（`FREEZE_SCRIPT` が無条件 true）、解析の失敗（`ok` 欠落を
+//! 成功扱い）、検証の失敗（catch で `errors` に積むだけで `ok: true` へ到達）。
+//! 診断を**集める**ことと判定に**使う**ことは別である。集めるだけの
+//! エラーリストは、対処した気にさせる分だけ無いより悪い。
+//!
+//! | 層 | 失敗を検知できるか | 検知したらどう倒れるか / 検知できぬ理由 |
+//! |----|----|----|
+//! | [`READY_HOOK_SCRIPT`] 注入 | CDP エラーは検知 | Rust 側 `Err`（fail-closed）。`defineProperty` 失敗は JS 内で握るが、`storyRenders` 保険が外れれば pending のままタイムアウトへ倒れる（fail-closed） |
+//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない） |
+//! | style 注入（`freezeRoot`） | throw は検知 | `errors` に積まれ最終判定で `ok: false`（fail-closed）。CSP による黙殺は**例外が出ず検知不能**——だから次の「CSS 適用検証」層がある |
+//! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
+//! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは**検知できぬ**——promise が解決せず evaluate が返らないため撮影に到達しない（誤った絵は出ない）。停止性は上位の CI ジョブタイムアウト頼み |
+//! | running 収集（`collectRunning`） | throw は検知 | `getAnimations`・走査の失敗は `errors` → `ok: false`（fail-closed）。クロスオリジン iframe の中は**原理的に数えられぬ**（`contentDocument` が null）——README「届かない範囲」に契約として明記 |
+//! | CSS 適用検証 | 検知 | 値の不一致は `ok: false`。検証呼び出し自体の throw も `errors` → `ok: false`（fail-closed）。検証は root ごとに最初の要素 1 点のサンプルであり全要素ではない（個別要素の `!important` 上書きは「届かない範囲」）。切り離された root は描画に影響しないため対象外 |
+//! | 結果の JSON 化 | 間接的に検知 | `JSON.stringify` の差し替え・失敗は文字列でない/読めない応答となり、Rust 側 [`freeze_verdict`] が unparseable として失敗（fail-closed） |
+//! | Rust 側の解析（[`freeze_verdict`]） | 検知 | `ok === true` と確かめられた場合のみ撮影へ進む。欠落・型違い・parse 失敗はすべて unparseable（fail-closed） |
+//! | iframe・shadow 走査（`freezeRoot` 再帰） | 部分的 | open shadow root と同一オリジン iframe には到達。closed shadow root は**列挙する API が存在せず検知不能**、静止処理より後から生成される root にも届かない——いずれも README「届かない範囲」でページ側の責務と定めてある |
+//! | スクリーンショット | 検知 | CDP エラーは Rust 側 `Err`（fail-closed） |
+//!
+//! 残る fail-open は「原理的に観測できない」もの（closed shadow root・
+//! クロスオリジン iframe・後から生成される root）だけであり、これらは
+//! 検知不能な理由とともに README の「届かない範囲」で利用者との契約に
+//! 昇格させてある。観測できるのに判定に使っていない失敗は残さないこと。
+//!
 //! ## 後始末
 //!
 //! `StoryRenderer` / `StaticServer` はどちらも drop で確実に止まる
@@ -235,6 +265,15 @@ JSON.stringify((() => {
 /// なるため、迂回は行わない。CSP が静止 CSS を拒否するページでは
 /// 検証が fail-closed で失敗し、利用者に原因が伝わる。
 ///
+/// **検証層自身の失敗も fail-closed である**。`getComputedStyle` が throw
+/// する（ページ側の差し替え・壊れた環境）など、注入・シーク・収集・検証の
+/// どの層でも `errors` に積まれた失敗が 1 件でもあれば、最後に `ok: false`
+/// を返して撮影を止める。`errors` は診断の置き場ではなく判定の入力である
+/// ——「検証できなかった」を「検証を通った」へ倒さない。唯一の例外は
+/// クロスオリジン iframe への到達不能で、これは原理的に触れない
+/// 「届かない範囲」として README に明記してある。各層の失敗経路の全体は
+/// モジュール先頭の「層ごとの失敗経路」を参照。
+///
 /// open shadow root と同一オリジン iframe（shadow 内にあるものも含む）は
 /// root 単位で再帰的に辿り、CSS 注入とアニメーションのシークを行う。
 /// closed shadow root、クロスオリジン iframe、canvas / rAF 駆動の JS
@@ -355,15 +394,25 @@ const FREEZE_SCRIPT: &str = r#"
             running.push(name + ':' + target);
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        // running の収集に失敗すると「残っていない」と区別できず、
+        // 収束判定が偽の成功へ倒れる。errors に積んで判定へ反映する。
+        errors.push('collectRunning: getAnimations failed: ' + String(e && e.message || e));
+      }
       try {
         for (const el of r.querySelectorAll('*')) {
           if (el.shadowRoot) collect(el.shadowRoot);
           if ((el.localName === 'iframe' || el.localName === 'frame')) {
+            // クロスオリジン iframe には原理的に触れない（contentDocument は
+            // null を返す）。ここの握りつぶしは意図的で、errors に積まない。
             try { collect(el.contentDocument); } catch (e) {}
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        // 走査に失敗した root の中は数えられていない。偽の成功を防ぐため
+        // errors に積んで判定へ反映する。
+        errors.push('collectRunning: traversal failed: ' + String(e && e.message || e));
+      }
     };
     collect(root);
     return running;
@@ -396,6 +445,10 @@ const FREEZE_SCRIPT: &str = r#"
   // style が拒否されるが例外は発生しない）。
   for (const root of frozenRoots) {
     try {
+      // 検証時点で切り離された root（除去された iframe の document・
+      // 切断された host の shadow root）は描画に影響しない上、computed
+      // style が空になって偽の失敗を生むので検証対象から外す。
+      if (root.nodeType === Node.DOCUMENT_NODE ? !root.defaultView : !root.isConnected) continue;
       const el = root.querySelector('*');
       if (!el) continue;
       const cs = getComputedStyle(el);
@@ -410,14 +463,24 @@ const FREEZE_SCRIPT: &str = r#"
         });
       }
     } catch (e) {
+      // 検証自体の失敗。ここで積んだエラーは下の errors 判定で
+      // 失敗として返る——「検証できなかった」を成功へ倒さない。
       errors.push('CSS verification failed: ' + String(e && e.message || e));
     }
   }
-  return JSON.stringify({
-    ok: true,
-    sweeps: sweeps,
-    errors: errors.length > 0 ? errors : undefined,
-  });
+  // errors は診断の置き場ではなく判定の入力である。1 件でも積まれていれば
+  // 「静止できたと確かめられていない」状態なので、撮影へ進ませず失敗を
+  // 返す（fail-closed）。注入・シーク・収集・検証のどの層の失敗もここで
+  // 拾われる——集めるだけで見ない fail-open を残さない。
+  if (errors.length > 0) {
+    return JSON.stringify({
+      ok: false,
+      sweeps: sweeps,
+      reason: 'freeze layer reported ' + errors.length + ' internal error(s)',
+      errors: errors,
+    });
+  }
+  return JSON.stringify({ ok: true, sweeps: sweeps });
 })()
 "#;
 
@@ -849,13 +912,27 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
         // 静止を確かめられた。撮影へ進む。`ok` 以外のキーは検査しない
         // （将来 FREEZE_SCRIPT が返すものを増やしても正当な応答を弾かない）。
         Some(true) => Ok(()),
-        // 静止に失敗した。reason があれば CSS 適用の検証失敗、
-        // running があればアニメーションが残っている。
+        // 静止に失敗した。reason があれば CSS 適用の検証失敗か freeze 層内部の
+        // エラー、running があればアニメーションが残っている。errors は
+        // FREEZE_SCRIPT が各層で集めた診断で、あれば原因ごとメッセージに載せる
+        // ——集めた診断は判定にも表示にも使う。
         Some(false) => {
+            let errors_note = parsed
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(" (errors: {joined})")
+                })
+                .unwrap_or_default();
             if let Some(reason) = parsed.get("reason").and_then(|v| v.as_str()) {
                 return Err(RenderError::Story {
                     story_id: story_id.to_string(),
-                    message: format!("freeze failed: {reason}"),
+                    message: format!("freeze failed: {reason}{errors_note}"),
                 });
             }
             let running = parsed.get("running").and_then(|v| v.as_array());
@@ -871,7 +948,7 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
                 story_id: story_id.to_string(),
                 message: format!(
                     "freeze failed: {count} animation(s) still running \
-                     after {sweeps} sweep(s): [{names}]",
+                     after {sweeps} sweep(s): [{names}]{errors_note}",
                     count = running.map(|a| a.len()).unwrap_or(0),
                     sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0),
                 ),
@@ -3171,6 +3248,87 @@ mod tests {
         assert!(
             !message.contains("freeze failed"),
             "a parse failure must not masquerade as a freeze failure, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// 検証層自身を失敗させるバンドル。preview の iframe（iframe.html）の
+    /// main world で `window.getComputedStyle` を throw する関数へ差し替える。
+    /// [`FREEZE_SCRIPT`] は同じ main world で評価されるため、CSS 適用検証の
+    /// `getComputedStyle(el)` 呼び出しがこの差し替えを踏んで throw する。
+    fn write_throwing_verification_bundle(root: &Path) {
+        std::fs::write(
+            root.join("iframe.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%;height:100vh;background:#00ff00; }
+</style></head>
+<body><div id="storybook-root"><div id="box"></div></div>
+<script>
+  window.getComputedStyle = function () {
+    throw new Error('getComputedStyle is broken on this page');
+  };
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    setTimeout(function () { channel.emit('storyRendered', 'throwing'); }, 20);
+  }, 20);
+</script>
+</body></html>"#,
+        )
+        .expect("write iframe.html");
+    }
+
+    /// **検証層の失敗の fail-closed**: CSS 適用検証の `getComputedStyle` が
+    /// throw するページで、レンダラは撮影せず失敗を返すこと。
+    ///
+    /// 修正前のコード（検証の catch が `errors` に積むだけで `ok: true` へ
+    /// 到達する）では、このページは freeze 失敗にならず PNG 取得まで黙って
+    /// 成功していた（positive control として実測済み）。レビュアーが
+    /// preview の iframe（iframe.html）内で `window.getComputedStyle` を
+    /// throw する関数へ差し替えて再現したのと同じ形である。
+    ///
+    /// 証明する: 検証層自身の失敗が fail-closed に倒れ、集めた `errors` が
+    /// 判定に使われること。証明しない: 静止そのもの・CSS 適用の成否。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn throwing_verification_fails_instead_of_silently_succeeding() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP throwing_verification_fails_instead_of_silently_succeeding: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_throwing_verification_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "throwing")
+            .await
+            .expect_err("a failing verification layer must fail — not silently capture a PNG");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze failed"),
+            "the error must go through the freeze-failure path, got {message:?}"
+        );
+        assert!(
+            message.contains("CSS verification failed"),
+            "the error must carry the collected verification error, got {message:?}"
         );
 
         renderer.close().await;

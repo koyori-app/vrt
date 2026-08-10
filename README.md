@@ -575,6 +575,18 @@ CSP `style-src 'self'` のページでは inline style が拒否されて適用�
 Storybook の CSP が `style-src 'self'` で inline style を拒否する場合は、
 静止 CSS の nonce を許可するか、`style-src 'unsafe-inline'` を追加すること。
 
+**検証層自身の失敗も fail-closed である**: `getComputedStyle` が throw する
+（ページ側スクリプトによる差し替え・切り離された document 等）など、静止処理の
+どの層でも内部エラーが 1 件でもあれば、撮影せず失敗を返す。「静止できたと
+確かめられていない」状態で撮った絵を baseline に混ぜないためである。
+これは**セキュリティ境界ではない**——脅威モデルは一貫して「事故」であり、
+悪意あるページへの防御ではない（成功の応答そのものを偽造するページは
+原理的に検出できない）。main world の組み込み関数（`JSON.stringify` /
+`getComputedStyle` 等）の差し替えを失敗として扱うのは、悪意の検出のため
+ではなく、polyfill や計測コードの事故・壊れた環境を沈黙させないためである。
+各層の失敗経路の一覧はレンダラのモジュールコメント
+（`crates/service/src/render/browser.rs` の「層ごとの失敗経路」）を参照。
+
 **静止後に始まる transition のイベントも届かない**: 静止は
 `transition-duration: 0s` / `transition-delay: 0s` の注入で行う。CSS Transitions
 の仕様では duration と delay の合計（combined duration）が 0s より大きいときに
