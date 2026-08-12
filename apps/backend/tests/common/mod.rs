@@ -362,6 +362,64 @@ impl MockGithub {
             .collect()
     }
 
+    /// PR コメント API 一式を受け付ける。
+    ///
+    /// - `GET /repos/{repo}/issues/{pr}/comments` は `existing` をそのまま返す
+    /// - `POST`（作成）は 201、`PATCH /repos/{repo}/issues/comments/{id}`（更新）は 200
+    pub async fn expect_pr_comments(&self, repo: &str, pr: i64, existing: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repo}/issues/{pr}/comments")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(existing))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/repos/{repo}/issues/{pr}/comments")))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 100 })))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("PATCH"))
+            .and(path_regex(format!(r"^/repos/{repo}/issues/comments/\d+$")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": 100 })))
+            .mount(&self.server)
+            .await;
+    }
+
+    /// これまでに受けた PR コメントの作成（POST）/ 更新（PATCH）リクエストを返す。
+    pub async fn pr_comment_requests(&self, repo: &str, pr: i64) -> Vec<wiremock::Request> {
+        let create = format!("/repos/{repo}/issues/{pr}/comments");
+        let update_prefix = format!("/repos/{repo}/issues/comments/");
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|req| {
+                (req.method == wiremock::http::Method::POST && req.url.path() == create)
+                    || (req.method == wiremock::http::Method::PATCH
+                        && req.url.path().starts_with(&update_prefix))
+            })
+            .collect()
+    }
+
+    /// PR コメントの作成 / 更新が届くまで待ち、そのリクエストを返す。
+    pub async fn wait_for_pr_comment(
+        &self,
+        repo: &str,
+        pr: i64,
+        timeout: std::time::Duration,
+    ) -> wiremock::Request {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(req) = self.pr_comment_requests(repo, pr).await.into_iter().next() {
+                return req;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("no pr comment request for {repo}#{pr} within {timeout:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     /// 指定 state のステータス POST が届くまで待ち、そのボディを返す。
     pub async fn wait_for_status(
         &self,

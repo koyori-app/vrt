@@ -1,10 +1,12 @@
-//! GitHub App 連携（PR コミットステータス）。
+//! GitHub App 連携（PR コミットステータス・PR コメント）。
 //!
 //! - App 資格情報の組み立ては [`github_app`]。設定が無ければ `None` を返し、
 //!   呼び出し側は「機能無効」として素通りする（起動は止めない）。
 //! - Installation Access Token は Valkey にキャッシュする（[`installation_token`]）。
 //!   GitHub のトークン有効期限は 1 時間なので、少し短い 50 分を TTL にする。
 //! - コミットステータスの POST は [`post_commit_status`]。
+//! - PR へのビルドリンクコメントは [`upsert_pr_comment`]（マーカー付きコメントを
+//!   1 PR × 1 プロジェクトにつき 1 件だけ維持する）。
 //!
 //! ## forge-github との分担
 //!
@@ -604,6 +606,156 @@ pub async fn post_commit_status(
     ))
 }
 
+// ── PR コメント（ビルドリンク）──────────────────────────────────────────────
+//
+// Chromatic のように、ビルドの状態とレビュー UI へのリンクを PR のコメントとして
+// 掲示する。ビルドの状態遷移ごとに新しいコメントを積むとうるさいので、
+// 不可視マーカーで自分のコメントを見つけて更新する（無ければ作成）。
+
+/// PR コメントを走査するページ数の上限（1 ページ 100 件）。
+///
+/// コメント 1,000 件超の PR で自分のコメントを見つけられなくても、コメントは
+/// 補助表示なので諦めて新規作成にフォールバックする（リポジトリ一覧と違って
+/// エラーにはしない）。
+const MAX_COMMENT_PAGES: u32 = 10;
+
+/// 自分のコメントを識別する不可視マーカー。
+///
+/// プロジェクト単位にすることで、複数プロジェクトが同じ PR に報告しても
+/// 互いのコメントを上書きしない。
+pub fn pr_comment_marker(project_id: Uuid) -> String {
+    format!("<!-- vrt:{project_id} -->")
+}
+
+/// PR コメントの本文を組み立てる。
+///
+/// `description` は [`status_for_build`] の文言をそのまま使う。
+pub fn pr_comment_body(
+    marker: &str,
+    project_slug: &str,
+    build_number: i64,
+    description: &str,
+    target_url: &str,
+) -> String {
+    format!(
+        "{marker}\n## 📸 VRT — {project_slug} build #{build_number}\n\n\
+         **{description}**\n\n[View build]({target_url})\n"
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct IssueComment {
+    id: i64,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// 失敗レスポンスをヘッダ・本文込みで [`GithubApiError`] に変換する。
+async fn error_from_response(context: &str, response: reqwest::Response) -> GithubApiError {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body: String = response
+        .text()
+        .await
+        .unwrap_or_default()
+        .chars()
+        .take(500)
+        .collect();
+    classify_failure(context, status, &headers, &body)
+}
+
+/// マーカーを含む既存コメントを PR から探す。見つからなければ `None`。
+async fn find_marker_comment(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    repo: &str,
+    pr_number: i32,
+    marker: &str,
+) -> Result<Option<i64>, GithubApiError> {
+    for page in 1..=MAX_COMMENT_PAGES {
+        let url = format!(
+            "{}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}",
+            base_url.trim_end_matches('/')
+        );
+        let response = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list pr comments: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(error_from_response("list pr comments", response).await);
+        }
+
+        let comments: Vec<IssueComment> = response
+            .json()
+            .await
+            .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode pr comments: {e}")))?;
+
+        // 一覧は古い順で返る。マーカーを引用した他人のコメントより先に、
+        // 自分の（最初に作った）コメントが必ずヒットする。
+        let page_len = comments.len();
+        if let Some(comment) = comments
+            .into_iter()
+            .find(|c| c.body.as_deref().is_some_and(|b| b.contains(marker)))
+        {
+            return Ok(Some(comment.id));
+        }
+        if page_len < 100 {
+            return Ok(None);
+        }
+    }
+    // ponytail: ページ上限到達時は「見つからなかった」扱いで新規作成に倒す。
+    // 巨大 PR で重複コメントが出うるが、コメントは補助表示なので許容する。
+    Ok(None)
+}
+
+/// PR のビルドリンクコメントを作成または更新する。
+///
+/// `marker` を含む既存コメントがあれば `PATCH` で本文を差し替え、
+/// 無ければ `POST /repos/{repo}/issues/{pr_number}/comments` で作成する。
+///
+/// ponytail: 同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿に
+/// なりうる。ビルドの状態遷移は時間的に離れていて実害が薄いのでロックは持たない。
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_pr_comment(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    repo: &str,
+    pr_number: i32,
+    marker: &str,
+    body: &str,
+) -> Result<(), GithubApiError> {
+    let existing = find_marker_comment(http, base_url, token, repo, pr_number, marker).await?;
+
+    let base = base_url.trim_end_matches('/');
+    let request = match existing {
+        Some(comment_id) => http.patch(format!("{base}/repos/{repo}/issues/comments/{comment_id}")),
+        None => http.post(format!("{base}/repos/{repo}/issues/{pr_number}/comments")),
+    };
+
+    let response = request
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("upsert pr comment: {e}")))?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+    Err(error_from_response("upsert pr comment", response).await)
+}
+
 // ── installations（claim とプロジェクト紐付け）──────────────────────────────
 
 use common::error::AppError;
@@ -800,6 +952,27 @@ mod tests {
             build_target_url("https://vrt.example.com/", "acme", "web", 42),
             "https://vrt.example.com/t/acme/p/web/builds/42"
         );
+    }
+
+    #[test]
+    fn pr_comment_body_embeds_marker_and_link() {
+        let marker = pr_comment_marker(Uuid::nil());
+        assert_eq!(marker, "<!-- vrt:00000000-0000-0000-0000-000000000000 -->");
+
+        let body = pr_comment_body(
+            &marker,
+            "web",
+            42,
+            "4 changes detected, awaiting review",
+            "https://vrt.example.com/t/acme/p/web/builds/42",
+        );
+        assert!(
+            body.starts_with(&marker),
+            "マーカーが先頭にあること: {body}"
+        );
+        assert!(body.contains("web build #42"));
+        assert!(body.contains("4 changes detected, awaiting review"));
+        assert!(body.contains("https://vrt.example.com/t/acme/p/web/builds/42"));
     }
 
     #[test]

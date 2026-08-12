@@ -1040,6 +1040,8 @@ async fn build_lifecycle_posts_commit_statuses_to_github() {
     let sha = Uuid::new_v4().simple().to_string();
 
     app.github().expect_commit_statuses(repo, &sha).await;
+    // 既存コメントは無い → 作成（POST）経路。
+    app.github().expect_pr_comments(repo, 7, json!([])).await;
 
     // installation を作って claim し、プロジェクトに紐付ける。
     app.post_github_webhook(
@@ -1141,6 +1143,28 @@ async fn build_lifecycle_posts_commit_statuses_to_github() {
     assert_eq!(
         success["description"].as_str(),
         Some("Visual changes approved")
+    );
+
+    // PR にはビルドリンクのコメントが投稿される（マーカー + ビルド URL 入り）。
+    let comment = app
+        .github()
+        .wait_for_pr_comment(repo, 7, POLL_TIMEOUT)
+        .await;
+    assert_eq!(comment.method, wiremock::http::Method::POST, "新規作成");
+    let comment_body: Value = serde_json::from_slice(&comment.body).expect("comment json");
+    let text = comment_body["body"].as_str().expect("comment body text");
+    assert!(
+        text.contains(&format!("<!-- vrt:{} -->", project.project_id)),
+        "マーカーを含む: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "{}/t/{}/p/{}/builds/{number}",
+            app.base_url(),
+            project.tenant_slug,
+            project.project_slug
+        )),
+        "ビルド URL を含む: {text}"
     );
 
     // 認証ヘッダの確認: installation access token が Bearer で付いている。
@@ -1263,6 +1287,103 @@ async fn rejecting_a_build_posts_a_failure_status() {
     assert_eq!(
         failure["description"].as_str(),
         Some("Visual changes rejected")
+    );
+
+    // PR に紐付かないビルドはコメント API に一切触らない。
+    let comment_requests: Vec<_> = app
+        .github()
+        .server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|req| req.url.path().contains("/issues/"))
+        .collect();
+    assert!(
+        comment_requests.is_empty(),
+        "build without a PR must not touch the comments API"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn existing_pr_comment_is_updated_instead_of_duplicated() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &sha).await;
+    // マーカー入りの既存コメントがある → 更新（PATCH）経路。
+    app.github()
+        .expect_pr_comments(
+            repo,
+            9,
+            json!([
+                { "id": 11, "body": "just a human comment" },
+                { "id": 55, "body": format!("<!-- vrt:{} -->\nold body", project.project_id) },
+            ]),
+        )
+        .await;
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    app.post_json(
+        &format!("/v1/github/installations/{installation_id}/claim"),
+        json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
+    )
+    .await;
+    app.patch_json(
+        &format!("/v1/projects/{}/github", project.project_id),
+        json!({ "installation_id": installation_id, "github_repo": repo }),
+    )
+    .await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+
+    let res = app
+        .post_json_with_bearer(
+            &format!(
+                "/v1/ci/projects/{}/{}/builds",
+                project.tenant_slug, project.project_slug
+            ),
+            &token,
+            json!({ "branch": "feature/z", "commit_sha": sha, "pull_request_number": 9 }),
+        )
+        .await;
+    let build: Value = res.json().await.expect("build json");
+    let build_id: Uuid = build["id"].as_str().expect("build id").parse().unwrap();
+
+    app.upload_screenshot(build_id, &token, "home", png(8, 8, [0, 0, 255, 255]))
+        .await;
+    app.post_with_bearer(&format!("/v1/ci/builds/{build_id}/finalize"), &token)
+        .await;
+
+    let comment = app
+        .github()
+        .wait_for_pr_comment(repo, 9, POLL_TIMEOUT)
+        .await;
+    assert_eq!(
+        comment.method,
+        wiremock::http::Method::PATCH,
+        "既存のマーカーコメントは更新する（重複作成しない）"
+    );
+    assert!(
+        comment.url.path().ends_with("/issues/comments/55"),
+        "マーカーを含むコメント (id=55) を更新する: {}",
+        comment.url.path()
     );
 }
 

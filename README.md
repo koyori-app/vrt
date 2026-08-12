@@ -7,7 +7,7 @@ Visual regression testing as a service. CI が撮ったスクリーンショッ�
 - **マルチテナント**: テナント（組織）> プロジェクト > ビルド > スクリーンショット
 - **CI からは PAT ひとつ**: ビルド作成 → PNG アップロード → finalize → ポーリング
 - **レビュー UI**: 差分のサイドバイサイド / オーバーレイ表示、キーボード操作
-- **GitHub App 連携**: PR にレビュー結果を commit status として返す（任意）
+- **GitHub App 連携**: PR にレビュー結果を commit status とビルドリンクのコメントで返す（任意）
 
 設計の詳細は [docs/architecture.md](docs/architecture.md)。
 GitHub App の設定は [docs/github-app.md](docs/github-app.md)。
