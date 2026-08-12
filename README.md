@@ -695,7 +695,8 @@ CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮るこ�
 エミュレートした状態で行う。ページのナビゲーション前に
 `Emulation.setEmulatedMedia` で一度設定するので、CSS メディアクエリにも、
 初期化時に `matchMedia` を読む JS にも、実利用者が OS で reduce を
-設定したときと同じ条件で見える。
+設定したときと同じ条件で見える。切り替えは Web UI のプロジェクト設定
+（Settings タブのチェックボックス）からも行える——同じ `PATCH` を叩く。
 
 **効く範囲は狭い。** 上の静止機構が `getAnimations()` に載るもの
 （CSS animation / transition / Web Animations）を実装の行儀に依存せず

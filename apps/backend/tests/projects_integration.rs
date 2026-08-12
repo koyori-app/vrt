@@ -59,6 +59,9 @@ async fn project_crud_within_tenant() {
     assert_eq!(body["default_branch"].as_str(), Some("main"));
     assert_eq!(body["diff_threshold"].as_f64(), Some(0.1));
     assert_eq!(body["diff_ratio_fail"].as_f64(), Some(0.0));
+    // reduced-motion エミュレーションは既定 OFF（有効化は baseline を一度
+    // 入れ替えるので、明示的に選ばせる——README の既定値の契約）。
+    assert_eq!(body["emulate_reduced_motion"].as_bool(), Some(false));
     assert!(body["github_installation_id"].is_null());
     assert!(body["github_repo"].is_null());
 
@@ -81,6 +84,7 @@ async fn project_crud_within_tenant() {
                 "default_branch": "develop",
                 "diff_threshold": 0.25,
                 "diff_ratio_fail": 0.5,
+                "emulate_reduced_motion": true,
             }),
         )
         .await;
@@ -90,6 +94,20 @@ async fn project_crud_within_tenant() {
     assert_eq!(body["default_branch"].as_str(), Some("develop"));
     assert_eq!(body["diff_threshold"].as_f64(), Some(0.25));
     assert_eq!(body["diff_ratio_fail"].as_f64(), Some(0.5));
+    // 設定画面のチェックボックスが辿る往復（PATCH → 応答）。ここが通らないと
+    // UI から有効化しても撮影側へは届かない。
+    assert_eq!(body["emulate_reduced_motion"].as_bool(), Some(true));
+
+    // フィールドを省略した更新は現在値を据え置く（bool でも「未指定＝据え置き」）。
+    let patch = app
+        .patch_json(
+            &format!("/v1/projects/{project_id}"),
+            json!({ "name": "Web App 2" }),
+        )
+        .await;
+    assert_eq!(patch.status(), StatusCode::OK);
+    let body: serde_json::Value = patch.json().await.expect("patch json");
+    assert_eq!(body["emulate_reduced_motion"].as_bool(), Some(true));
 
     // 削除（owner）
     assert_eq!(
