@@ -203,18 +203,29 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
             &description,
             &target_url,
         );
-        upsert_pr_comment(
+        let wrote_comment = upsert_pr_comment(
             &state.http,
             &state.settings.github_api_base_url(),
             &token,
             repo,
             pr_number,
             &marker,
+            build.number,
             &body,
         )
         .await?;
 
-        tracing::info!(%build_id, repo, pr_number, "upserted github pr comment");
+        if wrote_comment {
+            tracing::info!(%build_id, repo, pr_number, "upserted github pr comment");
+        } else {
+            tracing::info!(
+                %build_id,
+                repo,
+                pr_number,
+                build_number = build.number,
+                "skipped stale github pr comment update"
+            );
+        }
     }
 
     Ok(())

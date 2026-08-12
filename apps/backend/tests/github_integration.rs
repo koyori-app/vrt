@@ -15,8 +15,12 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use apalis::prelude::Data;
 use common::{TEST_INSTALLATION_TOKEN, TestApp};
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
@@ -149,6 +153,31 @@ async fn create_tenant_and_project(app: &TestApp) -> Project {
         project_id: project["id"].as_str().expect("project id").to_string(),
         project_slug,
     }
+}
+
+async fn create_pr_build(
+    app: &TestApp,
+    project: &Project,
+    token: &str,
+    sha: &str,
+    pr_number: i32,
+) -> Value {
+    let response = app
+        .post_json_with_bearer(
+            &format!(
+                "/v1/ci/projects/{}/{}/builds",
+                project.tenant_slug, project.project_slug
+            ),
+            token,
+            json!({
+                "branch": "feature/stale-comment",
+                "commit_sha": sha,
+                "pull_request_number": pr_number,
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED, "create PR build");
+    response.json().await.expect("build json")
 }
 
 // ── 1. webhook の署名検証 ────────────────────────────────────────────────
@@ -1384,6 +1413,148 @@ async fn existing_pr_comment_is_updated_instead_of_duplicated() {
         comment.url.path().ends_with("/issues/comments/55"),
         "マーカーを含むコメント (id=55) を更新する: {}",
         comment.url.path()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_build_job_does_not_overwrite_newer_pr_comment() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 10;
+    let old_sha = Uuid::new_v4().simple().to_string();
+    let new_sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &old_sha).await;
+    app.github().expect_commit_statuses(repo, &new_sha).await;
+
+    // GitHub 上のコメント本文を保持する stateful mock。POST 後の GET は、実際の
+    // GitHub API と同じように作成済みコメントを返す。
+    let current_comment = Arc::new(Mutex::new(None::<String>));
+    let comments_for_get = Arc::clone(&current_comment);
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{repo}/issues/{pr_number}/comments")))
+        .respond_with(move |_request: &wiremock::Request| {
+            let comments = comments_for_get
+                .lock()
+                .expect("comment state lock")
+                .as_ref()
+                .map(|body| json!([{ "id": 100, "body": body }]))
+                .unwrap_or_else(|| json!([]));
+            ResponseTemplate::new(200).set_body_json(comments)
+        })
+        .mount(&app.github().server)
+        .await;
+
+    let comment_for_post = Arc::clone(&current_comment);
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{repo}/issues/{pr_number}/comments")))
+        .respond_with(move |request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).expect("comment json");
+            *comment_for_post.lock().expect("comment state lock") =
+                Some(payload["body"].as_str().expect("comment body").to_owned());
+            ResponseTemplate::new(201).set_body_json(json!({ "id": 100 }))
+        })
+        .mount(&app.github().server)
+        .await;
+
+    let comment_for_patch = Arc::clone(&current_comment);
+    Mock::given(method("PATCH"))
+        .and(path(format!("/repos/{repo}/issues/comments/100")))
+        .respond_with(move |request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).expect("comment json");
+            *comment_for_patch.lock().expect("comment state lock") =
+                Some(payload["body"].as_str().expect("comment body").to_owned());
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 100 }))
+        })
+        .mount(&app.github().server)
+        .await;
+
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    app.post_json(
+        &format!("/v1/github/installations/{installation_id}/claim"),
+        json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(&app, &project.tenant_id).await }),
+    )
+    .await;
+    app.patch_json(
+        &format!("/v1/projects/{}/github", project.project_id),
+        json!({ "installation_id": installation_id, "github_repo": repo }),
+    )
+    .await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+    let old_build = create_pr_build(&app, &project, &token, &old_sha, pr_number).await;
+    let new_build = create_pr_build(&app, &project, &token, &new_sha, pr_number).await;
+    let old_build_id = old_build["id"].as_str().unwrap().parse().unwrap();
+    let new_build_id = new_build["id"].as_str().unwrap().parse().unwrap();
+    let old_number = old_build["number"].as_i64().unwrap();
+    let new_number = new_build["number"].as_i64().unwrap();
+    assert!(new_number > old_number);
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: new_build_id,
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("new build status job");
+
+    let new_comment = current_comment
+        .lock()
+        .expect("comment state lock")
+        .clone()
+        .expect("new build created a comment");
+    assert!(new_comment.contains(&format!("<!-- vrt:build_number:{new_number} -->")));
+    assert!(new_comment.contains(&format!("/builds/{new_number}")));
+    assert_eq!(
+        app.github()
+            .pr_comment_requests(repo, i64::from(pr_number))
+            .await
+            .len(),
+        1
+    );
+
+    // 新しいビルドの後で古いジョブを実行しても、コメントは書き戻されない。
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: old_build_id,
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("stale build status job");
+
+    let final_comment = current_comment
+        .lock()
+        .expect("comment state lock")
+        .clone()
+        .expect("comment remains present");
+    assert_eq!(final_comment, new_comment);
+    assert!(final_comment.contains(&format!("/builds/{new_number}")));
+    assert!(!final_comment.contains(&format!("/builds/{old_number}")));
+    assert_eq!(
+        app.github()
+            .pr_comment_requests(repo, i64::from(pr_number))
+            .await
+            .len(),
+        1,
+        "stale job must not POST or PATCH the PR comment"
     );
 }
 

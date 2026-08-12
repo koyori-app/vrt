@@ -627,6 +627,23 @@ pub fn pr_comment_marker(project_id: Uuid) -> String {
     format!("<!-- vrt:{project_id} -->")
 }
 
+/// コメントが指しているビルド番号を保持する不可視メタデータ。
+const PR_COMMENT_BUILD_NUMBER_PREFIX: &str = "<!-- vrt:build_number:";
+
+fn pr_comment_build_number_metadata(build_number: i64) -> String {
+    format!("{PR_COMMENT_BUILD_NUMBER_PREFIX}{build_number} -->")
+}
+
+fn parse_pr_comment_build_number(body: &str) -> Option<i64> {
+    body.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(PR_COMMENT_BUILD_NUMBER_PREFIX)?
+            .strip_suffix(" -->")?
+            .parse()
+            .ok()
+    })
+}
+
 /// PR コメントの本文を組み立てる。
 ///
 /// `description` は [`status_for_build`] の文言をそのまま使う。
@@ -637,8 +654,9 @@ pub fn pr_comment_body(
     description: &str,
     target_url: &str,
 ) -> String {
+    let build_number_metadata = pr_comment_build_number_metadata(build_number);
     format!(
-        "{marker}\n## 📸 VRT — {project_slug} build #{build_number}\n\n\
+        "{marker}\n{build_number_metadata}\n## 📸 VRT — {project_slug} build #{build_number}\n\n\
          **{description}**\n\n[View build]({target_url})\n"
     )
 }
@@ -672,7 +690,7 @@ async fn find_marker_comment(
     repo: &str,
     pr_number: i32,
     marker: &str,
-) -> Result<Option<i64>, GithubApiError> {
+) -> Result<Option<IssueComment>, GithubApiError> {
     for page in 1..=MAX_COMMENT_PAGES {
         let url = format!(
             "{}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}",
@@ -704,7 +722,7 @@ async fn find_marker_comment(
             .into_iter()
             .find(|c| c.body.as_deref().is_some_and(|b| b.contains(marker)))
         {
-            return Ok(Some(comment.id));
+            return Ok(Some(comment));
         }
         if page_len < 100 {
             return Ok(None);
@@ -719,6 +737,9 @@ async fn find_marker_comment(
 ///
 /// `marker` を含む既存コメントがあれば `PATCH` で本文を差し替え、
 /// 無ければ `POST /repos/{repo}/issues/{pr_number}/comments` で作成する。
+/// 既存コメントの不可視メタデータが現在と同じか新しいビルド番号を指している場合は、
+/// 遅延・再試行された古いジョブによる巻き戻しを防ぐため更新しない。
+/// 戻り値は書き込んだ場合に `true`、古いジョブとしてスキップした場合に `false`。
 ///
 /// ponytail: 同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿に
 /// なりうる。ビルドの状態遷移は時間的に離れていて実害が薄いのでロックは持たない。
@@ -730,13 +751,26 @@ pub async fn upsert_pr_comment(
     repo: &str,
     pr_number: i32,
     marker: &str,
+    build_number: i64,
     body: &str,
-) -> Result<(), GithubApiError> {
+) -> Result<bool, GithubApiError> {
     let existing = find_marker_comment(http, base_url, token, repo, pr_number, marker).await?;
 
     let base = base_url.trim_end_matches('/');
     let request = match existing {
-        Some(comment_id) => http.patch(format!("{base}/repos/{repo}/issues/comments/{comment_id}")),
+        Some(comment)
+            if comment
+                .body
+                .as_deref()
+                .and_then(parse_pr_comment_build_number)
+                .is_some_and(|existing_number| existing_number >= build_number) =>
+        {
+            return Ok(false);
+        }
+        Some(comment) => http.patch(format!(
+            "{base}/repos/{repo}/issues/comments/{}",
+            comment.id
+        )),
         None => http.post(format!("{base}/repos/{repo}/issues/{pr_number}/comments")),
     };
 
@@ -751,7 +785,7 @@ pub async fn upsert_pr_comment(
         .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("upsert pr comment: {e}")))?;
 
     if response.status().is_success() {
-        return Ok(());
+        return Ok(true);
     }
     Err(error_from_response("upsert pr comment", response).await)
 }
@@ -970,6 +1004,8 @@ mod tests {
             body.starts_with(&marker),
             "マーカーが先頭にあること: {body}"
         );
+        assert!(body.contains("<!-- vrt:build_number:42 -->"));
+        assert_eq!(parse_pr_comment_build_number(&body), Some(42));
         assert!(body.contains("web build #42"));
         assert!(body.contains("4 changes detected, awaiting review"));
         assert!(body.contains("https://vrt.example.com/t/acme/p/web/builds/42"));
