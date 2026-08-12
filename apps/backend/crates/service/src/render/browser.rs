@@ -1083,34 +1083,14 @@ impl StoryRenderer {
         // evaluate の CDP エラーは READY probe / FREEZE evaluate と同じ扱いで
         // deadline までリトライし、期限で story 分類の Timeout に倒す。
         if self.options.emulate_reduced_motion {
-            let probe_result = loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                match tokio::time::timeout(remaining, page.evaluate(REDUCED_MOTION_PROBE)).await {
-                    Ok(Ok(result)) => break result,
-                    Err(_) => {
-                        return Err(RenderError::Timeout {
-                            story_id: story_id.to_string(),
-                            timeout: self.options.story_timeout,
-                            phase: "the reduced-motion verification never returned a verdict",
-                        });
-                    }
-                    Ok(Err(e)) => {
-                        tracing::trace!(
-                            %story_id, error = %e,
-                            "reduced-motion probe evaluate failed; retrying"
-                        );
-                        if std::time::Instant::now() + POLL_INTERVAL >= deadline {
-                            return Err(RenderError::Timeout {
-                                story_id: story_id.to_string(),
-                                timeout: self.options.story_timeout,
-                                phase: "the reduced-motion verification evaluate kept \
-                                 failing until the story deadline",
-                            });
-                        }
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
-                }
-            };
+            let probe_result = evaluate_with_deadline_retry(
+                || page.evaluate(REDUCED_MOTION_PROBE),
+                deadline,
+                story_id,
+                self.options.story_timeout,
+                REDUCED_MOTION_PHASES,
+            )
+            .await?;
             reduced_motion_verdict(probe_result.value(), story_id)?;
         }
 
@@ -1146,33 +1126,14 @@ impl StoryRenderer {
             // 同じ [`RenderError::Timeout`] で返す。本物の環境異常（ブラウザ死）
             // でも失うのは最大 1 story ぶんの予算で、次の story の `new_page` が
             // 環境分類の Cdp で中断する（分類表はモジュール先頭を参照）。
-            let freeze_result = loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                match tokio::time::timeout(remaining, page.evaluate(FREEZE_SCRIPT)).await {
-                    Ok(Ok(result)) => break result,
-                    Err(_) => {
-                        return Err(RenderError::Timeout {
-                            story_id: story_id.to_string(),
-                            timeout: self.options.story_timeout,
-                            phase: "the freeze did not finish: the page never yielded a verdict \
-                             (requestAnimationFrame may not be firing)",
-                        });
-                    }
-                    Ok(Err(e)) => {
-                        tracing::trace!(%story_id, error = %e, "freeze evaluate failed; retrying");
-                        if std::time::Instant::now() + POLL_INTERVAL >= deadline {
-                            return Err(RenderError::Timeout {
-                                story_id: story_id.to_string(),
-                                timeout: self.options.story_timeout,
-                                phase: "the freeze evaluate kept failing until the story \
-                                 deadline (the page may be navigating or reloading, or its \
-                                 pending callbacks were collected)",
-                            });
-                        }
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
-                }
-            };
+            let freeze_result = evaluate_with_deadline_retry(
+                || page.evaluate(FREEZE_SCRIPT),
+                deadline,
+                story_id,
+                self.options.story_timeout,
+                FREEZE_PHASES,
+            )
+            .await?;
 
             // FREEZE_SCRIPT は JSON 文字列を返す。`ok === true` と確かめられた
             // 場合にだけ撮影へ進む（fail-closed）。ok: false（静止に失敗）も、
@@ -1209,6 +1170,103 @@ impl Drop for StoryRenderer {
         // `close()` を通らずに落ちた経路（panic / early return）でも
         // handler タスクを残さない。子プロセスは Browser の Drop が始末する。
         self.handler_task.abort();
+    }
+}
+
+/// [`evaluate_with_deadline_retry`] が失敗を名づけるための文字列一式。
+///
+/// **一本化するのは機構であって分類ではない**。待ち・リトライ・期限の手続きは
+/// 経路をまたいで一つで足りるが、「どの段で何が起きたか」は経路ごとに別の
+/// ままでなければならない——`phase` は README の failure paths 表から辿れる
+/// 診断であり、二経路が同じ文字列を返した時点でログから段を復元できなくなる。
+/// 経路ごとの定数（[`REDUCED_MOTION_PHASES`] / [`FREEZE_PHASES`]）に閉じ込め、
+/// 混入を `phase_strings_stay_distinct_per_path` が固定している。
+#[derive(Debug, Clone, Copy)]
+struct EvaluatePhases {
+    /// CDP エラーをリトライするときの trace ログ。
+    retry_log: &'static str,
+    /// deadline までに evaluate が返らなかったときの `phase`。
+    timeout: &'static str,
+    /// CDP エラーのリトライが deadline で尽きたときの `phase`。
+    retry_exhausted: &'static str,
+}
+
+/// reduced-motion 検証（[`REDUCED_MOTION_PROBE`]）の分類。
+const REDUCED_MOTION_PHASES: EvaluatePhases = EvaluatePhases {
+    retry_log: "reduced-motion probe evaluate failed; retrying",
+    timeout: "the reduced-motion verification never returned a verdict",
+    retry_exhausted: "the reduced-motion verification evaluate kept \
+                      failing until the story deadline",
+};
+
+/// 静止（[`FREEZE_SCRIPT`]）の分類。
+const FREEZE_PHASES: EvaluatePhases = EvaluatePhases {
+    retry_log: "freeze evaluate failed; retrying",
+    timeout: "the freeze did not finish: the page never yielded a verdict \
+              (requestAnimationFrame may not be firing)",
+    retry_exhausted: "the freeze evaluate kept failing until the story \
+                      deadline (the page may be navigating or reloading, or its \
+                      pending callbacks were collected)",
+};
+
+/// READY 待ちの後に走る evaluate の**機構**——共有 deadline への載せ方・
+/// CDP エラーのリトライ・期限での倒し方——を一つにまとめたもの。
+///
+/// reduced-motion 検証と静止は、抽出前は同型のループを別々に持っていた
+/// （約 30 行ずつ）。同型のまま二箇所にあるということは、片方だけ直せば
+/// 非対称が生まれるということでもある——freeze evaluate の CDP エラーを
+/// 即 [`RenderError::Cdp`]（環境分類＝ビルド即中断）へ倒していた非対称を
+/// cmd_632 で塞いだのが、まさにその型の事故だった。
+///
+/// 手続きは次の三段:
+///
+/// 1. `deadline` までの**残余**に evaluate を載せる（独立予算にしない。
+///    1 story の最悪所要が段の数だけ膨らみ、「story ごとの描画タイムアウト」
+///    という README の契約を裏切るため）
+/// 2. 残余を使い切って返らなければ [`EvaluatePhases::timeout`] の
+///    [`RenderError::Timeout`]
+/// 3. CDP エラーは撮影対象ページの内容に起因しうる（navigation / reload に
+///    よる実行コンテキスト破棄、pending promise の GC 回収——どちらも
+///    cmd_632 の実測）ので [`POLL_INTERVAL`] ごとにリトライし、次の一回が
+///    deadline を跨ぐなら [`EvaluatePhases::retry_exhausted`] の
+///    [`RenderError::Timeout`]（story 分類）で倒す
+///
+/// `evaluate` はクロージャで受ける。ページを直接持たないので、両分岐
+/// （期限切れ・リトライ切れ）をブラウザ無しで決定的に試験できる。
+async fn evaluate_with_deadline_retry<T, F, Fut>(
+    mut evaluate: F,
+    deadline: std::time::Instant,
+    story_id: &str,
+    story_timeout: Duration,
+    phases: EvaluatePhases,
+) -> Result<T, RenderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, chromiumoxide::error::CdpError>>,
+{
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, evaluate()).await {
+            Ok(Ok(result)) => return Ok(result),
+            Err(_) => {
+                return Err(RenderError::Timeout {
+                    story_id: story_id.to_string(),
+                    timeout: story_timeout,
+                    phase: phases.timeout,
+                });
+            }
+            Ok(Err(e)) => {
+                tracing::trace!(%story_id, error = %e, "{}", phases.retry_log);
+                if std::time::Instant::now() + POLL_INTERVAL >= deadline {
+                    return Err(RenderError::Timeout {
+                        story_id: story_id.to_string(),
+                        timeout: story_timeout,
+                        phase: phases.retry_exhausted,
+                    });
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
     }
 }
 
@@ -1887,6 +1945,212 @@ mod tests {
                 "{label}: a parse failure must not be reported as a freeze failure"
             );
         }
+    }
+
+    /// cmd_632 で実測した CDP エラー（-32000。navigation / reload が pending
+    /// evaluate の実行コンテキストを壊したときの文言）を模す。
+    fn cdp_context_destroyed() -> chromiumoxide::error::CdpError {
+        chromiumoxide::error::CdpError::ChromeMessage(
+            "Inspected target navigated or closed".to_string(),
+        )
+    }
+
+    /// **機構を一本化しても分類は経路ごとに別のまま**であること。
+    ///
+    /// [`evaluate_with_deadline_retry`] が共有するのは待ち・リトライ・期限
+    /// だけで、`phase` はログから「どの段で落ちたか」を復元するための診断
+    /// （README の failure paths 表への入口）である。二経路が同じ文字列を
+    /// 返した時点でその復元ができなくなる——抽出の副作用として最も起きやすい
+    /// 事故がこれなので、定数の段階で固定しておく。
+    ///
+    /// 証明する: 二経路の文字列が一つも重ならず、経路名と段が文言から読めること。
+    /// 証明しない: 呼び出し側がそれぞれ正しい定数を渡していること（実ブラウザ系の
+    /// `*_fails_story_scoped` と `*_never_returns_a_verdict` が担う）。
+    #[test]
+    fn phase_strings_stay_distinct_per_path() {
+        let reduced = [
+            REDUCED_MOTION_PHASES.retry_log,
+            REDUCED_MOTION_PHASES.timeout,
+            REDUCED_MOTION_PHASES.retry_exhausted,
+        ];
+        let freeze = [
+            FREEZE_PHASES.retry_log,
+            FREEZE_PHASES.timeout,
+            FREEZE_PHASES.retry_exhausted,
+        ];
+        for r in reduced {
+            for f in freeze {
+                assert_ne!(
+                    r, f,
+                    "the two paths must not share a diagnostic string — a shared \
+                     phase makes the failing stage unrecoverable from the logs"
+                );
+            }
+        }
+
+        // 経路の中でも「返らなかった」と「リトライが尽きた」は別の段である。
+        assert_ne!(
+            REDUCED_MOTION_PHASES.timeout, REDUCED_MOTION_PHASES.retry_exhausted,
+            "a timeout and an exhausted retry are different stages"
+        );
+        assert_ne!(
+            FREEZE_PHASES.timeout, FREEZE_PHASES.retry_exhausted,
+            "a timeout and an exhausted retry are different stages"
+        );
+
+        // どの経路の失敗かが文言そのものから読めること。
+        for phase in reduced {
+            assert!(
+                phase.contains("reduced-motion"),
+                "the reduced-motion path must name itself, got {phase:?}"
+            );
+        }
+        for phase in freeze {
+            assert!(
+                phase.contains("freeze"),
+                "the freeze path must name itself, got {phase:?}"
+            );
+        }
+    }
+
+    /// **リトライ切れ**が、経路自身の `retry_exhausted` を積んだ
+    /// [`RenderError::Timeout`] へ倒れること（両経路）。
+    ///
+    /// 期待値は定数を引かずに文字列リテラルで書く——定数を引くと、二経路の
+    /// 分類が入れ替わっても等式が保たれてしまい、この試験が何も検知しなく
+    /// なるためである。
+    ///
+    /// 証明する: 消えない CDP エラーが（即 [`RenderError::Cdp`] ではなく）
+    /// リトライされ、deadline で経路ごとの Timeout に倒れること。
+    /// 証明しない: 実ブラウザでその CDP エラーが実際に起きること
+    /// （`reloading_page_during_freeze_fails_story_scoped` 他が担う）。
+    #[tokio::test]
+    async fn evaluate_retry_exhaustion_falls_to_the_paths_own_phase() {
+        let cases: [(EvaluatePhases, &str); 2] = [
+            (
+                REDUCED_MOTION_PHASES,
+                "the reduced-motion verification evaluate kept failing until the story deadline",
+            ),
+            (
+                FREEZE_PHASES,
+                "the freeze evaluate kept failing until the story deadline (the page may be \
+                 navigating or reloading, or its pending callbacks were collected)",
+            ),
+        ];
+
+        for (phases, expected) in cases {
+            let attempts = std::cell::Cell::new(0usize);
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            let err = evaluate_with_deadline_retry::<(), _, _>(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    std::future::ready(Err(cdp_context_destroyed()))
+                },
+                deadline,
+                "story-x",
+                Duration::from_secs(7),
+                phases,
+            )
+            .await
+            .expect_err("a CDP error that never clears must fail at the deadline");
+
+            assert!(
+                attempts.get() > 1,
+                "the mechanism must retry a CDP error instead of failing on the first \
+                 one, got {} attempt(s)",
+                attempts.get()
+            );
+            match err {
+                RenderError::Timeout {
+                    story_id,
+                    timeout,
+                    phase,
+                } => {
+                    assert_eq!(phase, expected, "the phase must name this path's stage");
+                    assert_eq!(timeout, Duration::from_secs(7));
+                    assert_eq!(story_id, "story-x");
+                }
+                other => panic!("an exhausted retry must be story-scoped Timeout, got {other:?}"),
+            }
+        }
+    }
+
+    /// **期限切れ**（evaluate がそもそも返らない）が、経路自身の `timeout` を
+    /// 積んだ [`RenderError::Timeout`] へ倒れること（両経路）。
+    ///
+    /// 期待値を文字列リテラルで書く理由は上の試験と同じ。
+    ///
+    /// 証明する: 返らない evaluate が deadline で打ち切られ、経路ごとの phase
+    /// で報告されること。証明しない: 実ページが返らなくなる条件
+    /// （`raf_suppressed_page_fails_within_the_story_timeout` 他が担う）。
+    #[tokio::test]
+    async fn evaluate_that_never_returns_falls_to_the_paths_own_timeout_phase() {
+        let cases: [(EvaluatePhases, &str); 2] = [
+            (
+                REDUCED_MOTION_PHASES,
+                "the reduced-motion verification never returned a verdict",
+            ),
+            (
+                FREEZE_PHASES,
+                "the freeze did not finish: the page never yielded a verdict \
+                 (requestAnimationFrame may not be firing)",
+            ),
+        ];
+
+        for (phases, expected) in cases {
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let err = evaluate_with_deadline_retry(
+                std::future::pending::<Result<(), chromiumoxide::error::CdpError>>,
+                deadline,
+                "story-y",
+                Duration::from_secs(9),
+                phases,
+            )
+            .await
+            .expect_err("an evaluate that never returns must be cut at the deadline");
+
+            match err {
+                RenderError::Timeout {
+                    story_id,
+                    timeout,
+                    phase,
+                } => {
+                    assert_eq!(phase, expected, "the phase must name this path's stage");
+                    assert_eq!(timeout, Duration::from_secs(9));
+                    assert_eq!(story_id, "story-y");
+                }
+                other => panic!("a deadline overrun must be story-scoped Timeout, got {other:?}"),
+            }
+        }
+    }
+
+    /// リトライは**回復もする**こと——抽出で「一度でも失敗したら倒す」に
+    /// 変わっていないことの対照（この試験が無いと、上の二つは「常に失敗
+    /// させる実装」でも通ってしまう）。
+    #[tokio::test]
+    async fn evaluate_retries_until_the_error_clears() {
+        let attempts = std::cell::Cell::new(0usize);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let value = evaluate_with_deadline_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                let attempt = attempts.get();
+                std::future::ready(if attempt < 3 {
+                    Err(cdp_context_destroyed())
+                } else {
+                    Ok("verdict")
+                })
+            },
+            deadline,
+            "story-z",
+            Duration::from_secs(5),
+            FREEZE_PHASES,
+        )
+        .await
+        .expect("a transient CDP error must not be fatal");
+
+        assert_eq!(value, "verdict");
+        assert_eq!(attempts.get(), 3, "the first two failures must be retried");
     }
 
     /// Chromium を実際に起動する煙テスト。実行ファイルが無ければスキップする。
@@ -3924,11 +4188,19 @@ mod tests {
         renderer.close().await;
 
         let err = result.expect_err("a page that reloads during the freeze must fail");
+        let RenderError::Timeout { phase, .. } = err else {
+            panic!(
+                "a story that destroys the freeze evaluate by navigating must be \
+                 classified story-scoped (Timeout), not as an infrastructure Cdp \
+                 error that aborts the whole build, got {err:?}"
+            );
+        };
+        // 機構は reduced-motion 検証と共有していても、名乗る段は freeze のまま
+        // であること（どちらの freeze phase で終わるかは最後の一回が pending の
+        // まま期限を迎えたかで変わるので、経路だけを固定する）。
         assert!(
-            matches!(err, RenderError::Timeout { .. }),
-            "a story that destroys the freeze evaluate by navigating must be \
-             classified story-scoped (Timeout), not as an infrastructure Cdp \
-             error that aborts the whole build, got {err:?}"
+            phase.contains("freeze") && !phase.contains("reduced-motion"),
+            "the failing stage must be reported as the freeze one, got {phase:?}"
         );
     }
 
@@ -4018,11 +4290,16 @@ mod tests {
         renderer.close().await;
 
         let err = result.expect_err("a page that discards rAF callbacks must fail");
+        let RenderError::Timeout { phase, .. } = err else {
+            panic!(
+                "a story whose freeze promise is garbage-collected must be \
+                 classified story-scoped (Timeout), not as an infrastructure Cdp \
+                 error that aborts the whole build, got {err:?}"
+            );
+        };
         assert!(
-            matches!(err, RenderError::Timeout { .. }),
-            "a story whose freeze promise is garbage-collected must be \
-             classified story-scoped (Timeout), not as an infrastructure Cdp \
-             error that aborts the whole build, got {err:?}"
+            phase.contains("freeze") && !phase.contains("reduced-motion"),
+            "the failing stage must be reported as the freeze one, got {phase:?}"
         );
     }
 
@@ -4297,6 +4574,16 @@ mod tests {
   @media (prefers-reduced-motion: reduce) { .css-box { background:#0000ff; } }"#,
             "",
             r#"      var root = document.getElementById('storybook-root');
+      if (id === 'demo-rm--blocking') {
+        // reduced-motion プローブが最初に触る API を、返ってこない構築子へ
+        // 差し替える（story の描画そのものは触らない）。READY 判定は先に
+        // 済むので、止まるのは検証の evaluate だけ——「verdict を返さない」
+        // 段を決定的に作れる。
+        window.CSSStyleSheet = function () {
+          var end = Date.now() + 15000;
+          while (Date.now() < end) {}
+        };
+      }
       if (id === 'demo-rm--mocked') {
         window.matchMedia = function () {
           return { matches: false, media: '',
@@ -4528,6 +4815,70 @@ mod tests {
             .await
             .expect("without the request the mocked page is a legitimate story");
         renderer.close().await;
+    }
+
+    /// **配線の固定**: reduced-motion 検証が verdict を返さないとき、freeze の
+    /// phase ではなく **reduced-motion 自身の phase** で倒れること。
+    ///
+    /// 機構（待ち・リトライ・期限）は [`evaluate_with_deadline_retry`] に
+    /// 一本化されているが、分類は呼び出し側が渡す定数で決まる。ヘルパ自体の
+    /// 両分岐はブラウザ無しの `evaluate_*` 系が固定しているので、ここが
+    /// 固定するのは**この経路が [`REDUCED_MOTION_PHASES`] を渡していること**
+    /// ——freeze 側と取り違えても型は通ってしまう一点である。
+    ///
+    /// fixture は検証プローブが最初に触る `CSSStyleSheet` を、返らない
+    /// 構築子へ差し替える。差し替えは story 描画後に効くので READY 判定は
+    /// 通り、止まるのは検証の evaluate だけになる。
+    ///
+    /// 証明する: 経路の phase と story 分類。証明しない: リトライ切れ側の
+    /// 配線（実ページで CDP エラーを決定的に起こす手立てが無い——後述の
+    /// 判断できなかった点）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reduced_motion_probe_that_never_returns_fails_with_its_own_phase() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP a_reduced_motion_probe_that_never_returns_fails_with_its_own_phase: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(4);
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        // 外周上限: ここで落ちたら evaluate が deadline に載っていない。
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            renderer.render_story(&server.base_url(), "demo-rm--blocking"),
+        )
+        .await
+        .expect("render_story must return within the outer bound");
+        renderer.close().await;
+
+        let err = result.expect_err("a verification that never returns must not be captured");
+        match err {
+            RenderError::Timeout { phase, .. } => {
+                assert_eq!(
+                    phase, "the reduced-motion verification never returned a verdict",
+                    "the stage must be reported as the reduced-motion one"
+                );
+                assert!(
+                    !phase.contains("freeze"),
+                    "the freeze stage must not answer for the reduced-motion one"
+                );
+            }
+            other => panic!(
+                "a verification that never returns must be story-scoped Timeout, \
+                 not an infrastructure failure that aborts the build, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
