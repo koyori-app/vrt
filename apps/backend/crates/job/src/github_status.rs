@@ -1,4 +1,8 @@
-//! ビルドの状態を GitHub のコミットステータスへ反映するジョブ。
+//! ビルドの状態を GitHub のコミットステータスと PR コメントへ反映するジョブ。
+//!
+//! コミットステータスに加えて、ビルドが PR に紐付いている
+//! （`pull_request_number` がある）場合はレビュー UI へのリンクを PR コメントとして
+//! 掲示する（マーカー付きコメントの upsert。Chromatic と同じ見せ方）。
 //!
 //! 投入元は 3 箇所:
 //!
@@ -23,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use entity::{builds, projects, tenants};
 use service::github::{
     GithubApiError, STATUS_CONTEXT, build_target_url, github_app, installation_token,
-    post_commit_status, status_for_build,
+    post_commit_status, pr_comment_body, pr_comment_marker, status_for_build, upsert_pr_comment,
 };
 
 use crate::JobState;
@@ -186,6 +190,32 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
         state = %commit_state,
         "posted github commit status"
     );
+
+    // PR に紐付くビルドはレビュー UI へのリンクをコメントとして掲示する。
+    // ステータスの後に置く: コメントが transient に失敗してリトライされても、
+    // ステータスの再 POST は無害（GitHub は context ごとに最新だけを表示する）。
+    if let Some(pr_number) = build.pull_request_number {
+        let marker = pr_comment_marker(project.id);
+        let body = pr_comment_body(
+            &marker,
+            &project.slug,
+            build.number,
+            &description,
+            &target_url,
+        );
+        upsert_pr_comment(
+            &state.http,
+            &state.settings.github_api_base_url(),
+            &token,
+            repo,
+            pr_number,
+            &marker,
+            &body,
+        )
+        .await?;
+
+        tracing::info!(%build_id, repo, pr_number, "upserted github pr comment");
+    }
 
     Ok(())
 }

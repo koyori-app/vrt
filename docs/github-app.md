@@ -1,6 +1,7 @@
-# GitHub App 連携（PR コミットステータス）
+# GitHub App 連携（PR コミットステータス・PR コメント）
 
-VRT は GitHub App として PR のコミットステータス（`context: vrt`）を書き込む。
+VRT は GitHub App として PR のコミットステータス（`context: vrt`）を書き込み、
+PR に紐付くビルドにはレビュー UI へのリンクをコメントとして掲示する。
 未設定でも VRT のコアフローはそのまま動く（連携部分だけが無効になる）。
 
 ## 1. GitHub App を作る
@@ -14,6 +15,7 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 | Setup URL | `https://<APP_URL>/github/setup` |
 | Webhook secret | 任意のランダム文字列（`GITHUB_WEBHOOK_SECRET` に入れる） |
 | Repository permissions → **Commit statuses** | **Read and write** |
+| Repository permissions → **Pull requests** | **Read and write**（PR コメントに必要） |
 | Repository permissions → Metadata | Read-only（自動で付く） |
 | Subscribe to events | **Installation target** / **Installation**（`installation` イベント） |
 | Where can this GitHub App be installed? | 運用に合わせて |
@@ -74,6 +76,18 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 
 差分検出（`changes_detected`）を `failure` にしないのは、差分そのものは失敗ではなく
 **人間のレビュー待ち**だから。PR は「保留」のまま止まり、承認 / 却下で確定する。
+
+### PR コメント
+
+ビルドが PR に紐付いている（CLI が `pull_request_number` を送っている）場合は、
+ステータスと同じ内容 + ビルド詳細へのリンクを PR のコメントとしても掲示する。
+コメントは状態遷移ごとに積まず、不可視マーカー（`<!-- vrt:{project_id} -->`）で
+自分のコメントを見つけて**上書き更新**する（1 PR × 1 プロジェクトにつき 1 件）。
+
+> **既存インストールへの注意**
+> Pull requests 権限を後から App に追加した場合、既存の installation では
+> オーナーが新しい権限を承認するまでコメントは 403 で失敗する
+> （警告ログのみ。コミットステータスはそのまま動く）。
 
 ## 5. アンインストール・サスペンド
 
