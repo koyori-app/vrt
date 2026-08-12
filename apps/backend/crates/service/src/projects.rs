@@ -68,6 +68,11 @@ pub struct ProjectSettings {
     /// ビルド保持数の上限。外側 `None` は据え置き、`Some(None)` は無制限（NULL）に設定、
     /// `Some(Some(n))` は上限を `n` に設定する。
     pub build_retention_limit: Option<Option<i32>>,
+    /// storybook モードの撮影時に `prefers-reduced-motion: reduce` を
+    /// エミュレートするか。既定 OFF（[`create_project`]）——有効にすると
+    /// 撮る絵が変わり、そのプロジェクトの baseline が一度入れ替わるため、
+    /// 利用者が明示的に選んだときにだけ変える。
+    pub emulate_reduced_motion: Option<bool>,
 }
 
 /// テナント内のプロジェクト一覧（作成順）。
@@ -159,6 +164,7 @@ pub async fn create_project<C: ConnectionTrait>(
         viewport_width: Set(DEFAULT_VIEWPORT_WIDTH),
         viewport_height: Set(DEFAULT_VIEWPORT_HEIGHT),
         build_retention_limit: Set(None),
+        emulate_reduced_motion: Set(false),
         github_installation_id: Set(None),
         github_repo: Set(None),
         created_at: Set(now),
@@ -211,6 +217,9 @@ pub async fn update_project<C: ConnectionTrait>(
     }
     if let Some(build_retention_limit) = settings.build_retention_limit {
         active.build_retention_limit = Set(build_retention_limit);
+    }
+    if let Some(emulate_reduced_motion) = settings.emulate_reduced_motion {
+        active.emulate_reduced_motion = Set(emulate_reduced_motion);
     }
     active.updated_at = Set(Utc::now().fixed_offset());
     Ok(active.update(db).await?)

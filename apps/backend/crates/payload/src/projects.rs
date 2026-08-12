@@ -41,6 +41,10 @@ pub struct ProjectResponse {
     /// 保持する完了ビルド数の上限。null は無制限。
     #[schema(nullable)]
     pub build_retention_limit: Option<i32>,
+    /// storybook モードの撮影時に `prefers-reduced-motion: reduce` を
+    /// エミュレートするか。既定 false。有効化すると撮る絵が変わり、
+    /// baseline が一度入れ替わる。
+    pub emulate_reduced_motion: bool,
     #[schema(nullable)]
     pub github_installation_id: Option<i64>,
     #[schema(nullable)]
@@ -64,6 +68,7 @@ impl From<projects::Model> for ProjectResponse {
             viewport_width: model.viewport_width,
             viewport_height: model.viewport_height,
             build_retention_limit: model.build_retention_limit,
+            emulate_reduced_motion: model.emulate_reduced_motion,
             github_installation_id: model.github_installation_id,
             github_repo: model.github_repo,
             created_at: model.created_at.with_timezone(&Utc),
@@ -104,4 +109,9 @@ pub struct UpdateProjectRequest {
     #[schema(nullable, value_type = Option<i32>)]
     #[serde(default, deserialize_with = "double_option")]
     pub build_retention_limit: Option<Option<i32>>,
+    /// storybook モードの撮影時に `prefers-reduced-motion: reduce` を
+    /// エミュレートするか。省略すると現在値を据え置く。既定は false。
+    /// **有効化すると撮る絵が変わり、そのプロジェクトの baseline が
+    /// 一度入れ替わる**——最初のビルドで差分をレビューして承認すること。
+    pub emulate_reduced_motion: Option<bool>,
 }

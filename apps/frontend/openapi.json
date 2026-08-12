@@ -3953,7 +3953,7 @@
           "Projects"
         ],
         "summary": "プロジェクト設定を更新",
-        "description": "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0、`viewport_width` / `viewport_height` は 64〜10000（storybook モードのレンダリング用）。",
+        "description": "admin 以上が必要。`diff_threshold` / `diff_ratio_fail` は 0.0〜1.0、`viewport_width` / `viewport_height` は 64〜10000（storybook モードのレンダリング用）。`emulate_reduced_motion` は撮影時に `prefers-reduced-motion: reduce` をエミュレートする（既定 false。有効化すると baseline が一度入れ替わる）。",
         "operationId": "update_project",
         "parameters": [
           {
@@ -6940,6 +6940,7 @@
           "diff_ratio_fail",
           "viewport_width",
           "viewport_height",
+          "emulate_reduced_motion",
           "created_at",
           "updated_at"
         ],
@@ -6968,6 +6969,10 @@
             "type": "number",
             "format": "double",
             "description": "1 ピクセルを差分と判定する色距離のしきい値（0.0〜1.0）。"
+          },
+          "emulate_reduced_motion": {
+            "type": "boolean",
+            "description": "storybook モードの撮影時に `prefers-reduced-motion: reduce` を\nエミュレートするか。既定 false。有効化すると撮る絵が変わり、\nbaseline が一度入れ替わる。"
           },
           "github_installation_id": {
             "type": [
@@ -7308,6 +7313,13 @@
               "null"
             ],
             "format": "double"
+          },
+          "emulate_reduced_motion": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "storybook モードの撮影時に `prefers-reduced-motion: reduce` を\nエミュレートするか。省略すると現在値を据え置く。既定は false。\n**有効化すると撮る絵が変わり、そのプロジェクトの baseline が\n一度入れ替わる**——最初のビルドで差分をレビューして承認すること。"
           },
           "name": {
             "type": [

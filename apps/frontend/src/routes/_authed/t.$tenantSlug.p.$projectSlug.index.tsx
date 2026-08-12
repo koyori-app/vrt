@@ -8,6 +8,7 @@ import { CommitLink } from "@/components/commit-link";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -238,6 +239,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
   const [retention, setRetention] = useState(
     project.build_retention_limit == null ? "" : String(project.build_retention_limit),
   );
+  const [reducedMotion, setReducedMotion] = useState(project.emulate_reduced_motion);
 
   useEffect(() => {
     setName(project.name);
@@ -249,6 +251,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
     setRetention(
       project.build_retention_limit == null ? "" : String(project.build_retention_limit),
     );
+    setReducedMotion(project.emulate_reduced_motion);
   }, [project]);
 
   const update = $api.useMutation("patch", "/v1/projects/{project_id}", {
@@ -273,6 +276,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
         viewport_width: Number(viewportWidth),
         viewport_height: Number(viewportHeight),
         build_retention_limit: retention.trim() === "" ? null : Number(retention),
+        emulate_reduced_motion: reducedMotion,
       },
     });
   }
@@ -375,6 +379,28 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
               Keep only this many completed builds per project. Older builds (and their screenshots)
               are deleted automatically; builds referenced by the current baseline are always kept.
             </p>
+          </div>
+          <div className="space-y-2 sm:col-span-2">
+            {/* The cost has to be readable before the box is ticked: enabling this
+                replaces the baseline once. Same warning as the README section. */}
+            <label className="flex items-start gap-3 text-sm">
+              <Checkbox
+                className="mt-0.5"
+                checked={reducedMotion}
+                disabled={!canEdit}
+                onCheckedChange={(checked) => setReducedMotion(checked === true)}
+              />
+              <span>
+                <span className="font-medium">Emulate prefers-reduced-motion</span>
+                <span className="block text-xs text-muted-foreground">
+                  Renders storybook-mode captures as if the viewer had asked for reduced motion.
+                  Stories that respect the preference then look different, so the baseline is
+                  replaced once — review and approve the diff on the first build after you enable
+                  this. A story where the emulation cannot be verified fails instead of being
+                  captured.
+                </span>
+              </span>
+            </label>
           </div>
           <div className="sm:col-span-2">
             <Button type="submit" disabled={!canEdit || update.isPending}>

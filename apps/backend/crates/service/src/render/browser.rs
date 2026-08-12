@@ -6,6 +6,9 @@
 //!    ループバック限定なので外部からは触れない
 //! 2. [`StoryRenderer`] が chromiumoxide で Chromium を起動し、
 //!    `http://127.0.0.1:{port}/iframe.html?id={story_id}&viewMode=story` を開く
+//!    （project 設定で有効な場合は、ナビゲーション前に
+//!    `Emulation.setEmulatedMedia` で `prefers-reduced-motion: reduce` を
+//!    エミュレートし、撮影直前に適用を実測する——効いていなければ撮らない）
 //! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
 //!    短い settle 待ちのあと [`FREEZE_SCRIPT`] でキャレットとアニメーションを
 //!    決定的に静止させてから、ビューポートを PNG で撮る
@@ -55,9 +58,13 @@
 //! | Rust 側の解析（[`freeze_verdict`]） | 検知 | `ok === true` と確かめられた場合のみ撮影へ進む。欠落・型違い・parse 失敗はすべて unparseable（fail-closed） |
 //! | iframe・shadow 走査（`freezeRoot` 再帰） | 部分的 | open shadow root と同一オリジン iframe には到達。closed shadow root は**列挙する API が存在せず検知不能**、静止処理より後から生成される root にも届かない——いずれも README「届かない範囲」でページ側の責務と定めてある |
 //! | スクリーンショット | 検知 | CDP エラーは Rust 側 `Err`（fail-closed） |
+//! | reduced-motion 適用（`Emulation.setEmulatedMedia`） | 検知（CDP エラー・無応答とも） | project 設定で有効なときだけ `new_page` 直後（ナビゲーション前）に一度呼ぶ。CDP エラーは Rust 側 `Err` → [`RenderError::Cdp`]（環境分類・即中断。story のスクリプトを待たない一往復で、失敗の原因はブラウザ側——`new_page` と同じ分類）。無応答は chromiumoxide の request timeout（既定 30 秒）が `CdpError::Timeout` を返し、同じ `Cdp` へ倒れる（fail-closed） |
+//! | reduced-motion 適用の検証（[`REDUCED_MOTION_PROBE`]） | 部分的に検知 | 「呼び出しは成功したが実際にはメディアクエリが変わっていない」を撮影直前に実測する——constructed stylesheet の `@media (prefers-reduced-motion: reduce)` が効いたかのプローブ（`--vrt-reduced-motion`）と `matchMedia().matches` の**両輪**。どちらかが不成立なら `ok: false` → [`RenderError::Story`]（fail-closed。reduce を返さない壊れた/モックされた `matchMedia`——polyfill やテストダブルの事故——はここで落ちる）。evaluate の CDP エラーは READY probe と同様 deadline までリトライし期限で [`RenderError::Timeout`]。**ページが両方の観測を偽装する積極的な偽りは原理的に検知不能**——検証はページの JS realm で走り、CDP に emulated media 状態を読み戻す API が無い。脅威モデルは一貫して事故であり悪意ではない（README「検証層自身の失敗も fail-closed である」と同じ契約） |
+//! | reduced-motion 有効なのに呼び出し自体が漏れる | 実行時には検知不能 | 検知器の不在そのものがこの失敗であり、実行時観測では塞げない（「呼ばれなかったこと」を観測する層は、それ自身も呼ばれない）。構造で塞ぐ——適用は [`StoryRenderer::render_story`] の単一チョークポイントにだけ置き、分岐は `RenderOptions::emulate_reduced_motion` の一つ、project 列からの配線は `render_build` の単体テストで固定、経路全体は「ON で絵が変わる」positive control テスト（`reduced_motion_emulation_changes_the_picture_and_is_deterministic`）が貫通して固定する |
 //!
 //! 残る fail-open は「原理的に観測できない」もの（closed shadow root・
-//! クロスオリジン iframe・後から生成される root）だけであり、これらは
+//! クロスオリジン iframe・後から生成される root・reduced-motion 検証の
+//! 観測を両輪とも偽装するページ）だけであり、これらは
 //! 検知不能な理由とともに README の「届かない範囲」で利用者との契約に
 //! 昇格させてある。観測できるのに判定に使っていない失敗は残さないこと。
 //!
@@ -78,6 +85,8 @@
 //! | FREEZE evaluate | READY 待ちと**共有**の deadline（`started + story_timeout`）の残余。1 story の最悪所要は約 `story_timeout` + `SETTLE_DELAY` に収まる | [`RenderError::Timeout`]（時間切れ。READY 側と同じ分類。evaluate の CDP エラーも READY probe と同様 deadline までリトライし、期限で同じ Timeout——即 [`RenderError::Cdp`] へは倒さない） | `raf_suppressed_page_fails_within_the_story_timeout`・`freeze_timeout_shares_the_story_deadline_with_the_ready_wait`・`reloading_page_during_freeze_fails_story_scoped`・`collected_freeze_promise_fails_story_scoped` |
 //! | FREEZE 結果の解析 | 即時（待ちなし） | [`RenderError::Story`]（`freeze_verdict`） | `freeze_verdict_*` 単体群・`garbled_freeze_result_fails_instead_of_silently_succeeding` |
 //! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
+//! | reduced-motion 適用 | chromiumoxide の request timeout（既定 30 秒。一往復コマンド共通の機構） | [`RenderError::Cdp`] | `reduced_motion_emulation_changes_the_picture_and_is_deterministic` |
+//! | reduced-motion 検証 | evaluate リトライは READY 待ちと共有の deadline 残余。判定自体は即時 | [`RenderError::Story`]（[`reduced_motion_verdict`]）/ リトライ期限切れは [`RenderError::Timeout`] | `a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing`・`reduced_motion_verdict_*` 単体群 |
 //!
 //! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
 //!
@@ -102,6 +111,9 @@
 //! | FREEZE evaluate のエラー・ハング | リトライ→期限で [`RenderError::Timeout`] | story | navigation / reload・rAF 捨ては story のスクリプトの挙動（実測経路は上表） |
 //! | FREEZE verdict（静止失敗・解析不能） | [`RenderError::Story`] | story | その story のアニメーション・応答の内容に起因 |
 //! | スクリーンショット | [`RenderError::Cdp`] | 環境（即中断） | JS を待たない一往復の CDP コマンド——失敗はブラウザ側 |
+//! | reduced-motion 適用（`setEmulatedMedia`） | [`RenderError::Cdp`] | 環境（即中断） | `new_page` 直後・story のスクリプトを待たない一往復——失敗はブラウザ側 |
+//! | reduced-motion 検証の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | READY probe と同じ——ナビゲーション中の一時的な context 差し替えが主因 |
+//! | reduced-motion 検証の不成立・解析不能 | [`RenderError::Story`] | story | `matchMedia` の差し替え等、そのページの内容に起因 |
 //! | スクリーンショット名の規則違反 | `StoryFailure` 直行（`render_build`） | story | story の title / name に起因。全違反を 1 ビルドで列挙する |
 //! | ストレージ・DB・baseline 流用の失敗 | `anyhow`（`render_build`） | 環境（即中断） | 保存経路の異常は次の story でも再現する |
 //! | バンドル展開・stories 空 | `anyhow`（`render_build`） | ビルド全体（ループ前に中断） | story 以前の前提が壊れている |
@@ -130,6 +142,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
@@ -624,6 +637,61 @@ const FREEZE_SCRIPT: &str = r#"
 })()
 "#;
 
+/// reduced-motion エミュレーションが実際に効いているかを撮影直前に実測するプローブ。
+///
+/// `Emulation.setEmulatedMedia` の応答が成功でも、「メディアクエリが実際に
+/// 変わった」ことの証明にはならない——できたことは効いたことの証明ではない。
+/// 二輪で実測する:
+///
+/// 1. **CSS 輪**: constructed stylesheet の `@media (prefers-reduced-motion:
+///    reduce)` 内でだけ立つカスタムプロパティ（`--vrt-reduced-motion`）を
+///    `getComputedStyle` で読む。CSS カスケードの実評価であり、
+///    `matchMedia` 関数オブジェクトには依存しない
+/// 2. **matchMedia 輪**: `window.matchMedia('(prefers-reduced-motion:
+///    reduce)').matches === true`。JS 実装が実際に参照する観測面であり、
+///    reduce を返さない壊れた/モックされた `matchMedia`（polyfill・テスト
+///    ダブルの事故）をここで検出する——CSS 輪だけでは「CSS には効いたが
+///    JS には見えない」ページを素通ししてしまう
+///
+/// どちらか一方でも不成立なら `ok: false`（fail-closed）。プローブ自体の
+/// throw も `errors` → `ok: false` で、集めた診断は判定にも表示にも使う。
+/// 両輪とも偽装するページは原理的に検出できない（モジュール doc の表を参照）。
+const REDUCED_MOTION_PROBE: &str = r#"
+(() => {
+  const errors = [];
+  let cssApplied = false;
+  let mmMatches = false;
+  try {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(
+      '@media (prefers-reduced-motion: reduce) { :root { --vrt-reduced-motion: on; } }'
+    );
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+    cssApplied =
+      getComputedStyle(document.documentElement)
+        .getPropertyValue('--vrt-reduced-motion')
+        .trim() === 'on';
+    document.adoptedStyleSheets = document.adoptedStyleSheets.filter((s) => s !== sheet);
+    if (!cssApplied) {
+      errors.push('the reduce media query did not apply to the CSS cascade');
+    }
+  } catch (e) {
+    errors.push('css probe: ' + String(e));
+  }
+  try {
+    mmMatches = window.matchMedia('(prefers-reduced-motion: reduce)').matches === true;
+    if (!mmMatches) {
+      errors.push(
+        'matchMedia does not report reduce (the emulation was not applied, or matchMedia is broken or mocked)'
+      );
+    }
+  } catch (e) {
+    errors.push('matchMedia probe: ' + String(e));
+  }
+  return JSON.stringify({ ok: cssApplied && mmMatches, errors: errors });
+})()
+"#;
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -714,6 +782,13 @@ pub struct RenderOptions {
     /// 検証する positive control のためにある。本番経路（`render_build`）は
     /// [`RenderOptions::new`] を通るので常に `true`。
     pub freeze_before_capture: bool,
+    /// `prefers-reduced-motion: reduce` をエミュレートして撮るか。
+    /// 既定は `false`（project 設定の既定 OFF と一致）。
+    ///
+    /// `true` のときはナビゲーション前に `Emulation.setEmulatedMedia` を
+    /// 一度設定し、撮影直前に [`REDUCED_MOTION_PROBE`] で「実際に効いている」
+    /// ことを実測する。効いていると確かめられなければ撮らない（fail-closed）。
+    pub emulate_reduced_motion: bool,
 }
 
 impl RenderOptions {
@@ -728,6 +803,7 @@ impl RenderOptions {
             viewport_height,
             story_timeout: DEFAULT_STORY_TIMEOUT,
             freeze_before_capture: true,
+            emulate_reduced_motion: false,
         }
     }
 }
@@ -904,6 +980,29 @@ impl StoryRenderer {
             })?;
 
         let result = async {
+            // reduced-motion のエミュレーションは**ナビゲーション前**に一度
+            // 設定する。撮影直前に設定すると、初期化時に一度だけ
+            // `matchMedia` を読む実装（この層の主対象である rAF / canvas
+            // 実装の最頻形）には見えない——OS で reduce を設定した実利用者は
+            // ページ読み込みの最初から reduce で描画されるのであり、それと
+            // 同じ条件で撮る。`Emulation.setEmulatedMedia` はセッション状態
+            // なのでナビゲーションを跨いで効き続け、「実際に効いているか」は
+            // 撮影直前に [`REDUCED_MOTION_PROBE`] で実測する（fail-closed）。
+            // story のスクリプトを待たない一往復の CDP コマンドなので、
+            // 失敗は `new_page` と同じ環境分類（無応答は chromiumoxide の
+            // request timeout（既定 30 秒）が拾う——モジュール doc の表を参照）。
+            if self.options.emulate_reduced_motion {
+                page.execute(
+                    SetEmulatedMediaParams::builder()
+                        .feature(MediaFeature::new("prefers-reduced-motion", "reduce"))
+                        .build(),
+                )
+                .await
+                .map_err(|source| RenderError::Cdp {
+                    story_id: story_id.to_string(),
+                    source,
+                })?;
+            }
             page.evaluate_on_new_document(READY_HOOK_SCRIPT)
                 .await
                 .map_err(|source| RenderError::Cdp {
@@ -977,6 +1076,24 @@ impl StoryRenderer {
 
         tokio::time::sleep(SETTLE_DELAY).await;
 
+        // reduced-motion を要求した project では、撮影直前に「実際に効いて
+        // いる」ことを実測する。setEmulatedMedia の応答が成功でも効いた
+        // 証明にはならず、「reduce を要求したのに適用されなかった」が
+        // 黙って通れば、静止させたと信じたまま動く絵を撮る（fail-closed）。
+        // evaluate の CDP エラーは READY probe / FREEZE evaluate と同じ扱いで
+        // deadline までリトライし、期限で story 分類の Timeout に倒す。
+        if self.options.emulate_reduced_motion {
+            let probe_result = evaluate_with_deadline_retry(
+                || page.evaluate(REDUCED_MOTION_PROBE),
+                deadline,
+                story_id,
+                self.options.story_timeout,
+                REDUCED_MOTION_PHASES,
+            )
+            .await?;
+            reduced_motion_verdict(probe_result.value(), story_id)?;
+        }
+
         // 撮影直前にキャレットとアニメーションを決定的な座標へ固定する。
         // 静止に失敗したまま撮ると flaky な絵が baseline に混ざるので、
         // 黙って続行せず失敗として返す（fail-closed）。
@@ -1009,33 +1126,14 @@ impl StoryRenderer {
             // 同じ [`RenderError::Timeout`] で返す。本物の環境異常（ブラウザ死）
             // でも失うのは最大 1 story ぶんの予算で、次の story の `new_page` が
             // 環境分類の Cdp で中断する（分類表はモジュール先頭を参照）。
-            let freeze_result = loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                match tokio::time::timeout(remaining, page.evaluate(FREEZE_SCRIPT)).await {
-                    Ok(Ok(result)) => break result,
-                    Err(_) => {
-                        return Err(RenderError::Timeout {
-                            story_id: story_id.to_string(),
-                            timeout: self.options.story_timeout,
-                            phase: "the freeze did not finish: the page never yielded a verdict \
-                             (requestAnimationFrame may not be firing)",
-                        });
-                    }
-                    Ok(Err(e)) => {
-                        tracing::trace!(%story_id, error = %e, "freeze evaluate failed; retrying");
-                        if std::time::Instant::now() + POLL_INTERVAL >= deadline {
-                            return Err(RenderError::Timeout {
-                                story_id: story_id.to_string(),
-                                timeout: self.options.story_timeout,
-                                phase: "the freeze evaluate kept failing until the story \
-                                 deadline (the page may be navigating or reloading, or its \
-                                 pending callbacks were collected)",
-                            });
-                        }
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                    }
-                }
-            };
+            let freeze_result = evaluate_with_deadline_retry(
+                || page.evaluate(FREEZE_SCRIPT),
+                deadline,
+                story_id,
+                self.options.story_timeout,
+                FREEZE_PHASES,
+            )
+            .await?;
 
             // FREEZE_SCRIPT は JSON 文字列を返す。`ok === true` と確かめられた
             // 場合にだけ撮影へ進む（fail-closed）。ok: false（静止に失敗）も、
@@ -1072,6 +1170,103 @@ impl Drop for StoryRenderer {
         // `close()` を通らずに落ちた経路（panic / early return）でも
         // handler タスクを残さない。子プロセスは Browser の Drop が始末する。
         self.handler_task.abort();
+    }
+}
+
+/// [`evaluate_with_deadline_retry`] が失敗を名づけるための文字列一式。
+///
+/// **一本化するのは機構であって分類ではない**。待ち・リトライ・期限の手続きは
+/// 経路をまたいで一つで足りるが、「どの段で何が起きたか」は経路ごとに別の
+/// ままでなければならない——`phase` は README の failure paths 表から辿れる
+/// 診断であり、二経路が同じ文字列を返した時点でログから段を復元できなくなる。
+/// 経路ごとの定数（[`REDUCED_MOTION_PHASES`] / [`FREEZE_PHASES`]）に閉じ込め、
+/// 混入を `phase_strings_stay_distinct_per_path` が固定している。
+#[derive(Debug, Clone, Copy)]
+struct EvaluatePhases {
+    /// CDP エラーをリトライするときの trace ログ。
+    retry_log: &'static str,
+    /// deadline までに evaluate が返らなかったときの `phase`。
+    timeout: &'static str,
+    /// CDP エラーのリトライが deadline で尽きたときの `phase`。
+    retry_exhausted: &'static str,
+}
+
+/// reduced-motion 検証（[`REDUCED_MOTION_PROBE`]）の分類。
+const REDUCED_MOTION_PHASES: EvaluatePhases = EvaluatePhases {
+    retry_log: "reduced-motion probe evaluate failed; retrying",
+    timeout: "the reduced-motion verification never returned a verdict",
+    retry_exhausted: "the reduced-motion verification evaluate kept \
+                      failing until the story deadline",
+};
+
+/// 静止（[`FREEZE_SCRIPT`]）の分類。
+const FREEZE_PHASES: EvaluatePhases = EvaluatePhases {
+    retry_log: "freeze evaluate failed; retrying",
+    timeout: "the freeze did not finish: the page never yielded a verdict \
+              (requestAnimationFrame may not be firing)",
+    retry_exhausted: "the freeze evaluate kept failing until the story \
+                      deadline (the page may be navigating or reloading, or its \
+                      pending callbacks were collected)",
+};
+
+/// READY 待ちの後に走る evaluate の**機構**——共有 deadline への載せ方・
+/// CDP エラーのリトライ・期限での倒し方——を一つにまとめたもの。
+///
+/// reduced-motion 検証と静止は、抽出前は同型のループを別々に持っていた
+/// （約 30 行ずつ）。同型のまま二箇所にあるということは、片方だけ直せば
+/// 非対称が生まれるということでもある——freeze evaluate の CDP エラーを
+/// 即 [`RenderError::Cdp`]（環境分類＝ビルド即中断）へ倒していた非対称を
+/// cmd_632 で塞いだのが、まさにその型の事故だった。
+///
+/// 手続きは次の三段:
+///
+/// 1. `deadline` までの**残余**に evaluate を載せる（独立予算にしない。
+///    1 story の最悪所要が段の数だけ膨らみ、「story ごとの描画タイムアウト」
+///    という README の契約を裏切るため）
+/// 2. 残余を使い切って返らなければ [`EvaluatePhases::timeout`] の
+///    [`RenderError::Timeout`]
+/// 3. CDP エラーは撮影対象ページの内容に起因しうる（navigation / reload に
+///    よる実行コンテキスト破棄、pending promise の GC 回収——どちらも
+///    cmd_632 の実測）ので [`POLL_INTERVAL`] ごとにリトライし、次の一回が
+///    deadline を跨ぐなら [`EvaluatePhases::retry_exhausted`] の
+///    [`RenderError::Timeout`]（story 分類）で倒す
+///
+/// `evaluate` はクロージャで受ける。ページを直接持たないので、両分岐
+/// （期限切れ・リトライ切れ）をブラウザ無しで決定的に試験できる。
+async fn evaluate_with_deadline_retry<T, F, Fut>(
+    mut evaluate: F,
+    deadline: std::time::Instant,
+    story_id: &str,
+    story_timeout: Duration,
+    phases: EvaluatePhases,
+) -> Result<T, RenderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, chromiumoxide::error::CdpError>>,
+{
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, evaluate()).await {
+            Ok(Ok(result)) => return Ok(result),
+            Err(_) => {
+                return Err(RenderError::Timeout {
+                    story_id: story_id.to_string(),
+                    timeout: story_timeout,
+                    phase: phases.timeout,
+                });
+            }
+            Ok(Err(e)) => {
+                tracing::trace!(%story_id, error = %e, "{}", phases.retry_log);
+                if std::time::Instant::now() + POLL_INTERVAL >= deadline {
+                    return Err(RenderError::Timeout {
+                        story_id: story_id.to_string(),
+                        timeout: story_timeout,
+                        phase: phases.retry_exhausted,
+                    });
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
     }
 }
 
@@ -1145,6 +1340,64 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
                      after {sweeps} sweep(s): [{names}]{errors_note}",
                     count = running.map(|a| a.len()).unwrap_or(0),
                     sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0),
+                ),
+            })
+        }
+        None => Err(unparseable(format!(
+            "missing or non-boolean `ok` key (raw: {raw})"
+        ))),
+    }
+}
+
+/// [`REDUCED_MOTION_PROBE`] の返り値を検分し、撮影へ進んでよいか判定する。
+///
+/// [`freeze_verdict`] と同じ受理条件——`ok` が `true` であると確かめられた
+/// 場合にだけ `Ok(())` を返し、それ以外はすべて失敗（fail-closed）:
+///
+/// - `ok: false` — **エミュレーションが効いていると確かめられなかった**。
+///   `errors` にどちらの輪（CSS / matchMedia）が不成立だったかが載る
+/// - 値が文字列でない／JSON として読めない／`ok` が無い・bool でない —
+///   **検証結果を解析できなかった**。効いているかどうか自体が不明
+///
+/// どちらも既存の freeze 失敗と同じ [`RenderError::Story`] 経路を使う
+/// （story 単位に隔離され、残りの story は撮り続けられる）。
+fn reduced_motion_verdict(
+    value: Option<&serde_json::Value>,
+    story_id: &str,
+) -> Result<(), RenderError> {
+    let unparseable = |detail: String| RenderError::Story {
+        story_id: story_id.to_string(),
+        message: format!("reduced-motion verification result was unparseable: {detail}"),
+    };
+    let Some(raw) = value.and_then(|v| v.as_str()) else {
+        return Err(unparseable(format!(
+            "expected a JSON string, got {value:?}"
+        )));
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| unparseable(format!("{e} (raw: {raw})")))?;
+    match parsed.get("ok").and_then(|v| v.as_bool()) {
+        // 効いていると確かめられた。撮影へ進む。`ok` 以外のキーは検査しない
+        // （将来プローブが返すものを増やしても正当な応答を弾かない）。
+        Some(true) => Ok(()),
+        Some(false) => {
+            let errors_note = parsed
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(" (errors: {joined})")
+                })
+                .unwrap_or_default();
+            Err(RenderError::Story {
+                story_id: story_id.to_string(),
+                message: format!(
+                    "reduced-motion emulation was requested but could not be \
+                     verified as applied{errors_note}"
                 ),
             })
         }
@@ -1692,6 +1945,212 @@ mod tests {
                 "{label}: a parse failure must not be reported as a freeze failure"
             );
         }
+    }
+
+    /// cmd_632 で実測した CDP エラー（-32000。navigation / reload が pending
+    /// evaluate の実行コンテキストを壊したときの文言）を模す。
+    fn cdp_context_destroyed() -> chromiumoxide::error::CdpError {
+        chromiumoxide::error::CdpError::ChromeMessage(
+            "Inspected target navigated or closed".to_string(),
+        )
+    }
+
+    /// **機構を一本化しても分類は経路ごとに別のまま**であること。
+    ///
+    /// [`evaluate_with_deadline_retry`] が共有するのは待ち・リトライ・期限
+    /// だけで、`phase` はログから「どの段で落ちたか」を復元するための診断
+    /// （README の failure paths 表への入口）である。二経路が同じ文字列を
+    /// 返した時点でその復元ができなくなる——抽出の副作用として最も起きやすい
+    /// 事故がこれなので、定数の段階で固定しておく。
+    ///
+    /// 証明する: 二経路の文字列が一つも重ならず、経路名と段が文言から読めること。
+    /// 証明しない: 呼び出し側がそれぞれ正しい定数を渡していること（実ブラウザ系の
+    /// `*_fails_story_scoped` と `*_never_returns_a_verdict` が担う）。
+    #[test]
+    fn phase_strings_stay_distinct_per_path() {
+        let reduced = [
+            REDUCED_MOTION_PHASES.retry_log,
+            REDUCED_MOTION_PHASES.timeout,
+            REDUCED_MOTION_PHASES.retry_exhausted,
+        ];
+        let freeze = [
+            FREEZE_PHASES.retry_log,
+            FREEZE_PHASES.timeout,
+            FREEZE_PHASES.retry_exhausted,
+        ];
+        for r in reduced {
+            for f in freeze {
+                assert_ne!(
+                    r, f,
+                    "the two paths must not share a diagnostic string — a shared \
+                     phase makes the failing stage unrecoverable from the logs"
+                );
+            }
+        }
+
+        // 経路の中でも「返らなかった」と「リトライが尽きた」は別の段である。
+        assert_ne!(
+            REDUCED_MOTION_PHASES.timeout, REDUCED_MOTION_PHASES.retry_exhausted,
+            "a timeout and an exhausted retry are different stages"
+        );
+        assert_ne!(
+            FREEZE_PHASES.timeout, FREEZE_PHASES.retry_exhausted,
+            "a timeout and an exhausted retry are different stages"
+        );
+
+        // どの経路の失敗かが文言そのものから読めること。
+        for phase in reduced {
+            assert!(
+                phase.contains("reduced-motion"),
+                "the reduced-motion path must name itself, got {phase:?}"
+            );
+        }
+        for phase in freeze {
+            assert!(
+                phase.contains("freeze"),
+                "the freeze path must name itself, got {phase:?}"
+            );
+        }
+    }
+
+    /// **リトライ切れ**が、経路自身の `retry_exhausted` を積んだ
+    /// [`RenderError::Timeout`] へ倒れること（両経路）。
+    ///
+    /// 期待値は定数を引かずに文字列リテラルで書く——定数を引くと、二経路の
+    /// 分類が入れ替わっても等式が保たれてしまい、この試験が何も検知しなく
+    /// なるためである。
+    ///
+    /// 証明する: 消えない CDP エラーが（即 [`RenderError::Cdp`] ではなく）
+    /// リトライされ、deadline で経路ごとの Timeout に倒れること。
+    /// 証明しない: 実ブラウザでその CDP エラーが実際に起きること
+    /// （`reloading_page_during_freeze_fails_story_scoped` 他が担う）。
+    #[tokio::test]
+    async fn evaluate_retry_exhaustion_falls_to_the_paths_own_phase() {
+        let cases: [(EvaluatePhases, &str); 2] = [
+            (
+                REDUCED_MOTION_PHASES,
+                "the reduced-motion verification evaluate kept failing until the story deadline",
+            ),
+            (
+                FREEZE_PHASES,
+                "the freeze evaluate kept failing until the story deadline (the page may be \
+                 navigating or reloading, or its pending callbacks were collected)",
+            ),
+        ];
+
+        for (phases, expected) in cases {
+            let attempts = std::cell::Cell::new(0usize);
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            let err = evaluate_with_deadline_retry::<(), _, _>(
+                || {
+                    attempts.set(attempts.get() + 1);
+                    std::future::ready(Err(cdp_context_destroyed()))
+                },
+                deadline,
+                "story-x",
+                Duration::from_secs(7),
+                phases,
+            )
+            .await
+            .expect_err("a CDP error that never clears must fail at the deadline");
+
+            assert!(
+                attempts.get() > 1,
+                "the mechanism must retry a CDP error instead of failing on the first \
+                 one, got {} attempt(s)",
+                attempts.get()
+            );
+            match err {
+                RenderError::Timeout {
+                    story_id,
+                    timeout,
+                    phase,
+                } => {
+                    assert_eq!(phase, expected, "the phase must name this path's stage");
+                    assert_eq!(timeout, Duration::from_secs(7));
+                    assert_eq!(story_id, "story-x");
+                }
+                other => panic!("an exhausted retry must be story-scoped Timeout, got {other:?}"),
+            }
+        }
+    }
+
+    /// **期限切れ**（evaluate がそもそも返らない）が、経路自身の `timeout` を
+    /// 積んだ [`RenderError::Timeout`] へ倒れること（両経路）。
+    ///
+    /// 期待値を文字列リテラルで書く理由は上の試験と同じ。
+    ///
+    /// 証明する: 返らない evaluate が deadline で打ち切られ、経路ごとの phase
+    /// で報告されること。証明しない: 実ページが返らなくなる条件
+    /// （`raf_suppressed_page_fails_within_the_story_timeout` 他が担う）。
+    #[tokio::test]
+    async fn evaluate_that_never_returns_falls_to_the_paths_own_timeout_phase() {
+        let cases: [(EvaluatePhases, &str); 2] = [
+            (
+                REDUCED_MOTION_PHASES,
+                "the reduced-motion verification never returned a verdict",
+            ),
+            (
+                FREEZE_PHASES,
+                "the freeze did not finish: the page never yielded a verdict \
+                 (requestAnimationFrame may not be firing)",
+            ),
+        ];
+
+        for (phases, expected) in cases {
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let err = evaluate_with_deadline_retry(
+                std::future::pending::<Result<(), chromiumoxide::error::CdpError>>,
+                deadline,
+                "story-y",
+                Duration::from_secs(9),
+                phases,
+            )
+            .await
+            .expect_err("an evaluate that never returns must be cut at the deadline");
+
+            match err {
+                RenderError::Timeout {
+                    story_id,
+                    timeout,
+                    phase,
+                } => {
+                    assert_eq!(phase, expected, "the phase must name this path's stage");
+                    assert_eq!(timeout, Duration::from_secs(9));
+                    assert_eq!(story_id, "story-y");
+                }
+                other => panic!("a deadline overrun must be story-scoped Timeout, got {other:?}"),
+            }
+        }
+    }
+
+    /// リトライは**回復もする**こと——抽出で「一度でも失敗したら倒す」に
+    /// 変わっていないことの対照（この試験が無いと、上の二つは「常に失敗
+    /// させる実装」でも通ってしまう）。
+    #[tokio::test]
+    async fn evaluate_retries_until_the_error_clears() {
+        let attempts = std::cell::Cell::new(0usize);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let value = evaluate_with_deadline_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                let attempt = attempts.get();
+                std::future::ready(if attempt < 3 {
+                    Err(cdp_context_destroyed())
+                } else {
+                    Ok("verdict")
+                })
+            },
+            deadline,
+            "story-z",
+            Duration::from_secs(5),
+            FREEZE_PHASES,
+        )
+        .await
+        .expect("a transient CDP error must not be fatal");
+
+        assert_eq!(value, "verdict");
+        assert_eq!(attempts.get(), 3, "the first two failures must be retried");
     }
 
     /// Chromium を実際に起動する煙テスト。実行ファイルが無ければスキップする。
@@ -3729,11 +4188,19 @@ mod tests {
         renderer.close().await;
 
         let err = result.expect_err("a page that reloads during the freeze must fail");
+        let RenderError::Timeout { phase, .. } = err else {
+            panic!(
+                "a story that destroys the freeze evaluate by navigating must be \
+                 classified story-scoped (Timeout), not as an infrastructure Cdp \
+                 error that aborts the whole build, got {err:?}"
+            );
+        };
+        // 機構は reduced-motion 検証と共有していても、名乗る段は freeze のまま
+        // であること（どちらの freeze phase で終わるかは最後の一回が pending の
+        // まま期限を迎えたかで変わるので、経路だけを固定する）。
         assert!(
-            matches!(err, RenderError::Timeout { .. }),
-            "a story that destroys the freeze evaluate by navigating must be \
-             classified story-scoped (Timeout), not as an infrastructure Cdp \
-             error that aborts the whole build, got {err:?}"
+            phase.contains("freeze") && !phase.contains("reduced-motion"),
+            "the failing stage must be reported as the freeze one, got {phase:?}"
         );
     }
 
@@ -3823,11 +4290,16 @@ mod tests {
         renderer.close().await;
 
         let err = result.expect_err("a page that discards rAF callbacks must fail");
+        let RenderError::Timeout { phase, .. } = err else {
+            panic!(
+                "a story whose freeze promise is garbage-collected must be \
+                 classified story-scoped (Timeout), not as an infrastructure Cdp \
+                 error that aborts the whole build, got {err:?}"
+            );
+        };
         assert!(
-            matches!(err, RenderError::Timeout { .. }),
-            "a story whose freeze promise is garbage-collected must be \
-             classified story-scoped (Timeout), not as an infrastructure Cdp \
-             error that aborts the whole build, got {err:?}"
+            phase.contains("freeze") && !phase.contains("reduced-motion"),
+            "the failing stage must be reported as the freeze one, got {phase:?}"
         );
     }
 
@@ -4080,6 +4552,333 @@ mod tests {
         );
 
         renderer.close().await;
+    }
+
+    /// reduced-motion を尊重して見た目が変わるバンドル。エミュレーション検証用。
+    ///
+    /// - `demo-rm--box` : 上半分は **CSS メディアクエリ**で色が変わる
+    ///   （通常 赤 / reduce 青）。下半分は **JS が描画時に一度だけ
+    ///   `matchMedia` を読んで**色を決める（通常 黄 / reduce 緑）。
+    ///   JS 側はエミュレーションが**ナビゲーション前に**効いていることの
+    ///   証明になる——撮影直前に設定したのでは、描画時に読んだ値は
+    ///   通常のままで黄が出る
+    /// - `demo-rm--mocked` : `window.matchMedia` を「常に matches: false」の
+    ///   モックへ差し替えるページ（polyfill / テストダブルの事故を模す）。
+    ///   エミュレーション有効時は検証の matchMedia 輪が不成立になり、
+    ///   fail-closed で落ちるべき対象
+    fn write_reduced_motion_bundle(root: &Path) {
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  .css-box { width:100%; height:50vh; background:#ff0000; }
+  @media (prefers-reduced-motion: reduce) { .css-box { background:#0000ff; } }"#,
+            "",
+            r#"      var root = document.getElementById('storybook-root');
+      if (id === 'demo-rm--blocking') {
+        // reduced-motion プローブが最初に触る API を、返ってこない構築子へ
+        // 差し替える（story の描画そのものは触らない）。READY 判定は先に
+        // 済むので、止まるのは検証の evaluate だけ——「verdict を返さない」
+        // 段を決定的に作れる。
+        window.CSSStyleSheet = function () {
+          var end = Date.now() + 15000;
+          while (Date.now() < end) {}
+        };
+      }
+      if (id === 'demo-rm--mocked') {
+        window.matchMedia = function () {
+          return { matches: false, media: '',
+                   addEventListener: function () {}, removeEventListener: function () {} };
+        };
+      }
+      var cssBox = document.createElement('div');
+      cssBox.className = 'css-box';
+      root.appendChild(cssBox);
+      var jsBox = document.createElement('div');
+      jsBox.style.width = '100%';
+      jsBox.style.height = '50vh';
+      jsBox.style.background =
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches
+          ? '#00ff00' : '#ffff00';
+      root.appendChild(jsBox);
+      channel.emit('storyRendered', id);"#,
+        );
+    }
+
+    /// `ok === true` と確かめられたときだけ成功。それ以外——`ok: false`・
+    /// 解析不能——はすべて失敗（fail-closed）。[`freeze_verdict`] と同じ
+    /// 受理条件を reduced-motion 検証にも要求する。
+    ///
+    /// 証明する: `reduced_motion_verdict` の受理条件のみ。証明しない:
+    /// 実ブラウザでプローブがこの形の JSON を返すこと（実ブラウザ系が担う）。
+    #[test]
+    fn reduced_motion_verdict_accepts_only_a_verified_ok_true() {
+        let json = |raw: &str| serde_json::Value::String(raw.to_string());
+
+        assert!(reduced_motion_verdict(Some(&json(r#"{"ok":true}"#)), "s").is_ok());
+        // 将来プローブの戻り値を拡張しても ok:true なら通る。
+        assert!(
+            reduced_motion_verdict(Some(&json(r#"{"ok":true,"errors":[],"extra":1}"#)), "s")
+                .is_ok()
+        );
+
+        // ok:false は「効いていると確かめられなかった」。errors が原因ごと載る。
+        let message = reduced_motion_verdict(
+            Some(&json(
+                r#"{"ok":false,"errors":["matchMedia does not report reduce"]}"#,
+            )),
+            "s",
+        )
+        .expect_err("ok:false must fail")
+        .to_string();
+        assert!(
+            message.contains("could not be verified")
+                && message.contains("matchMedia does not report reduce"),
+            "the failure must carry the probe's diagnostics, got {message:?}"
+        );
+
+        // 解析不能はすべて「効いているか不明」の失敗。成功へ倒さない。
+        let unparseable: Vec<(&str, Option<serde_json::Value>)> = vec![
+            ("evaluate returned no value", None),
+            ("non-string value", Some(serde_json::json!(42))),
+            ("non-JSON string", Some(json("not json"))),
+            ("missing ok key", Some(json(r#"{"errors":[]}"#))),
+            ("non-boolean ok", Some(json(r#"{"ok":"true"}"#))),
+        ];
+        for (label, value) in &unparseable {
+            let message = reduced_motion_verdict(value.as_ref(), "s")
+                .expect_err(&format!("{label}: must fail"))
+                .to_string();
+            assert!(
+                message.contains("unparseable"),
+                "{label}: the error must say the result could not be parsed, got {message:?}"
+            );
+        }
+    }
+
+    /// **positive control**: reduced-motion エミュレーションが絵を実際に
+    /// 変えること、そして決定的であること。
+    ///
+    /// - OFF: CSS 輪は赤・JS 輪は黄（fixture が動いていることの対照——
+    ///   ここで色が出なければ、ON の検証は何も証明しない）
+    /// - ON: CSS 輪は青（メディアクエリが CSS カスケードに効いた）・
+    ///   JS 輪は緑（**描画時に一度だけ読む** `matchMedia` にも見えた =
+    ///   ナビゲーション前の適用が効いている）
+    /// - ON の二回撮りはバイト一致（決定性）・ON と OFF の絵は異なる
+    ///
+    /// 証明する: エミュレーションの適用・検証・配線が経路全体として効くこと
+    /// （「設定が有効なのに呼び出しが漏れる」経路をこのテストが貫通して固定）。
+    /// 証明しない: 適用に失敗したとき落ちること（下の mocked テストが担う）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reduced_motion_emulation_changes_the_picture_and_is_deterministic() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP reduced_motion_emulation_changes_the_picture_and_is_deterministic: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+
+        // OFF（既定）: 通常の絵。fixture が本当に分岐を描いていることの対照。
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch (emulation off)");
+        let off = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("capture without emulation");
+        renderer.close().await;
+
+        let image = decode_png(&off);
+        let css = image.get_pixel(160, 60);
+        let js = image.get_pixel(160, 180);
+        assert_eq!(
+            (css[0], css[1], css[2]),
+            (255, 0, 0),
+            "without emulation the CSS branch must be the no-preference color"
+        );
+        assert_eq!(
+            (js[0], js[1], js[2]),
+            (255, 255, 0),
+            "without emulation the render-time matchMedia read must be no-preference"
+        );
+
+        // ON: reduce の絵。二回撮って決定性も確かめる。
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch (emulation on)");
+        let first = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("first capture with emulation");
+        let second = renderer
+            .render_story(&server.base_url(), "demo-rm--box")
+            .await
+            .expect("second capture with emulation");
+        renderer.close().await;
+
+        assert_eq!(
+            first, second,
+            "two captures under reduced-motion emulation must be byte-identical"
+        );
+        assert_ne!(
+            first, off,
+            "the emulated capture must differ from the non-emulated one — \
+             otherwise the emulation changed nothing and the switch is a no-op"
+        );
+
+        let image = decode_png(&first);
+        let css = image.get_pixel(160, 60);
+        let js = image.get_pixel(160, 180);
+        assert_eq!(
+            (css[0], css[1], css[2]),
+            (0, 0, 255),
+            "the reduce media query must reach the CSS cascade"
+        );
+        assert_eq!(
+            (js[0], js[1], js[2]),
+            (0, 255, 0),
+            "a render-time matchMedia read must see reduce — the emulation must be \
+             applied before navigation, not right before the capture"
+        );
+    }
+
+    /// **fail-closed**: エミュレーションを要求したのに「効いている」と
+    /// 確かめられないページでは、撮らずに失敗すること。
+    ///
+    /// fixture は `window.matchMedia` を「常に matches: false」のモックへ
+    /// 差し替える（polyfill / テストダブルの事故を模す）。CSS 輪は効いて
+    /// いるが matchMedia 輪が不成立——JS 実装には reduce が見えないまま
+    /// 撮ることになるので、fail-closed で落とす。**検証を入れる前の実装
+    /// （setEmulatedMedia を呼ぶだけ）はこのページを成功として撮っていた**
+    /// ——このテストが落ちなくなったら、検証が判定から外れている。
+    ///
+    /// 対照: エミュレーションを**要求していない** project では、同じページが
+    /// 成功する——モックされた matchMedia は「reduce を要求した」ときにだけ
+    /// 失敗になる（検証は要求の裏取りであり、ページの行儀の監査ではない）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options.clone())
+            .await
+            .expect("launch (emulation on)");
+        let err = renderer
+            .render_story(&server.base_url(), "demo-rm--mocked")
+            .await
+            .expect_err(
+                "a page whose matchMedia cannot confirm the emulation must fail \
+                 instead of being captured",
+            );
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("could not be verified") && message.contains("matchMedia"),
+            "the error must say the emulation could not be verified and name the \
+             failing probe, got {message:?}"
+        );
+        assert!(
+            matches!(err, RenderError::Story { .. }),
+            "the failure must be story-scoped so the remaining stories keep rendering"
+        );
+
+        // 対照: 要求していなければ同じページでも成功する。
+        options.emulate_reduced_motion = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch (emulation off)");
+        renderer
+            .render_story(&server.base_url(), "demo-rm--mocked")
+            .await
+            .expect("without the request the mocked page is a legitimate story");
+        renderer.close().await;
+    }
+
+    /// **配線の固定**: reduced-motion 検証が verdict を返さないとき、freeze の
+    /// phase ではなく **reduced-motion 自身の phase** で倒れること。
+    ///
+    /// 機構（待ち・リトライ・期限）は [`evaluate_with_deadline_retry`] に
+    /// 一本化されているが、分類は呼び出し側が渡す定数で決まる。ヘルパ自体の
+    /// 両分岐はブラウザ無しの `evaluate_*` 系が固定しているので、ここが
+    /// 固定するのは**この経路が [`REDUCED_MOTION_PHASES`] を渡していること**
+    /// ——freeze 側と取り違えても型は通ってしまう一点である。
+    ///
+    /// fixture は検証プローブが最初に触る `CSSStyleSheet` を、返らない
+    /// 構築子へ差し替える。差し替えは story 描画後に効くので READY 判定は
+    /// 通り、止まるのは検証の evaluate だけになる。
+    ///
+    /// 証明する: 経路の phase と story 分類。証明しない: リトライ切れ側の
+    /// 配線（実ページで CDP エラーを決定的に起こす手立てが無い——後述の
+    /// 判断できなかった点）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reduced_motion_probe_that_never_returns_fails_with_its_own_phase() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP a_reduced_motion_probe_that_never_returns_fails_with_its_own_phase: \
+                 no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_reduced_motion_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(4);
+        options.emulate_reduced_motion = true;
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        // 外周上限: ここで落ちたら evaluate が deadline に載っていない。
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            renderer.render_story(&server.base_url(), "demo-rm--blocking"),
+        )
+        .await
+        .expect("render_story must return within the outer bound");
+        renderer.close().await;
+
+        let err = result.expect_err("a verification that never returns must not be captured");
+        match err {
+            RenderError::Timeout { phase, .. } => {
+                assert_eq!(
+                    phase, "the reduced-motion verification never returned a verdict",
+                    "the stage must be reported as the reduced-motion one"
+                );
+                assert!(
+                    !phase.contains("freeze"),
+                    "the freeze stage must not answer for the reduced-motion one"
+                );
+            }
+            other => panic!(
+                "a verification that never returns must be story-scoped Timeout, \
+                 not an infrastructure failure that aborts the build, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]

@@ -688,6 +688,52 @@ CSP を `Page.setBypassCSP` で迂回すると本番と異なる絵を撮るこ�
 比較するだけなので、キャレット隠蔽やアニメーション静止は撮影側で行うこと
 （Playwright なら `caret: 'hide'` / `animations: 'disabled'` に相当）。
 
+#### `prefers-reduced-motion` のエミュレーション（プロジェクト単位・既定 OFF）
+
+プロジェクト設定の `emulate_reduced_motion`（`PATCH /v1/projects/{id}`）を
+有効にすると、storybook モードの撮影を `prefers-reduced-motion: reduce` を
+エミュレートした状態で行う。ページのナビゲーション前に
+`Emulation.setEmulatedMedia` で一度設定するので、CSS メディアクエリにも、
+初期化時に `matchMedia` を読む JS にも、実利用者が OS で reduce を
+設定したときと同じ条件で見える。切り替えは Web UI のプロジェクト設定
+（Settings タブのチェックボックス）からも行える——同じ `PATCH` を叩く。
+
+**効く範囲は狭い。** 上の静止機構が `getAnimations()` に載るもの
+（CSS animation / transition / Web Animations）を実装の行儀に依存せず
+止めるのに対し、reduced-motion が動きを止められるのは
+**canvas / `requestAnimationFrame` など JS が毎フレーム描き直す実装のうち、
+`prefers-reduced-motion` を自分で尊重するものだけ**である。
+
+- **効くもの**: rAF / canvas 駆動で、かつメディアクエリ（CSS）や
+  `matchMedia`（JS）を見て動きを抑える実装
+- **効かないもの**:
+  - メディアクエリを見ない rAF / canvas 実装（尊重しない実装に
+    ブラウザ側から強制する手段は無い）
+  - アニメーション画像（GIF / APNG）・`<video>`・SMIL——ブラウザ自身が
+    進めるもので、そもそも「行儀」の概念が無い
+  - `getAnimations()` に載るアニメーション——こちらは reduce の尊重に
+    関係なく上の静止機構が既に止めている
+
+つまり**これを入れても flaky が消えるわけではない**。静止機構が原理的に
+届かない領域（rAF / canvas）のうち、行儀の良い実装との狭い交差にだけ効く
+追加の手である——自前のコンポーネントに `prefers-reduced-motion` の尊重を
+規約として課せる場合に最も価値がある。
+
+**既定が OFF なのは、有効化すると撮る絵が変わるから**である。reduce を
+尊重する story の絵が変わり、**そのプロジェクトの baseline が一度
+入れ替わる**——有効化後の最初のビルドで出る差分をレビューして承認すること
+（静止機構の「移行手順」と同じ一度きりの差分）。
+
+**fail-closed である**: 有効にした project では、撮影直前に「エミュレーションが
+実際に効いているか」を CSS カスケード（constructed stylesheet の
+`@media` プローブ）と `matchMedia` の両面で実測し、**効いていると確かめられ
+なければその story は撮らずにエラーにする**（`reduced-motion emulation was
+requested but could not be verified as applied`）。`matchMedia` を reduce を
+返さないモックへ差し替えるページ（polyfill やテストダブルの事故）はここで
+落ちる。ページが両方の観測を偽装する場合は原理的に検出できない——脅威モデルが
+事故であり悪意でないのは静止機構の検証と同じである。失敗経路の全数は
+`crates/service/src/render/browser.rs` の「層ごとの失敗経路」を参照。
+
 #### `vrt` CLI で 1 コマンド（推奨）
 
 同梱の CLI（`apps/backend/crates/cli`、バイナリ名 `vrt`）を使うと、ビルド作成 →
