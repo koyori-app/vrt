@@ -61,6 +61,10 @@
 //! | reduced-motion 適用（`Emulation.setEmulatedMedia`） | 検知（CDP エラー・無応答とも） | project 設定で有効なときだけ `new_page` 直後（ナビゲーション前）に一度呼ぶ。CDP エラーは Rust 側 `Err` → [`RenderError::Cdp`]（環境分類・即中断。story のスクリプトを待たない一往復で、失敗の原因はブラウザ側——`new_page` と同じ分類）。無応答は chromiumoxide の request timeout（既定 30 秒）が `CdpError::Timeout` を返し、同じ `Cdp` へ倒れる（fail-closed） |
 //! | reduced-motion 適用の検証（[`REDUCED_MOTION_PROBE`]） | 部分的に検知 | 「呼び出しは成功したが実際にはメディアクエリが変わっていない」を撮影直前に実測する——constructed stylesheet の `@media (prefers-reduced-motion: reduce)` が効いたかのプローブ（`--vrt-reduced-motion`）と `matchMedia().matches` の**両輪**。どちらかが不成立なら `ok: false` → [`RenderError::Story`]（fail-closed。reduce を返さない壊れた/モックされた `matchMedia`——polyfill やテストダブルの事故——はここで落ちる）。evaluate の CDP エラーは READY probe と同様 deadline までリトライし期限で [`RenderError::Timeout`]。**ページが両方の観測を偽装する積極的な偽りは原理的に検知不能**——検証はページの JS realm で走り、CDP に emulated media 状態を読み戻す API が無い。脅威モデルは一貫して事故であり悪意ではない（README「検証層自身の失敗も fail-closed である」と同じ契約） |
 //! | reduced-motion 有効なのに呼び出し自体が漏れる | 実行時には検知不能 | 検知器の不在そのものがこの失敗であり、実行時観測では塞げない（「呼ばれなかったこと」を観測する層は、それ自身も呼ばれない）。構造で塞ぐ——適用は [`StoryRenderer::render_story`] の単一チョークポイントにだけ置き、分岐は `RenderOptions::emulate_reduced_motion` の一つ、project 列からの配線は `render_build` の単体テストで固定、経路全体は「ON で絵が変わる」positive control テスト（`reduced_motion_emulation_changes_the_picture_and_is_deterministic`）が貫通して固定する |
+//! | フォント条件待ち① 読み込みの**失敗**（[`FONTS_WAIT_SCRIPT`]） | 検知しない（個々の `FontFace.status === 'error'` を数えれば列挙は可能） | `document.fonts.ready` は仕様上、読み込みの成否に依らず「読み込み中が無くなった」時点で解決する——失敗したフォントは代替字形へ**決定的に**倒れ、その絵は揺れない。本経路の契約は「同じビルドから同じ絵」（決定性）であって「本来の字形で撮る」ではないため、失敗を撮影エラーへ昇格させない——到達不能なフォントを使う story を恒久的に撮影不能へ誤分類する方が害が大きい。ビルド間で読めたり読めなかったりする外部フォントは差分として**見える**のが正しい（発見性——それは撮影過程の揺れではなくページの挙動の変化である） |
+//! | フォント条件待ち② `ready` 解決後の新たなフォント要求 | 部分的に検知 | 応答の直前に `status` を読み直し、`'loading'` へ戻っていれば `ok: false`（fail-closed）。応答から撮影までの残余窓（evaluate 往復・freeze）に始まる要求は検知できぬ——スクリーンショットは JS を走らせない一往復の CDP コマンドで、その瞬間のフォント状態を読み戻す API が無い。ready 後に字体を差し替える story は、静止後にアニメを生むページと同じくページ側の責務（README「届かない範囲」と同じ契約） |
+//! | フォント条件待ち③ ページが `document.fonts` を差し替える | 形の壊れは検知 | FontFaceSet らしい形（`status` が文字列・`ready.then` が関数）でなければ**待たずに** `ok: false`（fail-closed。無いものは待てないが、無いことを黙って通さない）。仕様どおりの顔で即解決を返す偽物は原理的に検知不能——脅威モデルは一貫して事故であり悪意ではない（reduced-motion 検証と同じ契約） |
+//! | フォント条件待ち④ `ready` が期限内に解決しない | 検知 | evaluate が返らないので、READY 待ちと共有の deadline の残余（`tokio::time::timeout`）が期限で [`RenderError::Timeout`] へ倒す（fail-closed——**撮らない**。修正前は 250ms 経過後に代替字形のまま撮れてしまい、揺れる絵が baseline に混ざった） |
 //!
 //! 残る fail-open は「原理的に観測できない」もの（closed shadow root・
 //! クロスオリジン iframe・後から生成される root・reduced-motion 検証の
@@ -87,6 +91,7 @@
 //! | スクリーンショット | **なし**——CDP 呼び出しが返らない場合は上位の CI ジョブタイムアウト頼み。JS の promise を待たない一往復コマンドで、ハングの既知経路が無いため保留（欠けと認識した上での判断） | [`RenderError::Cdp`] | `renders_a_story_to_a_png_with_the_requested_viewport` |
 //! | reduced-motion 適用 | chromiumoxide の request timeout（既定 30 秒。一往復コマンド共通の機構） | [`RenderError::Cdp`] | `reduced_motion_emulation_changes_the_picture_and_is_deterministic` |
 //! | reduced-motion 検証 | evaluate リトライは READY 待ちと共有の deadline 残余。判定自体は即時 | [`RenderError::Story`]（[`reduced_motion_verdict`]）/ リトライ期限切れは [`RenderError::Timeout`] | `a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing`・`reduced_motion_verdict_*` 単体群 |
+//! | フォント条件待ち（[`FONTS_WAIT_SCRIPT`]） | READY 待ちと**共有**の deadline の残余（`ready` が解決しないページは evaluate ごと期限で倒れる） | [`RenderError::Timeout`]（期限）/ [`RenderError::Story`]（[`fonts_verdict`]——`document.fonts` の欠落・形違い・解決後の再読み込み開始） | `waiting_for_fonts_ready_makes_repeated_captures_agree`・`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`fonts_verdict_*` 単体群 |
 //!
 //! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
 //!
@@ -114,6 +119,8 @@
 //! | reduced-motion 適用（`setEmulatedMedia`） | [`RenderError::Cdp`] | 環境（即中断） | `new_page` 直後・story のスクリプトを待たない一往復——失敗はブラウザ側 |
 //! | reduced-motion 検証の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | READY probe と同じ——ナビゲーション中の一時的な context 差し替えが主因 |
 //! | reduced-motion 検証の不成立・解析不能 | [`RenderError::Story`] | story | `matchMedia` の差し替え等、そのページの内容に起因 |
+//! | フォント条件待ちの evaluate エラー・`ready` 未解決 | リトライ→期限で [`RenderError::Timeout`] | story | どのフォントを要求し返すかは story のバンドル・内容に起因（FREEZE の rAF 捨てと同じ分類） |
+//! | フォント条件待ちの不成立・解析不能 | [`RenderError::Story`]（[`fonts_verdict`]） | story | `document.fonts` の形・フォント状態はそのページの内容に起因 |
 //! | スクリーンショット名の規則違反 | `StoryFailure` 直行（`render_build`） | story | story の title / name に起因。全違反を 1 ビルドで列挙する |
 //! | ストレージ・DB・baseline 流用の失敗 | `anyhow`（`render_build`） | 環境（即中断） | 保存経路の異常は次の story でも再現する |
 //! | バンドル展開・stories 空 | `anyhow`（`render_build`） | ビルド全体（ループ前に中断） | story 以前の前提が壊れている |
@@ -152,7 +159,20 @@ use tokio::task::JoinHandle;
 
 /// 1 ストーリーあたりの描画待ちタイムアウト。
 pub const DEFAULT_STORY_TIMEOUT: Duration = Duration::from_secs(30);
-/// 描画完了を検出してから撮るまでの落ち着き待ち（フォント・アニメーションの初期化ぶん）。
+/// 描画完了を検出してから撮るまでの落ち着き待ち。
+///
+/// かつての注記は「フォント・アニメーションの初期化ぶん」だったが、どちらも
+/// もうこの時間待ちの担当ではない——アニメーションは #19 の条件つき静止
+/// （`FREEZE_SCRIPT`・fail-closed）、フォントは [`FONTS_WAIT_SCRIPT`] の
+/// `document.fonts.ready` 条件待ち（cmd_656・fail-closed）がそれぞれ
+/// 引き受けた。時間待ちは「間に合ったか」がキャッシュの温度や負荷で変わり、
+/// 同じビルドから違う絵を作る（cmd_656 で実測）。
+///
+/// 残しているのは、完了シグナルも条件待ちも未整備の非同期初期化——画像の
+/// 読み込み・デコードなど、`storyRendered` の後に絵を変えうるがどの層も
+/// まだ待っていないもの——への暫定の緩衝としてである。これを外すのは、
+/// それらにも「何を待つか」が明示された条件待ちを整えてから（cmd_656 と
+/// 同型の実測つきで）行うこと。時間待ちを条件待ちの代わりに数えてはならない。
 pub const SETTLE_DELAY: Duration = Duration::from_millis(250);
 /// 描画完了判定のポーリング間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -692,6 +712,53 @@ const REDUCED_MOTION_PROBE: &str = r#"
 })()
 "#;
 
+/// webfont の読み込み完了を条件待ちするスクリプト。
+///
+/// `storyRendered` はフォントを待たずに出る——フォント読み込みは style/layout が
+/// 要求してから走る非同期処理で、描画完了シグナルの管轄外にある。かつては
+/// [`SETTLE_DELAY`]（250ms の時間待ち）がこれを吸収するつもりでいたが、
+/// 「間に合えば本来の字形・間に合わねば代替字形」という競争をそのまま
+/// 撮っていた（cmd_656 で実測。同じバンドルを同じブラウザで繰り返し撮ると
+/// 序盤の撮影だけがバイト不一致になり、不一致の絵はすべて
+/// `document.fonts.check()` 不成立＝フォント未着だった）。時間待ちは
+/// キャッシュの温度で勝敗が変わる。`document.fonts.ready` は時間ではなく
+/// 「読み込み中のフォントが無くなった」という**状態**を待つので、温度に依らない。
+///
+/// 返り値は JSON 文字列。`ready` の解決後に `status` を読み直し、
+/// `'loaded'` と確かめられた場合だけ `ok: true`（解決と応答の間に新たな
+/// フォント要求が始まっていたら `'loading'` に戻っており、ここで検知される）。
+/// `document.fonts` が欠落・非 FontFaceSet 形なら待たずに `ok: false`
+/// （fail-closed。無いものを待てないが、無いことは黙って通さない）。
+/// `ready` が解決しないページはこの evaluate 自体が返らず、Rust 側の
+/// 共有 deadline（[`evaluate_with_deadline_retry`]）が期限で
+/// [`RenderError::Timeout`] へ倒す（fail-closed——撮らない）。
+const FONTS_WAIT_SCRIPT: &str = r#"
+(() => {
+  let fonts = null;
+  try {
+    fonts = document.fonts;
+  } catch (e) {
+    return JSON.stringify({ ok: false, errors: ['accessing document.fonts threw: ' + String(e)] });
+  }
+  if (!fonts || typeof fonts.status !== 'string' || !fonts.ready || typeof fonts.ready.then !== 'function') {
+    return JSON.stringify({
+      ok: false,
+      errors: ['document.fonts is missing or does not look like a FontFaceSet (status: ' + String(fonts && fonts.status) + ')']
+    });
+  }
+  return Promise.resolve(fonts.ready).then(
+    () => JSON.stringify({
+      ok: fonts.status === 'loaded',
+      status: String(fonts.status),
+      errors: fonts.status === 'loaded'
+        ? []
+        : ['fonts.ready resolved but new font loads have already started (status: ' + String(fonts.status) + ')']
+    }),
+    (e) => JSON.stringify({ ok: false, errors: ['document.fonts.ready rejected: ' + String(e)] })
+  );
+})()
+"#;
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -789,6 +856,13 @@ pub struct RenderOptions {
     /// 一度設定し、撮影直前に [`REDUCED_MOTION_PROBE`] で「実際に効いている」
     /// ことを実測する。効いていると確かめられなければ撮らない（fail-closed）。
     pub emulate_reduced_motion: bool,
+    /// 撮影前に `document.fonts.ready` の条件待ちを行うか。
+    ///
+    /// `false` はテスト専用の裏口で、「待たないと本当に絵が揺れる」ことを
+    /// 検証する positive control のためにある（`freeze_before_capture` と
+    /// 同じ規約）。本番経路（`render_build`）は [`RenderOptions::new`] を
+    /// 通るので常に `true`。
+    pub wait_for_fonts: bool,
 }
 
 impl RenderOptions {
@@ -804,6 +878,7 @@ impl RenderOptions {
             story_timeout: DEFAULT_STORY_TIMEOUT,
             freeze_before_capture: true,
             emulate_reduced_motion: false,
+            wait_for_fonts: true,
         }
     }
 }
@@ -1076,6 +1151,25 @@ impl StoryRenderer {
 
         tokio::time::sleep(SETTLE_DELAY).await;
 
+        // webfont は「時間」ではなく「状態」で待つ。storyRendered はフォントを
+        // 待たずに出るため、ここで document.fonts.ready の解決（＝読み込み中の
+        // フォントが無くなった状態）を実測してから先へ進む。SETTLE_DELAY の
+        // **後**に置くのは、settle 窓の間に始まったフォント要求も待ちに
+        // 含めるため。evaluate は READY 待ちと共有の deadline の残余に載せ、
+        // ready が解決しないページは期限で Timeout に倒す（fail-closed——
+        // 揺れる可能性のある絵を撮るくらいなら撮らない）。
+        if self.options.wait_for_fonts {
+            let wait_result = evaluate_with_deadline_retry(
+                || page.evaluate(FONTS_WAIT_SCRIPT),
+                deadline,
+                story_id,
+                self.options.story_timeout,
+                FONTS_PHASES,
+            )
+            .await?;
+            fonts_verdict(wait_result.value(), story_id)?;
+        }
+
         // reduced-motion を要求した project では、撮影直前に「実際に効いて
         // いる」ことを実測する。setEmulatedMedia の応答が成功でも効いた
         // 証明にはならず、「reduce を要求したのに適用されなかった」が
@@ -1197,6 +1291,15 @@ const REDUCED_MOTION_PHASES: EvaluatePhases = EvaluatePhases {
     timeout: "the reduced-motion verification never returned a verdict",
     retry_exhausted: "the reduced-motion verification evaluate kept \
                       failing until the story deadline",
+};
+
+/// フォント条件待ち（[`FONTS_WAIT_SCRIPT`]）の分類。
+const FONTS_PHASES: EvaluatePhases = EvaluatePhases {
+    retry_log: "fonts-ready wait evaluate failed; retrying",
+    timeout: "the fonts-ready wait never finished: document.fonts.ready did \
+              not resolve within the story deadline",
+    retry_exhausted: "the fonts-ready wait evaluate kept failing until the \
+                      story deadline",
 };
 
 /// 静止（[`FREEZE_SCRIPT`]）の分類。
@@ -1398,6 +1501,61 @@ fn reduced_motion_verdict(
                 message: format!(
                     "reduced-motion emulation was requested but could not be \
                      verified as applied{errors_note}"
+                ),
+            })
+        }
+        None => Err(unparseable(format!(
+            "missing or non-boolean `ok` key (raw: {raw})"
+        ))),
+    }
+}
+
+/// [`FONTS_WAIT_SCRIPT`] の返り値を検分し、撮影へ進んでよいか判定する。
+///
+/// [`freeze_verdict`] / [`reduced_motion_verdict`] と同じ受理条件——`ok` が
+/// `true` であると確かめられた場合にだけ `Ok(())` を返し、それ以外は
+/// すべて失敗（fail-closed）:
+///
+/// - `ok: false` — **フォントが揃ったと確かめられなかった**。`errors` に
+///   原因（`document.fonts` の欠落・形違い、解決後の再読み込み開始）が載る
+/// - 値が文字列でない／JSON として読めない／`ok` が無い・bool でない —
+///   **待ちの結果を解析できなかった**。揃ったかどうか自体が不明
+///
+/// どちらも [`RenderError::Story`] 経路（story 単位に隔離。残りの story は
+/// 撮り続けられる）。
+fn fonts_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(), RenderError> {
+    let unparseable = |detail: String| RenderError::Story {
+        story_id: story_id.to_string(),
+        message: format!("fonts-ready wait result was unparseable: {detail}"),
+    };
+    let Some(raw) = value.and_then(|v| v.as_str()) else {
+        return Err(unparseable(format!(
+            "expected a JSON string, got {value:?}"
+        )));
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|e| unparseable(format!("{e} (raw: {raw})")))?;
+    match parsed.get("ok").and_then(|v| v.as_bool()) {
+        // 揃ったと確かめられた。撮影へ進む。`ok` 以外のキーは検査しない
+        // （将来スクリプトが返すものを増やしても正当な応答を弾かない）。
+        Some(true) => Ok(()),
+        Some(false) => {
+            let errors_note = parsed
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    let joined = arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    format!(" (errors: {joined})")
+                })
+                .unwrap_or_default();
+            Err(RenderError::Story {
+                story_id: story_id.to_string(),
+                message: format!(
+                    "fonts were not verified as loaded before the capture{errors_note}"
                 ),
             })
         }
@@ -1708,6 +1866,361 @@ mod tests {
         );
     }
 
+    /// 非同期 web フォントを使うバンドル。フォント到着と撮影タイミングの競争検証用。
+    ///
+    /// - `demo-font--text` : `@font-face` の webfont を使うテキスト（ラテン＋日本語）。
+    ///   本物の Storybook preview と同じく、`storyRendered` は**フォントを待たずに**
+    ///   出す（フォント読み込みは style/layout が要求してから走る非同期処理で、
+    ///   描画完了シグナルはそれを待たない）。
+    ///
+    /// 右上 40x40 の marker が `document.fonts.check()` の rAF ポーリングで
+    /// 赤（未着）→緑（適用済み）に変わるため、撮影された絵自身が
+    /// 「撮影時点で webfont が揃っていたか」を証言する。差分の出た二枚を
+    /// 見比べたとき、glyph の違いと marker の色が必ず連動する——これが
+    /// 「差分はフォント差である」ことを画像内で分ける手掛かりになる。
+    ///
+    /// フォント本体はバンドルに置かず、テスト側の遅延配信ルート（`/font.ttf`）が
+    /// 配る。到着タイミングをテストが決定的に制御するためである。
+    fn write_webfont_bundle(root: &Path) {
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  @font-face { font-family: 'VrtTestFont'; src: url('font.ttf'); }
+  .webfont-text { font-family: 'VrtTestFont', monospace; font-size: 40px; }
+  #font-marker { position: fixed; top: 0; right: 0; width: 40px; height: 40px; background: #cc0000; }"#,
+            "",
+            r#"      var root = document.getElementById('storybook-root');
+      var text = document.createElement('div');
+      text.className = 'webfont-text';
+      text.textContent = 'Hamburgefonstiv 0123456789 いろはにほへと 撮影';
+      root.appendChild(text);
+      var marker = document.createElement('div');
+      marker.id = 'font-marker';
+      root.appendChild(marker);
+      (function poll() {
+        if (document.fonts.check("40px 'VrtTestFont'")) {
+          marker.style.background = '#00cc00';
+        } else {
+          requestAnimationFrame(poll);
+        }
+      })();
+      channel.emit('storyRendered', id);"#,
+        );
+    }
+
+    /// システムに実在する TTF を探す（webfont fixture の素材）。
+    ///
+    /// フォントのバイト列自体はテストの本題ではない——「fallback と字形の違う
+    /// 実フォントが非同期に届く」ことだけが要る。リポジトリにフォントを
+    /// 同梱しない（ライセンス表記の管理を増やさない）ため、chromium と同じく
+    /// 環境探索 + SKIP ガードで扱う。
+    fn discover_test_font() -> Option<Vec<u8>> {
+        const CANDIDATES: [&str; 3] = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+            "/usr/share/fonts/TTF/DejaVuSerif.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSerif.ttf",
+        ];
+        CANDIDATES.iter().find_map(|path| std::fs::read(path).ok())
+    }
+
+    /// バンドル配信 + `/font.ttf` だけ初回リクエストを `first_hit_delay` 遅らせる
+    /// 使い捨てサーバー。
+    ///
+    /// 本番は build ごとに新規 `user_data_dir` で Chromium を起動する（キャッシュは
+    /// 毎 build 冷えている）。フォントの初回取得だけが遅く、以降は
+    /// ディスク/メモリキャッシュで即答になる——その冷え/温みの非対称を、
+    /// 「初回だけ遅い」ルートで決定的に再現する。`Cache-Control: no-store` を
+    /// 返すのはリクエスト数を実測可能にするため（ブラウザキャッシュに吸われず、
+    /// 何回ネットワークまで取りに来たかを hits で数えられる）。
+    async fn start_font_delay_server(
+        root: &Path,
+        font_bytes: Vec<u8>,
+        first_hit_delay: Duration,
+    ) -> (
+        SocketAddr,
+        JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_in_route = hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/font.ttf",
+                axum::routing::get(move || {
+                    let hits = hits_in_route.clone();
+                    let bytes = font_bytes.clone();
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            tokio::time::sleep(first_hit_delay).await;
+                        }
+                        (
+                            [
+                                (axum::http::header::CONTENT_TYPE, "font/ttf"),
+                                (axum::http::header::CACHE_CONTROL, "no-store"),
+                            ],
+                            bytes,
+                        )
+                    }
+                }),
+            )
+            .fallback_service(tower_http::services::ServeDir::new(root));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind font delay server");
+        let addr = listener.local_addr().expect("local_addr");
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, task, hits)
+    }
+
+    /// 【cmd_656・実測再現 / positive control】フォントを条件待ちしないと、
+    /// 同じバンドル・同じブラウザで同じ story を繰り返し撮ってもバイト列が
+    /// 一致しないこと。
+    ///
+    /// 本番の形（build ごとに冷えたプロファイルで多数の story を順に撮る）を
+    /// 「初回だけ遅いフォント配信」で縮約する: 1 回目の撮影ではフォントが
+    /// SETTLE_DELAY（250ms）に間に合わず、2 回目以降はキャッシュ相当で即着する。
+    /// 差分は**序盤に偏り**、外れた絵はすべて marker 赤（フォント未着）——
+    /// それがフォント読み込み競争の指紋である（cmd_656 の初回実測: 8 回中
+    /// 1 回・run 0 のみ不一致・marker と完全連動）。
+    ///
+    /// `wait_for_fonts = false` はテスト専用の裏口。この試験は
+    /// `waiting_for_fonts_ready_makes_repeated_captures_agree` の陽性対照で、
+    /// 「fixture が本当に非同期にフォントを読み、待たなければ本当に揺れる」
+    /// ことを固定する——これが落ちるなら一致側の試験は何も検証していない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_delay_alone_lets_the_font_race_the_capture() {
+        use std::sync::atomic::Ordering;
+
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP settle_delay_alone_lets_the_font_race_the_capture: no chromium");
+            return;
+        };
+        let Some(font) = discover_test_font() else {
+            eprintln!("SKIP settle_delay_alone_lets_the_font_race_the_capture: no test font found");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_webfont_bundle(dir.path());
+        let (addr, server_task, hits) =
+            start_font_delay_server(dir.path(), font, Duration::from_millis(600)).await;
+        let base_url = format!("http://{addr}");
+
+        // 裏口: フォント条件待ちを切り、SETTLE_DELAY の時間待ちだけの
+        // 修正前の撮影過程を再現する。
+        let mut options = RenderOptions::new(chromium, 640, 360);
+        options.wait_for_fonts = false;
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch chromium");
+
+        const RUNS: usize = 8;
+        let mut hashes: Vec<String> = Vec::new();
+        let mut markers: Vec<(u8, u8, u8)> = Vec::new();
+        for i in 0..RUNS {
+            let png = renderer
+                .render_story(&base_url, "demo-font--text")
+                .await
+                .expect("render story");
+            // PR #11 の content_hash と同じ物差しで測る。
+            let hash = crate::screenshots::content_hash(&png);
+            let image = image::ImageReader::with_format(
+                std::io::Cursor::new(&png),
+                image::ImageFormat::Png,
+            )
+            .decode()
+            .expect("decode screenshot")
+            .to_rgba8();
+            let px = image.get_pixel(640 - 10, 10);
+            let marker = (px[0], px[1], px[2]);
+            eprintln!(
+                "run {i}: hash={} marker={:?} font_fetches_so_far={}",
+                &hash[..23],
+                marker,
+                hits.load(Ordering::SeqCst)
+            );
+            hashes.push(hash);
+            markers.push(marker);
+        }
+        renderer.close().await;
+        server_task.abort();
+
+        // 集計: 最頻ハッシュ（=温まった安定状態）から外れた run を数える。
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for h in &hashes {
+            *counts.entry(h.as_str()).or_default() += 1;
+        }
+        let modal = counts
+            .iter()
+            .max_by_key(|(_, n)| **n)
+            .map(|(h, _)| h.to_string())
+            .expect("at least one hash");
+        let outliers: Vec<usize> = (0..RUNS).filter(|&i| hashes[i] != modal).collect();
+        eprintln!(
+            "outlier runs (differ from modal hash): {:?} / total {RUNS}",
+            outliers
+        );
+
+        assert!(
+            !outliers.is_empty(),
+            "reproduction failed: all {RUNS} captures of the same build agreed byte-for-byte"
+        );
+        // 序盤偏り: 外れ run はすべて「フォント未着（marker 赤）」で、
+        // 安定 run はすべて「フォント適用済み（marker 緑）」——差分が
+        // フォント差であることを絵の中の証言で結びつける。
+        for &i in &outliers {
+            assert_eq!(
+                markers[i],
+                (0xcc, 0x00, 0x00),
+                "run {i} differs from the modal image but its marker is not red (font-pending)"
+            );
+        }
+        for i in (0..RUNS).filter(|i| !outliers.contains(i)) {
+            assert_eq!(
+                markers[i],
+                (0x00, 0xcc, 0x00),
+                "run {i} matches the modal image but its marker is not green (font-applied)"
+            );
+        }
+    }
+
+    /// 【cmd_656・修正の実測】`document.fonts.ready` を条件待ちすると、
+    /// 陽性対照（`settle_delay_alone_lets_the_font_race_the_capture`）と
+    /// **同じ**遅延フォント配信でも、繰り返し撮った絵がバイト単位で一致する。
+    ///
+    /// 一致だけでなく marker が全 run で緑（フォント適用済み）であることも
+    /// 確かめる——「フォントが一度も当たらないから毎回同じ」という
+    /// 偽りの一致（fallback で揃っただけ）をここで弾く。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn waiting_for_fonts_ready_makes_repeated_captures_agree() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP waiting_for_fonts_ready_makes_repeated_captures_agree: no chromium");
+            return;
+        };
+        let Some(font) = discover_test_font() else {
+            eprintln!(
+                "SKIP waiting_for_fonts_ready_makes_repeated_captures_agree: no test font found"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_webfont_bundle(dir.path());
+        let (addr, server_task, _hits) =
+            start_font_delay_server(dir.path(), font, Duration::from_millis(600)).await;
+        let base_url = format!("http://{addr}");
+
+        // 本番と同じ既定（wait_for_fonts = true）。
+        let renderer = StoryRenderer::launch(RenderOptions::new(chromium, 640, 360))
+            .await
+            .expect("launch chromium");
+
+        const RUNS: usize = 8;
+        let mut hashes: Vec<String> = Vec::new();
+        for i in 0..RUNS {
+            let png = renderer
+                .render_story(&base_url, "demo-font--text")
+                .await
+                .expect("render story");
+            let hash = crate::screenshots::content_hash(&png);
+            let image = image::ImageReader::with_format(
+                std::io::Cursor::new(&png),
+                image::ImageFormat::Png,
+            )
+            .decode()
+            .expect("decode screenshot")
+            .to_rgba8();
+            let px = image.get_pixel(640 - 10, 10);
+            assert_eq!(
+                (px[0], px[1], px[2]),
+                (0x00, 0xcc, 0x00),
+                "run {i}: the font marker must be green (webfont applied) — \
+                 agreement via never-loading fallback would be a false pass"
+            );
+            hashes.push(hash);
+        }
+        renderer.close().await;
+        server_task.abort();
+
+        assert!(
+            hashes.iter().all(|h| h == &hashes[0]),
+            "all captures of the same build must agree byte-for-byte once \
+             fonts are condition-waited, got: {hashes:?}"
+        );
+    }
+
+    /// 【cmd_656・fail-closed の実測】フォントが期限内に届かないページは
+    /// **撮らずに** [`RenderError::Timeout`]（[`FONTS_PHASES`] の phase）で
+    /// 落ちる。同じページを修正前の撮影過程（`wait_for_fonts = false` の
+    /// 裏口）に通すと**撮れてしまう**——これが塞いだ穴の実測である。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_font_that_never_arrives_fails: no chromium");
+            return;
+        };
+        let Some(font) = discover_test_font() else {
+            eprintln!("SKIP a_font_that_never_arrives_fails: no test font found");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_webfont_bundle(dir.path());
+        // 「初回リクエストを 1 時間遅らせる」＝この試験の時間内には決して
+        // 届かないフォント。story_timeout（下の 5 秒）が先に尽きる。
+        // 遅延は**初回ヒットにだけ**掛かるため、render ごとに独立の
+        // サーバーを立てる——一つを共用すると先の render がヒットを消費し、
+        // 後の render には即応してしまう（本試験の初版がその形で偽陰性を出した）。
+        let (addr, server_task, _hits) =
+            start_font_delay_server(dir.path(), font.clone(), Duration::from_secs(3600)).await;
+
+        // 修正前の過程（裏口）: フォントが届かなくても代替字形のまま
+        // 撮れてしまっていた——穴が実在したことの陽性対照。
+        let mut unfixed = RenderOptions::new(chromium.clone(), 640, 360);
+        unfixed.story_timeout = Duration::from_secs(5);
+        unfixed.wait_for_fonts = false;
+        let renderer = StoryRenderer::launch(unfixed)
+            .await
+            .expect("launch chromium");
+        let png = renderer
+            .render_story(&format!("http://{addr}"), "demo-font--text")
+            .await
+            .expect("without the fonts wait the capture silently proceeds");
+        assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        renderer.close().await;
+        server_task.abort();
+
+        // 修正後（本番既定）: 撮らずに Timeout（fail-closed）。
+        let (addr, server_task, _hits) =
+            start_font_delay_server(dir.path(), font, Duration::from_secs(3600)).await;
+        let mut fixed = RenderOptions::new(chromium, 640, 360);
+        fixed.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(fixed).await.expect("launch chromium");
+        let err = renderer
+            .render_story(&format!("http://{addr}"), "demo-font--text")
+            .await
+            .expect_err("a never-arriving font must fail the story, not capture fallback glyphs");
+        renderer.close().await;
+        server_task.abort();
+
+        match err {
+            RenderError::Timeout { phase, .. } => {
+                assert_eq!(
+                    phase, FONTS_PHASES.timeout,
+                    "the failure must be attributed to the fonts wait stage"
+                );
+            }
+            other => panic!("expected a fonts-wait Timeout, got: {other:?}"),
+        }
+    }
+
     /// open shadow root の内側にアニメ源を持つバンドル。root 単位の静止検証用。
     ///
     /// - `demo-shadow--caret` : shadow 内のスタイルが `caret-color` を**明示**した
@@ -1978,13 +2491,23 @@ mod tests {
             FREEZE_PHASES.timeout,
             FREEZE_PHASES.retry_exhausted,
         ];
-        for r in reduced {
-            for f in freeze {
-                assert_ne!(
-                    r, f,
-                    "the two paths must not share a diagnostic string — a shared \
-                     phase makes the failing stage unrecoverable from the logs"
-                );
+        let fonts = [
+            FONTS_PHASES.retry_log,
+            FONTS_PHASES.timeout,
+            FONTS_PHASES.retry_exhausted,
+        ];
+        let paths = [reduced, freeze, fonts];
+        for (i, a) in paths.iter().enumerate() {
+            for b in paths.iter().skip(i + 1) {
+                for s_a in a {
+                    for s_b in b {
+                        assert_ne!(
+                            s_a, s_b,
+                            "two paths must not share a diagnostic string — a shared \
+                             phase makes the failing stage unrecoverable from the logs"
+                        );
+                    }
+                }
             }
         }
 
@@ -1995,6 +2518,10 @@ mod tests {
         );
         assert_ne!(
             FREEZE_PHASES.timeout, FREEZE_PHASES.retry_exhausted,
+            "a timeout and an exhausted retry are different stages"
+        );
+        assert_ne!(
+            FONTS_PHASES.timeout, FONTS_PHASES.retry_exhausted,
             "a timeout and an exhausted retry are different stages"
         );
 
@@ -2010,6 +2537,67 @@ mod tests {
                 phase.contains("freeze"),
                 "the freeze path must name itself, got {phase:?}"
             );
+        }
+        for phase in fonts {
+            assert!(
+                phase.contains("fonts"),
+                "the fonts path must name itself, got {phase:?}"
+            );
+        }
+    }
+
+    /// [`fonts_verdict`] は `ok` が `true` と確かめられた場合だけ撮影へ通す
+    /// （fail-closed）。
+    ///
+    /// 証明する: `ok: false` は診断つきの [`RenderError::Story`] に、解析できない
+    /// 応答（文字列でない・壊れた JSON・`ok` 欠落・応答なし）は unparseable の
+    /// [`RenderError::Story`] に倒れ、どれも黙って撮影へ進まないこと。
+    /// 証明しない: 実ブラウザで [`FONTS_WAIT_SCRIPT`] がこれらの形を実際に
+    /// 返すこと（実ブラウザ系の試験が担う）。
+    #[test]
+    fn fonts_verdict_accepts_only_a_verified_ok_true() {
+        let ok = serde_json::json!(r#"{"ok":true,"status":"loaded","errors":[]}"#);
+        fonts_verdict(Some(&ok), "s").expect("a verified ok:true must pass");
+
+        let not_ok = serde_json::json!(
+            r#"{"ok":false,"errors":["document.fonts is missing or does not look like a FontFaceSet (status: undefined)"]}"#
+        );
+        match fonts_verdict(Some(&not_ok), "s").expect_err("ok:false must fail") {
+            RenderError::Story { message, .. } => {
+                assert!(
+                    message.contains("not verified as loaded"),
+                    "the failure must say what could not be verified, got: {message}"
+                );
+                assert!(
+                    message.contains("document.fonts is missing"),
+                    "the collected diagnostics must reach the message, got: {message}"
+                );
+            }
+            other => panic!("expected a story-scoped failure, got: {other:?}"),
+        }
+    }
+
+    /// [`fonts_verdict`] は解析できない応答を成功へ倒さない（fail-closed）。
+    #[test]
+    fn fonts_verdict_rejects_unparseable_results() {
+        let garbled = [
+            serde_json::json!(42),
+            serde_json::json!("this is not json"),
+            serde_json::json!(r#"{"status":"loaded"}"#),
+            serde_json::json!(r#"{"ok":"yes"}"#),
+        ];
+        for value in &garbled {
+            match fonts_verdict(Some(value), "s").expect_err("garbled results must fail") {
+                RenderError::Story { message, .. } => assert!(
+                    message.contains("unparseable"),
+                    "the failure must say the result was unparseable, got: {message}"
+                ),
+                other => panic!("expected a story-scoped failure, got: {other:?}"),
+            }
+        }
+        match fonts_verdict(None, "s").expect_err("a missing result must fail") {
+            RenderError::Story { message, .. } => assert!(message.contains("unparseable")),
+            other => panic!("expected a story-scoped failure, got: {other:?}"),
         }
     }
 
@@ -3783,6 +4371,11 @@ mod tests {
 
         let mut options = RenderOptions::new(chromium, 320, 240);
         options.story_timeout = Duration::from_secs(10);
+        // フォント条件待ちも同じ JSON.stringify プロトコルを使うため、この
+        // garble はまず fonts 層で fail-closed になる（それ自体は
+        // `garbled_fonts_result_fails_instead_of_silently_succeeding` が固定）。
+        // ここでは freeze 層の verdict を隔離して検証したいので裏口で切る。
+        options.wait_for_fonts = false;
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
         let err = renderer
@@ -3799,6 +4392,45 @@ mod tests {
         assert!(
             !message.contains("freeze failed"),
             "a parse failure must not masquerade as a freeze failure, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// **positive control（解析不能応答・fonts 層）**: [`FONTS_WAIT_SCRIPT`] の
+    /// 返り値を読めないとき、レンダラは撮影せず「解析できなかった」失敗を
+    /// 返すこと（[`fonts_verdict`] の実ブラウザ貫通）。
+    ///
+    /// バンドルは freeze 用の garbled と同じもの——`ok` キーを持つ
+    /// オブジェクトの `JSON.stringify` だけを壊すページは、同じプロトコルを
+    /// 使う fonts 層にまず捕まる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn garbled_fonts_result_fails_instead_of_silently_succeeding() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP garbled_fonts_result_fails_instead_of_silently_succeeding: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_garbled_freeze_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(10);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "garbled")
+            .await
+            .expect_err("an unreadable fonts-wait result must fail — not silently succeed");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("fonts-ready wait result was unparseable"),
+            "the error must say the fonts-wait result could not be parsed, got {message:?}"
         );
 
         renderer.close().await;

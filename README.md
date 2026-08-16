@@ -581,9 +581,13 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
   - UA シャドウ内の組み込みアニメーション（不確定状態の `<progress>` 等——
     closed shadow root と同じく外から列挙する口が無い）
 - 読み込み・描画の進行に伴う**一度きり**の見た目変化: 遅延読み込み画像
-  （`loading="lazy"`）・画像のデコード完了・Web Font の適用（FOUT / FOIT）・
-  `content-visibility: auto` の遅延描画。アニメーションではないので静止の
-  対象にならず、描画完了シグナル後の settle 待ちが吸収する best-effort
+  （`loading="lazy"`）・画像のデコード完了・`content-visibility: auto` の
+  遅延描画。アニメーションではないので静止の対象にならず、描画完了シグナル
+  後の settle 待ちが吸収する best-effort。**Web Font の適用（FOUT / FOIT）は
+  ここから外れた**——撮影前に `document.fonts.ready` を条件待ちし、期限内に
+  解決しなければその story は失敗になる（fail-closed。保証するのは
+  「同じビルドから同じ絵」であり「本来の字形」ではない——読み込みに
+  失敗したフォントは仕様どおり代替字形のまま解決し、その絵は決定的）
 - 利用者側スタイルが要素セレクタ等で `!important` 明示した `caret-color` /
   `transition`（注入 CSS も `!important` だが `*` セレクタ＝specificity 0
   なので、`!important` 同士の比較では specificity の高い利用者側の宣言が勝つ。

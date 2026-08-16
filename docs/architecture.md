@@ -248,7 +248,8 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 3. 展開先を `127.0.0.1:0`（OS 任せの空きポート）でループバック配信する
 4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、ストーリーを**逐次**
    `iframe.html?id=<storyId>&viewMode=story` で開く。`#storybook-root`（6 系は
-   `#root`）に中身が入るまでポーリングし、settle 待ちのあとビューポートを PNG で撮る。
+   `#root`）に中身が入るまでポーリングし、settle 待ち・`document.fonts.ready` の
+   条件待ちのあとビューポートを PNG で撮る。
    ビューポートはプロジェクトの `viewport_width` / `viewport_height`（既定 1280x720）
 5. `{title}/{name}` の名前で `screenshots` 行に保存する
    （`metadata` に `story_id` / `title` を残す）
