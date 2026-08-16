@@ -2456,17 +2456,15 @@ mod tests {
         write_two_wave_webfont_bundle(dir.path());
         // 一波は即応・二波は 1 時間遅延＝この試験の時間内には決して届かない。
         // story_timeout（5 秒）が先に尽きる。
-        let (addr, server_task) = start_two_wave_font_server(
-            dir.path(),
-            font,
-            Duration::ZERO,
-            Duration::from_secs(3600),
-        )
-        .await;
+        let (addr, server_task) =
+            start_two_wave_font_server(dir.path(), font, Duration::ZERO, Duration::from_secs(3600))
+                .await;
 
         let mut options = RenderOptions::new(chromium, 640, 360);
         options.story_timeout = Duration::from_secs(5);
-        let renderer = StoryRenderer::launch(options).await.expect("launch chromium");
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch chromium");
         let err = renderer
             .render_story(&format!("http://{addr}"), "demo-font--two-waves")
             .await
@@ -2523,7 +2521,9 @@ mod tests {
             let png = renderer
                 .render_story(&server.base_url(), "demo-font--text")
                 .await
-                .expect("a story whose font fails to load must still capture (intentional fail-open)");
+                .expect(
+                    "a story whose font fails to load must still capture (intentional fail-open)",
+                );
             let image = image::ImageReader::with_format(
                 std::io::Cursor::new(&png),
                 image::ImageFormat::Png,
