@@ -4,6 +4,7 @@ import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-r
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
+import { buildGraph, BuildGraph } from "@/components/build-graph";
 import { CommitLink } from "@/components/commit-link";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -105,6 +106,7 @@ function ProjectPage() {
           <BuildsTable
             projectId={project.id}
             githubRepo={project.github_repo}
+            defaultBranch={project.default_branch}
             tenantSlug={tenantSlug}
             projectSlug={project.slug}
           />
@@ -134,16 +136,19 @@ function ProjectPage() {
 function BuildsTable({
   projectId,
   githubRepo,
+  defaultBranch,
   tenantSlug,
   projectSlug,
 }: {
   projectId: string;
   githubRepo: string | null | undefined;
+  defaultBranch: string;
   tenantSlug: string;
   projectSlug: string;
 }) {
   const builds = useBuilds(projectId);
   const navigate = useNavigate();
+  const graph = buildGraph(builds.data?.builds ?? [], defaultBranch);
 
   return (
     <Card>
@@ -151,6 +156,9 @@ function BuildsTable({
         <Table>
           <TableHeader>
             <TableRow>
+              <TableHead style={{ width: graph.width }}>
+                <span className="sr-only">Branch graph</span>
+              </TableHead>
               <TableHead className="w-20">Build</TableHead>
               <TableHead>Branch</TableHead>
               <TableHead className="w-28">Commit</TableHead>
@@ -163,7 +171,7 @@ function BuildsTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {builds.data?.builds.map((build) => {
+            {builds.data?.builds.map((build, index) => {
               const to = "/t/$tenantSlug/p/$projectSlug/builds/$number" as const;
               const params = { tenantSlug, projectSlug, number: String(build.number) };
               return (
@@ -176,6 +184,9 @@ function BuildsTable({
                     void navigate({ to, params });
                   }}
                 >
+                  <TableCell className="relative p-0" style={{ width: graph.width }}>
+                    <BuildGraph row={graph.rows[index]!} branch={build.branch} />
+                  </TableCell>
                   <TableCell>
                     {/* The real, keyboard-focusable navigation. The row onClick above is
                         a mouse-only enhancement that points at the same destination. */}
@@ -216,7 +227,7 @@ function BuildsTable({
             })}
             {!builds.data?.builds.length ? (
               <TableRow>
-                <TableCell colSpan={7} className="text-sm text-muted-foreground">
+                <TableCell colSpan={8} className="text-sm text-muted-foreground">
                   {builds.isLoading ? "Loading…" : "No builds yet. Upload screenshots from CI."}
                 </TableCell>
               </TableRow>
