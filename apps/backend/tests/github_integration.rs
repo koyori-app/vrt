@@ -1630,7 +1630,7 @@ async fn stale_build_job_does_not_overwrite_newer_commit_status() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn other_project_on_the_same_repo_does_not_block_the_commit_status() {
+async fn commit_status_guard_respects_project_boundary_in_status_history() {
     // commit status の context (`vrt`) は全プロジェクト共通で、ビルド番号はプロジェクトごとの
     // 独立した連番。同じ repo に紐づく別プロジェクトの番号と比べると、番号が小さいだけの
     // プロジェクトが恒久的にステータスを書けなくなる。
@@ -1662,7 +1662,7 @@ async fn other_project_on_the_same_repo_does_not_block_the_commit_status() {
         .await;
 
     // leader 側の番号を進めてから status を書く。follower の 1 本目より大きい番号になる。
-    create_pr_build(&app, &leader, &token, &sha, pr_number).await;
+    let stale_leader_build = create_pr_build(&app, &leader, &token, &sha, pr_number).await;
     let leader_build = create_pr_build(&app, &leader, &token, &sha, pr_number).await;
     let follower_build = create_pr_build(&app, &follower, &token, &sha, pr_number).await;
     let leader_number = leader_build["number"].as_i64().unwrap();
@@ -1686,7 +1686,7 @@ async fn other_project_on_the_same_repo_does_not_block_the_commit_status() {
         job::GithubStatusJob {
             build_id: follower_build["id"].as_str().unwrap().parse().unwrap(),
         },
-        Data::new(job_state),
+        Data::new(job_state.clone()),
     )
     .await
     .expect("follower status job");
@@ -1707,6 +1707,23 @@ async fn other_project_on_the_same_repo_does_not_block_the_commit_status() {
             )
             .as_str()
         )
+    );
+
+    // leader の古いジョブが遅れて届く。直近のステータスは follower のものなので、
+    // 自プロジェクトの最新（leader_number）を履歴から探せないと巻き戻る。
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: stale_leader_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("stale leader status job");
+
+    assert_eq!(
+        app.github().status_requests(repo, &sha).await.len(),
+        2,
+        "別プロジェクトの status が間に挟まっても、古い自プロジェクトのビルドは弾く"
     );
 }
 

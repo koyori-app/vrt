@@ -559,8 +559,13 @@ pub fn build_target_url(
 /// 独立した連番なので、別プロジェクトが書いたステータスの番号と比べても意味が無い。
 /// そのため URL のテナント / プロジェクト slug が一致した場合だけ番号を返す。
 ///
+/// 結合ステータス（`/commits/{sha}/status`）は context ごとの最新 1 件しか返さないので使わない。
+/// 同じ repo に紐づく別プロジェクトが後から同じ context に書くと、自プロジェクトの最新が
+/// 隠れて判定が素通りしてしまう（A#10 → B#1 → 遅延した A#9 で巻き戻る）。
+/// 履歴を返す `/statuses` を新しい順に辿り、context と slug の両方が一致する最初の 1 件を使う。
+///
 /// 次のいずれでも `None` を返し、呼び出し側は判定を諦めて書き込む:
-/// 既存ステータスが無い / context が違う / URL が別プロジェクトを指す / URL から番号を読めない。
+/// 一致するステータスが履歴に無い / URL から番号を読めない / [`MAX_STATUS_PAGES`] を超えた。
 ///
 /// ponytail: GET と POST の間は不可分ではないので、GET の時点で観測できた巻き戻しだけを
 /// 防ぐ。窓を閉じるなら SHA 単位の直列化が要る。
@@ -576,53 +581,59 @@ pub async fn latest_status_build_number(
     project_slug: &str,
 ) -> Result<Option<i64>, GithubApiError> {
     #[derive(serde::Deserialize)]
-    struct CombinedStatus {
-        statuses: Vec<CommitStatus>,
-    }
-
-    #[derive(serde::Deserialize)]
     struct CommitStatus {
         context: String,
         #[serde(default)]
         target_url: Option<String>,
     }
 
-    // 結合ステータスは context ごとの最新だけを返すので、件数が context 数で頭打ちになり
-    // ページングが要らない（`/statuses` は同じ SHA への全書き込みを返すため、他の CI が
-    // 多い repo では vrt の最新が 1 ページ目から押し出されうる）。
-    let url = format!(
-        "{}/repos/{repo}/commits/{sha}/status",
-        base_url.trim_end_matches('/')
-    );
-    let response = http
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .header("User-Agent", USER_AGENT)
-        .send()
-        .await
-        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("get combined status: {e}")))?;
+    for page in 1..=MAX_STATUS_PAGES {
+        let url = format!(
+            "{}/repos/{repo}/commits/{sha}/statuses?per_page=100&page={page}",
+            base_url.trim_end_matches('/')
+        );
+        let response = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list commit statuses: {e}")))?;
 
-    if !response.status().is_success() {
-        return Err(error_from_response("get combined status", response).await);
+        if !response.status().is_success() {
+            return Err(error_from_response("list commit statuses", response).await);
+        }
+
+        let statuses: Vec<CommitStatus> = response.json().await.map_err(|e| {
+            GithubApiError::Transient(anyhow::anyhow!("decode commit statuses: {e}"))
+        })?;
+
+        // 一覧は新しい順で返る。最初に一致したものが自プロジェクトの最新ステータス。
+        let page_len = statuses.len();
+        if let Some(number) = statuses
+            .into_iter()
+            .filter(|s| s.context == context)
+            .filter_map(|s| s.target_url)
+            .find_map(|url| {
+                let (tenant, project, number) = parse_target_url_build(&url)?;
+                (tenant == tenant_slug && project == project_slug).then_some(number)
+            })
+        {
+            return Ok(Some(number));
+        }
+        if page_len < 100 {
+            return Ok(None);
+        }
     }
-
-    let combined: CombinedStatus = response
-        .json()
-        .await
-        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode combined status: {e}")))?;
-
-    Ok(combined
-        .statuses
-        .into_iter()
-        .find(|s| s.context == context)
-        .and_then(|s| s.target_url)
-        .and_then(|url| {
-            let (tenant, project, number) = parse_target_url_build(&url)?;
-            (tenant == tenant_slug && project == project_slug).then_some(number)
-        }))
+    // ponytail: ページ上限到達時は判定を諦めて書き込む。他 CI が同じ SHA に数百件書く repo で
+    // だけ起きる話で、そのときの挙動は #23 以前（無条件に書き込む）と同じ。
+    Ok(None)
 }
+
+/// [`latest_status_build_number`] が遡るページ数の上限（`/statuses` は 100 件/ページ）。
+const MAX_STATUS_PAGES: u32 = 10;
 
 /// `.../t/{tenant}/p/{project}/builds/{number}` を分解する（[`build_target_url`] の逆）。
 fn parse_target_url_build(target_url: &str) -> Option<(&str, &str, i64)> {

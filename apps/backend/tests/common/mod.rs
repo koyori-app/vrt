@@ -344,8 +344,8 @@ impl MockGithub {
     /// コミットステータス API 一式を受け付ける。
     ///
     /// - `POST /repos/{repo}/statuses/{sha}` は 201 を返し、本文を保持する
-    /// - `GET /repos/{repo}/commits/{sha}/status` は保持した内容のうち context ごとの
-    ///   最新だけを結合ステータスとして返す（実際の結合ステータス API と同じ形）
+    /// - `GET /repos/{repo}/commits/{sha}/statuses` は保持した全件を新しい順で返す
+    ///   （実際の API と同じく履歴。context ごとの最新に潰さない）
     ///
     /// 実際の GitHub と同じく POST した内容が以降の GET に見えるので、
     /// 「古いビルドのステータスで新しいビルドを上書きしない」判定を検証できる。
@@ -368,20 +368,16 @@ impl MockGithub {
             .await;
 
         Mock::given(method("GET"))
-            .and(path(format!("/repos/{repo}/commits/{sha}/status")))
+            .and(path(format!("/repos/{repo}/commits/{sha}/statuses")))
             .respond_with(move |_request: &wiremock::Request| {
-                let mut seen = std::collections::HashSet::new();
                 let statuses: Vec<serde_json::Value> = posted
                     .lock()
                     .expect("status state lock")
                     .iter()
                     .rev()
-                    .filter(|body| {
-                        seen.insert(body["context"].as_str().unwrap_or_default().to_owned())
-                    })
                     .cloned()
                     .collect();
-                ResponseTemplate::new(200).set_body_json(json!({ "statuses": statuses }))
+                ResponseTemplate::new(200).set_body_json(statuses)
             })
             .mount(&self.server)
             .await;
