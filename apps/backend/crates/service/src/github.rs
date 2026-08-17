@@ -548,6 +548,71 @@ pub fn build_target_url(
     )
 }
 
+/// 同じ context の既存コミットステータスが指しているビルド番号。
+///
+/// commit status には PR コメントのような不可視メタデータを埋める場所が無いので、
+/// [`build_target_url`] が組み立てた `target_url` の末尾（`/builds/{number}`）から読む。
+/// 既存ステータスが無い・context が違う・URL から番号を読めない場合は `None` を返し、
+/// 呼び出し側は判定を諦めて書き込む。
+///
+/// ponytail: GET と POST の間は不可分ではないので、GET の時点で観測できた巻き戻しだけを
+/// 防ぐ。窓を閉じるなら SHA 単位の直列化が要る。
+pub async fn latest_status_build_number(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    context: &str,
+) -> Result<Option<i64>, GithubApiError> {
+    #[derive(serde::Deserialize)]
+    struct CommitStatus {
+        context: String,
+        #[serde(default)]
+        target_url: Option<String>,
+    }
+
+    // 新しい順に返る。同じ context の先頭が最後に書かれたステータス。
+    let url = format!(
+        "{}/repos/{repo}/commits/{sha}/statuses?per_page=100",
+        base_url.trim_end_matches('/')
+    );
+    let response = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list commit statuses: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(error_from_response("list commit statuses", response).await);
+    }
+
+    let statuses: Vec<CommitStatus> = response
+        .json()
+        .await
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode commit statuses: {e}")))?;
+
+    Ok(statuses
+        .into_iter()
+        .find(|s| s.context == context)
+        .and_then(|s| s.target_url)
+        .and_then(|url| parse_target_url_build_number(&url)))
+}
+
+/// `.../builds/{number}` からビルド番号を読む（[`build_target_url`] の逆）。
+fn parse_target_url_build_number(target_url: &str) -> Option<i64> {
+    target_url
+        .trim_end_matches('/')
+        .rsplit_once("/builds/")?
+        .1
+        .parse()
+        .ok()
+}
+
 /// `POST /repos/{repo}/statuses/{sha}` でコミットステータスを作成する。
 ///
 /// `repo` は `owner/name`。`token` は Installation Access Token。
@@ -634,14 +699,30 @@ fn pr_comment_build_number_metadata(build_number: i64) -> String {
     format!("{PR_COMMENT_BUILD_NUMBER_PREFIX}{build_number} -->")
 }
 
-fn parse_pr_comment_build_number(body: &str) -> Option<i64> {
-    body.lines().find_map(|line| {
+/// 既存コメントから読み取ったビルド番号メタデータの状態。
+///
+/// 「メタデータが無い」（#22 以前に作られたコメント。移行のため素通しする）と
+/// 「メタデータはあるが読めない」を区別するために 3 状態にしている。
+/// どちらも更新は通すが、後者は想定外なのでログに残す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentBuildNumber {
+    Missing,
+    Malformed,
+    Present(i64),
+}
+
+fn parse_pr_comment_build_number(body: &str) -> CommentBuildNumber {
+    let Some(value) = body.lines().find_map(|line| {
         line.trim()
             .strip_prefix(PR_COMMENT_BUILD_NUMBER_PREFIX)?
-            .strip_suffix(" -->")?
-            .parse()
-            .ok()
-    })
+            .strip_suffix(" -->")
+    }) else {
+        return CommentBuildNumber::Missing;
+    };
+    match value.parse() {
+        Ok(number) => CommentBuildNumber::Present(number),
+        Err(_) => CommentBuildNumber::Malformed,
+    }
 }
 
 /// PR コメントの本文を組み立てる。
@@ -733,16 +814,29 @@ async fn find_marker_comment(
     Ok(None)
 }
 
+/// 書き込んだか、古いジョブとしてスキップしたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentWrite {
+    Wrote,
+    /// 既存コメントがより新しいビルドを指していたのでスキップした。
+    SkippedStale {
+        existing_build_number: i64,
+    },
+}
+
 /// PR のビルドリンクコメントを作成または更新する。
 ///
 /// `marker` を含む既存コメントがあれば `PATCH` で本文を差し替え、
 /// 無ければ `POST /repos/{repo}/issues/{pr_number}/comments` で作成する。
-/// 既存コメントの不可視メタデータが現在と同じか新しいビルド番号を指している場合は、
+/// 既存コメントの不可視メタデータがより新しいビルド番号を指している場合は、
 /// 遅延・再試行された古いジョブによる巻き戻しを防ぐため更新しない。
-/// 戻り値は書き込んだ場合に `true`、古いジョブとしてスキップした場合に `false`。
+/// 同一ビルドの更新は通す（1 ビルドにつき finalize / 比較完了 / approve・reject と
+/// 複数回ジョブが走り、そのたびに description が変わるため）。
 ///
-/// ponytail: 同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿に
-/// なりうる。ビルドの状態遷移は時間的に離れていて実害が薄いのでロックは持たない。
+/// ponytail: 防げるのは GET の時点で観測できた巻き戻しだけで、GET と PATCH の間に
+/// 新しいジョブが書き込んだ場合は検知できない（issue comment API に条件付き更新が無い）。
+/// 同じ理由で、同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿にも
+/// なりうる。窓を実際に閉じるなら PR 単位でジョブを直列化することになる。
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_pr_comment(
     http: &reqwest::Client,
@@ -753,24 +847,39 @@ pub async fn upsert_pr_comment(
     marker: &str,
     build_number: i64,
     body: &str,
-) -> Result<bool, GithubApiError> {
+) -> Result<CommentWrite, GithubApiError> {
     let existing = find_marker_comment(http, base_url, token, repo, pr_number, marker).await?;
 
     let base = base_url.trim_end_matches('/');
     let request = match existing {
-        Some(comment)
-            if comment
+        Some(comment) => {
+            match comment
                 .body
                 .as_deref()
-                .and_then(parse_pr_comment_build_number)
-                .is_some_and(|existing_number| existing_number >= build_number) =>
-        {
-            return Ok(false);
+                .map_or(CommentBuildNumber::Missing, parse_pr_comment_build_number)
+            {
+                CommentBuildNumber::Present(existing_build_number)
+                    if existing_build_number > build_number =>
+                {
+                    return Ok(CommentWrite::SkippedStale {
+                        existing_build_number,
+                    });
+                }
+                CommentBuildNumber::Malformed => {
+                    tracing::warn!(
+                        repo,
+                        pr_number,
+                        comment_id = comment.id,
+                        "pr comment has unparsable build number metadata; updating anyway"
+                    );
+                }
+                _ => {}
+            }
+            http.patch(format!(
+                "{base}/repos/{repo}/issues/comments/{}",
+                comment.id
+            ))
         }
-        Some(comment) => http.patch(format!(
-            "{base}/repos/{repo}/issues/comments/{}",
-            comment.id
-        )),
         None => http.post(format!("{base}/repos/{repo}/issues/{pr_number}/comments")),
     };
 
@@ -785,7 +894,7 @@ pub async fn upsert_pr_comment(
         .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("upsert pr comment: {e}")))?;
 
     if response.status().is_success() {
-        return Ok(true);
+        return Ok(CommentWrite::Wrote);
     }
     Err(error_from_response("upsert pr comment", response).await)
 }
@@ -1005,10 +1114,36 @@ mod tests {
             "マーカーが先頭にあること: {body}"
         );
         assert!(body.contains("<!-- vrt:build_number:42 -->"));
-        assert_eq!(parse_pr_comment_build_number(&body), Some(42));
+        assert_eq!(
+            parse_pr_comment_build_number(&body),
+            CommentBuildNumber::Present(42)
+        );
         assert!(body.contains("web build #42"));
         assert!(body.contains("4 changes detected, awaiting review"));
         assert!(body.contains("https://vrt.example.com/t/acme/p/web/builds/42"));
+    }
+
+    #[test]
+    fn distinguishes_missing_and_malformed_build_number_metadata() {
+        assert_eq!(
+            parse_pr_comment_build_number("<!-- vrt:proj -->\n## VRT\n"),
+            CommentBuildNumber::Missing
+        );
+        assert_eq!(
+            parse_pr_comment_build_number("<!-- vrt:build_number:oops -->"),
+            CommentBuildNumber::Malformed
+        );
+    }
+
+    #[test]
+    fn reads_build_number_back_from_target_url() {
+        let url = build_target_url("https://vrt.example.com", "acme", "web", 42);
+        assert_eq!(parse_target_url_build_number(&url), Some(42));
+        assert_eq!(parse_target_url_build_number(&format!("{url}/")), Some(42));
+        assert_eq!(
+            parse_target_url_build_number("https://vrt.example.com/t/acme/p/web"),
+            None
+        );
     }
 
     #[test]
