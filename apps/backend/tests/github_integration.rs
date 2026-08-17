@@ -15,12 +15,17 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use apalis::prelude::Data;
 use common::{TEST_INSTALLATION_TOKEN, TestApp};
 use entity::scopes::Scope;
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wiremock::{Mock, ResponseTemplate, matchers::method, matchers::path, matchers::query_param};
@@ -149,6 +154,31 @@ async fn create_tenant_and_project(app: &TestApp) -> Project {
         project_id: project["id"].as_str().expect("project id").to_string(),
         project_slug,
     }
+}
+
+async fn create_pr_build(
+    app: &TestApp,
+    project: &Project,
+    token: &str,
+    sha: &str,
+    pr_number: i32,
+) -> Value {
+    let response = app
+        .post_json_with_bearer(
+            &format!(
+                "/v1/ci/projects/{}/{}/builds",
+                project.tenant_slug, project.project_slug
+            ),
+            token,
+            json!({
+                "branch": "feature/stale-comment",
+                "commit_sha": sha,
+                "pull_request_number": pr_number,
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED, "create PR build");
+    response.json().await.expect("build json")
 }
 
 // ── 1. webhook の署名検証 ────────────────────────────────────────────────
@@ -1385,6 +1415,413 @@ async fn existing_pr_comment_is_updated_instead_of_duplicated() {
         "マーカーを含むコメント (id=55) を更新する: {}",
         comment.url.path()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_build_job_does_not_overwrite_newer_pr_comment() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 10;
+    let old_sha = Uuid::new_v4().simple().to_string();
+    let new_sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &old_sha).await;
+    app.github().expect_commit_statuses(repo, &new_sha).await;
+
+    mount_stateful_pr_comment(&app, repo, pr_number).await;
+    link_project_to_repo(&app, &project, installation_id, repo).await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+    let old_build = create_pr_build(&app, &project, &token, &old_sha, pr_number).await;
+    let new_build = create_pr_build(&app, &project, &token, &new_sha, pr_number).await;
+    let old_build_id = old_build["id"].as_str().unwrap().parse().unwrap();
+    let new_build_id = new_build["id"].as_str().unwrap().parse().unwrap();
+    let old_number = old_build["number"].as_i64().unwrap();
+    let new_number = new_build["number"].as_i64().unwrap();
+    assert!(new_number > old_number);
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: new_build_id,
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("new build status job");
+
+    let new_comment = latest_comment_body(&app, repo, pr_number).await;
+    assert!(new_comment.contains(&format!("<!-- vrt:build_number:{new_number} -->")));
+    assert!(new_comment.contains(&format!("/builds/{new_number}")));
+    assert_eq!(
+        app.github()
+            .pr_comment_requests(repo, i64::from(pr_number))
+            .await
+            .len(),
+        1
+    );
+
+    // 新しいビルドの後で古いジョブを実行しても、コメントは書き戻されない。
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: old_build_id,
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("stale build status job");
+
+    let final_comment = latest_comment_body(&app, repo, pr_number).await;
+    assert_eq!(final_comment, new_comment);
+    assert!(final_comment.contains(&format!("/builds/{new_number}")));
+    assert!(!final_comment.contains(&format!("/builds/{old_number}")));
+    assert_eq!(
+        app.github()
+            .pr_comment_requests(repo, i64::from(pr_number))
+            .await
+            .len(),
+        1,
+        "stale job must not POST or PATCH the PR comment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_build_state_transition_still_updates_the_pr_comment() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 11;
+    let sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &sha).await;
+    mount_stateful_pr_comment(&app, repo, pr_number).await;
+
+    link_project_to_repo(&app, &project, installation_id, repo).await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+    let build = create_pr_build(&app, &project, &token, &sha, pr_number).await;
+    let build_id: Uuid = build["id"].as_str().unwrap().parse().unwrap();
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob { build_id },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("initial status job");
+
+    let first = latest_comment_body(&app, repo, pr_number).await;
+    assert!(
+        first.contains("Waiting for screenshots"),
+        "作成直後のビルドの description: {first}"
+    );
+
+    // 同じビルドが承認まで進む（finalize / approve は同じ build_id でジョブを投げ直す）。
+    let row = entity::builds::Entity::find_by_id(build_id)
+        .one(&app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = row.into();
+    active.status = Set(entity::builds::BuildStatus::Approved);
+    active.update(&app.state.db).await.expect("approve build");
+
+    job::github_status::process(job::GithubStatusJob { build_id }, Data::new(job_state))
+        .await
+        .expect("second status job for the same build");
+
+    let second = latest_comment_body(&app, repo, pr_number).await;
+    assert!(
+        second.contains("Visual changes approved"),
+        "同一ビルドの状態遷移はコメントに反映される: {second}"
+    );
+    assert_eq!(
+        app.github()
+            .pr_comment_requests(repo, i64::from(pr_number))
+            .await
+            .len(),
+        2,
+        "同一ビルドの 2 回目のジョブも書き込む（stale 判定で弾かない）"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_build_job_does_not_overwrite_newer_commit_status() {
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let project = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 12;
+    // 同じコミットを 2 回ビルドした状況（再試行など）。commit status は SHA 単位なので
+    // 古いビルドのジョブが新しいビルドの結果を上書きしうる。
+    let sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &sha).await;
+    mount_stateful_pr_comment(&app, repo, pr_number).await;
+
+    link_project_to_repo(&app, &project, installation_id, repo).await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+    let old_build = create_pr_build(&app, &project, &token, &sha, pr_number).await;
+    let new_build = create_pr_build(&app, &project, &token, &sha, pr_number).await;
+    let old_build_id: Uuid = old_build["id"].as_str().unwrap().parse().unwrap();
+    let new_build_id: Uuid = new_build["id"].as_str().unwrap().parse().unwrap();
+    let old_number = old_build["number"].as_i64().unwrap();
+    let new_number = new_build["number"].as_i64().unwrap();
+    assert!(new_number > old_number);
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: new_build_id,
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("new build status job");
+
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: old_build_id,
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("stale build status job");
+
+    let statuses = app.github().status_requests(repo, &sha).await;
+    assert_eq!(
+        statuses.len(),
+        1,
+        "古いビルドのジョブは commit status を書き戻さない"
+    );
+    let body: Value = serde_json::from_slice(&statuses[0].body).expect("status json");
+    assert_eq!(
+        body["target_url"].as_str(),
+        Some(
+            format!(
+                "{}/t/{}/p/{}/builds/{new_number}",
+                app.base_url, project.tenant_slug, project.project_slug
+            )
+            .as_str()
+        )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_status_guard_respects_project_boundary_in_status_history() {
+    // commit status の context (`vrt`) は全プロジェクト共通で、ビルド番号はプロジェクトごとの
+    // 独立した連番。同じ repo に紐づく別プロジェクトの番号と比べると、番号が小さいだけの
+    // プロジェクトが恒久的にステータスを書けなくなる。
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let leader = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 13;
+    let sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &sha).await;
+    mount_stateful_pr_comment(&app, repo, pr_number).await;
+    link_project_to_repo(&app, &leader, installation_id, repo).await;
+
+    // 同じテナント・同じリポジトリの 2 つ目のプロジェクト（例: docs と storybook）。
+    let follower = create_sibling_project(&app, &leader).await;
+    app.patch_json(
+        &format!("/v1/projects/{}/github", follower.project_id),
+        json!({ "installation_id": installation_id, "github_repo": repo }),
+    )
+    .await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+
+    // leader 側の番号を進めてから status を書く。follower の 1 本目より大きい番号になる。
+    let stale_leader_build = create_pr_build(&app, &leader, &token, &sha, pr_number).await;
+    let leader_build = create_pr_build(&app, &leader, &token, &sha, pr_number).await;
+    let follower_build = create_pr_build(&app, &follower, &token, &sha, pr_number).await;
+    let leader_number = leader_build["number"].as_i64().unwrap();
+    let follower_number = follower_build["number"].as_i64().unwrap();
+    assert!(
+        leader_number > follower_number,
+        "別プロジェクトの方が大きい番号を持つ状況を作る"
+    );
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: leader_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("leader status job");
+
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: follower_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("follower status job");
+
+    let statuses = app.github().status_requests(repo, &sha).await;
+    assert_eq!(
+        statuses.len(),
+        2,
+        "別プロジェクトのビルド番号で stale 判定してはいけない"
+    );
+    let body: Value = serde_json::from_slice(&statuses[1].body).expect("status json");
+    assert_eq!(
+        body["target_url"].as_str(),
+        Some(
+            format!(
+                "{}/t/{}/p/{}/builds/{follower_number}",
+                app.base_url, follower.tenant_slug, follower.project_slug
+            )
+            .as_str()
+        )
+    );
+
+    // leader の古いジョブが遅れて届く。直近のステータスは follower のものなので、
+    // 自プロジェクトの最新（leader_number）を履歴から探せないと巻き戻る。
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: stale_leader_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("stale leader status job");
+
+    assert_eq!(
+        app.github().status_requests(repo, &sha).await.len(),
+        2,
+        "別プロジェクトの status が間に挟まっても、古い自プロジェクトのビルドは弾く"
+    );
+}
+
+/// 同じテナントにもう 1 つプロジェクトを作る。
+async fn create_sibling_project(app: &TestApp, sibling: &Project) -> Project {
+    let project_slug = format!("docs-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let res = app
+        .post_json(
+            &format!("/v1/tenants/{}/projects", sibling.tenant_id),
+            json!({ "name": "Docs", "slug": project_slug }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create sibling project");
+    let project: Value = res.json().await.expect("project json");
+
+    Project {
+        tenant_id: sibling.tenant_id.clone(),
+        tenant_slug: sibling.tenant_slug.clone(),
+        project_id: project["id"].as_str().expect("project id").to_string(),
+        project_slug,
+    }
+}
+
+/// installation の webhook → claim → プロジェクト紐付けまでを一息でやる。
+async fn link_project_to_repo(app: &TestApp, project: &Project, installation_id: i64, repo: &str) {
+    app.post_github_webhook(
+        "installation",
+        &installation_payload("created", installation_id, "acme-inc"),
+        None,
+    )
+    .await;
+    app.wait_for_installation(installation_id, POLL_TIMEOUT)
+        .await;
+    app.post_json(
+        &format!("/v1/github/installations/{installation_id}/claim"),
+        json!({ "tenant_id": project.tenant_id, "state": issue_setup_state(app, &project.tenant_id).await }),
+    )
+    .await;
+    app.patch_json(
+        &format!("/v1/projects/{}/github", project.project_id),
+        json!({ "installation_id": installation_id, "github_repo": repo }),
+    )
+    .await;
+}
+
+/// POST / PATCH した本文を保持し、以降の GET で返す PR コメント mock。
+async fn mount_stateful_pr_comment(app: &TestApp, repo: &str, pr_number: i32) {
+    let current = Arc::new(Mutex::new(None::<String>));
+
+    let for_get = Arc::clone(&current);
+    Mock::given(method("GET"))
+        .and(path(format!("/repos/{repo}/issues/{pr_number}/comments")))
+        .respond_with(move |_request: &wiremock::Request| {
+            let comments = for_get
+                .lock()
+                .expect("comment state lock")
+                .as_ref()
+                .map(|body| json!([{ "id": 100, "body": body }]))
+                .unwrap_or_else(|| json!([]));
+            ResponseTemplate::new(200).set_body_json(comments)
+        })
+        .mount(&app.github().server)
+        .await;
+
+    let for_post = Arc::clone(&current);
+    Mock::given(method("POST"))
+        .and(path(format!("/repos/{repo}/issues/{pr_number}/comments")))
+        .respond_with(move |request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).expect("comment json");
+            *for_post.lock().expect("comment state lock") =
+                Some(payload["body"].as_str().expect("comment body").to_owned());
+            ResponseTemplate::new(201).set_body_json(json!({ "id": 100 }))
+        })
+        .mount(&app.github().server)
+        .await;
+
+    Mock::given(method("PATCH"))
+        .and(path(format!("/repos/{repo}/issues/comments/100")))
+        .respond_with(move |request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).expect("comment json");
+            *current.lock().expect("comment state lock") =
+                Some(payload["body"].as_str().expect("comment body").to_owned());
+            ResponseTemplate::new(200).set_body_json(json!({ "id": 100 }))
+        })
+        .mount(&app.github().server)
+        .await;
+}
+
+/// 直近に書き込まれた PR コメントの本文（[`mount_stateful_pr_comment`] と対で使う）。
+async fn latest_comment_body(app: &TestApp, repo: &str, pr_number: i32) -> String {
+    let request = app
+        .github()
+        .pr_comment_requests(repo, i64::from(pr_number))
+        .await
+        .pop()
+        .expect("a pr comment was written");
+    let payload: Value = serde_json::from_slice(&request.body).expect("comment json");
+    payload["body"].as_str().expect("comment body").to_string()
 }
 
 // ── 5. GitHub App 未設定 ────────────────────────────────────────────────

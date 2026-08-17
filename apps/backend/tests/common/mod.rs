@@ -341,11 +341,44 @@ impl MockGithub {
         self.server.uri()
     }
 
-    /// `POST /repos/{repo}/statuses/{sha}` を受け付けて 201 を返す。
+    /// コミットステータス API 一式を受け付ける。
+    ///
+    /// - `POST /repos/{repo}/statuses/{sha}` は 201 を返し、本文を保持する
+    /// - `GET /repos/{repo}/commits/{sha}/statuses` は保持した全件を新しい順で返す
+    ///   （実際の API と同じく履歴。context ごとの最新に潰さない）
+    ///
+    /// 実際の GitHub と同じく POST した内容が以降の GET に見えるので、
+    /// 「古いビルドのステータスで新しいビルドを上書きしない」判定を検証できる。
     pub async fn expect_commit_statuses(&self, repo: &str, sha: &str) {
+        let posted = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+
+        let posted_for_post = std::sync::Arc::clone(&posted);
         Mock::given(method("POST"))
             .and(path(format!("/repos/{repo}/statuses/{sha}")))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "id": 1 })))
+            .respond_with(move |request: &wiremock::Request| {
+                if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) {
+                    posted_for_post
+                        .lock()
+                        .expect("status state lock")
+                        .push(body);
+                }
+                ResponseTemplate::new(201).set_body_json(json!({ "id": 1 }))
+            })
+            .mount(&self.server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/{repo}/commits/{sha}/statuses")))
+            .respond_with(move |_request: &wiremock::Request| {
+                let statuses: Vec<serde_json::Value> = posted
+                    .lock()
+                    .expect("status state lock")
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(statuses)
+            })
             .mount(&self.server)
             .await;
     }

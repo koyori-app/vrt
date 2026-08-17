@@ -548,6 +548,101 @@ pub fn build_target_url(
     )
 }
 
+/// 同じ context の既存コミットステータスが、このプロジェクトのどのビルドを指しているか。
+///
+/// commit status には PR コメントのような不可視メタデータを埋める場所が無いので、
+/// [`build_target_url`] が組み立てた `target_url`
+/// （`/t/{tenant}/p/{project}/builds/{number}`）から読む。
+///
+/// context (`vrt`) はプロジェクトごとに変わらず、`projects.github_repo` にも一意制約が無い
+/// （同じリポジトリに複数プロジェクトを紐付けられる）。ビルド番号はプロジェクトごとの
+/// 独立した連番なので、別プロジェクトが書いたステータスの番号と比べても意味が無い。
+/// そのため URL のテナント / プロジェクト slug が一致した場合だけ番号を返す。
+///
+/// 結合ステータス（`/commits/{sha}/status`）は context ごとの最新 1 件しか返さないので使わない。
+/// 同じ repo に紐づく別プロジェクトが後から同じ context に書くと、自プロジェクトの最新が
+/// 隠れて判定が素通りしてしまう（A#10 → B#1 → 遅延した A#9 で巻き戻る）。
+/// 履歴を返す `/statuses` を新しい順に辿り、context と slug の両方が一致する最初の 1 件を使う。
+///
+/// 次のいずれでも `None` を返し、呼び出し側は判定を諦めて書き込む:
+/// 一致するステータスが履歴に無い / URL から番号を読めない / [`MAX_STATUS_PAGES`] を超えた。
+///
+/// ponytail: GET と POST の間は不可分ではないので、GET の時点で観測できた巻き戻しだけを
+/// 防ぐ。窓を閉じるなら SHA 単位の直列化が要る。
+#[allow(clippy::too_many_arguments)]
+pub async fn latest_status_build_number(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    context: &str,
+    tenant_slug: &str,
+    project_slug: &str,
+) -> Result<Option<i64>, GithubApiError> {
+    #[derive(serde::Deserialize)]
+    struct CommitStatus {
+        context: String,
+        #[serde(default)]
+        target_url: Option<String>,
+    }
+
+    for page in 1..=MAX_STATUS_PAGES {
+        let url = format!(
+            "{}/repos/{repo}/commits/{sha}/statuses?per_page=100&page={page}",
+            base_url.trim_end_matches('/')
+        );
+        let response = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+            .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list commit statuses: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(error_from_response("list commit statuses", response).await);
+        }
+
+        let statuses: Vec<CommitStatus> = response.json().await.map_err(|e| {
+            GithubApiError::Transient(anyhow::anyhow!("decode commit statuses: {e}"))
+        })?;
+
+        // 一覧は新しい順で返る。最初に一致したものが自プロジェクトの最新ステータス。
+        let page_len = statuses.len();
+        if let Some(number) = statuses
+            .into_iter()
+            .filter(|s| s.context == context)
+            .filter_map(|s| s.target_url)
+            .find_map(|url| {
+                let (tenant, project, number) = parse_target_url_build(&url)?;
+                (tenant == tenant_slug && project == project_slug).then_some(number)
+            })
+        {
+            return Ok(Some(number));
+        }
+        if page_len < 100 {
+            return Ok(None);
+        }
+    }
+    // ponytail: ページ上限到達時は判定を諦めて書き込む。他 CI が同じ SHA に数百件書く repo で
+    // だけ起きる話で、そのときの挙動は #23 以前（無条件に書き込む）と同じ。
+    Ok(None)
+}
+
+/// [`latest_status_build_number`] が遡るページ数の上限（`/statuses` は 100 件/ページ）。
+const MAX_STATUS_PAGES: u32 = 10;
+
+/// `.../t/{tenant}/p/{project}/builds/{number}` を分解する（[`build_target_url`] の逆）。
+fn parse_target_url_build(target_url: &str) -> Option<(&str, &str, i64)> {
+    let (head, number) = target_url.trim_end_matches('/').rsplit_once("/builds/")?;
+    let (head, project) = head.rsplit_once("/p/")?;
+    let (_, tenant) = head.rsplit_once("/t/")?;
+    Some((tenant, project, number.parse().ok()?))
+}
+
 /// `POST /repos/{repo}/statuses/{sha}` でコミットステータスを作成する。
 ///
 /// `repo` は `owner/name`。`token` は Installation Access Token。
@@ -627,6 +722,39 @@ pub fn pr_comment_marker(project_id: Uuid) -> String {
     format!("<!-- vrt:{project_id} -->")
 }
 
+/// コメントが指しているビルド番号を保持する不可視メタデータ。
+const PR_COMMENT_BUILD_NUMBER_PREFIX: &str = "<!-- vrt:build_number:";
+
+fn pr_comment_build_number_metadata(build_number: i64) -> String {
+    format!("{PR_COMMENT_BUILD_NUMBER_PREFIX}{build_number} -->")
+}
+
+/// 既存コメントから読み取ったビルド番号メタデータの状態。
+///
+/// 「メタデータが無い」（#22 以前に作られたコメント。移行のため素通しする）と
+/// 「メタデータはあるが読めない」を区別するために 3 状態にしている。
+/// どちらも更新は通すが、後者は想定外なのでログに残す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommentBuildNumber {
+    Missing,
+    Malformed,
+    Present(i64),
+}
+
+fn parse_pr_comment_build_number(body: &str) -> CommentBuildNumber {
+    let Some(value) = body.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(PR_COMMENT_BUILD_NUMBER_PREFIX)?
+            .strip_suffix(" -->")
+    }) else {
+        return CommentBuildNumber::Missing;
+    };
+    match value.parse() {
+        Ok(number) => CommentBuildNumber::Present(number),
+        Err(_) => CommentBuildNumber::Malformed,
+    }
+}
+
 /// PR コメントの本文を組み立てる。
 ///
 /// `description` は [`status_for_build`] の文言をそのまま使う。
@@ -637,8 +765,9 @@ pub fn pr_comment_body(
     description: &str,
     target_url: &str,
 ) -> String {
+    let build_number_metadata = pr_comment_build_number_metadata(build_number);
     format!(
-        "{marker}\n## 📸 VRT — {project_slug} build #{build_number}\n\n\
+        "{marker}\n{build_number_metadata}\n## 📸 VRT — {project_slug} build #{build_number}\n\n\
          **{description}**\n\n[View build]({target_url})\n"
     )
 }
@@ -672,7 +801,7 @@ async fn find_marker_comment(
     repo: &str,
     pr_number: i32,
     marker: &str,
-) -> Result<Option<i64>, GithubApiError> {
+) -> Result<Option<IssueComment>, GithubApiError> {
     for page in 1..=MAX_COMMENT_PAGES {
         let url = format!(
             "{}/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}",
@@ -704,7 +833,7 @@ async fn find_marker_comment(
             .into_iter()
             .find(|c| c.body.as_deref().is_some_and(|b| b.contains(marker)))
         {
-            return Ok(Some(comment.id));
+            return Ok(Some(comment));
         }
         if page_len < 100 {
             return Ok(None);
@@ -715,13 +844,29 @@ async fn find_marker_comment(
     Ok(None)
 }
 
+/// 書き込んだか、古いジョブとしてスキップしたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentWrite {
+    Wrote,
+    /// 既存コメントがより新しいビルドを指していたのでスキップした。
+    SkippedStale {
+        existing_build_number: i64,
+    },
+}
+
 /// PR のビルドリンクコメントを作成または更新する。
 ///
 /// `marker` を含む既存コメントがあれば `PATCH` で本文を差し替え、
 /// 無ければ `POST /repos/{repo}/issues/{pr_number}/comments` で作成する。
+/// 既存コメントの不可視メタデータがより新しいビルド番号を指している場合は、
+/// 遅延・再試行された古いジョブによる巻き戻しを防ぐため更新しない。
+/// 同一ビルドの更新は通す（1 ビルドにつき finalize / 比較完了 / approve・reject と
+/// 複数回ジョブが走り、そのたびに description が変わるため）。
 ///
-/// ponytail: 同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿に
-/// なりうる。ビルドの状態遷移は時間的に離れていて実害が薄いのでロックは持たない。
+/// ponytail: 防げるのは GET の時点で観測できた巻き戻しだけで、GET と PATCH の間に
+/// 新しいジョブが書き込んだ場合は検知できない（issue comment API に条件付き更新が無い）。
+/// 同じ理由で、同一 PR のジョブが並行すると両方がマーカーを見つけられず二重投稿にも
+/// なりうる。窓を実際に閉じるなら PR 単位でジョブを直列化することになる。
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_pr_comment(
     http: &reqwest::Client,
@@ -730,13 +875,41 @@ pub async fn upsert_pr_comment(
     repo: &str,
     pr_number: i32,
     marker: &str,
+    build_number: i64,
     body: &str,
-) -> Result<(), GithubApiError> {
+) -> Result<CommentWrite, GithubApiError> {
     let existing = find_marker_comment(http, base_url, token, repo, pr_number, marker).await?;
 
     let base = base_url.trim_end_matches('/');
     let request = match existing {
-        Some(comment_id) => http.patch(format!("{base}/repos/{repo}/issues/comments/{comment_id}")),
+        Some(comment) => {
+            match comment
+                .body
+                .as_deref()
+                .map_or(CommentBuildNumber::Missing, parse_pr_comment_build_number)
+            {
+                CommentBuildNumber::Present(existing_build_number)
+                    if existing_build_number > build_number =>
+                {
+                    return Ok(CommentWrite::SkippedStale {
+                        existing_build_number,
+                    });
+                }
+                CommentBuildNumber::Malformed => {
+                    tracing::warn!(
+                        repo,
+                        pr_number,
+                        comment_id = comment.id,
+                        "pr comment has unparsable build number metadata; updating anyway"
+                    );
+                }
+                _ => {}
+            }
+            http.patch(format!(
+                "{base}/repos/{repo}/issues/comments/{}",
+                comment.id
+            ))
+        }
         None => http.post(format!("{base}/repos/{repo}/issues/{pr_number}/comments")),
     };
 
@@ -751,7 +924,7 @@ pub async fn upsert_pr_comment(
         .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("upsert pr comment: {e}")))?;
 
     if response.status().is_success() {
-        return Ok(());
+        return Ok(CommentWrite::Wrote);
     }
     Err(error_from_response("upsert pr comment", response).await)
 }
@@ -970,9 +1143,44 @@ mod tests {
             body.starts_with(&marker),
             "マーカーが先頭にあること: {body}"
         );
+        assert!(body.contains("<!-- vrt:build_number:42 -->"));
+        assert_eq!(
+            parse_pr_comment_build_number(&body),
+            CommentBuildNumber::Present(42)
+        );
         assert!(body.contains("web build #42"));
         assert!(body.contains("4 changes detected, awaiting review"));
         assert!(body.contains("https://vrt.example.com/t/acme/p/web/builds/42"));
+    }
+
+    #[test]
+    fn distinguishes_missing_and_malformed_build_number_metadata() {
+        assert_eq!(
+            parse_pr_comment_build_number("<!-- vrt:proj -->\n## VRT\n"),
+            CommentBuildNumber::Missing
+        );
+        assert_eq!(
+            parse_pr_comment_build_number("<!-- vrt:build_number:oops -->"),
+            CommentBuildNumber::Malformed
+        );
+    }
+
+    #[test]
+    fn reads_tenant_project_and_build_number_back_from_target_url() {
+        let url = build_target_url("https://vrt.example.com", "acme", "web", 42);
+        assert_eq!(parse_target_url_build(&url), Some(("acme", "web", 42)));
+        assert_eq!(
+            parse_target_url_build(&format!("{url}/")),
+            Some(("acme", "web", 42))
+        );
+        assert_eq!(
+            parse_target_url_build("https://vrt.example.com/t/acme/p/web"),
+            None
+        );
+        assert_eq!(
+            parse_target_url_build("https://vrt.example.com/t/acme/p/web/builds/x"),
+            None
+        );
     }
 
     #[test]

@@ -26,8 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use entity::{builds, projects, tenants};
 use service::github::{
-    GithubApiError, STATUS_CONTEXT, build_target_url, github_app, installation_token,
-    post_commit_status, pr_comment_body, pr_comment_marker, status_for_build, upsert_pr_comment,
+    CommentWrite, GithubApiError, STATUS_CONTEXT, build_target_url, github_app, installation_token,
+    latest_status_build_number, post_commit_status, pr_comment_body, pr_comment_marker,
+    status_for_build, upsert_pr_comment,
 };
 
 use crate::JobState;
@@ -170,26 +171,56 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
         build.number,
     );
 
-    post_commit_status(
+    // commit status は required status としてマージの門を守るので、PR コメントと同じく
+    // 遅延した古いビルドが新しい結果を巻き戻さないようにする。既存ステータスの
+    // target_url からビルド番号を読む（commit status にはメタデータを埋められない）。
+    // context は全プロジェクト共通なので、同じ repo に紐づく別プロジェクトのビルド番号と
+    // 比べないよう、slug の一致は latest_status_build_number 側で確認する。
+    let existing_status_number = latest_status_build_number(
         &state.http,
         &state.settings.github_api_base_url(),
         &token,
         repo,
         &build.commit_sha,
-        commit_state,
-        &description,
-        Some(&target_url),
         STATUS_CONTEXT,
+        &tenant.slug,
+        &project.slug,
     )
     .await?;
 
-    tracing::info!(
-        %build_id,
-        repo,
-        sha = %build.commit_sha,
-        state = %commit_state,
-        "posted github commit status"
-    );
+    if let Some(existing_build_number) =
+        existing_status_number.filter(|number| *number > build.number)
+    {
+        tracing::info!(
+            %build_id,
+            repo,
+            sha = %build.commit_sha,
+            build_number = build.number,
+            existing_build_number,
+            "skipped stale github commit status"
+        );
+    } else {
+        post_commit_status(
+            &state.http,
+            &state.settings.github_api_base_url(),
+            &token,
+            repo,
+            &build.commit_sha,
+            commit_state,
+            &description,
+            Some(&target_url),
+            STATUS_CONTEXT,
+        )
+        .await?;
+
+        tracing::info!(
+            %build_id,
+            repo,
+            sha = %build.commit_sha,
+            state = %commit_state,
+            "posted github commit status"
+        );
+    }
 
     // PR に紐付くビルドはレビュー UI へのリンクをコメントとして掲示する。
     // ステータスの後に置く: コメントが transient に失敗してリトライされても、
@@ -203,18 +234,35 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
             &description,
             &target_url,
         );
-        upsert_pr_comment(
+        let outcome = upsert_pr_comment(
             &state.http,
             &state.settings.github_api_base_url(),
             &token,
             repo,
             pr_number,
             &marker,
+            build.number,
             &body,
         )
         .await?;
 
-        tracing::info!(%build_id, repo, pr_number, "upserted github pr comment");
+        match outcome {
+            CommentWrite::Wrote => {
+                tracing::info!(%build_id, repo, pr_number, "upserted github pr comment");
+            }
+            CommentWrite::SkippedStale {
+                existing_build_number,
+            } => {
+                tracing::info!(
+                    %build_id,
+                    repo,
+                    pr_number,
+                    build_number = build.number,
+                    existing_build_number,
+                    "skipped stale github pr comment update"
+                );
+            }
+        }
     }
 
     Ok(())
