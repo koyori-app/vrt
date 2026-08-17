@@ -420,8 +420,8 @@ async fn render_all(
 
         match action {
             StoryAction::Render => {
-                let png = match renderer.render_story(base_url, &story.id).await {
-                    Ok(png) => png,
+                let rendered_story = match renderer.render_story(base_url, &story.id).await {
+                    Ok(rendered_story) => rendered_story,
                     // story 固有の失敗はその story だけをエラーにし、残りを
                     // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
                     Err(e) if is_story_scoped(&e) => {
@@ -443,6 +443,21 @@ async fn render_all(
                         return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
                     }
                 };
+
+                // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
+                // ここで build log に永続化して利用者へ届ける——`tracing::warn`
+                // だけではサーバー運用ログ止まりで、`passed` を受け取った
+                // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+                if let Some(warning) = &rendered_story.font_warning {
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Warn,
+                        font_warning_log_line(position, total, &story.id, warning),
+                    )
+                    .await?;
+                }
+                let png = rendered_story.png;
 
                 // `only_story_ids` モードのときだけ reused を明示する
                 // （`None` の従来経路は metadata を変えない）。
@@ -567,6 +582,18 @@ struct StoryFailure {
     message: String,
 }
 
+/// フォント警告の build log 行（`render_all` が `LogLevel::Warn` で永続化
+/// する）。`story failed {n}/{total}` 行と同じ並びで story を特定できる形。
+///
+/// この関数は「render_story が返した警告 → build log の行」の整形だけを
+/// 担い、単体テストで固定する。「`render_all` が実際に `build_logs::append`
+/// （warn）で永続化する」結線は、実 DB＋実ブラウザの統合試験
+/// `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+/// （tests/render_flow_integration.rs）が一気通貫で固定する。
+fn font_warning_log_line(position: usize, total: usize, story_id: &str, warning: &str) -> String {
+    format!("story warning {position}/{total} {story_id}: {warning}")
+}
+
 /// storybook の title / name から生成したスクリーンショット名を検証する。
 ///
 /// 違反は story の内容（title / name）に起因する **story 固有の失敗**として
@@ -680,6 +707,24 @@ mod tests {
         assert_eq!((on.viewport_width, on.viewport_height), (1280, 720));
         assert!(on.freeze_before_capture);
         assert!(on.wait_for_fonts);
+    }
+
+    /// フォント警告の build log 行の整形の固定（cmd_660 C）。
+    ///
+    /// 証明する: `render_story` が返した警告が、`story failed` 行と同じ並びの
+    /// 「story warning {n}/{total} {id}: ...」で build log の 1 行になる。
+    /// 証明しない: `render_all` が実際に `build_logs::append`
+    /// （`LogLevel::Warn`）を呼ぶ結線——それは実 DB＋実ブラウザの統合試験
+    /// `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+    /// （tests/render_flow_integration.rs）が、警告の**内容**は browser.rs の
+    /// `a_failing_font_load_captures_with_a_warning_and_stays_deterministic`
+    /// が固定する。
+    #[test]
+    fn font_warnings_format_into_a_build_log_line() {
+        assert_eq!(
+            font_warning_log_line(3, 40, "demo-font--text", "2 font(s) failed to load"),
+            "story warning 3/40 demo-font--text: 2 font(s) failed to load"
+        );
     }
 
     #[test]

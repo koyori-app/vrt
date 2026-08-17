@@ -199,6 +199,12 @@ fn bundle_zip(red: &str) -> Vec<u8> {
 
 /// [`bundle_zip`] と同じだが index.json を差し替えられる版。
 fn bundle_zip_with_index(index_json: &str, red: &str) -> Vec<u8> {
+    bundle_zip_with_files(index_json, &iframe_html(red))
+}
+
+/// [`bundle_zip_with_index`] と同じだが iframe.html も差し替えられる版
+/// （フォント 404 fixture 等、色塗り以外のページが要る試験用）。
+fn bundle_zip_with_files(index_json: &str, iframe: &str) -> Vec<u8> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buf);
@@ -206,7 +212,7 @@ fn bundle_zip_with_index(index_json: &str, red: &str) -> Vec<u8> {
             .compression_method(zip::CompressionMethod::Deflated);
         for (name, contents) in [
             ("index.json", index_json.to_string()),
-            ("iframe.html", iframe_html(red)),
+            ("iframe.html", iframe.to_string()),
         ] {
             writer.start_file(name, options).expect("start zip entry");
             writer
@@ -1262,6 +1268,107 @@ async fn omitting_mode_keeps_the_screenshots_behaviour() {
 // ── ビルド進捗ログ ────────────────────────────────────────────────────────
 
 /// 件数の数え上げ（ログメッセージの接頭辞ごと）。
+/// 読み込みに失敗する（404 になる）webfont を参照する 1 story の index。
+const FONT_404_INDEX_JSON: &str = r#"{
+  "v": 5,
+  "entries": {
+    "demo-font--text": {
+      "type": "story",
+      "id": "demo-font--text",
+      "title": "Demo/Font",
+      "name": "Text",
+      "importPath": "./src/Font.stories.tsx"
+    }
+  }
+}"#;
+
+/// `@font-face` が参照する `font.ttf` を**バンドルに入れない**ことで、
+/// 静的配信の 404＝「到達不能なフォント」を決定的に再現する iframe.html。
+fn font_404_bundle_zip() -> Vec<u8> {
+    bundle_zip_with_files(
+        FONT_404_INDEX_JSON,
+        r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>
+  html,body{margin:0;padding:0;background:#fff}
+  @font-face { font-family: 'VrtTestFont'; src: url('font.ttf'); }
+  .webfont-text { font-family: 'VrtTestFont', monospace; font-size: 40px; }
+</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    var el = document.createElement('div');
+    el.className = 'webfont-text';
+    el.textContent = 'Hamburgefonstiv 0123456789';
+    document.getElementById('storybook-root').appendChild(el);
+    channel.emit('storyRendered', id);
+  }, 0);
+</script>
+</body>
+</html>"#,
+    )
+}
+
+/// 【cmd_660 C】読み込みに失敗したフォントの警告が**永続 build log**
+/// （`warn` 行）に現れること——利用者が `passed` と一緒に読む場所への
+/// 一気通貫の固定。
+///
+/// 三層で閉じる: browser.rs の
+/// `a_failing_font_load_captures_with_a_warning_and_stays_deterministic` が
+/// 「render_story の成功値に警告が載る」ことを、render_build.rs の
+/// `font_warnings_format_into_a_build_log_line` が行の整形を、この試験が
+/// 「render_all が `build_logs::append`（warn）で実際に永続化し、ビルドは
+/// 失敗しない（意図した fail-open）」ことを固定する。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_font_load_leaves_a_warning_in_the_build_logs() {
+    if !chromium_or_skip("a_failing_font_load_leaves_a_warning_in_the_build_logs") {
+        return;
+    }
+    let fx = setup().await;
+
+    let build = fx.create_storybook_build("font0001").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload_bundle(build_id, font_404_bundle_zip())
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_ne!(
+        terminal["status"].as_str().unwrap_or_default(),
+        "failed",
+        "a 404 font must not fail the build (intended fail-open), got: {terminal}"
+    );
+
+    let logs = fx.build_logs(build_id).await;
+    let warn = logs
+        .iter()
+        .find(|l| l.level == "warn" && l.message.starts_with("story warning"))
+        .unwrap_or_else(|| panic!("a `story warning` warn line must be persisted, got: {logs:?}"));
+    assert!(
+        warn.message.contains("demo-font--text"),
+        "the warn line must name the story, got: {}",
+        warn.message
+    );
+    assert!(
+        warn.message.contains("font(s) failed to load") && warn.message.contains("VrtTestFont"),
+        "the warn line must carry the font warning with the failing family, got: {}",
+        warn.message
+    );
+}
+
 fn count_prefix(logs: &[entity::build_logs::Model], prefix: &str) -> usize {
     logs.iter()
         .filter(|l| l.message.starts_with(prefix))
