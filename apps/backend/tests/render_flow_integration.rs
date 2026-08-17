@@ -1267,7 +1267,6 @@ async fn omitting_mode_keeps_the_screenshots_behaviour() {
 
 // ── ビルド進捗ログ ────────────────────────────────────────────────────────
 
-/// 件数の数え上げ（ログメッセージの接頭辞ごと）。
 /// 読み込みに失敗する（404 になる）webfont を参照する 1 story の index。
 const FONT_404_INDEX_JSON: &str = r#"{
   "v": 5,
@@ -1369,6 +1368,7 @@ async fn a_failing_font_load_leaves_a_warning_in_the_build_logs() {
     );
 }
 
+/// 件数の数え上げ（ログメッセージの接頭辞ごと）。
 fn count_prefix(logs: &[entity::build_logs::Model], prefix: &str) -> usize {
     logs.iter()
         .filter(|l| l.message.starts_with(prefix))
