@@ -673,9 +673,13 @@ mod tests {
         assert!(on.emulate_reduced_motion);
         let off = render_options_for_project("chromium".into(), &project_fixture(false));
         assert!(!off.emulate_reduced_motion);
-        // 既存の配線が壊れていないこと（viewport・freeze 既定）。
+        // 既存の配線が壊れていないこと（viewport・freeze / fonts 既定）。
+        // `wait_for_fonts` の `false` はテスト専用の裏口で、本番既定 ON を
+        // 主張する非ブラウザ試験はここだけ——実ブラウザ試験群は chromium と
+        // フォントを欠く環境で SKIP し、既定の反転を検知できない。
         assert_eq!((on.viewport_width, on.viewport_height), (1280, 720));
         assert!(on.freeze_before_capture);
+        assert!(on.wait_for_fonts);
     }
 
     #[test]
