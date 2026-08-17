@@ -548,15 +548,23 @@ pub fn build_target_url(
     )
 }
 
-/// 同じ context の既存コミットステータスが指しているビルド番号。
+/// 同じ context の既存コミットステータスが、このプロジェクトのどのビルドを指しているか。
 ///
 /// commit status には PR コメントのような不可視メタデータを埋める場所が無いので、
-/// [`build_target_url`] が組み立てた `target_url` の末尾（`/builds/{number}`）から読む。
-/// 既存ステータスが無い・context が違う・URL から番号を読めない場合は `None` を返し、
-/// 呼び出し側は判定を諦めて書き込む。
+/// [`build_target_url`] が組み立てた `target_url`
+/// （`/t/{tenant}/p/{project}/builds/{number}`）から読む。
+///
+/// context (`vrt`) はプロジェクトごとに変わらず、`projects.github_repo` にも一意制約が無い
+/// （同じリポジトリに複数プロジェクトを紐付けられる）。ビルド番号はプロジェクトごとの
+/// 独立した連番なので、別プロジェクトが書いたステータスの番号と比べても意味が無い。
+/// そのため URL のテナント / プロジェクト slug が一致した場合だけ番号を返す。
+///
+/// 次のいずれでも `None` を返し、呼び出し側は判定を諦めて書き込む:
+/// 既存ステータスが無い / context が違う / URL が別プロジェクトを指す / URL から番号を読めない。
 ///
 /// ponytail: GET と POST の間は不可分ではないので、GET の時点で観測できた巻き戻しだけを
 /// 防ぐ。窓を閉じるなら SHA 単位の直列化が要る。
+#[allow(clippy::too_many_arguments)]
 pub async fn latest_status_build_number(
     http: &reqwest::Client,
     base_url: &str,
@@ -564,7 +572,14 @@ pub async fn latest_status_build_number(
     repo: &str,
     sha: &str,
     context: &str,
+    tenant_slug: &str,
+    project_slug: &str,
 ) -> Result<Option<i64>, GithubApiError> {
+    #[derive(serde::Deserialize)]
+    struct CombinedStatus {
+        statuses: Vec<CommitStatus>,
+    }
+
     #[derive(serde::Deserialize)]
     struct CommitStatus {
         context: String,
@@ -572,9 +587,11 @@ pub async fn latest_status_build_number(
         target_url: Option<String>,
     }
 
-    // 新しい順に返る。同じ context の先頭が最後に書かれたステータス。
+    // 結合ステータスは context ごとの最新だけを返すので、件数が context 数で頭打ちになり
+    // ページングが要らない（`/statuses` は同じ SHA への全書き込みを返すため、他の CI が
+    // 多い repo では vrt の最新が 1 ページ目から押し出されうる）。
     let url = format!(
-        "{}/repos/{repo}/commits/{sha}/statuses?per_page=100",
+        "{}/repos/{repo}/commits/{sha}/status",
         base_url.trim_end_matches('/')
     );
     let response = http
@@ -585,32 +602,34 @@ pub async fn latest_status_build_number(
         .header("User-Agent", USER_AGENT)
         .send()
         .await
-        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list commit statuses: {e}")))?;
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("get combined status: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(error_from_response("list commit statuses", response).await);
+        return Err(error_from_response("get combined status", response).await);
     }
 
-    let statuses: Vec<CommitStatus> = response
+    let combined: CombinedStatus = response
         .json()
         .await
-        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode commit statuses: {e}")))?;
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode combined status: {e}")))?;
 
-    Ok(statuses
+    Ok(combined
+        .statuses
         .into_iter()
         .find(|s| s.context == context)
         .and_then(|s| s.target_url)
-        .and_then(|url| parse_target_url_build_number(&url)))
+        .and_then(|url| {
+            let (tenant, project, number) = parse_target_url_build(&url)?;
+            (tenant == tenant_slug && project == project_slug).then_some(number)
+        }))
 }
 
-/// `.../builds/{number}` からビルド番号を読む（[`build_target_url`] の逆）。
-fn parse_target_url_build_number(target_url: &str) -> Option<i64> {
-    target_url
-        .trim_end_matches('/')
-        .rsplit_once("/builds/")?
-        .1
-        .parse()
-        .ok()
+/// `.../t/{tenant}/p/{project}/builds/{number}` を分解する（[`build_target_url`] の逆）。
+fn parse_target_url_build(target_url: &str) -> Option<(&str, &str, i64)> {
+    let (head, number) = target_url.trim_end_matches('/').rsplit_once("/builds/")?;
+    let (head, project) = head.rsplit_once("/p/")?;
+    let (_, tenant) = head.rsplit_once("/t/")?;
+    Some((tenant, project, number.parse().ok()?))
 }
 
 /// `POST /repos/{repo}/statuses/{sha}` でコミットステータスを作成する。
@@ -1136,12 +1155,19 @@ mod tests {
     }
 
     #[test]
-    fn reads_build_number_back_from_target_url() {
+    fn reads_tenant_project_and_build_number_back_from_target_url() {
         let url = build_target_url("https://vrt.example.com", "acme", "web", 42);
-        assert_eq!(parse_target_url_build_number(&url), Some(42));
-        assert_eq!(parse_target_url_build_number(&format!("{url}/")), Some(42));
+        assert_eq!(parse_target_url_build(&url), Some(("acme", "web", 42)));
         assert_eq!(
-            parse_target_url_build_number("https://vrt.example.com/t/acme/p/web"),
+            parse_target_url_build(&format!("{url}/")),
+            Some(("acme", "web", 42))
+        );
+        assert_eq!(
+            parse_target_url_build("https://vrt.example.com/t/acme/p/web"),
+            None
+        );
+        assert_eq!(
+            parse_target_url_build("https://vrt.example.com/t/acme/p/web/builds/x"),
             None
         );
     }

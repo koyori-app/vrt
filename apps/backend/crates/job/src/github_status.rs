@@ -174,6 +174,8 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
     // commit status は required status としてマージの門を守るので、PR コメントと同じく
     // 遅延した古いビルドが新しい結果を巻き戻さないようにする。既存ステータスの
     // target_url からビルド番号を読む（commit status にはメタデータを埋められない）。
+    // context は全プロジェクト共通なので、同じ repo に紐づく別プロジェクトのビルド番号と
+    // 比べないよう、slug の一致は latest_status_build_number 側で確認する。
     let existing_status_number = latest_status_build_number(
         &state.http,
         &state.settings.github_api_base_url(),
@@ -181,6 +183,8 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
         repo,
         &build.commit_sha,
         STATUS_CONTEXT,
+        &tenant.slug,
+        &project.slug,
     )
     .await?;
 

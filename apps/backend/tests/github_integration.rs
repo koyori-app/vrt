@@ -1629,6 +1629,107 @@ async fn stale_build_job_does_not_overwrite_newer_commit_status() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn other_project_on_the_same_repo_does_not_block_the_commit_status() {
+    // commit status の context (`vrt`) は全プロジェクト共通で、ビルド番号はプロジェクトごとの
+    // 独立した連番。同じ repo に紐づく別プロジェクトの番号と比べると、番号が小さいだけの
+    // プロジェクトが恒久的にステータスを書けなくなる。
+    let app = TestApp::new_with_github().await;
+    let user = app.login_as_new_user().await;
+    let leader = create_tenant_and_project(&app).await;
+    let installation_id = unique_installation_id();
+    let repo = "acme-inc/web";
+    let pr_number = 13;
+    let sha = Uuid::new_v4().simple().to_string();
+
+    app.github().expect_commit_statuses(repo, &sha).await;
+    mount_stateful_pr_comment(&app, repo, pr_number).await;
+    link_project_to_repo(&app, &leader, installation_id, repo).await;
+
+    // 同じテナント・同じリポジトリの 2 つ目のプロジェクト（例: docs と storybook）。
+    let follower = create_sibling_project(&app, &leader).await;
+    app.patch_json(
+        &format!("/v1/projects/{}/github", follower.project_id),
+        json!({ "installation_id": installation_id, "github_repo": repo }),
+    )
+    .await;
+
+    let (token, _) = app
+        .insert_personal_token(
+            user.id,
+            vec![Scope::WriteBuild, Scope::ReadBuild, Scope::ReadProject],
+        )
+        .await;
+
+    // leader 側の番号を進めてから status を書く。follower の 1 本目より大きい番号になる。
+    create_pr_build(&app, &leader, &token, &sha, pr_number).await;
+    let leader_build = create_pr_build(&app, &leader, &token, &sha, pr_number).await;
+    let follower_build = create_pr_build(&app, &follower, &token, &sha, pr_number).await;
+    let leader_number = leader_build["number"].as_i64().unwrap();
+    let follower_number = follower_build["number"].as_i64().unwrap();
+    assert!(
+        leader_number > follower_number,
+        "別プロジェクトの方が大きい番号を持つ状況を作る"
+    );
+
+    let job_state = backend::server::job_state_from(&app.state);
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: leader_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state.clone()),
+    )
+    .await
+    .expect("leader status job");
+
+    job::github_status::process(
+        job::GithubStatusJob {
+            build_id: follower_build["id"].as_str().unwrap().parse().unwrap(),
+        },
+        Data::new(job_state),
+    )
+    .await
+    .expect("follower status job");
+
+    let statuses = app.github().status_requests(repo, &sha).await;
+    assert_eq!(
+        statuses.len(),
+        2,
+        "別プロジェクトのビルド番号で stale 判定してはいけない"
+    );
+    let body: Value = serde_json::from_slice(&statuses[1].body).expect("status json");
+    assert_eq!(
+        body["target_url"].as_str(),
+        Some(
+            format!(
+                "{}/t/{}/p/{}/builds/{follower_number}",
+                app.base_url, follower.tenant_slug, follower.project_slug
+            )
+            .as_str()
+        )
+    );
+}
+
+/// 同じテナントにもう 1 つプロジェクトを作る。
+async fn create_sibling_project(app: &TestApp, sibling: &Project) -> Project {
+    let project_slug = format!("docs-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let res = app
+        .post_json(
+            &format!("/v1/tenants/{}/projects", sibling.tenant_id),
+            json!({ "name": "Docs", "slug": project_slug }),
+        )
+        .await;
+    assert_eq!(res.status(), StatusCode::CREATED, "create sibling project");
+    let project: Value = res.json().await.expect("project json");
+
+    Project {
+        tenant_id: sibling.tenant_id.clone(),
+        tenant_slug: sibling.tenant_slug.clone(),
+        project_id: project["id"].as_str().expect("project id").to_string(),
+        project_slug,
+    }
+}
+
 /// installation の webhook → claim → プロジェクト紐付けまでを一息でやる。
 async fn link_project_to_repo(app: &TestApp, project: &Project, installation_id: i64, repo: &str) {
     app.post_github_webhook(
