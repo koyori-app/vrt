@@ -587,7 +587,11 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
   ここから外れた**——撮影前に `document.fonts.ready` を条件待ちし、期限内に
   解決しなければその story は失敗になる（fail-closed）。フォント待ちは
   到達可能な**同一オリジン iframe の中まで再帰**する（静止処理と同じ範囲。
-  open shadow root の中へも潜り、`<iframe>` と `<frame>` の両方を見る。
+  open shadow root の中へも潜り、`<iframe>` と `<frame>` の両方を見る——
+  `<frame>` は frameset document の中でのみ現れ、story の top document には
+  なれないが、iframe が frameset を読む形で撮影対象に入りうる。`srcdoc` /
+  `about:blank` の iframe も同一オリジンであり、走査上は通常の同一オリジン
+  iframe と区別なく同じ扱いになる。
   クロスオリジン iframe の中は `contentDocument` が読めず観測できない——
   上記「届かない範囲」と同じ契約）。検証と撮影の間に
   document が入れ替わった（story が自分を reload した・`document.open()` で
