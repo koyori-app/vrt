@@ -1,7 +1,7 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
 import { buildGraph, BuildGraph } from "@/components/build-graph";
@@ -133,6 +133,9 @@ function ProjectPage() {
   );
 }
 
+/** Matches useBuilds' own default; kept explicit so the graph can tell a full page. */
+const BUILD_LIMIT = 50;
+
 function BuildsTable({
   projectId,
   githubRepo,
@@ -146,9 +149,14 @@ function BuildsTable({
   tenantSlug: string;
   projectSlug: string;
 }) {
-  const builds = useBuilds(projectId);
+  const builds = useBuilds(projectId, BUILD_LIMIT);
   const navigate = useNavigate();
-  const graph = buildGraph(builds.data?.builds ?? [], defaultBranch);
+  const rows = builds.data?.builds;
+  // A full page means older builds were cut off, not that these branches ended.
+  const graph = useMemo(
+    () => buildGraph(rows ?? [], defaultBranch, (rows?.length ?? 0) >= BUILD_LIMIT),
+    [rows, defaultBranch],
+  );
 
   return (
     <Card>
@@ -156,9 +164,8 @@ function BuildsTable({
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead style={{ width: graph.width }}>
-                <span className="sr-only">Branch graph</span>
-              </TableHead>
+              {/* The graph column is decorative and sized by its body cells. */}
+              <TableHead className="p-0" />
               <TableHead className="w-20">Build</TableHead>
               <TableHead>Branch</TableHead>
               <TableHead className="w-28">Commit</TableHead>
@@ -171,7 +178,7 @@ function BuildsTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {builds.data?.builds.map((build, index) => {
+            {graph.rows.map(({ build, cells }) => {
               const to = "/t/$tenantSlug/p/$projectSlug/builds/$number" as const;
               const params = { tenantSlug, projectSlug, number: String(build.number) };
               return (
@@ -184,8 +191,11 @@ function BuildsTable({
                     void navigate({ to, params });
                   }}
                 >
-                  <TableCell className="relative p-0" style={{ width: graph.width }}>
-                    <BuildGraph row={graph.rows[index]!} branch={build.branch} />
+                  <TableCell className="relative p-0">
+                    {/* The SVG is absolutely positioned, so this spacer is what
+                        actually reserves the column's width. */}
+                    <div style={{ width: graph.width }} />
+                    <BuildGraph cells={cells} />
                   </TableCell>
                   <TableCell>
                     {/* The real, keyboard-focusable navigation. The row onClick above is
