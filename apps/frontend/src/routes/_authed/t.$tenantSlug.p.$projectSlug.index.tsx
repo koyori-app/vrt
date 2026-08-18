@@ -133,7 +133,7 @@ function ProjectPage() {
   );
 }
 
-/** Matches useBuilds' own default; kept explicit so the graph can tell a full page. */
+/** Matches the limit passed to useBuilds for the builds table. */
 const BUILD_LIMIT = 50;
 
 function BuildsTable({
@@ -152,10 +152,12 @@ function BuildsTable({
   const builds = useBuilds(projectId, BUILD_LIMIT);
   const navigate = useNavigate();
   const rows = builds.data?.builds;
-  // A full page means older builds were cut off, not that these branches ended.
+  const total = builds.data?.total;
+  // The response includes the authoritative total, so a page with exactly BUILD_LIMIT
+  // builds is not mistaken for a truncated result when there are no older builds.
   const graph = useMemo(
-    () => buildGraph(rows ?? [], defaultBranch, (rows?.length ?? 0) >= BUILD_LIMIT),
-    [rows, defaultBranch],
+    () => buildGraph(rows ?? [], defaultBranch, total !== undefined && (rows?.length ?? 0) < total),
+    [rows, defaultBranch, total],
   );
 
   return (
