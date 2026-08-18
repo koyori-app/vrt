@@ -248,7 +248,15 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 3. 展開先を `127.0.0.1:0`（OS 任せの空きポート）でループバック配信する
 4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、ストーリーを**逐次**
    `iframe.html?id=<storyId>&viewMode=story` で開く。`#storybook-root`（6 系は
-   `#root`）に中身が入るまでポーリングし、settle 待ちのあとビューポートを PNG で撮る。
+   `#root`）に中身が入るまでポーリングし、settle 待ち・`document.fonts.ready` の
+   条件待ち（到達可能な同一オリジン iframe の中まで再帰する）・静止・
+   撮影直前の再確認（検証と撮影の間に document が入れ替わっていないか——
+   story が自分を reload / `document.open()` する場合は検証を描画完了待ちから
+   やり直す）のあと
+   ビューポートを PNG で撮る。読み込みに**失敗**したフォントは story を
+   失敗にせず、代替字形のまま撮って警告をビルドログ（warn 行）に残す——「同じビルドから
+   同じ絵」の保証が成り立つのは**同じビルド、かつ外部依存（外部 CDN の
+   フォント等）の応答が同じ場合**である。
    ビューポートはプロジェクトの `viewport_width` / `viewport_height`（既定 1280x720）
 5. `{title}/{name}` の名前で `screenshots` 行に保存する
    （`metadata` に `story_id` / `title` を残す）

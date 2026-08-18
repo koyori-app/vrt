@@ -581,9 +581,65 @@ UI でレビューして承認すれば静止後の絵が新しい baseline に�
   - UA シャドウ内の組み込みアニメーション（不確定状態の `<progress>` 等——
     closed shadow root と同じく外から列挙する口が無い）
 - 読み込み・描画の進行に伴う**一度きり**の見た目変化: 遅延読み込み画像
-  （`loading="lazy"`）・画像のデコード完了・Web Font の適用（FOUT / FOIT）・
-  `content-visibility: auto` の遅延描画。アニメーションではないので静止の
-  対象にならず、描画完了シグナル後の settle 待ちが吸収する best-effort
+  （`loading="lazy"`）・画像のデコード完了・`content-visibility: auto` の
+  遅延描画。アニメーションではないので静止の対象にならず、描画完了シグナル
+  後の settle 待ちが吸収する best-effort。**Web Font の適用（FOUT / FOIT）は
+  ここから外れた**——撮影前に `document.fonts.ready` を条件待ちし、期限内に
+  解決しなければその story は失敗になる（fail-closed）。フォント待ちは
+  到達可能な**同一オリジン iframe の中まで再帰**する（静止処理と同じ範囲。
+  open shadow root の中へも潜り、`<iframe>` と `<frame>` の両方を見る——
+  `<frame>` は frameset document の中でのみ現れ、story の top document には
+  なれないが、iframe が frameset を読む形で撮影対象に入りうる。`srcdoc` /
+  `about:blank` の iframe も同一オリジンであり、走査上は通常の同一オリジン
+  iframe と区別なく同じ扱いになる。
+  クロスオリジン iframe の中は `contentDocument` が読めず観測できない——
+  上記「届かない範囲」と同じ契約）。browsing context から**切り離された**
+  document（DOM から外された iframe・`location.replace` で置き換えられた
+  旧 document 等）は描画されず、静止処理と同じく対象外——待ちの最中に
+  切り離された場合も、その document は待ちからも判定からも外れる（外れた
+  document のフォントのために story は失敗しない）。検証と撮影の間に
+  document が入れ替わった（story が自分を reload した・`document.open()` で
+  書き換えた）場合や新たな読み込みが始まった場合は、撮影直前の再確認が
+  検知して検証を**描画完了待ちから**やり直す——reload 後の document では
+  story がまだ描画されていない時点で `document.fonts.ready` が解決しうる
+  （Blink の `ready` は「load イベント完了＋読み込み中フォント無し」で
+  解決する）ため、フォント待ちだけをやり直すと未描画の絵を撮ってしまう。
+  検知できないのは、再確認から撮影までの最後の一往復に始まる変化と、
+  **同一 document 内の DOM 全面置換**（`body.replaceChildren` 等——document
+  自体は入れ替わらないため、新しいフォント読み込みを伴う場合にしか
+  検知に掛からない）である。素の XML document（feed.xml を読む同一オリジン
+  iframe 等）は検証済みの印を刻む口（`dataset`）を持たないため、その
+  document の入れ替わりも印では検知できない（フォント状態の検査は行う）。
+  読み込みに
+  **失敗**したフォント（404・接続断・`local()` 不在等）は story を失敗に
+  **しない**——代替字形のまま撮り、警告（フォント名と、外部依存の応答が
+  run ごとに変われば同一ビルドから異なる絵が生じうる旨と、対処: フォント
+  ファイルをビルドへ同梱するか `@font-face` 参照を外す）を**ビルドログ
+  （warn 行）に残す**。原因の `@font-face` は project 全体で共有されるため
+  典型では全 story が同文の警告を出す——同文はビルドにつき初出の 1 行と、
+  件数・初出 story を運ぶ集計の 1 行に畳む（story ごとの `story failed` 行と
+  違い、行ごとに新しい情報が無いため）。失敗判定にすると
+  原因の `@font-face`（preview-head 等）が project 全体で共有されるため、
+  そのフォントを一切表示しない story まで全滅するからである。このため
+  「同じビルドから同じ絵」の保証が成り立つのは**同じビルド、かつ外部依存
+  （外部 CDN のフォント等）の応答が同じ場合**である——断続的にしか届かない
+  外部フォントは run ごとに違う絵を作りうる。恒久対処は警告の示すとおり
+  フォントの同梱か参照の除去。**既知の限界（費用）**: 読み込みが error へ
+  確定せず `ready` が解決しないフォント（無応答の CDN 等）は、story ごとに
+  最大 `story_timeout`（既定 30 秒）を丸ごと消費してから失敗し、原因の
+  `@font-face` が project 全体で共有されるため費用は story 数に比例して
+  累積する。フォント待ちに独立の短い上限を持たせるのは未着手である。
+  **既知の限界（load イベントの門）**: `document.fonts.ready` は仕様上
+  「document の load イベント完了＋読み込み中フォント無し」で解決する——
+  つまりこの待ちはフォントだけでなく **load イベントにも門を掛けられて
+  いる**。フォントが全て揃っていても、到達不能なホストへの `<script src>` /
+  `<img>` / analytics beacon が 1 本あるだけで `ready` は解決せず、全 story が
+  `story_timeout` ずつ消費して失敗する。走査が降りる同一オリジン iframe では
+  **iframe 側の load イベント**も同じ門になる（`/slow-endpoint` を読む iframe
+  1 つで top のフォントが揃っていても待ちが返らない）。条件待ち導入前
+  （`storyRendered`＋250ms）はこれらの story も撮れていた——この費用は
+  フォント CDN の無応答と同じく既知の限界であり、`ready` を独立の短い上限に
+  載せて診断可能に分けるのは未着手である
 - 利用者側スタイルが要素セレクタ等で `!important` 明示した `caret-color` /
   `transition`（注入 CSS も `!important` だが `*` セレクタ＝specificity 0
   なので、`!important` 同士の比較では specificity の高い利用者側の宣言が勝つ。

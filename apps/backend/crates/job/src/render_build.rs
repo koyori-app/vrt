@@ -381,6 +381,16 @@ async fn render_all(
     let mut rendered = 0usize;
     let mut reused = 0usize;
     let mut story_failures: Vec<StoryFailure> = Vec::new();
+    // フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
+    // 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
+    // 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
+    // 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
+    // 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
+    // ループ後の集計行（件数と初出 story）に畳む——300 story の project で
+    // 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
+    // 失われない。
+    let mut font_warning_counts: std::collections::BTreeMap<String, (usize, String)> =
+        std::collections::BTreeMap::new();
     let total = bundle.stories.len();
 
     for (idx, story) in bundle.stories.iter().enumerate() {
@@ -420,8 +430,8 @@ async fn render_all(
 
         match action {
             StoryAction::Render => {
-                let png = match renderer.render_story(base_url, &story.id).await {
-                    Ok(png) => png,
+                let rendered_story = match renderer.render_story(base_url, &story.id).await {
+                    Ok(rendered_story) => rendered_story,
                     // story 固有の失敗はその story だけをエラーにし、残りを
                     // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
                     Err(e) if is_story_scoped(&e) => {
@@ -443,6 +453,29 @@ async fn render_all(
                         return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
                     }
                 };
+
+                // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
+                // ここで build log に永続化して利用者へ届ける——`tracing::warn`
+                // だけではサーバー運用ログ止まりで、`passed` を受け取った
+                // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+                if let Some(warning) = &rendered_story.font_warning {
+                    // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
+                    // （集計はループ後。宣言と理由は font_warning_counts を参照）。
+                    let entry = font_warning_counts
+                        .entry(warning.clone())
+                        .or_insert((0usize, story.id.clone()));
+                    entry.0 += 1;
+                    if entry.0 == 1 {
+                        service::build_logs::append(
+                            &state.db,
+                            build.id,
+                            LogLevel::Warn,
+                            font_warning_log_line(position, total, &story.id, warning),
+                        )
+                        .await?;
+                    }
+                }
+                let png = rendered_story.png;
 
                 // `only_story_ids` モードのときだけ reused を明示する
                 // （`None` の従来経路は metadata を変えない）。
@@ -528,6 +561,20 @@ async fn render_all(
         }
     }
 
+    // 畳んだ同文フォント警告の集計行（初出行と対。1 story だけなら初出行が
+    // 全てを言い尽くしており、集計行は出さない）。
+    for (warning, (count, first_story)) in &font_warning_counts {
+        if *count > 1 {
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Warn,
+                font_warning_summary_line(*count, first_story, warning),
+            )
+            .await?;
+        }
+    }
+
     // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
         &state.db,
@@ -565,6 +612,35 @@ async fn render_all(
 struct StoryFailure {
     story_id: String,
     message: String,
+}
+
+/// フォント警告の build log 行（`render_all` が `LogLevel::Warn` で永続化
+/// する）。`story failed {n}/{total}` 行と同じ並びで story を特定できる形。
+///
+/// この関数は「render_story が返した警告 → build log の行」の整形だけを
+/// 担い、単体テストで固定する。「`render_all` が実際に `build_logs::append`
+/// （warn）で永続化する」結線は、実 DB＋実ブラウザの統合試験
+/// `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+/// （tests/render_flow_integration.rs）が一気通貫で固定する。
+fn font_warning_log_line(position: usize, total: usize, story_id: &str, warning: &str) -> String {
+    format!("story warning {position}/{total} {story_id}: {warning}")
+}
+
+/// 同文フォント警告の集計行（`render_all` がループ後に `LogLevel::Warn` で
+/// 1 回だけ永続化する）。
+///
+/// `story failed` 行を story ごとに残すのは行ごとに「どの story が落ちたか」
+/// という異なる情報があるからだが、フォント警告は原因（`@font-face`）が
+/// project 全体に共有されて**全行が同文**になる——だから story ごとではなく
+/// ビルドにつき「初出の 1 行＋この集計行」に畳む（cmd_663 ④）。story の
+/// 識別は件数と初出 story で保つ。警告の全文は初出行が既に運んでいるので、
+/// ここでは先頭節（`;` まで＝件数と要旨）だけを引く——同文を二度書かない。
+fn font_warning_summary_line(count: usize, first_story_id: &str, warning: &str) -> String {
+    let head = warning.split(';').next().unwrap_or(warning);
+    format!(
+        "story warning: {count} stories captured with the same font warning \
+         ({head}); first reported at {first_story_id}"
+    )
 }
 
 /// storybook の title / name から生成したスクリーンショット名を検証する。
@@ -673,9 +749,57 @@ mod tests {
         assert!(on.emulate_reduced_motion);
         let off = render_options_for_project("chromium".into(), &project_fixture(false));
         assert!(!off.emulate_reduced_motion);
-        // 既存の配線が壊れていないこと（viewport・freeze 既定）。
+        // 既存の配線が壊れていないこと（viewport・freeze / fonts 既定）。
+        // `wait_for_fonts` の `false` はテスト専用の裏口で、本番既定 ON を
+        // 主張する非ブラウザ試験はここだけ——実ブラウザ試験群は chromium と
+        // フォントを欠く環境で SKIP し、既定の反転を検知できない。
         assert_eq!((on.viewport_width, on.viewport_height), (1280, 720));
         assert!(on.freeze_before_capture);
+        assert!(on.wait_for_fonts);
+    }
+
+    /// フォント警告の build log 行の整形の固定（cmd_660 C）。
+    ///
+    /// 証明する: `render_story` が返した警告が、`story failed` 行と同じ並びの
+    /// 「story warning {n}/{total} {id}: ...」で build log の 1 行になる。
+    /// 証明しない: `render_all` が実際に `build_logs::append`
+    /// （`LogLevel::Warn`）を呼ぶ結線——それは実 DB＋実ブラウザの統合試験
+    /// `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+    /// （tests/render_flow_integration.rs）が、警告の**内容**は browser.rs の
+    /// `a_failing_font_load_captures_with_a_warning_and_stays_deterministic`
+    /// が固定する。
+    #[test]
+    fn font_warnings_format_into_a_build_log_line() {
+        assert_eq!(
+            font_warning_log_line(3, 40, "demo-font--text", "2 font(s) failed to load"),
+            "story warning 3/40 demo-font--text: 2 font(s) failed to load"
+        );
+    }
+
+    /// 同文フォント警告の集計行の整形の固定（cmd_663 ④）。
+    ///
+    /// 証明する: 件数・初出 story・警告の先頭節（`;` まで）が 1 行に載る——
+    /// 畳んでも「何件の story がどの警告だったか」は失われない。
+    /// 証明しない: `render_all` が同文を初出 1 行に抑止する結線——それは
+    /// 統合試験 `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+    /// （tests/render_flow_integration.rs）が二 story の bundle で固定する。
+    #[test]
+    fn font_warning_summary_carries_count_and_representative() {
+        assert_eq!(
+            font_warning_summary_line(
+                12,
+                "demo-font--text",
+                "2 font(s) failed to load; captured with fallback glyphs: A, B"
+            ),
+            "story warning: 12 stories captured with the same font warning \
+             (2 font(s) failed to load); first reported at demo-font--text"
+        );
+        // `;` を含まない警告文は全文が先頭節。
+        assert_eq!(
+            font_warning_summary_line(2, "s--a", "plain warning"),
+            "story warning: 2 stories captured with the same font warning \
+             (plain warning); first reported at s--a"
+        );
     }
 
     #[test]
