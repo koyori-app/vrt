@@ -53,8 +53,8 @@
 //!
 //! | 常駐状態 | 置く理由 | 世代を刻めるか | 刻めなければ／刻むまで何が起きたか |
 //! |----|----|----|----|
-//! | `window.__VRT_READY__`（rendered / error） | channel の accessor が window の性質なので、hook の state も window にしか置けない | **刻める**——イベント発火時の documentElement を rendered / error 各々に併記し、読む側（[`READY_PROBE`]）は現在の document と一致する印だけを信じる。error の「先着固定」も**世代の中で閉じる**——前 document の error が新 document の error の記録を塞がない（cmd_661 ①・cmd_662 ②） | 世代なしの rendered は前 document の印でやり直しの READY 待ちを素通りさせ、未描画の絵を撮った（cmd_661 ① 実測）。書く側が世代を見ない error は、新 document の二度目のエラーを記録せず、rendered だけが新世代で立って撮影が通った（cmd_662 ② 実測。fail-open） |
-//! | `__STORYBOOK_PREVIEW__.storyRenders`（保険経路） | Storybook 自身が window に置く内部状態——我々の設計物ではなく、刻む口を足せない | **刻めない** | completed: 現在の document の root に描画結果があることを併せて要求して緩和（root つき内容への差し替えは依然すり抜け——既知の限界）。errored / aborted: 門なし——stale が読まれても「誤った理由での story 失敗」（fail-closed 側）にしか倒れず、domReady は error の門として意味を成さない（[`READY_PROBE`] 内の判断コメント。cmd_662 ③） |
+//! | `window.__VRT_READY__`（rendered / error） | channel の accessor は window にしか張れない。state **自体**は document 側へも置ける（accessor は window・state は document という分担は、フォントの印 `dataset` で実装済みの形）が、window に置いたままにした——document 側へ移す道は取らなかった。理由: errorRoot / renderedRoot は documentElement への**参照**で `dataset`（文字列のみ）には刻めず、世代印だけで `document.open()` の生き残りは既に塞がっている——置き場を移しても同じ検知を別の形で得るだけで、検知の強度は上がらない（cmd_663 ⑧） | **刻める**——イベント発火時の documentElement を rendered / error 各々に併記し、読む側（[`READY_PROBE`]）は現在の document と一致する印だけを信じる。error の「先着固定」も**世代の中で閉じる**——前 document の error が新 document の error の記録を塞がない（cmd_661 ①・cmd_662 ②） | 世代なしの rendered は前 document の印でやり直しの READY 待ちを素通りさせ、未描画の絵を撮った（cmd_661 ① 実測）。書く側が世代を見ない error は、新 document の二度目のエラーを記録せず、rendered だけが新世代で立って撮影が通った（cmd_662 ② 実測。fail-open） |
+//! | `__STORYBOOK_PREVIEW__.storyRenders`（保険経路） | Storybook 自身が window に置く内部状態——我々の設計物ではない | **刻んでいない**（採らなかった判断。証明されているのは「現状の実装が刻まない」まで——Storybook の内部状態へ書き込んで世代を刻む改変は原理的には可能かもしれないが、他所の内部実装への書き込みはバージョン差で壊れる面を増やすため採らない。cmd_663 ⑧） | completed: 現在の document の root に描画結果があることを併せて要求して緩和（root つき内容への差し替えは依然すり抜け——既知の限界）。**この門の代償**: 保険経路にしか乗れない構成（channel を掴み損ねた・`__STORYBOOK_ADDONS_CHANNEL__` を経由しない等）では、中身が空になる**正当な** story（null を返す story・portal で body 直下へ描く story——root は空のまま）が `domReady` を永久に満たせず、門の導入前は撮れていたものが 30 秒 Timeout になる——倒れる向きは fail-closed（未検証の絵は撮らない）だが巻き添えであり、既知の限界として併記（cmd_663 ⑤。「root つき差し替えのすり抜け」と逆方向の対）。errored / aborted: 門なし——stale が読まれても「誤った理由での story 失敗」（fail-closed 側）にしか倒れず、domReady は error の門として意味を成さない（[`READY_PROBE`] 内の判断コメント。cmd_662 ③） |
 //! | `__STORYBOOK_ADDONS_CHANNEL__`・`__STORYBOOK_PREVIEW__` の**存在自体**（runtime 判定） | Storybook が代入する。hook は accessor で捕捉するだけで、存在の有無を「ランタイムがいるか」の判定に使う | **不要／不可**（イベント側の世代は hook が刻む。存在の有無に世代は無い） | 差し替え後も window に残るため、Storybook を持たない document へ差し替えると probe は runtime ありと誤認して永久に `pending`——DOM ヒューリスティック（Absent 経路）へは二度と落ちず、共有 deadline の Timeout へ倒れる（fail-closed。未検証の絵を撮る方向には壊れない。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が同型の到達側を固定） |
 //!
 //! ## 層ごとの失敗経路
@@ -89,7 +89,8 @@
 //! | フォント条件待ち② `ready` 解決後の新たなフォント要求 | 応答前の波は検知 | 応答の直前に `status` を読み直し、`'loading'` へ戻っていれば失敗にせず `ready` を**待ち直す**——二段以上でフォントを読むページは各波が有限なら収束し、そこから先は決定的に撮れる。読み込み**中**は失敗ではない——ここで即失敗にすると、フォントが問題なく届く二波ページを恒久的に撮影不能へ誤分類する（cmd_657 実測: 旧実装で二波 fixture が 8/8 失敗）。①の失敗検知は波が尽きた後に行うので、待ち直しと衝突しない。待ち直しに回数上限は設けない——上限値はどんな数でも根拠がなく、停止性は共有 deadline が担う。収束しないページは経路④の Timeout へ倒れる（`a_second_font_wave_after_ready_is_awaited_not_failed`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。応答から撮影までの窓に始まる要求・document の入れ替わりは、検証列の最後（静止の後・撮影の直前）の再確認（[`FONTS_RECHECK_PROBE`]——経路⑤）が検知し、検証列をやり直す。再確認から撮影までの**最後の一往復**に始まる変化だけは原理的に検知できぬ——スクリーンショットは JS を走らせない一往復の CDP コマンドで、その瞬間のフォント状態を読み戻す API が無い（README「届かない範囲」と同じ契約） |
 //! | フォント条件待ち⑤ 検証後の document 入れ替わり・新しい波（[`FONTS_RECHECK_PROBE`]） | 検知する（撮影の直前に、[`FONTS_WAIT_SCRIPT`] が成功時に検証した各 document へ残す印 `documentElement.dataset.vrtFontsVerified` と `document.fonts.status` を、FREEZE の `freezeRoot` と同じ範囲——open shadow root へ潜り `iframe` と `frame` の両方——で同一オリジン iframe まで再帰して 1 往復で読む。cmd_661 ②）。`dataset` を持たない documentElement（素の XML document）には印を刻む口が無く、両側で要求しない——その document の入れ替わりは印では捉えられない（fonts.status の検査は残る。cmd_661 追送）。**印が消えるのはナビゲーションと `document.open()` / `document.write()`**——どちらも documentElement を作り直す（印を window に置くと `document.open()` がグローバルオブジェクトを維持するため生き残り、入れ替わりを見逃す——cmd_660 実測で訂正）。**同一 document 内の DOM 全面置換（`body.replaceChildren` 等）では documentElement が残るため印も残り、捉えられない**（下の「本 PR で扱わないもの」を参照） | 不成立なら失敗ではなく検証列を**READY 待ちと `SETTLE_DELAY` から**やり直す（cmd_660）——Blink の `FontFaceSet.ready` は「load イベント完了＋読み込み中フォント無し」で解決するため、reload 後の document では story 未描画の時点で fonts 待ちが通ってしまい、fonts 待ちからのやり直しでは `storyRendered` 前の未描画の絵を撮る（cmd_660 実測: reload 後の再描画が遅い fixture で白い絵が撮れた。既存 reload fixture は reload 後 40ms で `storyRendered` を出すためこの経路を踏まなかった）。READY 待ちから回すことで二巡目の `storyErrored` / `storyThrewException` も観測される（cmd_660 実測: 修正前は黙殺して撮れていた）。ただし READY の印が世代を持つことが前提——`document.open()` はグローバルオブジェクトを維持するため、世代なしの `window.__VRT_READY__.rendered` は前 document の `true` のまま生き残り、やり直しの READY 待ちが新 document を一度も待たずに素通りしていた（cmd_661 ① 実測: 差し替え後の再描画が遅い fixture で未描画の白い絵が撮れ、二巡目の `storyThrewException` は黙殺された。世代印で修正）。storyRendered 後に自分を reload する story は、fonts 待ちが前 document で ok を返し FREEZE が navigated or closed のリトライを経て後 document で成功するため、修正前はフォント未検証の document がそのまま撮れた（cmd_659 実測。窓はリトライ全長＝数十秒になりうる）。フォント待ちを FREEZE の後ろへ動かす形は採らない（FREEZE は最終レイアウトを見る必要があり、フォント適用で始まる CSS transition も静止の対象）。常に二度待つ形も採らない——再待ちは窓が開いたと検知された時だけ。停止性は共有 deadline（やり直しが尽きねば [`RenderError::Timeout`]・fail-closed）。応答の解析不能は [`RenderError::Story`]（fail-closed）。`a_story_that_reloads_after_the_fonts_wait_is_not_captured_unverified`（陽性対照つき）・`a_reloading_story_whose_fonts_arrive_recovers_and_captures_verified`・`a_document_swapped_via_document_open_is_recaptured_verified`・`a_slowly_rerendering_reload_waits_for_its_second_ready`・`a_story_error_after_reload_is_observed_by_the_redo`・`a_document_open_swap_with_a_slow_rerender_waits_for_its_second_ready`・`a_story_error_after_a_document_open_swap_is_observed_by_the_redo`・`a_second_error_in_the_swapped_document_is_recorded_not_masked`・`a_stale_storyrenders_phase_does_not_ready_the_swapped_document`・`a_redo_round_regrants_the_dom_heuristic_its_signal_grace`・`fonts_inside_a_shadow_dom_iframe_are_awaited_before_the_capture`・`fonts_inside_a_frameset_frame_are_awaited_before_the_capture`・`a_same_origin_xml_iframe_does_not_break_the_fonts_wait` が固定 |
 //! | フォント条件待ち③ ページが `document.fonts` を差し替える | 形の壊れは検知 | FontFaceSet らしい形（`status` が文字列・`ready.then` が関数）でなければ**待たずに** `ok: false`（fail-closed。無いものは待てないが、無いことを黙って通さない）。仕様どおりの顔で即解決を返す偽物は原理的に検知不能——脅威モデルは一貫して事故であり悪意ではない（reduced-motion 検証と同じ契約）。判定は `fonts_verdict_accepts_only_a_verified_ok_true`・`fonts_verdict_rejects_unparseable_results`（単体。手書き JSON への受理条件のみ）が固定し、実ブラウザ貫通は `a_page_that_replaces_document_fonts_fails_the_shape_check`（形チェック分岐——`document.fonts` を非 FontFaceSet 形へ差し替えて [`RenderError::Story`] と `errors` の文言まで実測）と `garbled_fonts_result_fails_instead_of_silently_succeeding`（unparseable 分岐）が固定 |
-//! | フォント条件待ち④ `ready` が期限内に解決しない | 検知 | evaluate が返らないので、READY 待ちと共有の deadline の残余（`tokio::time::timeout`）が期限で [`RenderError::Timeout`] へ倒す（fail-closed——**撮らない**。修正前は 250ms 経過後に代替字形のまま撮れてしまい、揺れる絵が baseline に混ざった）。②の待ち直しが収束しない場合の安全弁もこの経路（`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定） |
+//! | フォント条件待ち④ `ready` が期限内に解決しない | 検知 | evaluate が返らないので、READY 待ちと共有の deadline の残余（`tokio::time::timeout`）が期限で [`RenderError::Timeout`] へ倒す（fail-closed——**撮らない**。修正前は 250ms 経過後に代替字形のまま撮れてしまい、揺れる絵が baseline に混ざった）。②の待ち直しが収束しない場合の安全弁もこの経路（`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。**`ready` が解決しない原因はフォントに限らない**——`ready` は仕様上 load イベント完了にも門を掛けられており、到達不能な非フォント subresource 1 本・load の終わらない同一オリジン iframe 1 つでも同じ Timeout に倒れる（既知の限界＝費用。cmd_663 ⑥。[`DEFAULT_STORY_TIMEOUT`] doc と README のフォント節に明記） |
+//! | フォント条件待ち⑥ 待ちの**最中**の document の切り離し（iframe の DOM からの除去・`location.replace`） | 検知する（各 `ready` を切り離し検知の race に載せる。走査（[`COLLECT_DOCUMENTS_JS`]）自体も `defaultView` の無い document を集めない——FREEZE の `freezeRoot` と同じ門。cmd_663 ②） | 切り離された document は描画されず `fonts.ready` は二度と settle しない——race が検知して**待ちからも判定からも捨てる**（撮る絵に影響しない document のために story を落とさない）。修正前はこの門が写されておらず、`Promise.all` が永久 pending となり story_timeout（既定 30 秒。実測 30.31s）を丸ごと消費して④の Timeout に倒れていた。検知の setTimeout ポーリングは fake timers で止まる——その場合は従来どおり deadline の Timeout（fail-closed）。`location.replace` で入れ替わった新 document は次の巡・撮影直前の再確認（⑤）が拾う。`a_detached_iframe_mid_fonts_wait_does_not_time_out_the_story` が固定 |
 //!
 //! 残る fail-open は二種に分けて管理する。
 //!
@@ -145,6 +146,19 @@
 //! | reduced-motion 検証 | evaluate リトライは READY 待ちと共有の deadline 残余。判定自体は即時 | [`RenderError::Story`]（[`reduced_motion_verdict`]）/ リトライ期限切れは [`RenderError::Timeout`] | `a_page_that_breaks_matchmedia_fails_instead_of_silently_capturing`・`reduced_motion_verdict_*` 単体群 |
 //! | フォント条件待ち（[`FONTS_WAIT_SCRIPT`]） | READY 待ちと**共有**の deadline の残余（`ready` が解決しない・再読み込みの波が尽きないページは evaluate ごと期限で倒れる）。**フォント待ちに独立の短い上限は未着手**——解決しないフォントは story ごとに最大 `story_timeout`（既定 30 秒）を消費し、story 数に比例して累積する（既知の限界。[`DEFAULT_STORY_TIMEOUT`] の doc と README のフォント節に明記） | [`RenderError::Timeout`]（期限）/ [`RenderError::Story`]（[`fonts_verdict`]——`document.fonts` の欠落・形違い・`ready` の reject）/ 読み込み**失敗**は警告つきで撮る（[`RenderedStory::font_warning`] → `render_all` が build log の `LogLevel::Warn` へ永続化。失敗経路①） | `waiting_for_fonts_ready_makes_repeated_captures_agree`・`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`a_second_font_wave_after_ready_is_awaited_not_failed`・`a_second_wave_that_never_ends_times_out_without_capturing`・`a_failing_font_load_captures_with_a_warning_and_stays_deterministic`・`a_page_that_replaces_document_fonts_fails_the_shape_check`・`fonts_inside_a_same_origin_iframe_are_awaited_before_the_capture`・`fonts_inside_a_frameset_frame_are_awaited_before_the_capture`・`fonts_verdict_*` 単体群 |
 //! | 撮影直前の再確認（[`FONTS_RECHECK_PROBE`]） | READY 待ちと**共有**の deadline の残余（evaluate リトライも、やり直しループ自体も同じ期限で打ち切る） | [`RenderError::Timeout`]（期限）/ [`RenderError::Story`]（[`fonts_recheck_verdict`]——解析不能のみ。不成立は失敗でなく検証列の READY 待ちからのやり直し） | `a_story_that_reloads_after_the_fonts_wait_is_not_captured_unverified`・`a_reloading_story_whose_fonts_arrive_recovers_and_captures_verified`・`a_document_swapped_via_document_open_is_recaptured_verified`・`a_slowly_rerendering_reload_waits_for_its_second_ready`・`a_story_error_after_reload_is_observed_by_the_redo`・`fonts_recheck_verdict_allows_capture_only_when_still_verified` 単体 |
+//!
+//! ## 走査と門の対応表（揃えた対象の付随物）
+//!
+//! 「既存の X に揃えた」は、走査の**形**（どこへ降りるか）だけでなく X が持つ
+//! **門**（除外条件・前提）まで写して初めて成り立つ（cmd_663 ①。defaultView の
+//! 門が六巡のあいだ fonts 側に写されていなかった）。**走査を揃える・門を
+//! 足すときは、この表の全行に同じ列を検めること。**
+//!
+//! | 走査 | 担い手 | 降下（shadow / iframe / frame） | cross-origin | 切り離し（`defaultView`）の門 | 切断（`isConnected`）の門 | 走査自身の throw |
+//! |----|----|----|----|----|----|----|
+//! | `walkRoots`（freezeRoot＝凍らせる側と collectRunning＝数える側が共有。cmd_663 ⑦で一本化） | [`FREEZE_SCRIPT`] | 全部降りる | `contentDocument` が null / throw——意図した握りつぶし（原理的に触れない。README 契約） | 注入は `defaultView` の無い document を対象外（描画されない）。シーク・収集は切り離し root にも走るが、描画されないので絵に影響しない | ——（root 単位の門は下の検証行が担う） | `collectAnimations` 内で `errors` → `ok: false`（fail-closed） |
+//! | 適用検証ループ（`frozenRoots`） | [`FREEZE_SCRIPT`] | 走査済み root の線形走査（降下なし） | ——（frozenRoots に載るのは到達できた root のみ） | document root は `defaultView` の無いものを検証対象外 | shadow root は `isConnected` でない host のものを検証対象外 | `errors` → `ok: false`（fail-closed） |
+//! | [`COLLECT_DOCUMENTS_JS`]（検証側 [`FONTS_WAIT_SCRIPT`] と再確認側 [`FONTS_RECHECK_PROBE`] が共有。cmd_662 ④） | フォント待ち・再確認 | 全部降りる（cmd_661 ②） | 同上（契約） | **`defaultView` の無い document を集めない＋待ちの最中の切り離しは `ready` との race が捨てる（cmd_663 ②——この列が空欄だった）** | ——（document 単位の走査。shadow root を root として扱わない） | 各利用側の try → fail-closed |
 //!
 //! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
 //!
@@ -225,6 +239,15 @@ use tokio::task::JoinHandle;
 /// 方針でも `ready` の解決を待つしかない。フォント待ちに独立の短い上限
 /// （例: 数秒）を持たせて被害を読みやすくするのは**未着手**である
 /// （README のフォント節にも同じ限界を明記）。
+///
+/// **既知の限界（load イベントの門。cmd_663 ⑥）**: `document.fonts.ready` は
+/// 仕様上「document の load イベント完了＋読み込み中フォント無し」で解決
+/// する——費用はフォントの無応答に限らない。フォントが全て `loaded` でも、
+/// 到達不能なホストへの `<script src>` / `<img>` / beacon が 1 本あるだけで
+/// `ready` は pending のまま全 story がこの時間ずつ失敗する。走査が降りる
+/// 同一オリジン iframe では **iframe 側の load イベント**も同じ門になる。
+/// 条件待ち導入前（`storyRendered`＋250ms）はどちらも撮れていた——
+/// フォント CDN 無応答と同じ費用の項として README にも明記。
 pub const DEFAULT_STORY_TIMEOUT: Duration = Duration::from_secs(30);
 /// 描画完了を検出してから撮るまでの落ち着き待ち。
 ///
@@ -268,8 +291,11 @@ const READY_HOOK_SCRIPT: &str = r#"
 (() => {
   if (window.__VRT_READY__) return;
   // rendered / error には「どの document で観測したか」の世代
-  // （その時点の documentElement への参照）を併記する。state は window に
-  // 置くしかない（channel の accessor が window の性質だから）が、
+  // （その時点の documentElement への参照）を併記する。accessor は window に
+  // しか張れないが、state 自体は document 側へも置ける（フォントの印 dataset
+  // と同じ分担）——window に置いたままにしたのは判断である（cmd_663 ⑧）:
+  // errorRoot / renderedRoot は documentElement への参照で dataset（文字列
+  // のみ）には刻めず、世代印だけで差し替えの生き残りは塞がっている。
   // `document.open()` / `document.write()` はグローバルオブジェクトを維持
   // したまま document を差し替えるため、印だけ window に残ると、やり直しの
   // READY 待ちが前 document の rendered: true で素通りする（cmd_661 ①。
@@ -369,10 +395,22 @@ JSON.stringify((() => {
       const phase = renders[renders.length - 1].phase;
       if (phase === 'completed') {
         // storyRenders は Storybook 自身が window に置く状態で、hook と違い
-        // 世代を刻む口が無い——前 document の completed が差し替えを
+        // 世代を刻んでいない（内部実装への書き込みは採らない判断——モジュール
+        // doc の常駐状態表を参照）——前 document の completed が差し替えを
         // 生き延びる。現在の document の root に描画結果があることを併せて
         // 要求する（root つきの内容へ差し替える形は依然すり抜ける。既知の
         // 限界としてモジュール doc の失敗経路表に明記）。
+        //
+        // この門の代償（cmd_663 ⑤・errored 分岐の判断の逆向きの帰結）:
+        // 何も描かず終える story は正当（このモジュールの出発点の
+        // PasswordStrengthBar）だが、保険経路にしか乗れない構成（channel を
+        // 掴み損ねた等）では null を返す story・portal で body 直下へ描く
+        // story の domReady が永久に false になり、門の導入前は撮れていた
+        // ものが 30 秒 Timeout に倒れる。向きは fail-closed（stale completed
+        // で未検証の絵を撮る fail-open を塞ぐ側）だが巻き添えである——
+        // root の中身に依存しない突き合わせ（completed 観測時の世代を Rust
+        // 側で覚える等）は検証世代の一般化そのもので、#27 の範囲外として
+        // 併記に留める（モジュール doc「本 PR で扱わないもの」）。
         if (domReady) return { state: 'ready' };
         return { state: 'pending', dom_ready: domReady };
       }
@@ -588,11 +626,29 @@ const FREEZE_SCRIPT: &str = r#"
   // <style>/<link> より後の順序に置かれるため、同 specificity の !important
   // 同士なら注入側が勝つ——利用者側がより高い specificity で !important を
   // 宣言した場合に負けるのは <style> 注入と同じ（README「届かない範囲」）。
-  const freezeRoot = (root) => {
+  // 走査（open shadow root への降下・`iframe` / `frame` の contentDocument への
+  // 降下）の共有ヘルパ。凍らせる側（freezeRoot）と数える側（collectRunning）は
+  // 従来この walk を各自に持つ写しで、片側だけ狭まる退行——「凍らせていないのに
+  // 数えもしない」fail-open——をどの試験も赤くできなかった（cmd_663 ⑦）。
+  // fonts 側の走査を COLLECT_DOCUMENTS_JS へ一本化した（cmd_662 ④）のと同じ
+  // 理由で、降下はこの一箇所だけが担う。perRoot が root ごとの仕事（注入＋
+  // シーク／running の収集）を行い、collectAnimations が走査済みの全要素を返す。
+  const walkRoots = (root, perRoot) => {
     if (!root) return;
+    const elements = perRoot(root);
+    for (const el of elements) {
+      if (el.shadowRoot) walkRoots(el.shadowRoot, perRoot);
+      if (el.localName === 'iframe' || el.localName === 'frame') {
+        // クロスオリジン iframe には原理的に触れない（contentDocument は
+        // null / throw）。ここの握りつぶしは意図的で、errors に積まない。
+        try { walkRoots(el.contentDocument, perRoot); } catch (e) {}
+      }
+    }
+  };
 
+  const freezeRoot = (root) => walkRoots(root, (r) => {
     try {
-      const doc = root.nodeType === Node.DOCUMENT_NODE ? root : root.ownerDocument;
+      const doc = r.nodeType === Node.DOCUMENT_NODE ? r : r.ownerDocument;
       const win = doc && doc.defaultView;
       // browsing context を持たない document（切り離された iframe 等）は
       // 描画されないので注入も検証も対象外（検証側の disconnected スキップと同じ扱い）。
@@ -609,9 +665,9 @@ const FREEZE_SCRIPT: &str = r#"
             sheetByDoc.set(doc, sheet);
           }
         }
-        if (sheet && !root.adoptedStyleSheets.includes(sheet)) {
-          root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
-          frozenRoots.push(root);
+        if (sheet && !r.adoptedStyleSheets.includes(sheet)) {
+          r.adoptedStyleSheets = [...r.adoptedStyleSheets, sheet];
+          frozenRoots.push(r);
         }
       }
     } catch (e) {
@@ -621,7 +677,7 @@ const FREEZE_SCRIPT: &str = r#"
 
     // document.getAnimations() は shadow tree の中を返さない実装があるため、
     // root 単位で collectRunning と同じ共通収集を通す（Set で重複は消える）。
-    const { animations, elements } = collectAnimations(root);
+    const { animations, elements } = collectAnimations(r);
 
     for (const anim of animations) {
       try {
@@ -652,26 +708,16 @@ const FREEZE_SCRIPT: &str = r#"
         pushError('seek/pause failed: ' + String(e && e.message || e));
       }
     }
-
-    // querySelectorAll は shadow 境界も iframe 境界も越えない。open shadow root
-    // と同一オリジン iframe（shadow 内のものも含む）には root ごとに潜る。
-    for (const el of elements) {
-      if (el.shadowRoot) freezeRoot(el.shadowRoot);
-      if (el.localName === 'iframe' || el.localName === 'frame') {
-        try { freezeRoot(el.contentDocument); } catch (e) {
-          // クロスオリジン iframe は原理的に触れない——これは握りつぶしてよい。
-        }
-      }
-    }
-  };
+    return elements;
+  });
 
   // 全 root から running な animation を集める。収集の視野は freezeRoot と
   // 同じ collectAnimations——収集失敗・API 欠落はそこで errors に積まれ、
   // 「残っていない」と「数えられなかった」が混ざらない（fail-closed）。
+  // 降下は freezeRoot と共有の walkRoots（cmd_663 ⑦）。
   const collectRunning = (root) => {
     const running = [];
-    const collect = (r) => {
-      if (!r) return;
+    walkRoots(root, (r) => {
       const { animations, elements } = collectAnimations(r);
       for (const a of animations) {
         if (a.playState === 'running') {
@@ -680,16 +726,8 @@ const FREEZE_SCRIPT: &str = r#"
           running.push(name + ':' + target);
         }
       }
-      for (const el of elements) {
-        if (el.shadowRoot) collect(el.shadowRoot);
-        if (el.localName === 'iframe' || el.localName === 'frame') {
-          // クロスオリジン iframe には原理的に触れない（contentDocument は
-          // null を返す）。ここの握りつぶしは意図的で、errors に積まない。
-          try { collect(el.contentDocument); } catch (e) {}
-        }
-      }
-    };
-    collect(root);
+      return elements;
+    });
     return running;
   };
 
@@ -869,6 +907,11 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// `frame` の両方を見る。cmd_661 ②）であり、フォント検証はその鏡である。
 /// クロスオリジン iframe は `contentDocument` が null で**原理的に観測
 /// できない**（README「届かない範囲」の契約。FREEZE の書き方に揃える）。
+/// 走査は freezeRoot の **`defaultView` の門**も写す（cmd_663 ②）——
+/// browsing context の無い document（切り離された iframe 等）は描画されず、
+/// その `fonts.ready` は二度と settle しないので、集めない。待ちの**最中**に
+/// 切り離された document は、各 `ready` と race するポーリングが検知して
+/// 待ちからも判定からも捨てる（詳細は `settle()` のコメント）。
 ///
 /// 成功時は検証した各 document の
 /// `documentElement.dataset.vrtFontsVerified = 'true'` の印を残す
@@ -910,6 +953,12 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// `fonts_inside_a_frameset_frame_are_awaited_before_the_capture` 等）が
 /// 両側まとめて赤くする。
 const COLLECT_DOCUMENTS_JS: &str = r#"const collectDocuments = (doc, out) => {
+    // browsing context を持たない document（切り離された iframe 等）は描画に
+    // 影響せず、その fonts.ready は二度と settle しない——FREEZE の freezeRoot
+    // が持つ defaultView の門をここにも写す（cmd_663 ②。走査は検証側と
+    // 再確認側で共有されるので、門も一箇所で両側に効く）。待ちの**最中**の
+    // 切り離しはこの門では捉えられない——そちらは settle() の race が担う。
+    if (!doc.defaultView) return;
     out.push(doc);
     const walk = (root) => {
       for (const el of root.querySelectorAll('*')) {
@@ -969,6 +1018,35 @@ const FONTS_WAIT_BODY: &str = r#"
   // 前提がある——ページが fake timers（sinon 等）で setTimeout を止めて
   // いれば、この譲りは発火せず evaluate は返らないが、その場合も共有
   // deadline の Timeout へ倒れる（fail-closed。黙って撮る方向には壊れない）。
+  // 待っている間に document が browsing context から切り離される（iframe の
+  // DOM からの除去・location.replace 等）と、その fonts.ready は二度と
+  // settle せず Promise.all が永久に pending になる——settle() の再帰は
+  // Promise.all の解決後にしか走らないため、「巡ごとに再収集する」はこの
+  // 局面では一度も回らず、story は共有 deadline の Timeout へ倒れていた
+  // （cmd_663 ②）。そこで各 ready を「切り離しの検知」と race させ、外れた
+  // document は待ちからも判定からも捨てる——描画されない document のために
+  // story を落とさない（FREEZE の freezeRoot が持つ defaultView の門と同じ
+  // 強度）。検知は setTimeout ポーリング——fake timers で setTimeout を
+  // 止めるページでは検知が発火せず、共有 deadline の Timeout へ倒れる
+  // （下の譲りティックと同じ前提・fail-closed）。ready 側が先に settle
+  // したらフラグでポーリングを止め、タイマーを残さない。
+  const DETACH_POLL_MS = 50;
+  const readyOrDetached = (s) => {
+    let settled = false;
+    const ready = Promise.resolve(s.fonts.ready).then(
+      (v) => { settled = true; return v; },
+      (e) => { settled = true; throw e; }
+    );
+    const detached = new Promise((resolve) => {
+      const check = () => {
+        if (settled) return;
+        if (!s.doc.defaultView) { resolve(); return; }
+        setTimeout(check, DETACH_POLL_MS);
+      };
+      setTimeout(check, DETACH_POLL_MS);
+    });
+    return Promise.race([ready, detached]);
+  };
   const settle = () => {
     let sets;
     try {
@@ -976,10 +1054,28 @@ const FONTS_WAIT_BODY: &str = r#"
     } catch (e) {
       return JSON.stringify({ ok: false, errors: [String(e)] });
     }
-    return Promise.all(sets.map((s) => Promise.resolve(s.fonts.ready))).then(
+    // ready の二度目の読み（一度目は gather の形チェック）も try で囲む——
+    // 初回は形チェックを通り後の読みで throw する stateful getter では、裸の
+    // 読みが settle 自体の throw になり、evaluate のリトライへ化けて原因と
+    // 食い違う phase の Timeout になる（印の書き込みと同じ理由。cmd_663 ③）。
+    let races;
+    try {
+      races = sets.map((s) => readyOrDetached(s));
+    } catch (e) {
+      return JSON.stringify({ ok: false, errors: ['reading document.fonts.ready threw: ' + String(e)] });
+    }
+    return Promise.all(races).then(
       () => {
-        if (sets.some((s) => s.fonts.status !== 'loaded')) {
-          return new Promise((resolve) => setTimeout(resolve, 0)).then(settle);
+        // status の二度目の読みも同じ理由で try に倒す（cmd_663 ③）。切り離しを
+        // race が検知した場合は、ここで生きている document だけへ絞る——外れた
+        // document の fonts は待ちからも判定からも外す（読めるとも限らない）。
+        try {
+          sets = sets.filter((s) => s.doc.defaultView);
+          if (sets.some((s) => s.fonts.status !== 'loaded')) {
+            return new Promise((resolve) => setTimeout(resolve, 0)).then(settle);
+          }
+        } catch (e) {
+          return JSON.stringify({ ok: false, errors: ['reading document.fonts.status threw: ' + String(e)] });
         }
         // 読み込みに失敗したフォントは撮影を止めない（意図した fail-open。
         // 採否の理由はモジュール doc 失敗経路①）。family を Set で一意化した
@@ -4110,6 +4206,70 @@ mod tests {
         }
     }
 
+    /// **同一 document の中で**二度 error を出すバンドル。`recordError` の
+    /// 「同一世代内は先着固定」の検証用（cmd_663 ⑨）。
+    ///
+    /// document の差し替えは行わない——二つの `storyThrewException` は同じ
+    /// documentElement の世代で撃たれる。
+    fn write_double_error_same_document_bundle(root: &Path) {
+        write_story_html(
+            root,
+            "  html,body{margin:0;padding:0;background:#fff}",
+            "",
+            r#"      channel.emit('storyThrewException', { message: 'first-error: the root cause' });
+      channel.emit('storyThrewException', { message: 'second-error: collateral damage' });"#,
+        );
+    }
+
+    /// 【cmd_663 ⑨】同一 document 内で二度出た error は**先着が固定**され、
+    /// 失敗メッセージは一度目のものになること。
+    ///
+    /// `recordError` の先着固定は「最初の失敗が根本原因で、続く失敗は
+    /// 巻き添えのことが多い」という診断上の判断（cmd_662 ② で世代の中へ
+    /// 閉じた半分の、**残り半分**の性質）だが、これまでどの試験も固定して
+    /// いなかった——先着固定を消して常時上書きにしても全試験が緑のまま
+    /// だった。本試験は upgrade 側（常時上書き＝二度目のメッセージが出る）を
+    /// 赤くする: 上書きに変えるとこの assert が 'second-error' を検出して落ちる。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_error_in_the_same_document_keeps_the_first() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_second_error_in_the_same_document: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_double_error_same_document_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 640, 360);
+        options.story_timeout = Duration::from_secs(15);
+        let renderer = StoryRenderer::launch(options)
+            .await
+            .expect("launch chromium");
+        let err = renderer
+            .render_story(&server.base_url(), "double-error-same-doc")
+            .await
+            .expect_err("a story that throws twice must fail with the first error");
+        renderer.close().await;
+
+        match err {
+            RenderError::Story { message, .. } => {
+                assert!(
+                    message.contains("first-error"),
+                    "the failure must carry the first error (the root cause), got: {message}"
+                );
+                assert!(
+                    !message.contains("second-error"),
+                    "the first-arrival pin within a generation must hold — seeing \
+                     the second error means recordError now always overwrites, \
+                     got: {message}"
+                );
+            }
+            other => panic!("expected a Story error, got: {other:?}"),
+        }
+    }
+
     /// `window.__STORYBOOK_PREVIEW__.storyRenders` の保険経路**だけ**で ready を
     /// 判定させるバンドル（channel は一切置かない）。差し替え後、前 document の
     /// `phase: 'completed'` が window 上で生き残ることの検証用（cmd_661 ①で
@@ -4785,6 +4945,247 @@ mod tests {
             (0x00, 0xff, 0x00),
             "the story behind the XML iframe must be captured normally"
         );
+    }
+
+    /// 同一オリジン iframe のフォントが**届かないまま**、フォント待ちの最中に
+    /// iframe が DOM から外されるバンドル。切り離された document の待ちの
+    /// 検証用（cmd_663 ②・yupix レビュー）。
+    ///
+    /// storyRendered（iframe load 駆動）の後 900ms で iframe を remove する。
+    /// フォント待ちは [`SETTLE_DELAY`]（250ms）後に始まり、iframe の
+    /// `font.ttf` は試験時間内に決して届かない（3600s 遅延配信）ので、待ちの
+    /// `Promise.all` は iframe の `fonts.ready` を掴んだまま切り離しを迎える。
+    /// frame.html はフォントを使うテキストを自分の load **後**に挿す
+    /// （[`write_webfont_frame_html`] の注記どおり）ため、iframe の load——
+    /// 親の storyRendered の引き金——はフォントに塞がれない。
+    fn write_detachable_iframe_webfont_bundle(root: &Path) {
+        write_webfont_frame_html(root);
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%; height:100vh; background:#00ff00; }
+  iframe { position:fixed; top:0; left:0; width:300px; height:200px; border:0; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var frame = document.createElement('iframe');
+      frame.src = 'frame.html';
+      document.getElementById('storybook-root').appendChild(frame);
+      frame.addEventListener('load', function () {
+        channel.emit('storyRendered', id);
+        // フォント待ち（SETTLE_DELAY 250ms の後に開始）が iframe の
+        // fonts.ready を掴んだ後に外れるよう、900ms 置いてから remove する。
+        setTimeout(function () { frame.remove(); }, 900);
+      });"#,
+        );
+    }
+
+    /// 【cmd_663 ②・実測】フォント待ちの最中に切り離された同一オリジン iframe
+    /// が story を Timeout させないこと——撮れて、絵（iframe の外れた後の
+    /// top document）が決定的であること。
+    ///
+    /// 修正前（6ca460f）は、`sets` が待ち始めの時点の document 集合で固定され、
+    /// 切り離された document の `fonts.ready` は二度と settle しないため
+    /// `Promise.all` が永久に pending になり、共有 deadline が尽きて
+    /// [`FONTS_PHASES`] の timeout phase で落ちた（実測は本試験の追加
+    /// コミットのメッセージと報告に記録。既定の story_timeout では 30 秒）。
+    /// FREEZE の `freezeRoot` は `defaultView` の無い document を対象外とする
+    /// 門を持つのに、揃えたはずの fonts 走査にはその門が写されていなかった。
+    ///
+    /// 修正後は、走査（[`COLLECT_DOCUMENTS_JS`]）が browsing context の無い
+    /// document を集めず、待ちの最中の切り離しは ready との race が検知して
+    /// その document を待ちからも判定からも捨てる——描画されない document の
+    /// ために story を落とさない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_detached_iframe_mid_fonts_wait_does_not_time_out_the_story() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_detached_iframe_mid_fonts_wait: no chromium");
+            return;
+        };
+        let font = require_test_font();
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_detachable_iframe_webfont_bundle(dir.path());
+
+        const RUNS: usize = 2;
+        let mut hashes: Vec<String> = Vec::new();
+        for i in 0..RUNS {
+            // 「初回だけ遅い」を run ごとに効かせるため、render ごとに独立の
+            // サーバーを立てる（`a_font_that_never_arrives_*` と同じ理由）。
+            let (addr, server_task, _hits) =
+                start_font_delay_server(dir.path(), font.clone(), Duration::from_secs(3600)).await;
+            let mut options = RenderOptions::new(chromium.clone(), 640, 360);
+            options.story_timeout = Duration::from_secs(12);
+            let renderer = StoryRenderer::launch(options)
+                .await
+                .expect("launch chromium");
+            let png = renderer
+                .render_story(&format!("http://{addr}"), "detached-iframe-font")
+                .await
+                .expect(
+                    "a story whose iframe is detached mid fonts-wait must capture — \
+                     a Timeout here means the wait kept holding the detached \
+                     document's never-settling fonts.ready (the pre-fix behaviour)",
+                )
+                .png;
+            renderer.close().await;
+            server_task.abort();
+
+            let image = image::ImageReader::with_format(
+                std::io::Cursor::new(&png),
+                image::ImageFormat::Png,
+            )
+            .decode()
+            .expect("decode screenshot")
+            .to_rgba8();
+            // iframe は撮影前に外れているので、絵は top document の緑一色。
+            // iframe が覆っていた左上も緑であることを確かめる——赤 marker が
+            // 見えるなら「外れたはずの iframe が写った」不定の絵である。
+            for (x, y) in [(320u32, 300u32), (150u32, 100u32)] {
+                let px = image.get_pixel(x, y);
+                assert_eq!(
+                    (px[0], px[1], px[2]),
+                    (0x00, 0xff, 0x00),
+                    "run {i}: the capture must show only the top document after \
+                     the iframe was detached (pixel at {x},{y})"
+                );
+            }
+            hashes.push(crate::screenshots::content_hash(&png));
+        }
+        assert!(
+            hashes.iter().all(|h| h == &hashes[0]),
+            "captures after a mid-wait iframe detach must be deterministic, got: {hashes:?}"
+        );
+    }
+
+    /// `document.fonts` を **stateful getter** の偽物へ差し替えるバンドル。
+    /// 「形チェック（`gather`）は通るが、settle の**二度目以降の読み**で
+    /// throw する」getter の検証用（cmd_663 ③・yupix レビュー）。
+    ///
+    /// 読みの回数は現行実装の読み順に合わせてある（変わると陽性対照の
+    /// 意味が変わるので注記）:
+    ///
+    /// - `throwing-fonts--ready` : `ready` は 1 evaluate につき gather の
+    ///   形チェックで 2 回（truthiness と `.then` の typeof）、settle の
+    ///   `Promise.resolve(s.fonts.ready)` で 3 回目が読まれる——3 の倍数の
+    ///   読みだけ throw することで、gather は毎回通り settle 側だけが落ちる
+    /// - `throwing-fonts--status` : `status` は gather の typeof 検査で 1 回、
+    ///   settle の `'loaded'` 比較で 2 回目が読まれる——偶数回の読みだけ
+    ///   throw する
+    ///
+    /// evaluate はリトライごとにスクリプトを**再実行**するため、単純な
+    /// 「N 回目以降ずっと throw」だと 2 回目の evaluate では gather の
+    /// 形チェック自体が throw して（既存の try に拾われ）即失敗になり、
+    /// 「裸の読みがリトライへ化けて deadline まで落ちない」という修正前の
+    /// 症状が再現できない。周期で throw させることで、どの evaluate でも
+    /// gather は通り settle の二度目の読みだけが落ち続ける。
+    fn write_stateful_fonts_getter_bundle(root: &Path) {
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  #box { width:100%; height:100vh; background:#00ff00; }"#,
+            r#"<div id="box"></div>"#,
+            r#"      var readyReads = 0;
+      var statusReads = 0;
+      var realReady = Promise.resolve();
+      var fake;
+      if (id === 'throwing-fonts--ready') {
+        fake = {
+          get status() { return 'loaded'; },
+          get ready() {
+            readyReads++;
+            if (readyReads % 3 === 0) {
+              throw new Error('stateful fonts.ready getter threw on a later read');
+            }
+            return realReady;
+          }
+        };
+      } else {
+        fake = {
+          get status() {
+            statusReads++;
+            if (statusReads % 2 === 0) {
+              throw new Error('stateful fonts.status getter threw on a later read');
+            }
+            return 'loaded';
+          },
+          ready: realReady
+        };
+      }
+      Object.defineProperty(document, 'fonts', {
+        configurable: true,
+        get: function () { return fake; }
+      });
+      channel.emit('storyRendered', id);"#,
+        );
+    }
+
+    /// 【cmd_663 ③・実測】`fonts.ready` / `fonts.status` の**二度目の読み**で
+    /// throw する stateful getter が、原因つきの即時 [`RenderError::Story`] に
+    /// 倒れること——deadline まで待った原因不明の Timeout にならないこと。
+    ///
+    /// 修正前（6ca460f）は、settle の `sets.map((s) => ...s.fonts.ready...)` と
+    /// `sets.some((s) => s.fonts.status !== 'loaded')` だけが try の外にあった
+    /// ——印の書き込み（1015 行）には「ここだけ裸だと、promise の reject が
+    /// evaluate のリトライへ化けて、原因と食い違う phase の Timeout になる」と
+    /// 正しく書いて囲ってあるのに、同じ露出の読みが二つ残っていた。throw は
+    /// evaluate の例外→ [`evaluate_with_deadline_retry`] のリトライへ化け、
+    /// story_timeout を丸ごと消費して [`FONTS_PHASES`] の retry_exhausted
+    /// phase で落ちた（実測は本試験の追加コミットのメッセージと報告に記録。
+    /// 既定の story_timeout では 30 秒）。
+    ///
+    /// 修正後は他の読み（gather・列挙・印）と同じく try → `ok:false` +
+    /// `errors` に倒れ、即座に理由（getter の throw 文言）つきで失敗する。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stateful_fonts_getter_fails_fast_with_the_reason() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_stateful_fonts_getter_fails_fast: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_stateful_fonts_getter_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        for (story_id, getter) in [
+            ("throwing-fonts--ready", "fonts.ready"),
+            ("throwing-fonts--status", "fonts.status"),
+        ] {
+            let mut options = RenderOptions::new(chromium.clone(), 640, 360);
+            // 「即座に」を時間で検証する: story_timeout（20s）を丸ごと待つ
+            // 修正前の挙動なら下の elapsed assert が落ちる。
+            options.story_timeout = Duration::from_secs(20);
+            let renderer = StoryRenderer::launch(options)
+                .await
+                .expect("launch chromium");
+            let started = std::time::Instant::now();
+            let err = renderer
+                .render_story(&server.base_url(), story_id)
+                .await
+                .expect_err("a throwing stateful fonts getter must fail the story");
+            let elapsed = started.elapsed();
+            renderer.close().await;
+
+            match err {
+                RenderError::Story { message, .. } => {
+                    assert!(
+                        message.contains("stateful") && message.contains("getter threw"),
+                        "{story_id}: the failure must carry the getter's own \
+                         throw message (the reason), got: {message:?}"
+                    );
+                }
+                other => panic!(
+                    "{story_id}: expected an immediate reasoned Story failure for \
+                     a throwing {getter} getter, got: {other:?}"
+                ),
+            }
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "{story_id}: the failure must be immediate, not a deadline \
+                 exhaustion — took {elapsed:?} (pre-fix this burned the whole \
+                 story_timeout as evaluate retries)"
+            );
+        }
     }
 
     /// open shadow root の内側にアニメ源を持つバンドル。root 単位の静止検証用。
@@ -6633,6 +7034,254 @@ mod tests {
         assert!(
             message.contains("freeze failed") && message.contains("still running"),
             "the error must describe what could not be frozen, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// 凍結不能アニメーション（animationend の無限連鎖）を持つ frame.html を
+    /// 書き出す共通素材。iframe 直下（[`write_iframe_unfreezable_bundle`]）と
+    /// frameset 経由（[`write_frameset_unfreezable_bundle`]）が共有する。
+    fn write_unfreezable_frame_html(root: &Path) {
+        std::fs::write(
+            root.join("unfreezable-frame.html"),
+            r#"<!doctype html>
+<html><head><style>
+  @keyframes blink-a { from { opacity:1; } to { opacity:0.5; } }
+  @keyframes blink-b { from { opacity:0.5; } to { opacity:1; } }
+  #box { width:100vw; height:100vh; background:#ff0000; }
+</style></head>
+<body><div id="box"></div>
+<script>
+  var box = document.getElementById('box');
+  box.addEventListener('animationend', function (e) {
+    // 無限連鎖: 一方が終わったら他方を開始する（top-level 版と同型）。
+    if (e.animationName === 'blink-a') {
+      box.style.animation = 'blink-b 0.03s linear 1 forwards';
+    } else {
+      box.style.animation = 'blink-a 0.03s linear 1 forwards';
+    }
+  });
+  box.style.animation = 'blink-a 0.03s linear 1 forwards';
+</script>
+</body></html>"#,
+        )
+        .expect("write unfreezable-frame.html");
+    }
+
+    /// **わざと凍らせられない**アニメーションを同一オリジン iframe の**中**に
+    /// 置くバンドル。走査（[`FREEZE_SCRIPT`] の `walkRoots`）の iframe 分岐の
+    /// 検知側検証用（cmd_663 ⑦——shadow 版
+    /// [`write_shadow_unfreezable_bundle`] と同型の空欄埋め）。
+    fn write_iframe_unfreezable_bundle(root: &Path) {
+        write_unfreezable_frame_html(root);
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  iframe { position:fixed; inset:0; width:100%; height:100vh; border:0; }"#,
+            "",
+            r#"      var frame = document.createElement('iframe');
+      frame.src = 'unfreezable-frame.html';
+      document.getElementById('storybook-root').appendChild(frame);
+      frame.addEventListener('load', function () {
+        channel.emit('storyRendered', id);
+      });"#,
+        );
+    }
+
+    /// 【cmd_663 ⑦】同一オリジン iframe の**中**の凍結不能アニメーションも
+    /// 「running が残った」として検知され、失敗を返すこと。
+    ///
+    /// shadow 版（`an_unfreezable_animation_inside_a_shadow_root_is_still_
+    /// detected`）と同じ理屈: 凍らせる側だけ iframe 降下を失っても running は
+    /// 残って失敗する（fail-closed）が、**数える側**だけ失うと iframe 内の
+    /// running を見逃して `ok: true` を返す fail-open になる——それを赤く
+    /// する試験が iframe 分岐には無かった。走査を `walkRoots` へ一本化した
+    /// 後は、この試験は共有走査そのものの iframe 分岐を（凍らせる側・数える側
+    /// まとめて）固定する。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfreezable_animation_inside_a_same_origin_iframe_is_still_detected() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP an_unfreezable_animation_inside_a_same_origin_iframe: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_iframe_unfreezable_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(30);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "iframe-unfreezable")
+            .await
+            .expect_err(
+                "an unfreezable animation inside a same-origin iframe must fail — \
+                 succeeding means the shared walk no longer descends into iframes",
+            );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze failed") && message.contains("still running"),
+            "the error must describe what could not be frozen, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// **わざと凍らせられない**アニメーションを frameset の `<frame>` の中に
+    /// 置くバンドル。走査の `frame` 分岐の検知側検証用（cmd_663 ⑦）。
+    /// frameset document は story の top にはなれない（body を持てず
+    /// `#storybook-root` を置けない）ため、iframe → frameset → frame の形は
+    /// [`write_frameset_webfont_bundle`] と同じ。
+    fn write_frameset_unfreezable_bundle(root: &Path) {
+        write_unfreezable_frame_html(root);
+        std::fs::write(
+            root.join("frameset.html"),
+            r#"<!doctype html>
+<html><frameset cols="100%"><frame src="unfreezable-frame.html"></frameset></html>"#,
+        )
+        .expect("write frameset.html");
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  iframe { position:fixed; inset:0; width:100%; height:100vh; border:0; }"#,
+            "",
+            r#"      var frame = document.createElement('iframe');
+      frame.src = 'frameset.html';
+      document.getElementById('storybook-root').appendChild(frame);
+      frame.addEventListener('load', function () {
+        channel.emit('storyRendered', id);
+      });"#,
+        );
+    }
+
+    /// 【cmd_663 ⑦】frameset の `<frame>` の中の凍結不能アニメーションも
+    /// 検知され、失敗を返すこと。
+    ///
+    /// 修正前の走査（freezeRoot / collectRunning が各自に持つ写し）では、
+    /// `frame` 分岐を**両側から**消しても既存のどの試験も赤くならなかった
+    /// ——frameset fixture はフォント待ち側（`fonts_inside_a_frameset_frame_
+    /// are_awaited_before_the_capture`）にしか無く、FREEZE の `frame` 分岐は
+    /// 宣言（README「`<iframe>` と `<frame>` の両方を見る」）だけで試験の
+    /// 裏づけが無かった。本試験は走査の `frame` 分岐を検知側から固定する。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfreezable_animation_inside_a_frameset_frame_is_still_detected() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP an_unfreezable_animation_inside_a_frameset_frame: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_frameset_unfreezable_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(30);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "frameset-unfreezable")
+            .await
+            .expect_err(
+                "an unfreezable animation inside a frameset frame must fail — \
+                 succeeding means the shared walk no longer descends through \
+                 `frame` elements",
+            );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("freeze failed") && message.contains("still running"),
+            "the error must describe what could not be frozen, got {message:?}"
+        );
+
+        renderer.close().await;
+    }
+
+    /// 無限スピナーを frameset の `<frame>` の中に置くバンドル。凍らせる側が
+    /// `frame` へ届くことの検証用（cmd_663 ⑦——検知側の
+    /// [`write_frameset_unfreezable_bundle`] と対）。
+    fn write_frameset_animated_bundle(root: &Path) {
+        std::fs::write(
+            root.join("spinner-frame.html"),
+            r#"<!doctype html>
+<html><head><style>
+  html,body{margin:0;padding:0;background:#fff}
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spinner {
+    width:120px;height:120px;margin:20px;
+    border:24px solid #dddddd;border-top-color:#ff0000;border-radius:50%;
+    animation: spin 1.7s linear infinite;
+  }
+</style></head>
+<body><div class="spinner"></div></body></html>"#,
+        )
+        .expect("write spinner-frame.html");
+        std::fs::write(
+            root.join("frameset.html"),
+            r#"<!doctype html>
+<html><frameset cols="100%"><frame src="spinner-frame.html"></frameset></html>"#,
+        )
+        .expect("write frameset.html");
+        write_story_html(
+            root,
+            r#"  html,body{margin:0;padding:0;background:#fff}
+  iframe { position:fixed; inset:0; width:100%; height:100vh; border:0; }"#,
+            "",
+            r#"      var frame = document.createElement('iframe');
+      frame.src = 'frameset.html';
+      document.getElementById('storybook-root').appendChild(frame);
+      frame.addEventListener('load', function () {
+        channel.emit('storyRendered', id);
+      });"#,
+        );
+    }
+
+    /// 【cmd_663 ⑦・凍らせる側】frameset の `<frame>` の中の無限アニメーション
+    /// が座標 0 で静止され、二回撮って同じ絵になること。
+    ///
+    /// 凍らせる側だけが `frame` へ届かない退行では、running が残って
+    /// 数える側が失敗させる（この試験は expect が落ちて赤）。両側まとめて
+    /// 届かない退行は上の検知側試験が赤くする——対で `frame` 分岐の
+    /// 全断面を覆う。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_animation_inside_a_frameset_frame_freezes_deterministically() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP an_animation_inside_a_frameset_frame_freezes: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_frameset_animated_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(15);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let first = renderer
+            .render_story(&server.base_url(), "frameset-spinner")
+            .await
+            .expect(
+                "first frameset spinner capture — a freeze failure means \
+                     the freezing side reaches the frame but could not settle it",
+            )
+            .png;
+        let second = renderer
+            .render_story(&server.base_url(), "frameset-spinner")
+            .await
+            .expect("second frameset spinner capture")
+            .png;
+        assert_eq!(
+            first, second,
+            "frameset spinner: two frozen captures must be byte-identical — \
+             a mismatch means the freezing side no longer reaches `frame` \
+             documents while the counting side also misses them"
         );
 
         renderer.close().await;

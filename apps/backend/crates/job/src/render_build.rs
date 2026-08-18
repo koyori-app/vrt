@@ -381,6 +381,16 @@ async fn render_all(
     let mut rendered = 0usize;
     let mut reused = 0usize;
     let mut story_failures: Vec<StoryFailure> = Vec::new();
+    // フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
+    // 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
+    // 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
+    // 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
+    // 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
+    // ループ後の集計行（件数と初出 story）に畳む——300 story の project で
+    // 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
+    // 失われない。
+    let mut font_warning_counts: std::collections::BTreeMap<String, (usize, String)> =
+        std::collections::BTreeMap::new();
     let total = bundle.stories.len();
 
     for (idx, story) in bundle.stories.iter().enumerate() {
@@ -449,13 +459,21 @@ async fn render_all(
                 // だけではサーバー運用ログ止まりで、`passed` を受け取った
                 // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
                 if let Some(warning) = &rendered_story.font_warning {
-                    service::build_logs::append(
-                        &state.db,
-                        build.id,
-                        LogLevel::Warn,
-                        font_warning_log_line(position, total, &story.id, warning),
-                    )
-                    .await?;
+                    // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
+                    // （集計はループ後。宣言と理由は font_warning_counts を参照）。
+                    let entry = font_warning_counts
+                        .entry(warning.clone())
+                        .or_insert((0usize, story.id.clone()));
+                    entry.0 += 1;
+                    if entry.0 == 1 {
+                        service::build_logs::append(
+                            &state.db,
+                            build.id,
+                            LogLevel::Warn,
+                            font_warning_log_line(position, total, &story.id, warning),
+                        )
+                        .await?;
+                    }
                 }
                 let png = rendered_story.png;
 
@@ -543,6 +561,20 @@ async fn render_all(
         }
     }
 
+    // 畳んだ同文フォント警告の集計行（初出行と対。1 story だけなら初出行が
+    // 全てを言い尽くしており、集計行は出さない）。
+    for (warning, (count, first_story)) in &font_warning_counts {
+        if *count > 1 {
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Warn,
+                font_warning_summary_line(*count, first_story, warning),
+            )
+            .await?;
+        }
+    }
+
     // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
         &state.db,
@@ -592,6 +624,23 @@ struct StoryFailure {
 /// （tests/render_flow_integration.rs）が一気通貫で固定する。
 fn font_warning_log_line(position: usize, total: usize, story_id: &str, warning: &str) -> String {
     format!("story warning {position}/{total} {story_id}: {warning}")
+}
+
+/// 同文フォント警告の集計行（`render_all` がループ後に `LogLevel::Warn` で
+/// 1 回だけ永続化する）。
+///
+/// `story failed` 行を story ごとに残すのは行ごとに「どの story が落ちたか」
+/// という異なる情報があるからだが、フォント警告は原因（`@font-face`）が
+/// project 全体に共有されて**全行が同文**になる——だから story ごとではなく
+/// ビルドにつき「初出の 1 行＋この集計行」に畳む（cmd_663 ④）。story の
+/// 識別は件数と初出 story で保つ。警告の全文は初出行が既に運んでいるので、
+/// ここでは先頭節（`;` まで＝件数と要旨）だけを引く——同文を二度書かない。
+fn font_warning_summary_line(count: usize, first_story_id: &str, warning: &str) -> String {
+    let head = warning.split(';').next().unwrap_or(warning);
+    format!(
+        "story warning: {count} stories captured with the same font warning \
+         ({head}); first reported at {first_story_id}"
+    )
 }
 
 /// storybook の title / name から生成したスクリーンショット名を検証する。
@@ -724,6 +773,32 @@ mod tests {
         assert_eq!(
             font_warning_log_line(3, 40, "demo-font--text", "2 font(s) failed to load"),
             "story warning 3/40 demo-font--text: 2 font(s) failed to load"
+        );
+    }
+
+    /// 同文フォント警告の集計行の整形の固定（cmd_663 ④）。
+    ///
+    /// 証明する: 件数・初出 story・警告の先頭節（`;` まで）が 1 行に載る——
+    /// 畳んでも「何件の story がどの警告だったか」は失われない。
+    /// 証明しない: `render_all` が同文を初出 1 行に抑止する結線——それは
+    /// 統合試験 `a_failing_font_load_leaves_a_warning_in_the_build_logs`
+    /// （tests/render_flow_integration.rs）が二 story の bundle で固定する。
+    #[test]
+    fn font_warning_summary_carries_count_and_representative() {
+        assert_eq!(
+            font_warning_summary_line(
+                12,
+                "demo-font--text",
+                "2 font(s) failed to load; captured with fallback glyphs: A, B"
+            ),
+            "story warning: 12 stories captured with the same font warning \
+             (2 font(s) failed to load); first reported at demo-font--text"
+        );
+        // `;` を含まない警告文は全文が先頭節。
+        assert_eq!(
+            font_warning_summary_line(2, "s--a", "plain warning"),
+            "story warning: 2 stories captured with the same font warning \
+             (plain warning); first reported at s--a"
         );
     }
 

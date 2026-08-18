@@ -1267,7 +1267,11 @@ async fn omitting_mode_keeps_the_screenshots_behaviour() {
 
 // ── ビルド進捗ログ ────────────────────────────────────────────────────────
 
-/// 読み込みに失敗する（404 になる）webfont を参照する 1 story の index。
+/// 読み込みに失敗する（404 になる）webfont を参照する 2 story の index。
+///
+/// 2 story にしてあるのは警告の**畳み**（cmd_663 ④）を結線で固定するため——
+/// 原因の `@font-face` は preview-head 相当で全 story に共有され、両 story が
+/// 同文の警告を出す。
 const FONT_404_INDEX_JSON: &str = r#"{
   "v": 5,
   "entries": {
@@ -1276,6 +1280,13 @@ const FONT_404_INDEX_JSON: &str = r#"{
       "id": "demo-font--text",
       "title": "Demo/Font",
       "name": "Text",
+      "importPath": "./src/Font.stories.tsx"
+    },
+    "demo-font--more": {
+      "type": "story",
+      "id": "demo-font--more",
+      "title": "Demo/Font",
+      "name": "More",
       "importPath": "./src/Font.stories.tsx"
     }
   }
@@ -1352,19 +1363,38 @@ async fn a_failing_font_load_leaves_a_warning_in_the_build_logs() {
     );
 
     let logs = fx.build_logs(build_id).await;
-    let warn = logs
+    let warns: Vec<_> = logs
         .iter()
-        .find(|l| l.level == "warn" && l.message.starts_with("story warning"))
-        .unwrap_or_else(|| panic!("a `story warning` warn line must be persisted, got: {logs:?}"));
+        .filter(|l| l.level == "warn" && l.message.starts_with("story warning"))
+        .collect();
+    // 畳み（cmd_663 ④）: 2 story が同文の警告を出すが、永続化されるのは
+    // 「初出の 1 行＋件数と初出 story を運ぶ集計の 1 行」の計 2 行——story
+    // ごとに 1 行ずつ（=2 行の同文）へ戻す退行はこの assert が落とす。
+    assert_eq!(
+        warns.len(),
+        2,
+        "exactly one first-occurrence line and one summary line must be \
+         persisted for two stories sharing the same font warning, got: {warns:?}"
+    );
+    // story の反復順は index の格納順に依存するので、「どちらかの story を
+    // 名指ししている」ことを見る（初出行と集計行の代表は同じ story になる）。
+    let first = &warns[0];
     assert!(
-        warn.message.contains("demo-font--text"),
-        "the warn line must name the story, got: {}",
-        warn.message
+        first.message.contains("demo-font--"),
+        "the first-occurrence line must name a story, got: {}",
+        first.message
     );
     assert!(
-        warn.message.contains("font(s) failed to load") && warn.message.contains("VrtTestFont"),
+        first.message.contains("font(s) failed to load") && first.message.contains("VrtTestFont"),
         "the warn line must carry the font warning with the failing family, got: {}",
-        warn.message
+        first.message
+    );
+    let summary = &warns[1];
+    assert!(
+        summary.message.contains("2 stories") && summary.message.contains("demo-font--"),
+        "the summary line must carry the story count and the representative \
+         story so no identity is lost by the collapse, got: {}",
+        summary.message
     );
 }
 
