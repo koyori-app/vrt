@@ -562,7 +562,7 @@ struct RenderTallies {
     /// 並列処理の完了順にかかわらず位置を保持し、最後に index 順へ戻して
     /// error_message を決定的にする。
     story_failures: Vec<(usize, StoryFailure)>,
-    /// フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
+    /// フォント警告の畳み込み: 警告文 → (件数, 初出 story)。
     /// 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
     /// 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
     /// 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
@@ -600,7 +600,7 @@ async fn persist_story_result(
             // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
             // ここで build log に永続化して利用者へ届ける——`tracing::warn`
             // だけではサーバー運用ログ止まりで、`passed` を受け取った
-            // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+            // 利用者は代替字形で撮られたことを知りようがない（C）。
             if let Some(warning) = &font_warning {
                 // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
                 // （集計はループ後。宣言と理由は font_warning_counts を参照）。
@@ -960,11 +960,15 @@ fn font_warning_log_line(position: usize, total: usize, story_id: &str, warning:
 /// `story failed` 行を story ごとに残すのは行ごとに「どの story が落ちたか」
 /// という異なる情報があるからだが、フォント警告は原因（`@font-face`）が
 /// project 全体に共有されて**全行が同文**になる——だから story ごとではなく
-/// ビルドにつき「初出の 1 行＋この集計行」に畳む（cmd_663 ④）。story の
-/// 識別は件数と初出 story で保つ。警告の全文は初出行が既に運んでいるので、
-/// ここでは先頭節（`;` まで＝件数と要旨）だけを引く——同文を二度書かない。
+/// ビルドにつき「初出の 1 行＋この集計行」に畳む。**この畳みで
+/// 2 件目以降の story ID は build log から失われる**（意図した割り切り。
+/// ——残るのは件数・初出 story・この行の要旨のみで、README にも
+/// 明記してある）。警告の対処説明の全文は初出行が既に運んでいるので、ここでは
+/// 先頭節（` — ` の前＝件数・要旨・family 一覧）だけを引く——family 名まで
+/// 載せるのは、集計行単独でも「どのフォントの話か」が分かるようにするため
+/// （`;` で切ると件数しか残らず、初出行まで遡らないと family が分からない）。
 fn font_warning_summary_line(count: usize, first_story_id: &str, warning: &str) -> String {
-    let head = warning.split(';').next().unwrap_or(warning);
+    let head = warning.split(" — ").next().unwrap_or(warning);
     format!(
         "story warning: {count} stories captured with the same font warning \
          ({head}); first reported at {first_story_id}"
@@ -1086,7 +1090,7 @@ mod tests {
         assert!(on.wait_for_fonts);
     }
 
-    /// フォント警告の build log 行の整形の固定（cmd_660 C）。
+    /// フォント警告の build log 行の整形の固定（C）。
     ///
     /// 証明する: `render_story` が返した警告が、`story failed` 行と同じ並びの
     /// 「story warning {n}/{total} {id}: ...」で build log の 1 行になる。
@@ -1104,10 +1108,13 @@ mod tests {
         );
     }
 
-    /// 同文フォント警告の集計行の整形の固定（cmd_663 ④）。
+    /// 同文フォント警告の集計行の整形の固定。
     ///
-    /// 証明する: 件数・初出 story・警告の先頭節（`;` まで）が 1 行に載る——
-    /// 畳んでも「何件の story がどの警告だったか」は失われない。
+    /// 証明する: 件数・初出 story・警告の先頭節（` — ` の前＝件数・要旨・
+    /// family 一覧）が 1 行に載る——集計行単独で「何件・どのフォント・初出は
+    /// どこ」が分かる。**畳みで 2 件目以降の story ID は失われる**（この行が
+    /// 運ぶ story は初出のみ。意図した割り切りで、対応する統合試験の assert も
+    /// 同じ前提を言明する）。
     /// 証明しない: `render_all` が同文を初出 1 行に抑止する結線——それは
     /// 統合試験 `a_failing_font_load_leaves_a_warning_in_the_build_logs`
     /// （tests/render_flow_integration.rs）が二 story の bundle で固定する。
@@ -1117,12 +1124,16 @@ mod tests {
             font_warning_summary_line(
                 12,
                 "demo-font--text",
-                "2 font(s) failed to load; captured with fallback glyphs: A, B"
+                "2 font(s) failed to load; captured with fallback glyphs: A, B — \
+                 if the failing font is an external dependency the pictures may vary"
             ),
             "story warning: 12 stories captured with the same font warning \
-             (2 font(s) failed to load); first reported at demo-font--text"
+             (2 font(s) failed to load; captured with fallback glyphs: A, B); \
+             first reported at demo-font--text",
+            "the head must keep the family list so the summary line alone says \
+             which fonts failed"
         );
-        // `;` を含まない警告文は全文が先頭節。
+        // ` — ` を含まない警告文は全文が先頭節。
         assert_eq!(
             font_warning_summary_line(2, "s--a", "plain warning"),
             "story warning: 2 stories captured with the same font warning \
