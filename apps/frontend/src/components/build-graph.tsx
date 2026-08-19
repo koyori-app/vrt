@@ -36,8 +36,14 @@ export type GraphRow<T> = { build: T; cells: Cells };
  * branch rather than by column — two unrelated branches sharing a column stay
  * visually distinct.
  *
- * `truncated` says the list was cut off by a fetch limit rather than exhausted, so
- * lanes still open at the last row continue off the bottom instead of terminating.
+ * `truncated` says the list was cut off by a fetch limit rather than exhausted. Only
+ * an exhausted list proves a branch ended: past the cut, any branch on the page may
+ * still have older builds. So a truncated page holds every lane open to the bottom
+ * and never recycles a column — a branch whose visible builds stopped early is drawn
+ * as continuing, not as terminated.
+ *
+ * ponytail: total count is all we have to go on. Return `has_older_builds` per branch
+ * from the list endpoint to close the lanes that really did end.
  */
 export function buildGraph<T extends { branch: string }>(
   builds: T[],
@@ -71,7 +77,6 @@ export function buildGraph<T extends { branch: string }>(
     open(defaultBranch);
   }
 
-  const bottomRow = builds.length - 1;
   let width = 0;
   const rows = builds.map((build, i) => {
     if (!active.includes(build.branch)) open(build.branch);
@@ -82,14 +87,16 @@ export function buildGraph<T extends { branch: string }>(
       return {
         color: colorOf(branch),
         top: i > first.get(branch)!,
-        bottom: i < last.get(branch)! || (truncated && i === bottomRow),
+        bottom: truncated || i < last.get(branch)!,
         dot: branch === build.branch,
       };
     });
     width = Math.max(width, active.length);
-    active.forEach((branch, lane) => {
-      if (branch !== null && last.get(branch) === i) active[lane] = null;
-    });
+    if (!truncated) {
+      active.forEach((branch, lane) => {
+        if (branch !== null && last.get(branch) === i) active[lane] = null;
+      });
+    }
     return { build, cells };
   });
 

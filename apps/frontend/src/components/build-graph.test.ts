@@ -33,6 +33,17 @@ describe("buildGraph", () => {
     expect(exhausted.rows[1]!.cells[0]!.bottom).toBe(false);
   });
 
+  it("holds a lane open past its last visible build when the page was truncated", () => {
+    // feature's only visible build is row 0, but the cut means older ones may exist
+    // below the page — its lane must not terminate, nor free its column for reuse.
+    const { rows, width } = buildGraph([b("feature"), b("main"), b("main")], "main", true);
+
+    expect(width).toBe(28);
+    expect(rows.map((row) => row.cells[1]!.bottom)).toEqual([true, true, true]);
+    expect(rows[2]!.cells[1]!.dot).toBe(false);
+    expect(rows[2]!.cells[1]!.color).toBe(rows[0]!.cells[1]!.color);
+  });
+
   it("holds the trunk's lane open above the default branch's newest build", () => {
     const { rows, width } = buildGraph([b("topic"), b("main")], "main");
 
