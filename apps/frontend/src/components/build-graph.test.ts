@@ -53,6 +53,42 @@ describe("buildGraph", () => {
     expect(rows[1]!.cells[0]!.dot).toBe(true);
   });
 
+  it("caps the lanes at the palette size and dots overflow branches on the last column", () => {
+    // 9 branches on a truncated page: no lane ever frees, so branches 7-9 overflow.
+    const builds = Array.from({ length: 9 }, (_, i) => b(`branch-${i}`));
+    const { rows, width } = buildGraph(builds, undefined, true);
+
+    expect(width).toBe(84);
+    // Cells grow with the opened lanes but never past the cap.
+    for (const row of rows) expect(row.cells.length).toBeLessThanOrEqual(6);
+    expect(rows[8]!.cells).toHaveLength(6);
+    // An overflow branch's row borrows the rightmost column: the lane owner's line
+    // continues through it, with the overflow branch's own dot color on top.
+    // branch-7 is the 8th branch colored, so the cycle hands it lane color 2.
+    const overflow = rows[7]!.cells[5]!;
+    expect(overflow.dot).toBe(true);
+    expect(overflow.color).toBe("var(--lane-6)");
+    expect(overflow.dotColor).toBe("var(--lane-2)");
+    expect(overflow.top).toBe(true);
+    expect(overflow.bottom).toBe(true);
+    // A laned branch's row is unaffected.
+    expect(rows[3]!.cells[3]!.dot).toBe(true);
+    expect(rows[3]!.cells[3]!.dotColor).toBeUndefined();
+  });
+
+  it("starts a late-acquired lane at the acquiring row instead of reaching up", () => {
+    // 7 branches × 2 builds: branch-6 is laneless at row 6 (all 6 lanes busy), then
+    // takes the column branch-0 frees. Its line must start where it got the lane —
+    // no upward segment pointing at rows where the column was someone else's.
+    const branches = Array.from({ length: 7 }, (_, n) => b(`branch-${n}`));
+    const { rows } = buildGraph([...branches, ...branches]);
+
+    expect(rows[6]!.cells[5]!.dotColor).toBeDefined();
+    expect(rows[13]!.cells[0]!.dot).toBe(true);
+    expect(rows[13]!.cells[0]!.dotColor).toBeUndefined();
+    expect(rows[13]!.cells[0]!.top).toBe(false);
+  });
+
   it("draws nothing for an empty list", () => {
     expect(buildGraph([], "main")).toEqual({ rows: [], width: 0 });
   });

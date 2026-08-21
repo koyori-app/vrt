@@ -167,7 +167,9 @@ function BuildsTable({
           <TableHeader>
             <TableRow>
               {/* The graph column is decorative and sized by its body cells. */}
-              <TableHead className="p-0" />
+              <TableHead className="p-0">
+                <span className="sr-only">Branch graph</span>
+              </TableHead>
               <TableHead className="w-20">Build</TableHead>
               <TableHead>Branch</TableHead>
               <TableHead className="w-28">Commit</TableHead>
