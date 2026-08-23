@@ -1,9 +1,10 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
+import { buildGraph, BuildGraph } from "@/components/build-graph";
 import { CommitLink } from "@/components/commit-link";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -105,6 +106,7 @@ function ProjectPage() {
           <BuildsTable
             projectId={project.id}
             githubRepo={project.github_repo}
+            defaultBranch={project.default_branch}
             tenantSlug={tenantSlug}
             projectSlug={project.slug}
           />
@@ -131,19 +133,32 @@ function ProjectPage() {
   );
 }
 
+/** Matches the limit passed to useBuilds for the builds table. */
+const BUILD_LIMIT = 50;
+
 function BuildsTable({
   projectId,
   githubRepo,
+  defaultBranch,
   tenantSlug,
   projectSlug,
 }: {
   projectId: string;
   githubRepo: string | null | undefined;
+  defaultBranch: string;
   tenantSlug: string;
   projectSlug: string;
 }) {
-  const builds = useBuilds(projectId);
+  const builds = useBuilds(projectId, BUILD_LIMIT);
   const navigate = useNavigate();
+  const rows = builds.data?.builds;
+  const total = builds.data?.total;
+  // The response includes the authoritative total, so a page with exactly BUILD_LIMIT
+  // builds is not mistaken for a truncated result when there are no older builds.
+  const graph = useMemo(
+    () => buildGraph(rows ?? [], defaultBranch, total !== undefined && (rows?.length ?? 0) < total),
+    [rows, defaultBranch, total],
+  );
 
   return (
     <Card>
@@ -151,6 +166,10 @@ function BuildsTable({
         <Table>
           <TableHeader>
             <TableRow>
+              {/* The graph column is decorative and sized by its body cells. */}
+              <TableHead className="p-0">
+                <span className="sr-only">Branch graph</span>
+              </TableHead>
               <TableHead className="w-20">Build</TableHead>
               <TableHead>Branch</TableHead>
               <TableHead className="w-28">Commit</TableHead>
@@ -163,7 +182,7 @@ function BuildsTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {builds.data?.builds.map((build) => {
+            {graph.rows.map(({ build, cells }) => {
               const to = "/t/$tenantSlug/p/$projectSlug/builds/$number" as const;
               const params = { tenantSlug, projectSlug, number: String(build.number) };
               return (
@@ -176,6 +195,12 @@ function BuildsTable({
                     void navigate({ to, params });
                   }}
                 >
+                  <TableCell className="relative p-0">
+                    {/* The SVG is absolutely positioned, so this spacer is what
+                        actually reserves the column's width. */}
+                    <div style={{ width: graph.width }} />
+                    <BuildGraph cells={cells} />
+                  </TableCell>
                   <TableCell>
                     {/* The real, keyboard-focusable navigation. The row onClick above is
                         a mouse-only enhancement that points at the same destination. */}
@@ -216,7 +241,7 @@ function BuildsTable({
             })}
             {!builds.data?.builds.length ? (
               <TableRow>
-                <TableCell colSpan={7} className="text-sm text-muted-foreground">
+                <TableCell colSpan={8} className="text-sm text-muted-foreground">
                   {builds.isLoading ? "Loading…" : "No builds yet. Upload screenshots from CI."}
                 </TableCell>
               </TableRow>
