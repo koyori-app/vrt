@@ -793,6 +793,95 @@ pub async fn mark_failed<C: ConnectionTrait>(
     Ok(active.update(db).await?)
 }
 
+/// 失敗ビルドの再実行でパイプラインのどこからやり直すか。
+///
+/// ジョブ投入はハンドラ側の責務（finalize と同じ分担）なので、遷移だけ行い
+/// 「どのジョブを投入すべきか」をこの型で返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTarget {
+    /// storybook モード: バンドルの再レンダリングから（`RenderBuildJob`）。
+    Render,
+    /// screenshots モード: アップロード済みスクリーンショットの比較から
+    /// （`CompareBuildJob`）。
+    Compare,
+}
+
+/// 失敗（`failed`）ビルドをパイプラインの先頭へ戻す。ジョブ投入は
+/// 呼び出し側（ハンドラ）が戻り値の [`RetryTarget`] に従って行う。
+///
+/// - storybook モード → `rendering`（バンドルから全ストーリーを撮り直す。
+///   部分撮影計画（capture plan）付きのビルドでも再実行は全撮影——計画の
+///   story ID はビルドに保存されておらず復元できないため。計画が固定した
+///   baseline と manifest は残るので、比較の正しさ（removed 判定・比較先）は
+///   保たれる。流用のはずだった story も撮り直すだけで、決定的レンダリングの
+///   前提では同じ絵になる）
+/// - screenshots モード → `processing`（PNG はアップロード済み。比較だけやり直す）
+///
+/// 前回の結果はクリアする: `error_message` / `completed_at` / 差分カウント。
+/// comparisons / screenshots の途中結果は各ジョブが開始時に自分で捨てる
+/// （リトライ安全性の既存設計）ので、ここでは触らない。
+///
+/// `failed` 以外は 409（再実行の入口は failed だけ——進行中の二重投入も、
+/// レビュー済み結果の破壊もこの一点で防ぐ）。storybook モードでバンドルが
+/// 未アップロード（`storybook_key` 無し）の failed ビルドも 409。
+///
+/// 検査と遷移は build 行ロック（[`crate::review_lock::build`]）を取った
+/// 1 トランザクション内で行う（finalize / plan 添付と同じ流儀）。呼び出し側の
+/// スナップショットで検査すると retry の併走が両方 200 になり、同じビルドへ
+/// ジョブが二重投入される——2 本目はロック下の再読込で `rendering` /
+/// `processing` を見て 409 に倒れる。
+pub async fn retry_failed(
+    db: &DatabaseConnection,
+    build_id: Uuid,
+) -> Result<(builds::Model, RetryTarget), AppError> {
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // ロック順 1（build のみ）。状態はこの取り直した行を正とする。
+            let build = crate::review_lock::build(txn, build_id).await?;
+            if build.status != BuildStatus::Failed {
+                return Err(AppError::ConflictDetail(format!(
+                    "only failed builds can be retried (build is {})",
+                    serde_json::to_value(build.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{:?}", build.status))
+                )));
+            }
+            let (to, target) = match build.mode {
+                BuildMode::Storybook => {
+                    if build.storybook_key.is_none() {
+                        return Err(AppError::ConflictDetail(
+                            "this build has no storybook bundle to re-render \
+                             (it failed before the bundle was uploaded)"
+                                .into(),
+                        ));
+                    }
+                    (BuildStatus::Rendering, RetryTarget::Render)
+                }
+                BuildMode::Screenshots => (BuildStatus::Processing, RetryTarget::Compare),
+            };
+            // 遷移表（`can_transition_to`）にもこの向きが載っていることを、
+            // 一本化の規約どおり release でも検査する。
+            if !build.status.can_transition_to(to) {
+                return Err(AppError::Conflict);
+            }
+
+            let mut active: builds::ActiveModel = build.into();
+            active.status = Set(to);
+            active.error_message = Set(None);
+            active.completed_at = Set(None);
+            active.total_count = Set(0);
+            active.changed_count = Set(0);
+            active.added_count = Set(0);
+            active.removed_count = Set(0);
+            active.unchanged_count = Set(0);
+            active.content_hash_skipped_count = Set(0);
+            Ok((active.update(txn).await?, target))
+        })
+    })
+    .await
+}
+
 /// レビュー待ち（`review_status = pending` かつ人手判断が要る）の比較件数。
 pub async fn pending_review_count<C: ConnectionTrait>(
     db: &C,

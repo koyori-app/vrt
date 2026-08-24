@@ -248,6 +248,7 @@ struct Fixture {
     tenant_slug: String,
     project_slug: String,
     project_id: Uuid,
+    tenant_id: Uuid,
     token: String,
 }
 
@@ -314,6 +315,7 @@ async fn setup() -> Fixture {
         tenant_slug,
         project_slug,
         project_id,
+        tenant_id: tenant_id.parse().expect("tenant uuid"),
         token,
     }
 }
@@ -1572,4 +1574,226 @@ async fn ci_build_logs_endpoint_is_tenant_scoped() {
         .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &owner.token)
         .await;
     assert_eq!(res.status(), StatusCode::OK, "owner can read its own logs");
+}
+
+// ── 失敗ビルドの再実行 ──────────────────────────────────────────────────
+
+/// 失敗した storybook ビルドは、原因（ここでは壊れたバンドル）を直したうえで
+/// 再実行すると**同じビルドのまま**完走する。前回の失敗の痕跡
+/// （error_message / completed_at）はクリアされ、進捗ログには前回の失敗ログの
+/// 後に再実行の区切り行が挟まる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_storybook_build_can_be_retried_and_completes() {
+    use sea_orm::EntityTrait;
+
+    if !chromium_or_skip("a_failed_storybook_build_can_be_retried_and_completes") {
+        return;
+    }
+    let fx = setup().await;
+
+    let build = fx.create_storybook_build("sbretry1").await;
+    let build_id = build_id_of(&build);
+
+    // index.json の無い zip でレンダリングを失敗させる。
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("iframe.html", options).expect("start");
+        writer.write_all(b"<html></html>").expect("write");
+        writer.finish().expect("finish");
+    }
+    assert_eq!(
+        fx.upload_bundle(build_id, buf.into_inner()).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(failed["status"].as_str(), Some("failed"));
+
+    // 原因を直す: 同じストレージキーへ正しいバンドルを置き直す。
+    // （バンドルの API は finalize 済みビルドへの再アップロードを許さないため、
+    //   「壊れた成果物を差し替えて再実行」の最小の代替としてストレージを直接書く。）
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let key = model.storybook_key.expect("storybook key");
+    service::render::upload_bundle(
+        &fx.app.state.storage,
+        &key,
+        bytes::Bytes::from(bundle_zip("#c00")),
+    )
+    .await
+    .expect("replace bundle");
+
+    // 再実行（セッション = テナント owner）。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "retry failed build");
+    let retried: Value = res.json().await.expect("retry json");
+    assert_eq!(retried["status"].as_str(), Some("rendering"));
+    assert!(
+        retried["error_message"].is_null(),
+        "error_message is cleared on retry, got {:?}",
+        retried["error_message"]
+    );
+    assert!(
+        retried["completed_at"].is_null(),
+        "completed_at is cleared on retry (the pipeline is running again)"
+    );
+
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        done["status"].as_str(),
+        Some("changes_detected"),
+        "retried build completes (error: {:?})",
+        done["error_message"]
+    );
+    assert_eq!(done["total_count"].as_i64(), Some(3), "docs entry skipped");
+    assert_eq!(done["added_count"].as_i64(), Some(3));
+
+    // サーバーが撮り直したスクリーンショットが揃っている。
+    let shots = fx.screenshots(build_id).await;
+    let names: Vec<&str> = shots.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Demo/Box/Blue", "Demo/Box/Empty", "Demo/Box/Red"]
+    );
+
+    // 進捗ログ: 前回の失敗ログ → 再実行の区切り → 新しい実行のログ、の順。
+    let logs = fx.build_logs(build_id).await;
+    let marker = logs
+        .iter()
+        .position(|l| l.message.contains("build retry requested"))
+        .expect("retry marker in build logs");
+    assert!(
+        logs[..marker]
+            .iter()
+            .any(|l| l.message.contains("render failed")),
+        "the old failure log stays before the retry marker"
+    );
+    assert!(
+        logs[marker..]
+            .iter()
+            .any(|l| l.message.contains("render started")),
+        "the new run logs after the retry marker"
+    );
+
+    // 完走した（failed でない）ビルドはもう再実行できない。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "only failed builds can be retried"
+    );
+}
+
+/// 進行中（pending）のビルドは再実行できない——二重投入の入口を塞ぐ。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_pending_build_is_rejected() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry2").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+/// 再実行の認可: 非メンバーは 403（存在も漏らさない）、member ロールも
+/// 403（admin 以上が必要——approve / reject と同じ境界）。
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_requires_an_admin_of_the_owning_tenant() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry3").await;
+    let build_id = build_id_of(&build);
+
+    // DB で直接 failed にする（レンダリングまで走らせない。retry の認可は
+    // ビルドの中身と無関係で、状態だけ揃えば検査できる）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    // 非メンバー: 403。
+    let outsider = TestApp::new().await;
+    let outsider_user = outsider.login_as_new_user().await;
+    let res = outsider
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "outsider must not retry another tenant's build"
+    );
+
+    // member ロール: 招き入れても admin 未満なので 403 のまま。
+    entity::tenant_members::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(fx.tenant_id),
+        user_id: Set(outsider_user.id),
+        role: Set(entity::tenant_members::TenantRole::Member),
+        created_at: Set(chrono::Utc::now().fixed_offset()),
+    }
+    .insert(&fx.app.state.db)
+    .await
+    .expect("insert membership");
+    let res = outsider
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "member role is below the admin requirement for retry"
+    );
+}
+
+/// バンドルをアップロードする前に失敗した storybook ビルドは、撮り直す素材が
+/// 無いので再実行できない（409）。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_failed_build_without_a_bundle_is_rejected() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry4").await;
+    let build_id = build_id_of(&build);
+
+    // アップロード前の失敗を DB 直接更新で再現する（例: サーバー側の掃除や
+    // 手動オペレーションで failed に落ちた形。storybook_key は無いまま）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    assert!(model.storybook_key.is_none(), "no bundle uploaded yet");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value = res.json().await.expect("error json");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("bundle"),
+        "the 409 should say the bundle is missing, got {message:?}"
+    );
 }

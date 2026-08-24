@@ -1138,6 +1138,130 @@
         }
       }
     },
+    "/v1/builds/{build_id}/retry": {
+      "post": {
+        "tags": [
+          "Builds"
+        ],
+        "summary": "失敗したビルドを再実行",
+        "description": "admin 以上が必要。`failed` のビルドだけを再実行できる。storybook モードはアップロード済みバンドルの再レンダリングから、screenshots モードはアップロード済みスクリーンショットの比較から やり直す。`failed` 以外、またはバンドル未アップロードの failed は 409。",
+        "operationId": "retry_build",
+        "parameters": [
+          {
+            "name": "build_id",
+            "in": "path",
+            "description": "ビルドID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "再実行を開始したビルド",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "再実行できない状態です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/builds/{build_id}/storybook/": {
       "get": {
         "tags": [
@@ -6309,7 +6433,7 @@
       },
       "BuildStatus": {
         "type": "string",
-        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                         └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n```",
+        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                         └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n\n再実行（failed のみ）:\nfailed ──retry──▶ rendering（storybook モード） | processing（screenshots モード）\n```",
         "enum": [
           "pending",
           "rendering",

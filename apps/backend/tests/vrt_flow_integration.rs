@@ -1036,3 +1036,61 @@ async fn build_can_be_fetched_by_project_scoped_number() {
         StatusCode::FORBIDDEN
     );
 }
+
+/// 失敗した screenshots モードのビルドの再実行は、アップロード済み PNG の
+/// **比較から**やり直して完走する（storybook モードと違いレンダリングは無い）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+
+    let build = fx.create_build("main", "retrycmp1").await;
+    let build_id: Uuid = build["id"].as_str().expect("build id").parse().unwrap();
+    assert_eq!(
+        fx.upload(build_id, "home", png(64, 64, [200, 30, 30, 255]))
+            .await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(done["status"].as_str(), Some("changes_detected"));
+
+    // 比較ジョブが一時障害で落ちた状況を DB 直接更新で再現する
+    // （compare の失敗を API 経由で決定的に起こす口は無い）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.error_message = Set(Some("simulated compare failure".into()));
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    // 再実行 → processing（比較から）に戻り、そのまま完走する。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "retry failed build");
+    let retried: Value = res.json().await.expect("retry json");
+    assert_eq!(
+        retried["status"].as_str(),
+        Some("processing"),
+        "screenshots-mode retry restarts at the compare step"
+    );
+    assert!(retried["error_message"].is_null());
+
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        done["status"].as_str(),
+        Some("changes_detected"),
+        "retried build completes (error: {:?})",
+        done["error_message"]
+    );
+    // 比較は作り直されて重複しない（compare ジョブが開始時に前回分を捨てる）。
+    let comparisons = fx.comparisons(build_id).await;
+    assert_eq!(comparisons.len(), 1);
+    assert_eq!(comparisons[0]["status"].as_str(), Some("added"));
+}

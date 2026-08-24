@@ -366,3 +366,75 @@ pub async fn reject_build(
 
     Ok(Json(rejected.into()))
 }
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
+    path = "/{build_id}/retry",
+    tag = "Builds",
+    summary = "失敗したビルドを再実行",
+    description = "admin 以上が必要。`failed` のビルドだけを再実行できる。\
+                   storybook モードはアップロード済みバンドルの再レンダリングから、\
+                   screenshots モードはアップロード済みスクリーンショットの比較から \
+                   やり直す。`failed` 以外、またはバンドル未アップロードの failed は 409。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    responses(
+        (status = 200, description = "再実行を開始したビルド", body = BuildResponse),
+        (status = 409, description = "再実行できない状態です", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn retry_build(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_session()?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Admin).await?;
+
+    // 検査は retry_failed が行ロック下で取り直した行に対して行う——ここで
+    // 読んだ build は認可（テナント境界）の解決にだけ使う。
+    let (build, target) = build_service::retry_failed(&state.db, build.id).await?;
+
+    // 進捗ログに区切りを残す——前回の失敗ログの直後から新しい実行のログが
+    // 続くので、どこからが再実行か読み手に分かるようにする。
+    log_service::append(
+        &state.db,
+        build.id,
+        log_service::LogLevel::Info,
+        "build retry requested; previous results were discarded",
+    )
+    .await?;
+
+    // ジョブ投入は遷移が成功したあとのここで行う（finalize と同じ分担。
+    // job を handler に依存させない）。各ジョブは開始時に前回の途中結果を
+    // 自分で捨てるので、ここでの掃除は不要。
+    match target {
+        build_service::RetryTarget::Render => {
+            job::render_build::enqueue(
+                &state.render_build_storage,
+                job::RenderBuildJob {
+                    build_id: build.id,
+                    only_story_ids: None,
+                },
+            )
+            .await
+            .map_err(AppError::Internal)?;
+        }
+        build_service::RetryTarget::Compare => {
+            job::compare_build::enqueue(
+                &state.compare_build_storage,
+                job::CompareBuildJob { build_id: build.id },
+            )
+            .await
+            .map_err(AppError::Internal)?;
+        }
+    }
+
+    // rendering / processing を GitHub の pending ステータスとして見せる
+    // （finalize と同じ）。連携が無ければジョブ側が何もせず終わる。
+    job::github_status::enqueue_best_effort(&state.github_status_storage, build.id).await;
+
+    Ok(Json(build.into()))
+}

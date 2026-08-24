@@ -167,6 +167,9 @@ GET /v1/auth/{provider}/callback
               │ 明示承認          ├── approve ──▶ approved (終端)
               └───────────────────┤
                                   └── reject  ──▶ rejected (終端)
+
+   failed ── retry ──▶ rendering（storybook モード）
+                     | processing（screenshots モード）
 ```
 
 - `pending` … ビルド行を作った直後。スクリーンショット（`screenshots` モード）
@@ -177,7 +180,12 @@ GET /v1/auth/{provider}/callback
 - `processing` … `compare_build` ジョブが走っている。
 - `passed` … 差分ゼロ。レビュー不要。ただし baseline 昇格のために明示承認はできる。
 - `changes_detected` … 差分あり。人間のレビュー待ち。
-- `failed` … 比較そのものが失敗（画像が壊れている等）。
+- `failed` … 比較そのものが失敗（画像が壊れている等）。終端だが唯一の例外として
+  再実行できる（`POST /v1/builds/{build_id}/retry`、admin 以上）。storybook
+  モードはアップロード済みバンドルの再レンダリング（`rendering`）から、
+  `screenshots` モードは比較（`processing`）からやり直す。`error_message` /
+  `completed_at` / 差分カウントはクリアされ、途中結果（screenshots /
+  comparisons）は各ジョブが開始時に捨てる。
 - `approved` … 承認済み。**このビルドの全スクリーンショットが
   `(project, branch)` の新しい baseline になる。**
 - `rejected` … 却下。baseline は更新されず、未レビューの比較は `rejected` になる。

@@ -40,7 +40,9 @@ function BuildReviewPage() {
       enabled: !!project?.id && Number.isFinite(Number(number)),
       refetchInterval: (query) => {
         const status = query.state.data?.status;
-        return status === "processing" || status === "pending" ? PROCESSING_POLL_MS : false;
+        return status === "processing" || status === "pending" || status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false;
       },
     },
   );
@@ -84,9 +86,21 @@ function BuildReview({
   const [filter, setFilter] = useComparisonFilter();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
 
-  const buildQuery = $api.useQuery("get", "/v1/builds/{build_id}", {
-    params: { path: { build_id: buildId } },
-  });
+  const buildQuery = $api.useQuery(
+    "get",
+    "/v1/builds/{build_id}",
+    { params: { path: { build_id: buildId } } },
+    {
+      // Keep the badge and error banner live while jobs run — including the
+      // rendering phase a storybook-mode retry restarts from this same screen.
+      refetchInterval: (query) => {
+        const status = query.state.data?.status;
+        return status === "processing" || status === "pending" || status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false;
+      },
+    },
+  );
   const build = buildQuery.data ?? initialBuild;
 
   const comparisonsQuery = $api.useQuery(
@@ -95,7 +109,9 @@ function BuildReview({
     { params: { path: { build_id: buildId } } },
     {
       refetchInterval:
-        build.status === "processing" || build.status === "pending" ? PROCESSING_POLL_MS : false,
+        build.status === "processing" || build.status === "pending" || build.status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false,
     },
   );
 
@@ -145,6 +161,14 @@ function BuildReview({
       toast.success("Build rejected");
     },
     onError: (error) => toast.error(errorMessage(error, "Could not reject build")),
+  });
+
+  const retryBuild = $api.useMutation("post", "/v1/builds/{build_id}/retry", {
+    onSuccess: async () => {
+      await invalidateBuild();
+      toast.success("Build retry started");
+    },
+    onError: (error) => toast.error(errorMessage(error, "Could not retry build")),
   });
 
   const review = useCallback(
@@ -297,6 +321,15 @@ function BuildReview({
             >
               Open Storybook
             </a>
+          </Button>
+        ) : null}
+        {build.status === "failed" ? (
+          <Button
+            variant="outline"
+            disabled={retryBuild.isPending}
+            onClick={() => retryBuild.mutate({ params: { path: { build_id: buildId } } })}
+          >
+            Retry build
           </Button>
         ) : null}
         <Button variant="success" disabled={approveBuild.isPending} onClick={onApproveBuild}>

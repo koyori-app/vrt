@@ -943,6 +943,10 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 - finalize 後は `pending → rendering → processing → …` と進む。
   `rendering` 中に 1 ストーリーでも撮れなければビルドは `failed` になり、
   `error_message` にどのストーリーで落ちたかが入る
+- `failed` のビルドは UI の **Retry build**（`POST /v1/builds/{build_id}/retry`、
+  admin 以上）で再実行できる。storybook モードはアップロード済みバンドルの
+  再レンダリングから、screenshots モードは比較からやり直す（環境起因の失敗——
+  一時的なレンダリング不調など——を CI の再プッシュ無しで拾い直す口）
 - 撮影サイズはプロジェクト設定の **Storybook viewport**（既定 1280x720）。
   UI の **Settings** タブか `PATCH /v1/projects/{id}` の
   `viewport_width` / `viewport_height` で変えられる

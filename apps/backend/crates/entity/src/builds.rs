@@ -45,6 +45,9 @@ pub enum BuildMode {
 ///                          └──────────────────────▶ failed
 ///
 /// どちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved
+///
+/// 再実行（failed のみ）:
+/// failed ──retry──▶ rendering（storybook モード） | processing（screenshots モード）
 /// ```
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, ToSchema,
@@ -79,10 +82,12 @@ pub enum BuildStatus {
 }
 
 impl BuildStatus {
-    /// 終端状態（これ以上遷移しない）か。
+    /// 終端状態（これ以上先へ進まない）か。
     ///
     /// `changes_detected` は**含まない**。パイプラインとしては終わっているが、
     /// レビューで `approved` / `rejected` に動くため。
+    /// `failed` は含む——終端だが、唯一の例外として**再実行**
+    /// （`service::builds::retry_failed`）でパイプラインの先頭へ戻れる。
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -99,7 +104,9 @@ impl BuildStatus {
     ///
     /// `completed_at` は「**自動処理が終わった時刻**」であって「レビューが終わった時刻」ではない。
     /// レンダリングと比較が終わって結果が確定した瞬間（`passed` / `changes_detected` / `failed`）に
-    /// 一度だけ打ち、以降は上書きしない。
+    /// 一度だけ打ち、以降は上書きしない。例外は失敗ビルドの再実行
+    /// （`service::builds::retry_failed`）で、パイプラインをやり直すので
+    /// `completed_at` をクリアし、再完了時に打ち直す。
     ///
     /// こう決めた理由:
     ///
@@ -131,6 +138,10 @@ impl BuildStatus {
             (ChangesDetected, Approved | Rejected) => true,
             // 差分ゼロで通ったビルドも、baseline 昇格のために明示承認できる。
             (Passed, Approved) => true,
+            // 失敗したビルドの再実行。どちらへ戻るかはモードで決まる
+            // （`service::builds::retry_failed` が振り分ける）。approved /
+            // rejected / passed からは戻れない——やり直しの入口は failed だけ。
+            (Failed, Rendering | Processing) => true,
             _ => false,
         }
     }
@@ -152,9 +163,26 @@ mod tests {
         assert!(!Rendering.can_transition_to(ChangesDetected));
         assert!(!Rendering.can_transition_to(Approved));
         assert!(!Rendering.is_terminal());
-        // rendering に戻る経路は無い。
+        // 進行中から rendering に戻る経路は無い（failed からの再実行だけが戻れる）。
         assert!(!Processing.can_transition_to(Rendering));
-        assert!(!Failed.can_transition_to(Rendering));
+    }
+
+    #[test]
+    fn retry_transitions() {
+        // 再実行の入口は failed だけ。モードに応じてパイプラインの先頭へ戻る。
+        assert!(Failed.can_transition_to(Rendering));
+        assert!(Failed.can_transition_to(Processing));
+        // 終端の結果を書き換える向きには戻れない。
+        assert!(!Failed.can_transition_to(Passed));
+        assert!(!Failed.can_transition_to(ChangesDetected));
+        assert!(!Failed.can_transition_to(Pending));
+        // failed 以外の終端からは再実行できない。
+        assert!(!Passed.can_transition_to(Rendering));
+        assert!(!Passed.can_transition_to(Processing));
+        assert!(!Approved.can_transition_to(Rendering));
+        assert!(!Approved.can_transition_to(Processing));
+        assert!(!Rejected.can_transition_to(Rendering));
+        assert!(!Rejected.can_transition_to(Processing));
     }
 
     #[test]
@@ -173,7 +201,6 @@ mod tests {
         assert!(!Pending.can_transition_to(Approved));
         assert!(!Processing.can_transition_to(Approved));
         assert!(!Approved.can_transition_to(Rejected));
-        assert!(!Failed.can_transition_to(Processing));
         assert!(!Rejected.can_transition_to(Approved));
     }
 
