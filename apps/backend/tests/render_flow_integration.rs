@@ -1263,6 +1263,11 @@ async fn a_bundle_without_an_index_fails_the_build_with_a_reason() {
 
     let build = fx.wait_for_terminal(build_id).await;
     assert_eq!(build["status"].as_str(), Some("failed"));
+    assert_eq!(build["failure_origin"].as_str(), Some("test"));
+    assert_eq!(
+        build["failure_code"].as_str(),
+        Some("storybook_bundle_invalid")
+    );
     let message = build["error_message"].as_str().unwrap_or_default();
     assert!(
         message.contains("index.json"),
@@ -1680,7 +1685,7 @@ async fn ci_build_logs_endpoint_is_tenant_scoped() {
 
 /// 失敗した storybook ビルドは、原因（ここでは壊れたバンドル）を直したうえで
 /// 再実行すると**同じビルドのまま**完走する。前回の失敗の痕跡
-/// （error_message / completed_at）はクリアされ、進捗ログには前回の失敗ログの
+/// （error_message / 失敗分類 / completed_at）はクリアされ、進捗ログには前回の失敗ログの
 /// 後に再実行の区切り行が挟まる。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_storybook_build_can_be_retried_and_completes() {
@@ -1710,6 +1715,11 @@ async fn a_failed_storybook_build_can_be_retried_and_completes() {
     assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
     let failed = fx.wait_for_terminal(build_id).await;
     assert_eq!(failed["status"].as_str(), Some("failed"));
+    assert_eq!(failed["failure_origin"].as_str(), Some("test"));
+    assert_eq!(
+        failed["failure_code"].as_str(),
+        Some("storybook_bundle_invalid")
+    );
 
     // 原因を直す: 同じストレージキーへ正しいバンドルを置き直す。
     // （バンドルの API は finalize 済みビルドへの再アップロードを許さないため、
@@ -1741,6 +1751,8 @@ async fn a_failed_storybook_build_can_be_retried_and_completes() {
         "error_message is cleared on retry, got {:?}",
         retried["error_message"]
     );
+    assert!(retried["failure_origin"].is_null());
+    assert!(retried["failure_code"].is_null());
     assert!(
         retried["completed_at"].is_null(),
         "completed_at is cleared on retry (the pipeline is running again)"

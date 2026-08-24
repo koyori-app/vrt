@@ -34,6 +34,24 @@ pub enum BuildMode {
     Storybook,
 }
 
+/// 失敗が利用者の Story / テストに起因するか、VRT の実行環境に起因するか。
+///
+/// ビルドのライフサイクルとは直交する情報なので [`BuildStatus::Failed`] の
+/// variant は増やさず、失敗したビルドだけがこの値を持つ。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, ToSchema,
+)]
+#[sea_orm(rs_type = "String", db_type = "String(StringLen::N(255))")]
+#[serde(rename_all = "snake_case")]
+pub enum BuildFailureOrigin {
+    /// Story、play test、Storybook バンドルなど、利用者が直す対象。
+    #[sea_orm(string_value = "test")]
+    Test,
+    /// Chromium、CDP、DB、Storage、worker など、VRT が直す対象。
+    #[sea_orm(string_value = "vrt")]
+    Vrt,
+}
+
 /// ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。
 ///
 /// ```text

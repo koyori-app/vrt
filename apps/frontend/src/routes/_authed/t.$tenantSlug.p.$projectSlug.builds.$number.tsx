@@ -12,6 +12,7 @@ import {
 import { ComparisonViewer } from "@/components/comparison-viewer";
 import { CommitLink } from "@/components/commit-link";
 import { BuildLogPanel } from "@/components/build-log-panel";
+import { BuildFailureAlert } from "@/components/build-failure-alert";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { $api, errorMessage, type Build, type Comparison } from "@/lib/api";
@@ -362,9 +363,11 @@ function BuildReview({
         {pendingReviews > 0 ? ` · ${pendingReviews} awaiting review` : ""}
       </p>
       {build.error_message ? (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {build.error_message}
-        </p>
+        <BuildFailureAlert
+          origin={build.failure_origin}
+          code={build.failure_code}
+          message={build.error_message}
+        />
       ) : null}
 
       <BuildLogPanel buildId={buildId} status={build.status} />

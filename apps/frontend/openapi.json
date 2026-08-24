@@ -6215,6 +6215,14 @@
         },
         "additionalProperties": false
       },
+      "BuildFailureOrigin": {
+        "type": "string",
+        "description": "失敗が利用者の Story / テストに起因するか、VRT の実行環境に起因するか。\n\nビルドのライフサイクルとは直交する情報なので [`BuildStatus::Failed`] の\nvariant は増やさず、失敗したビルドだけがこの値を持つ。",
+        "enum": [
+          "test",
+          "vrt"
+        ]
+      },
       "BuildListResponse": {
         "type": "object",
         "required": [
@@ -6384,6 +6392,24 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "failure_code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`story_failure`、`chromium_launch` などの機械可読な詳細コード。"
+          },
+          "failure_origin": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BuildFailureOrigin",
+                "description": "Story / テスト側の失敗か、VRT 実行環境側の失敗か。"
+              }
             ]
           },
           "id": {

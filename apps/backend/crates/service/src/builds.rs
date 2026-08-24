@@ -201,6 +201,8 @@ pub async fn create_build<C: ConnectionTrait>(
         unchanged_count: Set(0),
         content_hash_skipped_count: Set(0),
         error_message: Set(None),
+        failure_origin: Set(None),
+        failure_code: Set(None),
         approval_evidence: Set(None),
         approved_by: Set(None),
         approved_at: Set(None),
@@ -782,6 +784,8 @@ pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
     message: String,
+    failure_origin: builds::BuildFailureOrigin,
+    failure_code: impl Into<String>,
 ) -> Result<builds::Model, AppError> {
     // 既に終端状態なら何もしない（リトライ時の二重書き込み防止）。
     if build.status.is_terminal() {
@@ -790,6 +794,8 @@ pub async fn mark_failed<C: ConnectionTrait>(
     let mut active: builds::ActiveModel = build.into();
     active.status = Set(BuildStatus::Failed);
     active.error_message = Set(Some(message));
+    active.failure_origin = Set(Some(failure_origin));
+    active.failure_code = Set(Some(failure_code.into()));
     active.completed_at = Set(Some(Utc::now().fixed_offset()));
     Ok(active.update(db).await?)
 }
@@ -820,7 +826,7 @@ pub enum RetryTarget {
 /// - screenshots モード → `queued`（worker が取得後 `processing` へ進む。
 ///   PNG はアップロード済みなので、比較だけやり直す）
 ///
-/// 前回の結果はクリアする: `error_message` / `completed_at` / 差分カウント。
+/// 前回の結果はクリアする: `error_message` / 失敗分類 / `completed_at` / 差分カウント。
 /// comparisons / screenshots の途中結果は各ジョブが開始時に自分で捨てる
 /// （リトライ安全性の既存設計）ので、ここでは触らない。
 ///
@@ -872,6 +878,8 @@ pub async fn retry_failed(
             let mut active: builds::ActiveModel = build.into();
             active.status = Set(BuildStatus::Queued);
             active.error_message = Set(None);
+            active.failure_origin = Set(None);
+            active.failure_code = Set(None);
             active.completed_at = Set(None);
             active.total_count = Set(0);
             active.changed_count = Set(0);

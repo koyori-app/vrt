@@ -501,6 +501,12 @@ fn json_result_value(
     if let Some(message) = error {
         out["error"] = serde_json::Value::String(message.to_string());
     }
+    if let Some(origin) = &build.failure_origin {
+        out["failure_origin"] = serde_json::Value::String(origin.clone());
+    }
+    if let Some(code) = &build.failure_code {
+        out["failure_code"] = serde_json::Value::String(code.clone());
+    }
     out
 }
 
@@ -860,6 +866,12 @@ fn report(build: &BuildResponse) {
     if let Some(msg) = &build.error_message {
         println!("error_message={msg}");
     }
+    if let Some(origin) = &build.failure_origin {
+        println!("failure_origin={origin}");
+    }
+    if let Some(code) = &build.failure_code {
+        println!("failure_code={code}");
+    }
 }
 
 /// 最終状態から終了コードを決める。
@@ -918,6 +930,8 @@ mod tests {
             removed_count: 0,
             content_hash_skipped_count: 0,
             error_message: None,
+            failure_origin: None,
+            failure_code: None,
         }
     }
 
@@ -977,6 +991,8 @@ mod tests {
         let mut build = sample_build();
         build.status = "failed".into();
         build.error_message = Some("render worker crashed for 3 stories".into());
+        build.failure_origin = Some("vrt".into());
+        build.failure_code = Some("render_internal".into());
 
         let code = exit_code_for(&build.status);
         let value = json_result_value(&build, "acme", "web", code, build.error_message.as_deref());
@@ -984,6 +1000,8 @@ mod tests {
         assert_eq!(value["status"], "failed");
         assert_eq!(value["exit_code"], 2);
         assert_eq!(value["error"], "render worker crashed for 3 stories");
+        assert_eq!(value["failure_origin"], "vrt");
+        assert_eq!(value["failure_code"], "render_internal");
         assert!(!value.to_string().contains('\n'));
     }
 
@@ -1064,6 +1082,8 @@ mod tests {
             removed_count: 0,
             content_hash_skipped_count: 0,
             error_message: None,
+            failure_origin: None,
+            failure_code: None,
         }
     }
 

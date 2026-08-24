@@ -43,6 +43,10 @@ pub struct Model {
     pub content_hash_skipped_count: i32,
     #[sea_orm(column_type = "Text", nullable)]
     pub error_message: Option<String>,
+    /// 失敗原因の所有者（test / vrt）。旧ビルドと成功ビルドは NULL。
+    pub failure_origin: Option<super::super::builds::BuildFailureOrigin>,
+    /// 原因を機械判定するための詳細コード。
+    pub failure_code: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub approval_evidence: Option<Json>,
     pub approved_by: Option<Uuid>,

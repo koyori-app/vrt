@@ -66,6 +66,7 @@ export type TenantRole = Schemas["TenantRole"];
 export type Project = Schemas["ProjectResponse"];
 export type Build = Schemas["BuildResponse"];
 export type BuildStatus = Schemas["BuildStatus"];
+export type BuildFailureOrigin = Schemas["BuildFailureOrigin"];
 export type BuildLogEntry = Schemas["BuildLogEntry"];
 export type Comparison = Schemas["ComparisonResponse"];
 export type ComparisonStatus = Schemas["ComparisonStatus"];

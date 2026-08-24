@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use entity::{build_logs, builds, builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{
+    build_logs, builds, builds::BuildFailureOrigin, builds::BuildMode, builds::BuildStatus,
+    screenshots,
+};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BuildResponse {
@@ -49,6 +52,12 @@ pub struct BuildResponse {
     pub content_hash_skipped_count: i32,
     #[schema(nullable)]
     pub error_message: Option<String>,
+    /// Story / テスト側の失敗か、VRT 実行環境側の失敗か。
+    #[schema(nullable)]
+    pub failure_origin: Option<BuildFailureOrigin>,
+    /// `story_failure`、`chromium_launch` などの機械可読な詳細コード。
+    #[schema(nullable)]
+    pub failure_code: Option<String>,
     /// 危険を明示的に承知して承認した場合の証跡。
     #[schema(nullable)]
     pub approval_evidence: Option<serde_json::Value>,
@@ -87,6 +96,8 @@ impl From<builds::Model> for BuildResponse {
             unchanged_count: model.unchanged_count,
             content_hash_skipped_count: model.content_hash_skipped_count,
             error_message: model.error_message,
+            failure_origin: model.failure_origin,
+            failure_code: model.failure_code,
             approval_evidence: model.approval_evidence,
             approved_by: model.approved_by,
             approved_at: model.approved_at.map(|t| t.with_timezone(&Utc)),

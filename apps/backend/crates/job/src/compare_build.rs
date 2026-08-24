@@ -139,11 +139,15 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
-            service::builds::mark_failed(&state.db, build, truncate(&err.to_string(), 2000))
-                .await
-                .map_err(|e| -> BoxDynError {
-                    format!("mark build {build_id} failed: {e}").into()
-                })?;
+            service::builds::mark_failed(
+                &state.db,
+                build,
+                truncate(&err.to_string(), 2000),
+                entity::builds::BuildFailureOrigin::Vrt,
+                "compare_internal",
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("mark build {build_id} failed: {e}").into() })?;
             Ok(())
         }
     };

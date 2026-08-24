@@ -27,9 +27,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{
+    baseline_entries,
+    builds::{BuildFailureOrigin, BuildMode, BuildStatus},
+    screenshots,
+};
 use service::build_logs::LogLevel;
-use service::render::{RenderError, RenderOptions, StaticServer, StoryRenderer};
+use service::render::{BundleError, RenderError, RenderOptions, StaticServer, StoryRenderer};
 
 use crate::JobState;
 
@@ -43,6 +47,73 @@ pub const WORKER_CONCURRENCY: usize = 1;
 /// 本番の 4 CPU 環境で CPU / メモリのスパイクを抑えながら逐次処理を短縮するため、
 /// 固定値 2 とする。
 pub const STORY_RENDER_CONCURRENCY: usize = 2;
+
+/// 利用者が直せる入力・Story 側の失敗を `anyhow` の chain 内に保持する印。
+///
+/// それ以外のエラーは安全側に VRT 起因として扱う。文字列を解析して分類すると
+/// Chromium や Storybook の文言変更で判定が壊れるため、型として運ぶ。
+#[derive(Debug)]
+struct ClassifiedRenderFailure {
+    origin: BuildFailureOrigin,
+    code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ClassifiedRenderFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedRenderFailure {}
+
+fn classified_render_failure(
+    origin: BuildFailureOrigin,
+    code: &'static str,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    ClassifiedRenderFailure {
+        origin,
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// 永続化する失敗分類を、型付き原因から決める。
+fn classify_render_failure(error: &anyhow::Error) -> (BuildFailureOrigin, &'static str) {
+    if let Some(classified) = error.downcast_ref::<ClassifiedRenderFailure>() {
+        return (classified.origin, classified.code);
+    }
+
+    if let Some(render) = error.downcast_ref::<RenderError>() {
+        return match render {
+            RenderError::Story { .. } => (BuildFailureOrigin::Test, "story_failure"),
+            RenderError::Timeout { .. } => (BuildFailureOrigin::Test, "story_timeout"),
+            RenderError::Launch { .. } => (BuildFailureOrigin::Vrt, "chromium_launch"),
+            RenderError::Server(_) => (BuildFailureOrigin::Vrt, "static_server"),
+            RenderError::Cdp { .. } => (BuildFailureOrigin::Vrt, "browser_protocol"),
+        };
+    }
+
+    (BuildFailureOrigin::Vrt, "render_internal")
+}
+
+fn bundle_failure(error: BundleError) -> anyhow::Error {
+    match error {
+        // zip の内容ではなく、一時ディスクへの読み書きに失敗した経路。
+        BundleError::Io(error) => classified_render_failure(
+            BuildFailureOrigin::Vrt,
+            "storybook_bundle_io",
+            format!("io error while extracting storybook bundle: {error}"),
+        ),
+        error => classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_invalid",
+            error.to_string(),
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderBuildJob {
@@ -106,7 +177,14 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
     match run(build_id, job.only_story_ids, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            tracing::error!(%build_id, error = %err, "render build job failed");
+            let (failure_origin, failure_code) = classify_render_failure(&err);
+            tracing::error!(
+                %build_id,
+                error = %err,
+                ?failure_origin,
+                failure_code,
+                "render build job failed"
+            );
             // 失敗理由を成果物のログにも 1 行残す（UI/CI から追える）。
             service::build_logs::append(
                 &state.db,
@@ -119,11 +197,15 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
-            service::builds::mark_failed(&state.db, build, truncate(&err.to_string(), 2000))
-                .await
-                .map_err(|e| -> BoxDynError {
-                    format!("mark build {build_id} failed: {e}").into()
-                })?;
+            service::builds::mark_failed(
+                &state.db,
+                build,
+                truncate(&err.to_string(), 2000),
+                failure_origin,
+                failure_code,
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("mark build {build_id} failed: {e}").into() })?;
 
             // レンダリング失敗もビルドの終端なので GitHub にステータスを返す。
             crate::github_status::enqueue_best_effort(&state.github_status_storage, build_id).await;
@@ -174,10 +256,13 @@ async fn run(
         }
     };
 
-    let storybook_key = build
-        .storybook_key
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("build {build_id} has no storybook bundle"))?;
+    let storybook_key = build.storybook_key.clone().ok_or_else(|| {
+        classified_render_failure(
+            BuildFailureOrigin::Vrt,
+            "storybook_bundle_missing",
+            format!("build {build_id} has no storybook bundle"),
+        )
+    })?;
 
     let project = service::projects::get_project(db, build.project_id).await?;
 
@@ -211,11 +296,16 @@ async fn run(
         // 展開は同期 IO + 解凍で CPU バウンド。ワーカーのランタイムを塞がない。
         tokio::task::spawn_blocking(move || service::render::extract_and_index(&bytes, &dest))
             .await
-            .map_err(|e| anyhow::anyhow!("bundle extraction task join: {e}"))??
+            .map_err(|e| anyhow::anyhow!("bundle extraction task join: {e}"))?
+            .map_err(bundle_failure)?
     };
 
     if bundle.stories.is_empty() {
-        anyhow::bail!("storybook bundle contains no stories (only docs entries?)");
+        return Err(classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_empty",
+            "storybook bundle contains no stories (only docs entries?)",
+        ));
     }
 
     // バンドル展開が終わり、撮影対象のストーリー数が確定した時点で開始行を残す。
@@ -705,9 +795,10 @@ async fn render_all(
     // 残りの story は撮り終えているので、error_message とログには全失敗
     // story が一度に列挙される——「1 回のビルドで 1 件ずつ」にならない。
     if !story_failures.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{}",
-            summarize_story_failures(&story_failures, total)
+        return Err(classified_render_failure(
+            BuildFailureOrigin::Test,
+            "story_failure",
+            summarize_story_failures(&story_failures, total),
         ));
     }
 
@@ -990,6 +1081,45 @@ mod tests {
         // Launch / Cdp は chromiumoxide のエラー値が要るためここでは構築しない。
         // is_story_scoped は Story / Timeout を列挙するホワイトリストなので、
         // 新しい variant が増えても既定は「中断」側へ倒れる（fail-closed）。
+    }
+
+    #[test]
+    fn persisted_failure_classification_keeps_test_and_vrt_errors_distinct() {
+        let story = anyhow::Error::new(RenderError::Story {
+            story_id: "button--primary".into(),
+            message: "play function failed".into(),
+        });
+        assert_eq!(
+            classify_render_failure(&story),
+            (BuildFailureOrigin::Test, "story_failure")
+        );
+
+        let server = anyhow::Error::new(RenderError::Server("bind failed".into()));
+        assert_eq!(
+            classify_render_failure(&server),
+            (BuildFailureOrigin::Vrt, "static_server")
+        );
+
+        let bundle = classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_invalid",
+            "bad zip",
+        );
+        assert_eq!(
+            classify_render_failure(&bundle),
+            (BuildFailureOrigin::Test, "storybook_bundle_invalid")
+        );
+
+        let bundle_io = bundle_failure(BundleError::Io(std::io::Error::other("disk full")));
+        assert_eq!(
+            classify_render_failure(&bundle_io),
+            (BuildFailureOrigin::Vrt, "storybook_bundle_io")
+        );
+
+        assert_eq!(
+            classify_render_failure(&anyhow::anyhow!("database unavailable")),
+            (BuildFailureOrigin::Vrt, "render_internal")
+        );
     }
 
     /// 名前規則違反が story 固有の失敗（[`StoryFailure`]）として返り、

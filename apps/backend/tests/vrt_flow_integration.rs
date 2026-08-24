@@ -1066,6 +1066,8 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     let mut active: entity::builds::ActiveModel = model.into();
     active.status = Set(entity::builds::BuildStatus::Failed);
     active.error_message = Set(Some("simulated compare failure".into()));
+    active.failure_origin = Set(Some(entity::builds::BuildFailureOrigin::Vrt));
+    active.failure_code = Set(Some("compare_internal".into()));
     active.update(&fx.app.state.db).await.expect("force failed");
 
     // 再実行 → queued に戻り、worker が取得して比較から完走する。
@@ -1081,6 +1083,8 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
         "screenshots-mode retry waits for the compare worker"
     );
     assert!(retried["error_message"].is_null());
+    assert!(retried["failure_origin"].is_null());
+    assert!(retried["failure_code"].is_null());
 
     let done = fx.wait_for_terminal(build_id).await;
     assert_eq!(
