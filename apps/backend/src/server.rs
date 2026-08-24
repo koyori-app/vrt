@@ -112,8 +112,9 @@ pub fn spawn_github_status_worker(
 
 /// `RenderBuildJob` のワーカーを spawn する（ワーカー名の一意性は [`worker_name`] 参照）。
 ///
-/// Chromium を起動するため 1 ジョブが重い。同時実行数は
-/// [`render_build::WORKER_CONCURRENCY`]（= 1）に絞る。
+/// Chromium を起動するため 1 ジョブが重い。ジョブの同時実行数は
+/// [`render_build::WORKER_CONCURRENCY`]（= 1）に絞り、ジョブ内の story だけを
+/// [`render_build::STORY_RENDER_CONCURRENCY`]（= 2）で並列化する。
 pub fn spawn_render_build_worker(
     state: &AppState,
     shutdown: watch::Receiver<bool>,

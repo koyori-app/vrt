@@ -11,7 +11,8 @@
 //! 2. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリへ安全に展開
 //!    （[`service::render::bundle`] が zip-slip / zip bomb / symlink を弾く）
 //! 3. `index.json` からストーリー一覧を作り、ループバックの静的サーバーを立てる
-//! 4. ストーリーを**逐次**レンダリングして PNG を `screenshots` に保存
+//! 4. ストーリーを同じ Chromium 内で**最大 2 件ずつ並列**レンダリングして
+//!    PNG を `screenshots` に保存
 //!    （name は `{title}/{name}`、metadata に `{story_id, title}`）
 //! 5. `rendering → processing` に遷移し、`CompareBuildJob` を投入して既存の比較経路へ繋ぐ
 //!
@@ -36,6 +37,12 @@ pub const QUEUE_NAME: &str = "render_build";
 pub const MAX_RETRIES: usize = 2;
 /// ワーカーの同時実行数。1 ジョブがブラウザ 1 個を丸ごと持つので控えめにする。
 pub const WORKER_CONCURRENCY: usize = 1;
+/// 1 ビルド内で同時にレンダリングする story 数。
+///
+/// Chromium 自体はジョブごとに 1 個のまま、独立した page を 2 枚まで開く。
+/// 本番の 4 CPU 環境で CPU / メモリのスパイクを抑えながら逐次処理を短縮するため、
+/// 固定値 2 とする。
+pub const STORY_RENDER_CONCURRENCY: usize = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderBuildJob {
@@ -338,7 +345,100 @@ fn decide_story_action(
     }
 }
 
-/// 全ストーリーを逐次処理して保存する。
+/// 並列レンダリングから返す story 単位の成果物。
+///
+/// Chromium を使う処理と baseline の読み出しだけを並列化し、DB / object storage
+/// への保存と build log の追記は呼び出し側で 1 件ずつ行う。これにより、重い描画は
+/// 重ねつつ、保存失敗の扱いと集計更新を同期プリミティブ無しで一箇所に保てる。
+enum StoryTaskResult {
+    Rendered {
+        position: usize,
+        story_id: String,
+        title: String,
+        screenshot_name: common::validation::ScreenshotName,
+        png: Vec<u8>,
+        font_warning: Option<String>,
+    },
+    Reused {
+        position: usize,
+        story_id: String,
+        title: String,
+        screenshot_name: common::validation::ScreenshotName,
+        png: Vec<u8>,
+    },
+    Failed {
+        position: usize,
+        failure: StoryFailure,
+    },
+}
+
+/// 1 story をレンダリング、または baseline から読み出す。
+///
+/// この関数自体は build の集計行や screenshot 行を書かないため、
+/// 呼び出し側の [`tokio::try_join!`] で安全に 2 件まで並列実行できる。
+#[allow(clippy::too_many_arguments)]
+async fn process_story(
+    state: &JobState,
+    renderer: &StoryRenderer,
+    base_url: &str,
+    story: &service::render::Story,
+    position: usize,
+    only_set: Option<&HashSet<&str>>,
+    baseline_names: &HashSet<&str>,
+    baseline_entries: &HashMap<String, baseline_entries::Model>,
+) -> Result<StoryTaskResult, anyhow::Error> {
+    let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
+        Ok(name) => name,
+        Err(failure) => return Ok(StoryTaskResult::Failed { position, failure }),
+    };
+    let screenshot_name_str = screenshot_name.as_str().to_string();
+
+    let action = match only_set {
+        Some(ids) => decide_story_action(&story.id, &screenshot_name_str, ids, baseline_names),
+        None => StoryAction::Render,
+    };
+
+    match action {
+        StoryAction::Render => match renderer.render_story(base_url, &story.id).await {
+            Ok(rendered_story) => Ok(StoryTaskResult::Rendered {
+                position,
+                story_id: story.id.clone(),
+                title: story.title.clone(),
+                screenshot_name,
+                png: rendered_story.png,
+                font_warning: rendered_story.font_warning,
+            }),
+            Err(error) if is_story_scoped(&error) => Ok(StoryTaskResult::Failed {
+                position,
+                failure: StoryFailure {
+                    story_id: story.id.clone(),
+                    message: error.to_string(),
+                },
+            }),
+            Err(error) => Err(anyhow::anyhow!("render story `{}`: {error}", story.id)),
+        },
+        StoryAction::Reuse => {
+            let entry = baseline_entries.get(&screenshot_name_str).ok_or_else(|| {
+                anyhow::anyhow!("baseline entry for `{screenshot_name}` disappeared during reuse")
+            })?;
+            let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("download baseline for `{screenshot_name}`: {error}")
+                })?;
+
+            Ok(StoryTaskResult::Reused {
+                position,
+                story_id: story.id.clone(),
+                title: story.title.clone(),
+                screenshot_name,
+                png,
+            })
+        }
+    }
+}
+
+/// 全ストーリーを最大 2 件ずつ並列レンダリングして保存する。
 ///
 /// `only_story_ids` が `None` のときは全ストーリーを撮影する（従来どおり。
 /// metadata に `reused` は付けない）。`Some` のときは [`decide_story_action`]
@@ -370,9 +470,9 @@ fn decide_story_action(
 /// 費やすだけである。分類の全経路は `service::render::browser` モジュール
 /// 先頭の「story 固有の失敗と環境の失敗」表を参照。
 ///
-/// 停止性: 隔離によって所要時間の上限は変わらない——成功する story も
-/// もともと 1 件あたり最大 `story_timeout` かけてよい契約であり、上限は
-/// 従来と同じ `stories × story_timeout` のままである。
+/// 停止性: story ごとの `story_timeout` は変えず、同時実行数だけを
+/// [`STORY_RENDER_CONCURRENCY`] に制限する。1 story の停止性を維持しながら、
+/// 全体のレンダリング時間を概ね `ceil(stories / 2) × story_timeout` に抑える。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
     state: &JobState,
@@ -391,7 +491,9 @@ async fn render_all(
 
     let mut rendered = 0usize;
     let mut reused = 0usize;
-    let mut story_failures: Vec<StoryFailure> = Vec::new();
+    // 並列処理の完了順にかかわらず位置を保持し、最後に index 順へ戻して
+    // error_message を決定的にする。
+    let mut story_failures: Vec<(usize, StoryFailure)> = Vec::new();
     // フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
     // 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
     // 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
@@ -404,173 +506,166 @@ async fn render_all(
         std::collections::BTreeMap::new();
     let total = bundle.stories.len();
 
-    for (idx, story) in bundle.stories.iter().enumerate() {
-        let position = idx + 1;
-        // 名前規則（ScreenshotName——アップロード経路と同一）。storybook の
-        // title / name から生成した名前が規則に合わない場合は、黙って加工せず
-        // 失敗させて story 側の修正を促す（加工すると baseline 名との
-        // 突き合わせがずれる）。違反は story の title / name に起因する
-        // **story 固有の失敗**なので、レンダリング失敗と同じく story 単位で
-        // 隔離する——複数 story が違反していても 1 回のビルドで全件が
-        // 列挙され、「直しては次の 1 件」の反復にならない。名前は撮影にも
-        // baseline 流用にも要るため、隔離は Render / Reuse の分岐より前で行う。
-        let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
-            Ok(name) => name,
-            Err(failure) => {
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Error,
-                    format!(
-                        "story failed {position}/{total} {}: {}",
-                        story.id, failure.message
-                    ),
-                )
-                .await?;
-                story_failures.push(failure);
-                continue;
-            }
+    // 2 story ずつ同じタスク上で poll する。`tokio::spawn` を使わないので参照を
+    // `'static` 化する必要がなく、worker が要求する Send 境界も維持できる。
+    // 描画結果は元の index 順で永続化するため、build log と警告代表も決定的な
+    // まま。保持する PNG は最大 2 story 分に限られる。
+    let mut stories = bundle.stories.iter().enumerate();
+    while let Some((idx, story)) = stories.next() {
+        let first = process_story(
+            state,
+            renderer,
+            base_url,
+            story,
+            idx + 1,
+            only_set.as_ref(),
+            &baseline_names,
+            baseline_entries,
+        );
+
+        let batch = if let Some((second_idx, second_story)) = stories.next() {
+            let second = process_story(
+                state,
+                renderer,
+                base_url,
+                second_story,
+                second_idx + 1,
+                only_set.as_ref(),
+                &baseline_names,
+                baseline_entries,
+            );
+            let (first, second) = tokio::try_join!(first, second)?;
+            vec![first, second]
+        } else {
+            vec![first.await?]
         };
-        let screenshot_name_str = screenshot_name.as_str().to_string();
 
-        // `only_story_ids` 無しは常に撮影（後方互換）。
-        let action = match &only_set {
-            Some(ids) => decide_story_action(&story.id, &screenshot_name_str, ids, &baseline_names),
-            None => StoryAction::Render,
-        };
-
-        match action {
-            StoryAction::Render => {
-                let rendered_story = match renderer.render_story(base_url, &story.id).await {
-                    Ok(rendered_story) => rendered_story,
-                    // story 固有の失敗はその story だけをエラーにし、残りを
-                    // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
-                    Err(e) if is_story_scoped(&e) => {
-                        service::build_logs::append(
-                            &state.db,
-                            build.id,
-                            LogLevel::Error,
-                            format!("story failed {position}/{total} {}: {e}", story.id),
-                        )
-                        .await?;
-                        story_failures.push(StoryFailure {
-                            story_id: story.id.clone(),
-                            message: e.to_string(),
-                        });
-                        continue;
-                    }
-                    // 環境側の失敗は従来どおり即中断（続けても同じ理由で落ちる）。
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
-                    }
-                };
-
-                // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
-                // ここで build log に永続化して利用者へ届ける——`tracing::warn`
-                // だけではサーバー運用ログ止まりで、`passed` を受け取った
-                // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
-                if let Some(warning) = &rendered_story.font_warning {
-                    // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
-                    // （集計はループ後。宣言と理由は font_warning_counts を参照）。
-                    let entry = font_warning_counts
-                        .entry(warning.clone())
-                        .or_insert((0usize, story.id.clone()));
-                    entry.0 += 1;
-                    if entry.0 == 1 {
-                        service::build_logs::append(
-                            &state.db,
-                            build.id,
-                            LogLevel::Warn,
-                            font_warning_log_line(position, total, &story.id, warning),
-                        )
-                        .await?;
-                    }
-                }
-                let png = rendered_story.png;
-
-                // `only_story_ids` モードのときだけ reused を明示する
-                // （`None` の従来経路は metadata を変えない）。
-                let metadata = if only_set.is_some() {
-                    serde_json::json!({
-                        "story_id": story.id,
-                        "title": story.title,
-                        "reused": false,
-                    })
-                } else {
-                    serde_json::json!({
-                        "story_id": story.id,
-                        "title": story.title,
-                    })
-                };
-
-                service::screenshots::store_screenshot_with_metadata(
-                    &state.db,
-                    &state.storage,
-                    project.tenant_id,
-                    project.id,
-                    build.id,
+        for result in batch {
+            match result {
+                StoryTaskResult::Rendered {
+                    position,
+                    story_id,
+                    title,
                     screenshot_name,
-                    bytes::Bytes::from(png),
-                    Some(metadata),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("store screenshot for story `{}`: {e}", story.id))?;
-                rendered += 1;
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Info,
-                    format!("rendered {position}/{total} {}", story.id),
-                )
-                .await?;
-            }
-            StoryAction::Reuse => {
-                // decide_story_action が Reuse を返す時点で必ず存在する。
-                let entry = baseline_entries.get(&screenshot_name_str).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "baseline entry for `{screenshot_name}` disappeared during reuse"
-                    )
-                })?;
+                    png,
+                    font_warning,
+                } => {
+                    // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
+                    // ここで build log に永続化して利用者へ届ける——`tracing::warn`
+                    // だけではサーバー運用ログ止まりで、`passed` を受け取った
+                    // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+                    if let Some(warning) = &font_warning {
+                        // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
+                        // （集計はループ後。宣言と理由は font_warning_counts を参照）。
+                        let entry = font_warning_counts
+                            .entry(warning.clone())
+                            .or_insert((0usize, story_id.clone()));
+                        entry.0 += 1;
+                        if entry.0 == 1 {
+                            service::build_logs::append(
+                                &state.db,
+                                build.id,
+                                LogLevel::Warn,
+                                font_warning_log_line(position, total, &story_id, warning),
+                            )
+                            .await?;
+                        }
+                    }
 
-                // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
-                // バイト列が同一なので、後段の compare_build が unchanged と判定する。
-                let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
+                    // `only_story_ids` モードのときだけ reused を明示する
+                    // （`None` の従来経路は metadata を変えない）。
+                    let metadata = if only_set.is_some() {
+                        serde_json::json!({
+                            "story_id": &story_id,
+                            "title": &title,
+                            "reused": false,
+                        })
+                    } else {
+                        serde_json::json!({
+                            "story_id": &story_id,
+                            "title": &title,
+                        })
+                    };
+
+                    service::screenshots::store_screenshot_with_metadata(
+                        &state.db,
+                        &state.storage,
+                        project.tenant_id,
+                        project.id,
+                        build.id,
+                        screenshot_name,
+                        bytes::Bytes::from(png),
+                        Some(metadata),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("store screenshot for story `{story_id}`: {e}"))?;
+                    rendered += 1;
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Info,
+                        format!("rendered {position}/{total} {story_id}"),
+                    )
+                    .await?;
+                }
+                StoryTaskResult::Reused {
+                    position,
+                    story_id,
+                    title,
+                    screenshot_name,
+                    png,
+                } => {
+                    let metadata = serde_json::json!({
+                        "story_id": &story_id,
+                        "title": &title,
+                        "reused": true,
+                    });
+
+                    service::screenshots::store_screenshot_with_metadata(
+                        &state.db,
+                        &state.storage,
+                        project.tenant_id,
+                        project.id,
+                        build.id,
+                        screenshot_name,
+                        bytes::Bytes::from(png),
+                        Some(metadata),
+                    )
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!("download baseline for `{screenshot_name}`: {e}")
+                        anyhow::anyhow!("store reused screenshot for story `{story_id}`: {e}")
                     })?;
-
-                let metadata = serde_json::json!({
-                    "story_id": story.id,
-                    "title": story.title,
-                    "reused": true,
-                });
-
-                service::screenshots::store_screenshot_with_metadata(
-                    &state.db,
-                    &state.storage,
-                    project.tenant_id,
-                    project.id,
-                    build.id,
-                    screenshot_name,
-                    bytes::Bytes::from(png),
-                    Some(metadata),
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("store reused screenshot for story `{}`: {e}", story.id)
-                })?;
-                reused += 1;
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Info,
-                    format!("reused {position}/{total} {}", story.id),
-                )
-                .await?;
+                    reused += 1;
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Info,
+                        format!("reused {position}/{total} {story_id}"),
+                    )
+                    .await?;
+                }
+                StoryTaskResult::Failed { position, failure } => {
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Error,
+                        format!(
+                            "story failed {position}/{total} {}: {}",
+                            failure.story_id, failure.message
+                        ),
+                    )
+                    .await?;
+                    story_failures.push((position, failure));
+                }
             }
         }
     }
+
+    story_failures.sort_by_key(|(position, _)| *position);
+    let story_failures: Vec<StoryFailure> = story_failures
+        .into_iter()
+        .map(|(_, failure)| failure)
+        .collect();
 
     // 畳んだ同文フォント警告の集計行（初出行と対。1 story だけなら初出行が
     // 全てを言い尽くしており、集計行は出さない）。

@@ -255,7 +255,8 @@ HTTP リクエストはそこで完了する。worker が取得した時点で `
 2. `index.json`（v4/v5 の `entries`、6 系の `stories` も可）からストーリー一覧を作る。
    `type: "docs"` のエントリは撮らない
 3. 展開先を `127.0.0.1:0`（OS 任せの空きポート）でループバック配信する
-4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、ストーリーを**逐次**
+4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、独立した page で
+   ストーリーを**最大 2 件ずつ並列**に
    `iframe.html?id=<storyId>&viewMode=story` で開く。`#storybook-root`（6 系は
    `#root`）に中身が入るまでポーリングし、settle 待ち・`document.fonts.ready` の
    条件待ち（到達可能な同一オリジン iframe の中まで再帰する）・静止・
@@ -276,8 +277,8 @@ HTTP リクエストはそこで完了する。worker が取得した時点で `
 リトライされても `(build_id, name)` の UNIQUE にぶつからない。
 1 ストーリーでも撮れなければビルドは `failed` になり、`error_message` に
 どのストーリーで落ちたかが入る（Chromium が無い / 起動できない場合も同じ経路で
-`failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンスで、
-ワーカーの同時実行数は 1 に絞ってある。
+`failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンス、
+ワーカーの同時実行数は 1、ブラウザ内の story page 同時実行数は 2 に固定してある。
 
 ## ストレージ
 

@@ -123,6 +123,27 @@ const INDEX_JSON_WITH_EXTRA: &str = r#"{
   }
 }"#;
 
+/// 2 page が同時に開かれないと描画完了しない並列性テスト用 index。
+const CONCURRENT_INDEX_JSON: &str = r#"{
+  "v": 5,
+  "entries": {
+    "parallel--one": {
+      "type": "story",
+      "id": "parallel--one",
+      "title": "Parallel",
+      "name": "One",
+      "importPath": "./src/Parallel.stories.tsx"
+    },
+    "parallel--two": {
+      "type": "story",
+      "id": "parallel--two",
+      "title": "Parallel",
+      "name": "Two",
+      "importPath": "./src/Parallel.stories.tsx"
+    }
+  }
+}"#;
+
 /// `?id=` に対応する色でビューポート全面を塗る `iframe.html`。
 ///
 /// - フォントもアニメーションも使わない（= ピクセルが揺れない）
@@ -162,6 +183,48 @@ fn iframe_html(red: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+/// 2 story が互いの page 起動を `localStorage` で待つ fixture。
+///
+/// 同じ Chromium profile / origin の page は localStorage を共有する。逐次実行では
+/// 先頭 story が相手を永遠に待って timeout する一方、2 並列なら双方が印を置いて
+/// `storyRendered` を発火できる。時間の閾値に依存せず並列配線そのものを検証する。
+fn concurrent_iframe_html() -> &'static str {
+    r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var peer = id === 'parallel--one' ? 'parallel--two' : 'parallel--one';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+
+  var el = document.createElement('div');
+  el.style.width = '100vw';
+  el.style.height = '100vh';
+  el.style.background = id === 'parallel--one' ? '#ff0000' : '#0000ff';
+  document.getElementById('storybook-root').appendChild(el);
+
+  localStorage.setItem('vrt-parallel-' + id, 'ready');
+  (function waitForPeer() {
+    if (localStorage.getItem('vrt-parallel-' + peer) === 'ready') {
+      channel.emit('storyRendered', id);
+      return;
+    }
+    setTimeout(waitForPeer, 10);
+  })();
+</script>
+</body>
+</html>"#
 }
 
 /// バンドルに混ぜる「実バンドルらしさ」のためのダミー資産のサイズ。
@@ -496,6 +559,40 @@ fn chromium_or_skip(test: &str) -> bool {
 }
 
 // ── 本体 ────────────────────────────────────────────────────────────────
+
+/// render worker が同じ Chromium で 2 story を同時に進めること。
+///
+/// fixture の各 page は相手の page が起動するまで `storyRendered` を出さないため、
+/// 単に「速かった」ではなく、実際に 2 page が重なったことを一気通貫で証明する。
+#[tokio::test(flavor = "multi_thread")]
+async fn stories_are_rendered_two_at_a_time() {
+    if !chromium_or_skip("stories_are_rendered_two_at_a_time") {
+        return;
+    }
+    assert_eq!(job::render_build::STORY_RENDER_CONCURRENCY, 2);
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("parallel0001").await;
+    let build_id = build_id_of(&build);
+    let bundle = bundle_zip_with_files(CONCURRENT_INDEX_JSON, concurrent_iframe_html());
+
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("changes_detected"),
+        "both mutually waiting stories must render when two pages overlap: {terminal}"
+    );
+
+    let shots = fx.screenshots(build_id).await;
+    let names: Vec<&str> = shots.iter().map(|shot| shot.name.as_str()).collect();
+    assert_eq!(names, vec!["Parallel/One", "Parallel/Two"]);
+}
 
 /// storybook バンドルを投げてから比較結果が出るまでの一気通貫。
 #[tokio::test(flavor = "multi_thread")]
