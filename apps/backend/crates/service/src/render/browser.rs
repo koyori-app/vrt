@@ -166,7 +166,11 @@
 //! こと。** 分類基準は「次の story も同じ理由で落ちるか」——story の内容に
 //! 起因する失敗はその story だけをエラーにして残りを撮り続け（発見性）、
 //! 環境の失敗は即中断する（続行は同じエラーの羅列に story_timeout×N を
-//! 費やすだけ）。判定の実装は `render_build::is_story_scoped`（[`RenderError`]
+//! 費やすだけ）。ただし story 単位の CDP 失敗（[`RenderError::Cdp`]）だけは
+//! 中断へ倒す前に**新しいタブで 1 回やり直す**（[`retry_once_on_cdp`]。
+//! タブ単位の間欠故障——セッション確立メッセージの取りこぼしでそのタブへの
+//! コマンドが全て 30 秒タイムアウトする——の実測に対する救済。2 回目も
+//! 失敗すれば従来どおり即中断）。判定の実装は `render_build::is_story_scoped`（[`RenderError`]
 //! のホワイトリスト——新 variant の既定は中断側）と、名前検証の隔離
 //! （`render_build::render_all`）。**隔離してもビルドは fail-closed のまま**
 //! ——story_failures が 1 件でもあればビルドは `failed` になり、緑には
@@ -176,14 +180,14 @@
 //! |----|----|----|----|
 //! | Chromium 起動 | [`RenderError::Launch`] | 環境（ループ前に中断） | story を 1 つも処理できない |
 //! | 静的サーバー起動 | [`RenderError::Server`] | 環境（ループ前に中断） | 同上 |
-//! | `new_page` / READY hook 注入 / `goto` | [`RenderError::Cdp`] | 環境（即中断） | story のスクリプトはまだ実行されていない——失敗の原因にブラウザ側しかいない |
+//! | `new_page` / READY hook 注入 / `goto` | [`RenderError::Cdp`] | 環境（新タブで 1 回やり直し→即中断） | story のスクリプトはまだ実行されていない——失敗の原因にブラウザ側しかいない |
 //! | READY probe の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | ナビゲーション中の一時的な context 差し替えが主因 |
 //! | READY 待ち時間切れ | [`RenderError::Timeout`] | story | その story が描画完了シグナルを出さない |
 //! | `storyErrored` 等のシグナル | [`RenderError::Story`] | story | Storybook 自身による story 単位の失敗通知 |
 //! | FREEZE evaluate のエラー・ハング | リトライ→期限で [`RenderError::Timeout`] | story | navigation / reload・rAF 捨ては story のスクリプトの挙動（実測経路は上表） |
 //! | FREEZE verdict（静止失敗・解析不能） | [`RenderError::Story`] | story | その story のアニメーション・応答の内容に起因 |
-//! | スクリーンショット | [`RenderError::Cdp`] | 環境（即中断） | JS を待たない一往復の CDP コマンド——失敗はブラウザ側 |
-//! | reduced-motion 適用（`setEmulatedMedia`） | [`RenderError::Cdp`] | 環境（即中断） | `new_page` 直後・story のスクリプトを待たない一往復——失敗はブラウザ側 |
+//! | スクリーンショット | [`RenderError::Cdp`] | 環境（新タブで 1 回やり直し→即中断） | JS を待たない一往復の CDP コマンド——失敗はブラウザ側 |
+//! | reduced-motion 適用（`setEmulatedMedia`） | [`RenderError::Cdp`] | 環境（新タブで 1 回やり直し→即中断） | `new_page` 直後・story のスクリプトを待たない一往復——失敗はブラウザ側 |
 //! | reduced-motion 検証の evaluate エラー | リトライ→期限で [`RenderError::Timeout`] | story | READY probe と同じ——ナビゲーション中の一時的な context 差し替えが主因 |
 //! | reduced-motion 検証の不成立・解析不能 | [`RenderError::Story`] | story | `matchMedia` の差し替え等、そのページの内容に起因 |
 //! | フォント条件待ちの evaluate エラー・`ready` 未解決 | リトライ→期限で [`RenderError::Timeout`] | story | どのフォントを要求し返すかは story のバンドル・内容に起因（FREEZE の rAF 捨てと同じ分類） |
@@ -196,7 +200,8 @@
 //!
 //! 誤分類の非対称性（自己点検）: 環境の失敗を story と誤分類しても、ビルドは
 //! story_failures 非空で `failed` のまま（fail-open にならない）、続く story は
-//! 同じ環境異常なら `new_page` の環境分類で中断する——失う最大は 1 story 分の
+//! 同じ環境異常なら `new_page` の環境分類で中断する——失う最大は
+//! 1 story あたり 2 試行分（[`retry_once_on_cdp`] の 1 回やり直しを含む）の
 //! 時間予算。逆に story の失敗を環境と誤分類すると「1 ビルドで 1 件ずつ」しか
 //! 発見できない劣化になる（cmd_631/632 が潰した形）。どちらの向きも
 //! 「環境起因をビルド緑で通す」経路にはならない。
@@ -1310,6 +1315,38 @@ pub struct RenderedStory {
     pub font_warning: Option<String>,
 }
 
+/// [`RenderError::Cdp`] だけを 1 回やり直すリトライ骨格。
+///
+/// 対象を `Cdp` に限る理由: `Timeout` / `Story` は story 固有（やり直しても
+/// 同じ理由で落ちる）、`Launch` / `Server` はこの層（story 単位の撮影）には
+/// 来ない。2 回目も `Cdp` なら従来どおり環境失敗として返す——リトライは
+/// 1 回きりで、ブラウザ本体が本当に死んでいる場合の即中断（続行は同じ
+/// エラーの羅列に 30 秒×N を費やすだけ）を骨抜きにしない。
+///
+/// テストはこの骨格だけを固定する（意図した割り切り）——「`render_story` が
+/// この骨格を通り、2 回目が新しいタブで走る」配線は、実ブラウザでタブ単位の
+/// CDP 故障を決定的に再現する手段が無く、貫通テストにできない。
+async fn retry_once_on_cdp<F, Fut>(
+    story_id: &str,
+    mut attempt: F,
+) -> Result<RenderedStory, RenderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<RenderedStory, RenderError>>,
+{
+    match attempt().await {
+        Err(err @ RenderError::Cdp { .. }) => {
+            tracing::warn!(
+                %story_id,
+                error = %err,
+                "story hit a CDP failure; retrying once on a fresh tab"
+            );
+            attempt().await
+        }
+        result => result,
+    }
+}
+
 /// レンダリングのパラメータ。ビューポートはプロジェクト設定から渡す。
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
@@ -1509,7 +1546,26 @@ impl StoryRenderer {
     }
 
     /// 1 ストーリーを撮って PNG バイト列を返す。
+    ///
+    /// CDP 分類の失敗（[`RenderError::Cdp`]）だけは、新しいタブで 1 回だけ
+    /// やり直す（[`retry_once_on_cdp`]）。本番で「作ったタブへのコマンドが
+    /// すべて 30 秒タイムアウトする」間欠故障が観測された（2026-08-24。
+    /// Chromium 151 × chromiumoxide 0.9.1 で CDP メッセージのパース失敗
+    /// `WS Invalid message` が常在し、タブのセッション確立に関わる
+    /// メッセージを取りこぼした回だけタブが文鎮化する、が最有力の機序）。
+    /// ブラウザ自体は健在でタブ単位の故障なので、環境失敗として即中断へ
+    /// 倒す前に一度だけ新しいタブを試す。
     pub async fn render_story(
+        &self,
+        base_url: &str,
+        story_id: &str,
+    ) -> Result<RenderedStory, RenderError> {
+        retry_once_on_cdp(story_id, || self.render_story_attempt(base_url, story_id)).await
+    }
+
+    /// [`Self::render_story`] の 1 回ぶんの試行。リトライ判断は呼び出し側
+    /// （[`retry_once_on_cdp`]）に任せる。
+    async fn render_story_attempt(
         &self,
         base_url: &str,
         story_id: &str,
@@ -1569,7 +1625,19 @@ impl StoryRenderer {
         .await;
 
         // 撮影の成否によらずタブは閉じる（開きっぱなしだとメモリを食う）。
-        if let Err(e) = page.close().await {
+        // ただし CDP 失敗（＝タブが文鎮化してコマンドが 30 秒返らない実測
+        // 故障）の巡では close も同じセッション経由で 30 秒待たされるため、
+        // リトライを遅らせないようバックグラウンドで閉じる。close に失敗した
+        // タブはブラウザ終了（[`Self::close`]）まで残る——その費用より
+        // リトライの即応を取る。
+        if matches!(result, Err(RenderError::Cdp { .. })) {
+            let story_id = story_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = page.close().await {
+                    tracing::debug!(%story_id, error = %e, "closing story page failed");
+                }
+            });
+        } else if let Err(e) = page.close().await {
             tracing::debug!(%story_id, error = %e, "closing story page failed");
         }
 
@@ -2379,6 +2447,85 @@ mod tests {
             story_url("http://h", "a b&id=evil"),
             "http://h/iframe.html?id=a%20b%26id%3Devil&viewMode=story"
         );
+    }
+
+    fn cdp_error(story_id: &str) -> RenderError {
+        RenderError::Cdp {
+            story_id: story_id.to_string(),
+            source: chromiumoxide::error::CdpError::Timeout,
+        }
+    }
+
+    /// [`retry_once_on_cdp`] に、呼ばれるたびに用意した結果を先頭から返す
+    /// 試行を渡し、（最終結果, 試行回数）を返す。
+    async fn run_retry(
+        script: Vec<Result<RenderedStory, RenderError>>,
+    ) -> (Result<RenderedStory, RenderError>, u32) {
+        let script = std::cell::RefCell::new(script);
+        let calls = std::cell::Cell::new(0);
+        let result = retry_once_on_cdp("s--d", || {
+            calls.set(calls.get() + 1);
+            let next = script.borrow_mut().remove(0);
+            async move { next }
+        })
+        .await;
+        (result, calls.get())
+    }
+
+    /// タブ単位の間欠 CDP 故障（本番実測: セッション確立メッセージの
+    /// 取りこぼしでタブが文鎮化）は、新しいタブの 2 回目で回復する。
+    #[tokio::test]
+    async fn a_cdp_failure_is_retried_once_and_can_recover() {
+        let ok = RenderedStory {
+            png: vec![1, 2, 3],
+            font_warning: None,
+        };
+        let (result, calls) = run_retry(vec![Err(cdp_error("s--d")), Ok(ok)]).await;
+        assert_eq!(result.unwrap().png, vec![1, 2, 3]);
+        assert_eq!(calls, 2);
+    }
+
+    /// 2 回目も CDP 失敗ならリトライを重ねず、環境失敗（即中断の分類）の
+    /// まま返す——ブラウザ本体が死んでいる場合の即中断を骨抜きにしない。
+    #[tokio::test]
+    async fn a_second_cdp_failure_stops_retrying_and_stays_environmental() {
+        let (result, calls) = run_retry(vec![Err(cdp_error("s--d")), Err(cdp_error("s--d"))]).await;
+        assert!(matches!(result, Err(RenderError::Cdp { .. })));
+        assert_eq!(calls, 2);
+    }
+
+    /// story 固有の失敗（Story / Timeout）はやり直しても同じ理由で落ちる
+    /// だけなのでリトライしない。
+    #[tokio::test]
+    async fn story_scoped_failures_are_not_retried() {
+        let story = RenderError::Story {
+            story_id: "s--d".into(),
+            message: "boom".into(),
+        };
+        let (result, calls) = run_retry(vec![Err(story)]).await;
+        assert!(matches!(result, Err(RenderError::Story { .. })));
+        assert_eq!(calls, 1);
+
+        let timeout = RenderError::Timeout {
+            story_id: "s--d".into(),
+            timeout: Duration::from_secs(30),
+            phase: "test",
+        };
+        let (result, calls) = run_retry(vec![Err(timeout)]).await;
+        assert!(matches!(result, Err(RenderError::Timeout { .. })));
+        assert_eq!(calls, 1);
+    }
+
+    /// 成功はそのまま返し、余計な試行をしない。
+    #[tokio::test]
+    async fn a_success_is_returned_without_a_second_attempt() {
+        let ok = RenderedStory {
+            png: vec![9],
+            font_warning: None,
+        };
+        let (result, calls) = run_retry(vec![Ok(ok)]).await;
+        assert_eq!(result.unwrap().png, vec![9]);
+        assert_eq!(calls, 1);
     }
 
     /// 最小の「Storybook っぽい」バンドル（**ランタイム無し**）。
