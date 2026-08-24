@@ -154,12 +154,24 @@ pub async fn list_builds(
     let offset = query.offset.unwrap_or(0);
 
     let list = build_service::list_builds(&state.db, project.id, limit, offset).await?;
+    let baseline_sources = build_service::baseline_sources_for_builds(&state.db, &list).await?;
     let total = build_service::count_builds(&state.db, project.id).await?;
 
-    Ok(Json(BuildListResponse {
-        builds: list.into_iter().map(Into::into).collect(),
-        total,
-    }))
+    let builds = list
+        .into_iter()
+        .map(|model| {
+            let source = baseline_sources.get(&model.id);
+            let mut response: BuildResponse = model.into();
+            response.baseline_source = source.map(|source| BuildBaselineSourceResponse {
+                branch: source.branch.clone(),
+                build_id: source.source_build_id,
+                build_number: source.source_build_number,
+            });
+            response
+        })
+        .collect();
+
+    Ok(Json(BuildListResponse { builds, total }))
 }
 
 #[axum::debug_handler]

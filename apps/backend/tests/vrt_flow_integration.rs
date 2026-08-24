@@ -602,6 +602,29 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         .map(|b| b["number"].as_i64().unwrap_or(-1))
         .collect();
     assert_eq!(numbers, vec![3, 2, 1], "builds are listed newest first");
+    let listed = list["builds"].as_array().expect("builds array");
+    assert_eq!(
+        listed[0]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build2_id,
+            "build_number": 2,
+        }),
+        "build #3 exposes the approved build whose baseline it compared against"
+    );
+    assert_eq!(
+        listed[1]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build1_id,
+            "build_number": 1,
+        }),
+        "build #2 exposes its baseline ancestry"
+    );
+    assert!(
+        listed[2]["baseline_source"].is_null(),
+        "the root build has no invented ancestry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

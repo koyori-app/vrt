@@ -6215,6 +6215,35 @@
         },
         "additionalProperties": false
       },
+      "BuildBaselineSourceResponse": {
+        "type": "object",
+        "description": "VRT baseline の昇格元。Git の親commitではなく、比較系譜を表す。",
+        "required": [
+          "branch"
+        ],
+        "properties": {
+          "branch": {
+            "type": "string",
+            "description": "baseline が属するブランチ。"
+          },
+          "build_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "昇格元ビルド。保持期間で削除済みなら null。"
+          },
+          "build_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "昇格元ビルドのプロジェクト内番号。削除済みなら null。"
+          }
+        }
+      },
       "BuildFailureOrigin": {
         "type": "string",
         "description": "失敗が利用者の Story / テストに起因するか、VRT の実行環境に起因するか。\n\nビルドのライフサイクルとは直交する情報なので [`BuildStatus::Failed`] の\nvariant は増やさず、失敗したビルドだけがこの値を持つ。",
@@ -6356,6 +6385,17 @@
             ],
             "format": "uuid",
             "description": "比較に使った baseline（未確定なら null）。"
+          },
+          "baseline_source": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BuildBaselineSourceResponse",
+                "description": "このビルドが比較した baseline の派生元。ビルド一覧でのみ解決する。"
+              }
+            ]
           },
           "branch": {
             "type": "string"

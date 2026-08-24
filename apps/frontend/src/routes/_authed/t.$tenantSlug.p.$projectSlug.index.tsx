@@ -152,13 +152,7 @@ function BuildsTable({
   const builds = useBuilds(projectId, BUILD_LIMIT);
   const navigate = useNavigate();
   const rows = builds.data?.builds;
-  const total = builds.data?.total;
-  // The response includes the authoritative total, so a page with exactly BUILD_LIMIT
-  // builds is not mistaken for a truncated result when there are no older builds.
-  const graph = useMemo(
-    () => buildGraph(rows ?? [], defaultBranch, total !== undefined && (rows?.length ?? 0) < total),
-    [rows, defaultBranch, total],
-  );
+  const graph = useMemo(() => buildGraph(rows ?? [], defaultBranch), [rows, defaultBranch]);
 
   return (
     <Card>

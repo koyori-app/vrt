@@ -240,6 +240,78 @@ pub async fn list_builds<C: ConnectionTrait>(
         .await?)
 }
 
+/// ビルドが実際に比較した baseline の系譜。
+///
+/// `source_build_*` は保持期間によって昇格元ビルドが削除済みなら `None` だが、
+/// baseline 自体の branch は残る。UI はこの情報だけを使い、Git の親子関係を
+/// 推測せずに VRT 上の正確な派生元を描く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildBaselineSource {
+    pub branch: String,
+    pub source_build_id: Option<Uuid>,
+    pub source_build_number: Option<i64>,
+}
+
+/// 一覧に含まれる各ビルドの baseline 昇格元をまとめて解決する。
+///
+/// baseline と昇格元 build をそれぞれ一括取得し、ビルド数に比例した N+1 query を
+/// 避ける。返り値のキーは baseline ではなく一覧側の build ID。
+pub async fn baseline_sources_for_builds<C: ConnectionTrait>(
+    db: &C,
+    list: &[builds::Model],
+) -> Result<HashMap<Uuid, BuildBaselineSource>, AppError> {
+    let baseline_ids = list
+        .iter()
+        .filter_map(|build| build.baseline_id)
+        .collect::<HashSet<_>>();
+    if baseline_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let baseline_rows = baselines::Entity::find()
+        .filter(baselines::Column::Id.is_in(baseline_ids))
+        .all(db)
+        .await?;
+    let source_ids = baseline_rows
+        .iter()
+        .filter_map(|baseline| baseline.source_build_id)
+        .collect::<HashSet<_>>();
+    let source_builds = if source_ids.is_empty() {
+        Vec::new()
+    } else {
+        builds::Entity::find()
+            .filter(builds::Column::Id.is_in(source_ids))
+            .all(db)
+            .await?
+    };
+    let source_builds = source_builds
+        .into_iter()
+        .map(|build| (build.id, build))
+        .collect::<HashMap<_, _>>();
+    let baselines = baseline_rows
+        .into_iter()
+        .map(|baseline| (baseline.id, baseline))
+        .collect::<HashMap<_, _>>();
+
+    Ok(list
+        .iter()
+        .filter_map(|build| {
+            let baseline = baselines.get(&build.baseline_id?)?;
+            let source = baseline
+                .source_build_id
+                .and_then(|source_id| source_builds.get(&source_id));
+            Some((
+                build.id,
+                BuildBaselineSource {
+                    branch: baseline.branch.clone(),
+                    source_build_id: source.map(|source| source.id),
+                    source_build_number: source.map(|source| source.number),
+                },
+            ))
+        })
+        .collect())
+}
+
 /// プロジェクト内のビルド番号でビルドを取得する。
 ///
 /// `(project_id, number)` は一意。UI の `/builds/{number}` 表示が一覧を舐めずに済むように使う。

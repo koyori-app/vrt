@@ -1,10 +1,9 @@
 /**
  * A `git log --graph`-style lane column for the build list.
  *
- * ponytail: builds only store their own commit SHA — no parent SHAs — so the lanes
- * group builds by branch instead of following real ancestry: one lane per branch,
- * spanning from its newest build down to its oldest, with no merge/fork edges
- * between lanes. Store parent SHAs on the build to draw a true ancestry graph.
+ * This is VRT baseline ancestry, not inferred Git history. Every completed build
+ * points at the approved build whose baseline it actually compared against. A
+ * cross-branch pointer is rendered as a diagonal join into that source build.
  */
 
 const LANE_WIDTH = 14;
@@ -32,6 +31,8 @@ type Cell = {
   dot: boolean;
   /** Set when a laneless branch borrows this column for its dot; overrides `color` for the dot only. */
   dotColor?: string;
+  /** At this row, join this lane into another lane's build dot. */
+  joinTo?: number;
 };
 
 export type Cells = (Cell | null)[];
@@ -40,37 +41,69 @@ export type GraphRow<T> = { build: T; cells: Cells };
 /**
  * Lay out one lane per branch over a newest-first build list.
  *
- * A lane opens at a branch's newest build, stays occupied down to its oldest one,
- * then frees its column for a later branch. The default branch, when present, opens
- * first so the trunk starts leftmost. Columns get recycled, so color is keyed by
- * branch rather than by column — two unrelated branches sharing a column stay
- * visually distinct.
- *
- * `truncated` says the list was cut off by a fetch limit rather than exhausted. Only
- * an exhausted list proves a branch ended: past the cut, any branch on the page may
- * still have older builds. So a truncated page holds every lane open to the bottom
- * and never recycles a column — a branch whose visible builds stopped early is drawn
- * as continuing, not as terminated.
+ * A lane opens at a branch's newest build. Its lower end comes from the oldest
+ * visible build's `baseline_source`: it joins the source build when that build is
+ * visible, continues below the page when the source is older/deleted, and otherwise
+ * terminates at the build dot. The default branch, when present, opens first so the
+ * trunk starts leftmost. Columns get recycled only after that truthful endpoint.
  *
  * Lanes are capped at {@link MAX_LANES}: once every column is occupied, further
  * branches get no lane of their own — their builds are drawn as a lone dot on the
- * rightmost column. This bounds the column width even when a truncated page never
- * recycles a lane.
- *
- * ponytail: total count is all we have to go on. Return `has_older_builds` per branch
- * from the list endpoint to close the lanes that really did end.
+ * rightmost column. This bounds the column width even when several long-lived
+ * branches overlap.
  */
-export function buildGraph<T extends { branch: string }>(
-  builds: T[],
-  defaultBranch?: string,
-  truncated = false,
-): { rows: GraphRow<T>[]; width: number } {
+export function buildGraph<
+  T extends {
+    id: string;
+    number: number;
+    branch: string;
+    baseline_source?: {
+      branch: string;
+      build_id?: string | null;
+      build_number?: number | null;
+    } | null;
+  },
+>(builds: T[], defaultBranch?: string): { rows: GraphRow<T>[]; width: number } {
   const first = new Map<string, number>();
   const last = new Map<string, number>();
+  const indexById = new Map<string, number>();
   builds.forEach((build, i) => {
     if (!first.has(build.branch)) first.set(build.branch, i);
     last.set(build.branch, i);
+    indexById.set(build.id, i);
   });
+
+  // A branch remains open through the row where its oldest visible build joins
+  // the baseline source. When that source is outside retained/visible history,
+  // carry the lane to the page boundary instead of inventing an endpoint.
+  const end = new Map(last);
+  const joins = new Map<number, { from: string; to: string }[]>();
+  for (const [branch, lastRow] of last) {
+    const build = builds[lastRow]!;
+    const source = build.baseline_source;
+    if (!source) continue;
+
+    const sourceRow = source.build_id ? indexById.get(source.build_id) : undefined;
+    if (sourceRow !== undefined && sourceRow > lastRow) {
+      end.set(branch, sourceRow);
+      if (source.branch !== branch) {
+        const rowJoins = joins.get(sourceRow) ?? [];
+        rowJoins.push({ from: branch, to: source.branch });
+        joins.set(sourceRow, rowJoins);
+      }
+      continue;
+    }
+
+    const sourceIsOlder =
+      source.build_number === null ||
+      source.build_number === undefined ||
+      source.build_number < build.number;
+    if (sourceRow === undefined && sourceIsOlder && builds.length > 0) {
+      // One row beyond the last visible row keeps the final half-segment open,
+      // explicitly showing that the source lies below this page.
+      end.set(branch, builds.length);
+    }
+  }
 
   const colors = new Map<string, string>();
   const colorOf = (branch: string) => {
@@ -113,17 +146,22 @@ export function buildGraph<T extends { branch: string }>(
       return {
         color: colorOf(branch),
         top: i > opened.get(branch)!,
-        bottom: truncated || i < last.get(branch)!,
+        bottom: i < end.get(branch)!,
         dot: borrowed || branch === build.branch,
         ...(borrowed ? { dotColor: colorOf(build.branch) } : null),
       };
     });
     width = Math.max(width, active.length);
-    if (!truncated) {
-      active.forEach((branch, lane) => {
-        if (branch !== null && last.get(branch) === i) active[lane] = null;
-      });
+    for (const join of joins.get(i) ?? []) {
+      const fromLane = active.indexOf(join.from);
+      const toLane = active.indexOf(join.to);
+      if (fromLane === -1 || toLane === -1) continue;
+      const cell = cells[fromLane];
+      if (cell) cell.joinTo = toLane;
     }
+    active.forEach((branch, lane) => {
+      if (branch !== null && end.get(branch) === i) active[lane] = null;
+    });
     return { build, cells };
   });
 
@@ -142,7 +180,11 @@ export function BuildGraph({ cells }: { cells: Cells }) {
         const x = lane * LANE_WIDTH + LANE_WIDTH / 2;
         return (
           <g key={lane} stroke={cell.color} strokeWidth={STROKE} fill={cell.color}>
-            {cell.top ? <line x1={x} x2={x} y1="0" y2="50%" /> : null}
+            {cell.joinTo !== undefined ? (
+              <line x1={x} x2={cell.joinTo * LANE_WIDTH + LANE_WIDTH / 2} y1="0" y2="50%" />
+            ) : cell.top ? (
+              <line x1={x} x2={x} y1="0" y2="50%" />
+            ) : null}
             {cell.bottom ? <line x1={x} x2={x} y1="50%" y2="100%" /> : null}
             {cell.dot ? (
               // A borrowed dot gets a card-colored ring so it stays visible even when
