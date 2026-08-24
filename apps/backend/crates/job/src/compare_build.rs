@@ -202,6 +202,9 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         Some(id) => Some(service::baselines::get_baseline(db, id).await?),
         None => service::baselines::latest_for(db, &project, &build.branch).await?,
     };
+    // baseline が別 branch からの fallback（自分の baseline をまだ持たない枝が
+    // default branch の baseline を掴んだ等）かどうか。removed の判定に使う。
+    let cross_branch_baseline = baseline.as_ref().is_some_and(|b| b.branch != build.branch);
     let baseline_entries = match &baseline {
         Some(b) => service::baselines::entries(db, b.id).await?,
         None => Vec::new(),
@@ -219,13 +222,50 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("read capture plan: {e}"))?
     {
         Some(plan) => {
-            materialize_carry_forward(state, &project, &build, &baseline_entries, &plan, shots)
-                .await?
+            materialize_carry_forward(
+                state,
+                &project,
+                &build,
+                &baseline_entries,
+                &plan,
+                shots,
+                cross_branch_baseline,
+            )
+            .await?
         }
         None => shots,
     };
 
-    let pairs = join_by_name(shots, baseline_entries);
+    let mut pairs = join_by_name(shots, baseline_entries);
+    let not_reported_as_removed = if cross_branch_baseline {
+        drop_baseline_only_pairs(&mut pairs)
+    } else {
+        0
+    };
+    if not_reported_as_removed > 0 {
+        let baseline_branch = baseline
+            .as_ref()
+            .map(|b| b.branch.as_str())
+            .unwrap_or_default();
+        service::build_logs::append(
+            db,
+            build_id,
+            LogLevel::Info,
+            format!(
+                "used baseline from branch `{baseline_branch}`; did not report \
+                 {not_reported_as_removed} missing entries as removed \
+                 (別 branch の baseline を使ったため {not_reported_as_removed} 件の欠落を removed にしなかった)"
+            ),
+        )
+        .await?;
+        tracing::info!(
+            %build_id,
+            baseline_branch,
+            build_branch = %build.branch,
+            count = not_reported_as_removed,
+            "cross-branch baseline: missing entries not reported as removed"
+        );
+    }
     let total = pairs.len();
 
     // 比較対象数が確定した時点で開始行を残す。
@@ -453,6 +493,7 @@ where
 /// - insert がリトライ後も失敗し、かつ行が存在しないと確認できた場合だけ、
 ///   アップロード済みオブジェクトを補償削除する（行が確認できないときは
 ///   消さない——既存行が参照するオブジェクトを壊さない側に倒す）
+#[allow(clippy::too_many_arguments)]
 async fn materialize_carry_forward(
     state: &JobState,
     project: &projects::Model,
@@ -460,6 +501,7 @@ async fn materialize_carry_forward(
     baseline_entries: &[baseline_entries::Model],
     plan: &service::builds::CapturePlan,
     shots: Vec<screenshots::Model>,
+    cross_branch_baseline: bool,
 ) -> Result<Vec<screenshots::Model>, anyhow::Error> {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -598,12 +640,19 @@ async fn materialize_carry_forward(
         .await?;
     }
     if vanished > 0 {
+        // 異 branch fallback のときは、この欠落を removed と断定できない
+        // （後段の drop_baseline_only_pairs が比較対象から外す）。ログも合わせる。
+        let disposition = if cross_branch_baseline {
+            "baseline is from another branch; not reporting as removed"
+        } else {
+            "reporting as removed"
+        };
         service::build_logs::append(
             db,
             build.id,
             LogLevel::Info,
             format!(
-                "{vanished} baseline entr{} no longer in the story manifest; reporting as removed",
+                "{vanished} baseline entr{} no longer in the story manifest; {disposition}",
                 if vanished == 1 { "y is" } else { "ies are" }
             ),
         )
@@ -614,13 +663,39 @@ async fn materialize_carry_forward(
     Ok(service::screenshots::list_for_build(db, build.id).await?)
 }
 
+/// name → (今回のスクリーンショット, baseline エントリ) の完全外部結合。
+type JoinedPairs = BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)>;
+
+/// 異 branch の baseline（fallback）を使う比較で、今回のビルド側に無い名前を
+/// 比較対象から外し、外した件数を返す。
+///
+/// baseline がビルドと同じ branch なら、baseline にだけある名前は「この枝で
+/// story を消した」と断定できる。だが自分の baseline を持たない枝が別 branch
+/// （通常は default branch）の baseline へ fallback したとき、その欠落は
+///
+/// - この枝が本当に story を消した
+/// - 分岐後に baseline 側の branch へ追加された story を、この枝がまだ持っていない
+///
+/// の 2 つを区別できない。区別できないものを「消した」と断ずるほうが誤りなので、
+/// removed として報告しない（実害: 別 branch baseline の誤検知 removed が
+/// 35 件 × 複数 PR を汚した。koyori-app/vrt#38）。
+///
+/// 代償: 枝の初回ビルド（自分の baseline を持つ前）における本物の削除は、
+/// このビルドでは報告されない。枝が承認で自分の baseline を持った後の同 branch
+/// 比較と、main へマージされた後のビルドが同じ削除を removed として捕まえるため、
+/// 恒久的な見逃しにはならない。根治（git 系譜で baseline を選ぶ）は #38 で別途。
+fn drop_baseline_only_pairs(pairs: &mut JoinedPairs) -> usize {
+    let before = pairs.len();
+    pairs.retain(|_, (shot, _)| shot.is_some());
+    before - pairs.len()
+}
+
 /// name をキーにスクリーンショットと baseline エントリを完全外部結合する。
 fn join_by_name(
     shots: Vec<screenshots::Model>,
     entries: Vec<baseline_entries::Model>,
-) -> BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)> {
-    let mut map: BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)> =
-        BTreeMap::new();
+) -> JoinedPairs {
+    let mut map: JoinedPairs = BTreeMap::new();
     for shot in shots {
         let name = shot.name.clone();
         map.entry(name).or_default().0 = Some(shot);
@@ -782,6 +857,38 @@ mod tests {
         assert!(joined["about"].0.is_some() && joined["about"].1.is_none());
         // baseline だけ → removed
         assert!(joined["legacy"].0.is_none() && joined["legacy"].1.is_some());
+    }
+
+    /// 異 branch fallback の baseline にしか無い名前は比較対象から外れる（#38 誤検知対策）。
+    #[test]
+    fn cross_branch_baseline_missing_names_are_dropped_not_removed() {
+        let mut joined = join_by_name(
+            vec![shot("home")],
+            vec![entry("home"), entry("main-only-a"), entry("main-only-b")],
+        );
+
+        let dropped = drop_baseline_only_pairs(&mut joined);
+
+        assert_eq!(dropped, 2, "baseline 側にしか無い 2 件を外した数が返る");
+        assert_eq!(joined.len(), 1);
+        assert!(
+            joined["home"].0.is_some() && joined["home"].1.is_some(),
+            "両側にあるペアは比較対象に残る"
+        );
+        assert!(!joined.contains_key("main-only-a"));
+        assert!(!joined.contains_key("main-only-b"));
+    }
+
+    /// 両側にある・今回だけの名前は外されない（added / changed / unchanged は不変）。
+    #[test]
+    fn drop_baseline_only_pairs_keeps_added_and_matched() {
+        let mut joined = join_by_name(vec![shot("home"), shot("new-page")], vec![entry("home")]);
+
+        let dropped = drop_baseline_only_pairs(&mut joined);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(joined.len(), 2);
+        assert!(joined["new-page"].0.is_some() && joined["new-page"].1.is_none());
     }
 
     #[test]

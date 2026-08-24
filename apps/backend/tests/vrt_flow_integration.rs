@@ -1094,3 +1094,92 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     assert_eq!(comparisons.len(), 1);
     assert_eq!(comparisons[0]["status"].as_str(), Some("added"));
 }
+
+/// 異 branch fallback の baseline にしか無い名前を `removed` にしない（koyori-app/vrt#38）。
+///
+/// 自分の baseline を持たない枝は default branch の baseline へ fallback する。
+/// その baseline にあってビルドに無い名前は「枝が消した」のか「分岐後に main へ
+/// 追加された」のか区別できないため、removed として報告してはならない。
+/// 同 branch の比較では従来どおり removed になることも同時に固定する（回帰）。
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_branch_baseline_does_not_report_missing_entries_as_removed() {
+    let fx = setup().await;
+
+    let home = png(40, 30, [255, 255, 255, 255]);
+    let about = png(40, 30, [200, 200, 200, 255]);
+
+    // ── main #1: home + about → force 承認で main の baseline (2 件) ──────
+    let build1 = fx.create_build("main", "aaaa1111").await;
+    let build1_id = build_id_of(&build1);
+    assert_eq!(
+        fx.upload(build1_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fx.upload(build1_id, "about", about.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build1_id).await, StatusCode::OK);
+    let build1 = fx.wait_for_terminal(build1_id).await;
+    assert_eq!(build1["status"].as_str(), Some("changes_detected"));
+    let res = fx.approve(build1_id, true).await;
+    assert_eq!(res.status(), StatusCode::OK, "force approve main build");
+
+    // ── feature #2: home だけ（about 相当は撮っていない）─────────────────
+    //
+    // feature 枝は自分の baseline を持たないので main の baseline へ fallback する。
+    // 修正前はここで about が removed=1 と誤検知され changes_detected になっていた
+    // （陽性対照: 修正前のコードではこのテストは必ず落ちる）。
+    let build2 = fx.create_build("feature/no-own-baseline", "bbbb2222").await;
+    let build2_id = build_id_of(&build2);
+    assert_eq!(
+        fx.upload(build2_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build2_id).await, StatusCode::OK);
+    let build2 = fx.wait_for_terminal(build2_id).await;
+    assert_eq!(
+        build2["status"].as_str(),
+        Some("passed"),
+        "missing names against a cross-branch baseline must not be removed: {build2:?}"
+    );
+    assert_eq!(
+        counts(&build2),
+        (1, 0, 0, 0, 1),
+        "only the uploaded screenshot is compared; nothing is removed"
+    );
+    let cmps = fx.comparisons(build2_id).await;
+    assert_eq!(
+        cmps.len(),
+        1,
+        "the baseline-only name has no comparison row"
+    );
+    assert_eq!(find_comparison(&cmps, "home")["status"], "unchanged");
+    let logs = fx.build_logs(build2_id).await;
+    assert!(
+        logs.iter().any(|entry| {
+            entry["message"].as_str().is_some_and(|message| {
+                message.contains("did not report 1 missing entries as removed")
+            })
+        }),
+        "build log records how many missing entries were not reported as removed: {logs:?}"
+    );
+
+    // ── main #3: home だけ → 同 branch では従来どおり about が removed ────
+    let build3 = fx.create_build("main", "cccc3333").await;
+    let build3_id = build_id_of(&build3);
+    assert_eq!(
+        fx.upload(build3_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build3_id).await, StatusCode::OK);
+    let build3 = fx.wait_for_terminal(build3_id).await;
+    assert_eq!(
+        build3["status"].as_str(),
+        Some("changes_detected"),
+        "same-branch comparisons still report removals"
+    );
+    assert_eq!(counts(&build3), (2, 0, 0, 1, 1));
+    let cmps = fx.comparisons(build3_id).await;
+    assert_eq!(find_comparison(&cmps, "about")["status"], "removed");
+}
