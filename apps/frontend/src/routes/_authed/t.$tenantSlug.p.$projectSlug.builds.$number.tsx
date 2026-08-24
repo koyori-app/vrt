@@ -40,7 +40,10 @@ function BuildReviewPage() {
       enabled: !!project?.id && Number.isFinite(Number(number)),
       refetchInterval: (query) => {
         const status = query.state.data?.status;
-        return status === "processing" || status === "pending" || status === "rendering"
+        return status === "processing" ||
+          status === "pending" ||
+          status === "queued" ||
+          status === "rendering"
           ? PROCESSING_POLL_MS
           : false;
       },
@@ -91,11 +94,14 @@ function BuildReview({
     "/v1/builds/{build_id}",
     { params: { path: { build_id: buildId } } },
     {
-      // Keep the badge and error banner live while jobs run — including the
-      // rendering phase a storybook-mode retry restarts from this same screen.
+      // Keep the badge and error banner live from queueing through processing,
+      // including the rendering phase used by storybook-mode builds.
       refetchInterval: (query) => {
         const status = query.state.data?.status;
-        return status === "processing" || status === "pending" || status === "rendering"
+        return status === "processing" ||
+          status === "pending" ||
+          status === "queued" ||
+          status === "rendering"
           ? PROCESSING_POLL_MS
           : false;
       },
@@ -109,7 +115,10 @@ function BuildReview({
     { params: { path: { build_id: buildId } } },
     {
       refetchInterval:
-        build.status === "processing" || build.status === "pending" || build.status === "rendering"
+        build.status === "processing" ||
+        build.status === "pending" ||
+        build.status === "queued" ||
+        build.status === "rendering"
           ? PROCESSING_POLL_MS
           : false,
     },

@@ -152,13 +152,11 @@ GET /v1/auth/{provider}/callback
 ### ビルド
 
 ```
-              finalize (mode=screenshots)
-   pending ──────────────────────────────────────▶ processing
-      │                                              ▲
-      │  finalize (mode=storybook)                   │ 撮影完了
-      └────────────────────▶ rendering ──────────────┘
-                                │ 撮影失敗
-                                ▼
+   pending ── finalize ──▶ queued ── worker (screenshots) ──▶ processing
+                            │                                   ▲
+                            └── worker (storybook) ──▶ rendering┘
+                                                         │ 撮影失敗
+                                                         ▼
               ┌───────────────────┼───────────────────┐
               │                   │                   │
               ▼                   ▼                   ▼
@@ -168,13 +166,14 @@ GET /v1/auth/{provider}/callback
               └───────────────────┤
                                   └── reject  ──▶ rejected (終端)
 
-   failed ── retry ──▶ rendering（storybook モード）
-                     | processing（screenshots モード）
+   failed ── retry ──▶ queued
 ```
 
 - `pending` … ビルド行を作った直後。スクリーンショット（`screenshots` モード）
   か Storybook バンドル（`storybook` モード）を受け付けている。
-- `rendering` … `storybook` モードの `finalize` 後、`render_build` ジョブが
+- `queued` … finalize または再実行でパイプライン先頭のジョブを投入済み。
+  worker が取得すると storybook は `rendering`、screenshots は `processing` に進む。
+- `rendering` … `render_build` worker がジョブを取得後、
   ヘッドレス Chromium でストーリーを撮っている。撮り終えると `processing` に
   自動で繋がる。`screenshots` モードでは通らない。
 - `processing` … `compare_build` ジョブが走っている。
@@ -182,8 +181,8 @@ GET /v1/auth/{provider}/callback
 - `changes_detected` … 差分あり。人間のレビュー待ち。
 - `failed` … 比較そのものが失敗（画像が壊れている等）。終端だが唯一の例外として
   再実行できる（`POST /v1/builds/{build_id}/retry`、admin 以上）。storybook
-  モードはアップロード済みバンドルの再レンダリング（`rendering`）から、
-  `screenshots` モードは比較（`processing`）からやり直す。`error_message` /
+  モードはアップロード済みバンドルの再レンダリングから、`screenshots` モードは
+  比較からやり直す。どちらもまず `queued` に入り、`error_message` /
   `completed_at` / 差分カウントはクリアされ、途中結果（screenshots /
   comparisons）は各ジョブが開始時に捨てる。
 - `approved` … 承認済み。**このビルドの全スクリーンショットが
@@ -228,8 +227,9 @@ baseline がまだ無いプロジェクトでは、全スクリーンショッ�
 
 ## 比較ジョブ
 
-`finalize` はビルドを `processing` にして `compare_build` ジョブを積むだけで、
-HTTP リクエストはそこで完了する。実際の比較は apalis ワーカーが行う:
+`finalize` はビルドを `queued` にして `compare_build` ジョブを積むだけで、
+HTTP リクエストはそこで完了する。worker が取得した時点で `processing` に進み、
+実際の比較を行う:
 
 1. `(project, branch)` の最新 baseline を引く（無ければ全件 `added`）
 2. baseline とビルドのスクリーンショットを名前で突き合わせる
@@ -245,7 +245,8 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 
 `mode = storybook` のビルドは、CI が撮った PNG ではなく **ビルド済み Storybook
 の zip** を受け取り、サーバー側で撮る（Chromatic 方式）。`finalize` はビルドを
-`rendering` にして `render_build` ジョブを積むだけで、実処理はワーカーが行う:
+`queued` にして `render_build` ジョブを積むだけで、worker が取得した時点で
+`rendering` に進み実処理を行う:
 
 1. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリに展開する。
    展開は `service::render::bundle` が担当し、**zip-slip（`..` / 絶対パス /

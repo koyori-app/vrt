@@ -1,11 +1,13 @@
 //! アップロードされた Storybook バンドルをヘッドレス Chromium で撮影するジョブ。
 //!
 //! `POST /v1/ci/builds/{id}/finalize`（`mode = storybook`）が
-//! `pending → rendering` の遷移と同時に投入する。
+//! `pending → queued` の遷移と同時に投入し、worker が取得した時点で
+//! `queued → rendering` へ進める。
 //!
 //! 処理の流れ:
 //!
-//! 1. build / project をロードし、`rendering` でなければ何もせず終わる（重複投入の保護）
+//! 1. build / project をロードし、`queued → rendering` へ進める
+//!    （既に `rendering` の旧ジョブは後方互換で継続、それ以外は重複投入としてスキップ）
 //! 2. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリへ安全に展開
 //!    （[`service::render::bundle`] が zip-slip / zip bomb / symlink を弾く）
 //! 3. `index.json` からストーリー一覧を作り、ループバックの静的サーバーを立てる
@@ -148,13 +150,22 @@ async fn run(
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
-    if build.status != BuildStatus::Rendering {
-        tracing::info!(%build_id, status = ?build.status, "skipping render job for non-rendering build");
+    if build.mode != BuildMode::Storybook {
+        tracing::info!(%build_id, mode = ?build.mode, "skipping render job for non-storybook build");
         return Ok(());
     }
-    if build.mode != BuildMode::Storybook {
-        anyhow::bail!("build {build_id} is not a storybook-mode build");
-    }
+    let build = match build.status {
+        BuildStatus::Queued => {
+            service::builds::transition(db, build, BuildStatus::Rendering).await?
+        }
+        // Jobs queued by an older deployment already entered Rendering before
+        // enqueue. Let them finish across a rolling deploy.
+        BuildStatus::Rendering => build,
+        status => {
+            tracing::info!(%build_id, ?status, "skipping render job outside the queued/rendering phases");
+            return Ok(());
+        }
+    };
 
     let storybook_key = build
         .storybook_key

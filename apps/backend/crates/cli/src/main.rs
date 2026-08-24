@@ -998,7 +998,7 @@ mod tests {
         ] {
             assert!(is_settled(s), "{s} should be terminal");
         }
-        for s in ["pending", "rendering", "processing"] {
+        for s in ["pending", "queued", "rendering", "processing"] {
             assert!(!is_settled(s), "{s} should not be terminal");
         }
     }

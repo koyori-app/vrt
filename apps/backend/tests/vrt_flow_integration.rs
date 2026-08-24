@@ -228,7 +228,7 @@ impl Fixture {
             let build: Value = res.json().await.expect("build json");
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
-            if !matches!(status.as_str(), "pending" | "processing") {
+            if !matches!(status.as_str(), "pending" | "queued" | "processing") {
                 assert_completed_at_is_stamped(&build);
                 return build;
             }
@@ -1068,7 +1068,7 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     active.error_message = Set(Some("simulated compare failure".into()));
     active.update(&fx.app.state.db).await.expect("force failed");
 
-    // 再実行 → processing（比較から）に戻り、そのまま完走する。
+    // 再実行 → queued に戻り、worker が取得して比較から完走する。
     let res = fx
         .app
         .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
@@ -1077,8 +1077,8 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     let retried: Value = res.json().await.expect("retry json");
     assert_eq!(
         retried["status"].as_str(),
-        Some("processing"),
-        "screenshots-mode retry restarts at the compare step"
+        Some("queued"),
+        "screenshots-mode retry waits for the compare worker"
     );
     assert!(retried["error_message"].is_null());
 

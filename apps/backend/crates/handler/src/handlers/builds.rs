@@ -432,7 +432,7 @@ pub async fn retry_build(
         }
     }
 
-    // rendering / processing を GitHub の pending ステータスとして見せる
+    // queued を GitHub の pending ステータスとして見せる
     // （finalize と同じ）。連携が無ければジョブ側が何もせず終わる。
     job::github_status::enqueue_best_effort(&state.github_status_storage, build.id).await;
 

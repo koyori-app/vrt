@@ -391,7 +391,10 @@ impl Fixture {
             let build = self.get_build(build_id).await;
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
-            if !matches!(status.as_str(), "pending" | "rendering" | "processing") {
+            if !matches!(
+                status.as_str(),
+                "pending" | "queued" | "rendering" | "processing"
+            ) {
                 assert_completed_at_is_stamped(&build);
                 return build;
             }
@@ -545,8 +548,8 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
         finalized["status"].as_str(),
-        Some("rendering"),
-        "storybook finalize goes to rendering, not processing"
+        Some("queued"),
+        "storybook finalize stays queued until a render worker picks it up"
     );
 
     let build1 = fx.wait_for_terminal(build1_id).await;
@@ -715,8 +718,8 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
         finalized["status"].as_str(),
-        Some("rendering"),
-        "storybook finalize goes to rendering"
+        Some("queued"),
+        "storybook finalize stays queued until a render worker picks it up"
     );
 
     let build_b = fx.wait_for_terminal(build_b_id).await;
@@ -1635,7 +1638,7 @@ async fn a_failed_storybook_build_can_be_retried_and_completes() {
         .await;
     assert_eq!(res.status(), StatusCode::OK, "retry failed build");
     let retried: Value = res.json().await.expect("retry json");
-    assert_eq!(retried["status"].as_str(), Some("rendering"));
+    assert_eq!(retried["status"].as_str(), Some("queued"));
     assert!(
         retried["error_message"].is_null(),
         "error_message is cleared on retry, got {:?}",

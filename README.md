@@ -159,7 +159,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/screenshots" \
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. processing を抜けるまでポーリングする
+# 4. queued / processing を抜けるまでポーリングする
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 ```
 
@@ -919,7 +919,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
   -H "Authorization: Bearer $VRT_TOKEN"
 # 撮り直しを絞りたいときは only_story_ids を渡す（下の補足を参照）
 
-# 4. rendering / processing を抜けるまでポーリングする
+# 4. queued / rendering / processing を抜けるまでポーリングする
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 ```
 
@@ -940,7 +940,7 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
   全撮影ビルドは固定されず、比較時点の最新 baseline と比較される
 - `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
   1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
-- finalize 後は `pending → rendering → processing → …` と進む。
+- finalize 後は `pending → queued → rendering → processing → …` と進む。
   `rendering` 中に 1 ストーリーでも撮れなければビルドは `failed` になり、
   `error_message` にどのストーリーで落ちたかが入る
 - `failed` のビルドは UI の **Retry build**（`POST /v1/builds/{build_id}/retry`、

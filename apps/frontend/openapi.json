@@ -1623,7 +1623,7 @@
           "CI"
         ],
         "summary": "アップロードを締めてジョブを投入する",
-        "description": "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、`storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する（レンダリングが済むと自動で `processing` に繋がる）。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。ボディは任意。`storybook` モードで `only_story_ids` を渡すと、そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当。このとき `expected_baseline_commit_sha` は必須で、現在の baseline と照合してから比較対象として固定する）。`screenshots` モードの部分アップロードは、事前に`POST /v1/ci/builds/{build_id}/plan` で固定された capture plan と実際のアップロードの一致を検証する。`captured_names` は保存済み計画との任意のクロスチェックで、計画なしのビルドに渡すと 400。",
+        "description": "どちらのモードも `pending → queued` に遷移してジョブを投入する。worker が取得すると `screenshots` は `processing`、`storybook` は `rendering` に進み、レンダリング後は自動で `processing` に繋がる。以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。ボディは任意。`storybook` モードで `only_story_ids` を渡すと、そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当。このとき `expected_baseline_commit_sha` は必須で、現在の baseline と照合してから比較対象として固定する）。`screenshots` モードの部分アップロードは、事前に`POST /v1/ci/builds/{build_id}/plan` で固定された capture plan と実際のアップロードの一致を検証する。`captured_names` は保存済み計画との任意のクロスチェックで、計画なしのビルドに渡すと 400。",
         "operationId": "finalize_build",
         "parameters": [
           {
@@ -1650,7 +1650,7 @@
         },
         "responses": {
           "200": {
-            "description": "processing / rendering に遷移したビルド",
+            "description": "queued に遷移したビルド",
             "content": {
               "application/json": {
                 "schema": {
@@ -6433,9 +6433,10 @@
       },
       "BuildStatus": {
         "type": "string",
-        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                         └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n\n再実行（failed のみ）:\nfailed ──retry──▶ rendering（storybook モード） | processing（screenshots モード）\n```",
+        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ queued ──worker──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ queued ──worker──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                                             └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n\n再実行（failed のみ）:\nfailed ──retry──▶ queued ──worker──▶ rendering（storybook） | processing（screenshots）\n```",
         "enum": [
           "pending",
+          "queued",
           "rendering",
           "processing",
           "passed",

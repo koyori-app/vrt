@@ -656,7 +656,7 @@ impl TestApp {
         });
 
         // 本番の server::run と同じ形でワーカーを走らせる。
-        // これが無いと finalize したビルドが processing のまま止まる。
+        // これが無いと finalize したビルドが queued のまま止まる。
         let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
         backend::server::spawn_compare_build_worker(&state, worker_shutdown_rx.clone());
         backend::server::spawn_github_status_worker(&state, worker_shutdown_rx.clone());

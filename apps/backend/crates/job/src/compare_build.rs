@@ -1,6 +1,7 @@
 //! ビルドのスクリーンショットを baseline と突き合わせて差分を計算するジョブ。
 //!
-//! `POST /v1/ci/builds/{id}/finalize` が `pending → processing` の遷移と同時に投入する。
+//! `POST /v1/ci/builds/{id}/finalize` が `pending → queued` の遷移と同時に投入し、
+//! screenshots モードでは worker が取得した時点で `queued → processing` へ進める。
 //!
 //! 処理の流れ:
 //!
@@ -60,19 +61,16 @@ pub struct CompareBuildJob {
 ///   テーブルを毎回引き直すので、いつ投入されたジョブでも必ず拾える。
 ///
 /// 実際に統合テストで前者を踏んだ（並列実行で負荷が上がると
-/// `PgListener::connect_with` が finalize より遅れ、ビルドが processing のまま停止した）。
+/// `PgListener::connect_with` が finalize より遅れ、ビルドが queued のまま停止した）。
 /// 取りこぼしゼロを優先してポーリング型を採用する。
 ///
-/// ## 既知の制約（upstream）
+/// ## ポーリング間隔
 ///
-/// `Config::with_poll_interval` で渡した `poll_strategy` は
-/// apalis-postgres 1.0.0-rc.8 では**どちらのフェッチャからも読まれない**（デッドコンフィグ）。
-/// `PgFetcher` の待ち時間は `PgPollFetcher` にハードコードされた指数バックオフ
-/// （初期 1s → 2 倍ずつ → 上限 5 分。ジョブを 1 件でも拾えば 1s にリセット）で決まる。
-/// つまり「約 8.5 分以上まったくジョブが無かった直後の 1 本目」は最大 5 分待たされうる。
-/// 連続するビルドはリセット後なので即時に近い。
-/// ここを詰めるには upstream が `poll_strategy` を尊重するか、
-/// バックオフ上限を設定可能にする必要がある。
+/// upstream の apalis-postgres 1.0.0-rc.8 は `Config::with_poll_interval` を
+/// `PgPollFetcher` から読まず、アイドル時に最大 5 分まで指数バックオフする。
+/// VRT は同じ API / DB スキーマのローカルパッチ（`vendor/apalis-postgres`）で
+/// 1 秒固定にしている。これにより通知型の起動レースを持ち込まず、プロセス起動前に
+/// 投入されたジョブも拾いつつ、アイドル後の取得遅延を 1 秒程度に抑える。
 pub type CompareBuildStorage = PostgresStorage<CompareBuildJob>;
 
 /// 指定キュー名でストレージを組み立てる。
@@ -180,11 +178,20 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
-    if build.status != BuildStatus::Processing {
-        // finalize 済みでないビルドは処理しない（重複投入・遅延到着の保護）。
-        tracing::info!(%build_id, status = ?build.status, "skipping compare job for non-processing build");
-        return Ok(());
-    }
+    let build = match (build.mode, build.status) {
+        // screenshots モードのパイプライン先頭。worker が実際に取得してから
+        // processing にするため、UI はキュー待ちと処理中を区別できる。
+        (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
+            service::builds::transition(db, build, BuildStatus::Processing).await?
+        }
+        // storybook の render 完了後に積まれた compare job と、旧バージョンが
+        // finalize 時点で Processing にしたジョブはそのまま続行する。
+        (_, BuildStatus::Processing) => build,
+        (mode, status) => {
+            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            return Ok(());
+        }
+    };
 
     let project = service::projects::get_project(db, build.project_id).await?;
 

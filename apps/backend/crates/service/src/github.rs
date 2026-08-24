@@ -512,6 +512,10 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
 
     match build.status {
         Pending => (CommitState::Pending, "Waiting for screenshots".to_string()),
+        Queued => (
+            CommitState::Pending,
+            "Waiting for a build worker".to_string(),
+        ),
         Rendering => (
             CommitState::Pending,
             "Rendering stories from the Storybook bundle".to_string(),
@@ -1082,6 +1086,10 @@ mod tests {
     #[test]
     fn maps_build_status_to_commit_state() {
         use builds::BuildStatus::*;
+        assert_eq!(
+            status_for_build(&build(Queued, 0, 0, 0)).0,
+            CommitState::Pending
+        );
         assert_eq!(
             status_for_build(&build(Processing, 0, 0, 0)).0,
             CommitState::Pending
