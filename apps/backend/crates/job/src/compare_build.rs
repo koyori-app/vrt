@@ -194,6 +194,7 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
             &state.db,
             &state.storage,
             build.project_id,
+            state.settings.storage_min_retention_days,
         )
         .await;
     }

@@ -2001,6 +2001,7 @@ async fn processing_storybook_build_recovers_compare_handoff_idempotently() {
     .expect("compare storage");
     let render_state = job::RenderJobState {
         chromium_path: "unused-for-handoff-recovery".into(),
+        storage_min_retention_days: 0,
         db: fx.app.state.db.clone(),
         storage: fx.app.state.storage.clone(),
         github_status_storage: fx.app.state.github_status_storage.clone(),

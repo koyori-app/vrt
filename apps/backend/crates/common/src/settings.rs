@@ -75,6 +75,13 @@ pub struct Settings {
     pub s3_secret_access_key: Option<String>,
     pub s3_public_base_url: Option<String>,
     pub s3_force_path_style: Option<bool>,
+    /// ビルド自動プルーニングの最低保持日数（env `STORAGE_MIN_RETENTION_DAYS`、既定 0）。
+    ///
+    /// 作成からこの日数が経っていないビルドは `build_retention_limit` を超過していても
+    /// 削除しない。Wasabi のように削除済みオブジェクトへも最低保存期間（90 日）分を
+    /// 課金するストレージでは、期間内に消しても節約にならないため 90 を設定する。
+    #[serde(default)]
+    pub storage_min_retention_days: u32,
     /// ヘッドレス Chromium の実行ファイルパス（env `CHROMIUM_PATH`）。
     ///
     /// 未設定なら Storybook レンダリング機能そのものが無効になり、
@@ -267,6 +274,7 @@ mod tests {
             s3_secret_access_key: None,
             s3_public_base_url: None,
             s3_force_path_style: None,
+            storage_min_retention_days: 0,
             chromium_path: None,
             render_worker_enabled: default_render_worker_enabled(),
             storybook_render_enabled_override: None,

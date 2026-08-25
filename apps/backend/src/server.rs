@@ -47,6 +47,7 @@ pub fn render_job_state_from(state: &AppState) -> Option<RenderJobState> {
 
     Some(RenderJobState {
         chromium_path,
+        storage_min_retention_days: state.settings.storage_min_retention_days,
         db: state.db.clone(),
         storage: state.storage.clone(),
         github_status_storage: state.github_status_storage.clone(),

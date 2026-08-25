@@ -135,6 +135,10 @@ services:
       - S3_SECRET_ACCESS_KEY
       # MinIO・R2 等パススタイルが要る場合は 1/true/yes を設定する。
       - S3_FORCE_PATH_STYLE
+      # ビルド自動プルーニングの最低保持日数（既定 0 = 従来どおり）。Wasabi のように
+      # 削除済みオブジェクトにも最低保存期間分を課金するストレージでは 90 を設定する。
+      # runner 側にも同じ値を渡すこと。
+      - STORAGE_MIN_RETENTION_DAYS
       # --- GitHub App（任意。PR ステータス連携）---
       # GITHUB_APP_ID と GITHUB_APP_PRIVATE_KEY_PEM の両方が揃って初めて有効。
       # 片方だけだと警告ログのみで無言で無効になる。PEM は改行を \n にエスケープして 1 行で渡す
@@ -184,6 +188,8 @@ services:
       - S3_ACCESS_KEY_ID
       - S3_SECRET_ACCESS_KEY
       - S3_FORCE_PATH_STYLE
+      # backend と同じ値を設定する（レンダリング失敗時のプルーニングも同じガードに従わせる）。
+      - STORAGE_MIN_RETENTION_DAYS
     volumes:
       - uploads:/home/app/uploads
     depends_on:

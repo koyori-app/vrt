@@ -1495,12 +1495,15 @@ pub async fn reject_build(
 /// 保持数の設定に従って古い完了ビルドを掃除する（ベストエフォート）。
 ///
 /// プロジェクトの `build_retention_limit` が NULL（無制限）なら何もしない。
+/// `min_retention_days` は作成からの最低保持日数で、これより新しいビルドは
+/// 件数超過していても削除しない（Wasabi 等の最低保存期間課金への対策。0 で無効）。
 /// エラーはログに残すだけで呼び出し側の処理は失敗させないため、ビルド完了処理や
 /// 設定更新の後処理からそのまま呼べる。
 pub async fn prune_project_builds_best_effort(
     db: &DatabaseConnection,
     storage: &Arc<dyn StorageBackend>,
     project_id: Uuid,
+    min_retention_days: u32,
 ) {
     let project = match projects::Entity::find_by_id(project_id).one(db).await {
         Ok(Some(project)) => project,
@@ -1513,7 +1516,7 @@ pub async fn prune_project_builds_best_effort(
     let Some(limit) = project.build_retention_limit else {
         return;
     };
-    match prune_old_builds(db, storage, project_id, limit).await {
+    match prune_old_builds(db, storage, project_id, limit, min_retention_days).await {
         Ok(0) => {}
         Ok(deleted) => tracing::info!(%project_id, deleted, "pruned old builds"),
         Err(e) => tracing::warn!(%project_id, error = %e, "build pruning failed"),
@@ -1528,6 +1531,8 @@ pub async fn prune_project_builds_best_effort(
 ///   ビルドのスクリーンショットと**同じストレージキーを共有**するため、参照元を消すと
 ///   baseline の実体まで失われる
 /// - 進行中（非 terminal）のビルド。数えも消しもしない
+/// - 作成から `min_retention_days` 日経っていないビルド。Wasabi 等は削除後も最低保存
+///   期間分を課金するため、期間内の削除はコスト削減にならない（0 で無効）
 ///
 /// 削除順序は「先に DB 行 → その後ストレージ」。DB は builds を消せば screenshots /
 /// comparisons / build_logs が FK cascade で消える。ストレージ削除はベストエフォートで、
@@ -1539,10 +1544,15 @@ pub async fn prune_old_builds(
     storage: &Arc<dyn StorageBackend>,
     project_id: Uuid,
     limit: i32,
+    min_retention_days: u32,
 ) -> Result<u64, AppError> {
     if limit < 1 {
         return Ok(0);
     }
+
+    // これより新しいビルドは件数超過でも削除しない（min_retention_days = 0 なら全許可）。
+    let retention_cutoff =
+        Utc::now().fixed_offset() - chrono::Duration::days(i64::from(min_retention_days));
 
     // terminal 状態のビルドを新しい順に取得する。changes_detected は含めない
     // （レビュー待ちでパイプラインは終わっていないため、is_terminal と揃える）。
@@ -1576,6 +1586,9 @@ pub async fn prune_old_builds(
     let mut deleted = 0u64;
     for build in builds.into_iter().skip(limit as usize) {
         if protected.contains(&build.id) {
+            continue;
+        }
+        if build.created_at > retention_cutoff {
             continue;
         }
 

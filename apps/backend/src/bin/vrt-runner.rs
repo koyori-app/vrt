@@ -43,8 +43,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::io::Error::other(format!("runner storage initialization failed: {error}"))
         })?;
 
+    // API と同じ STORAGE_MIN_RETENTION_DAYS を渡す（未設定・不正値は 0 = 無効）。
+    let storage_min_retention_days = env::var("STORAGE_MIN_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+
     let state = RenderJobState {
         chromium_path: chromium_path.clone(),
+        storage_min_retention_days,
         db,
         storage,
         github_status_storage,

@@ -43,6 +43,8 @@ pub struct JobState {
 #[derive(Clone)]
 pub struct RenderJobState {
     pub chromium_path: String,
+    /// ビルド自動プルーニングの最低保持日数（`Settings::storage_min_retention_days` 相当）。
+    pub storage_min_retention_days: u32,
     pub db: DatabaseConnection,
     pub storage: Arc<dyn StorageBackend>,
     /// レンダリング失敗時の GitHub status 更新を投入するキュー。

@@ -221,6 +221,7 @@ pub async fn process(
                     &state.db,
                     &state.storage,
                     build.project_id,
+                    state.storage_min_retention_days,
                 )
                 .await;
             }
