@@ -15,7 +15,7 @@ use crate::error::{AppError, ServerError};
 use crate::extractors::AuthUser;
 use crate::openapi::CrudErrors;
 use entity::{
-    baseline_entries, builds, comparisons, projects, scopes::Scope, screenshots,
+    baseline_entries, builds, builds::BuildMode, comparisons, projects, scopes::Scope, screenshots,
     tenant_members::TenantRole,
 };
 use payload::builds::*;
@@ -405,8 +405,16 @@ pub async fn retry_build(
     let (build, _) =
         load_build_with_role(&state, build_id, auth.user_id, TenantRole::Admin).await?;
 
-    // 検査は retry_failed が行ロック下で取り直した行に対して行う——ここで
-    // 読んだ build は認可（テナント境界）の解決にだけ使う。
+    // 外部 runner も内蔵 worker も無い構成では queued に戻しても永久に進まない。
+    // 設定はプロセス起動中に変わらないため、状態遷移より先に拒否して failed を保つ。
+    if build.mode == BuildMode::Storybook && !state.settings.storybook_render_enabled() {
+        return Err(AppError::ConflictDetail(
+            "Storybook rendering is disabled; configure an internal worker or external runner before retrying this build"
+                .into(),
+        ));
+    }
+
+    // 状態・バンドル検査は retry_failed が行ロック下で取り直した行に対して行う。
     let (build, target) = build_service::retry_failed(&state.db, build.id).await?;
 
     // 進捗ログに区切りを残す——前回の失敗ログの直後から新しい実行のログが

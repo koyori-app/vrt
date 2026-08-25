@@ -20,7 +20,7 @@
 //! 途中で落ちて再実行されても `(build_id, name)` の UNIQUE 制約にぶつからない。
 
 use apalis::prelude::{BoxDynError, Data, TaskSink};
-use apalis_postgres::{Config, PgPool, PostgresStorage};
+use apalis_postgres::{Config, PgPool, PgTaskId, PostgresStorage};
 use sea_orm::prelude::Uuid;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ use entity::{
 use service::build_logs::LogLevel;
 use service::render::{BundleError, RenderError, RenderOptions, StaticServer, StoryRenderer};
 
-use crate::JobState;
+use crate::RenderJobState;
 
 pub const QUEUE_NAME: &str = "render_build";
 pub const MAX_RETRIES: usize = 2;
@@ -171,10 +171,15 @@ pub async fn enqueue(
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
 /// `Err` を返すのはビルド行にすら書き戻せなかったケースだけ。
-pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
+pub async fn process(
+    job: RenderBuildJob,
+    state: Data<RenderJobState>,
+    task_id: PgTaskId,
+) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
+    let compare_handoff_key = format!("render-build:{task_id}:compare");
 
-    match run(build_id, job.only_story_ids, &state).await {
+    match run(build_id, job.only_story_ids, &compare_handoff_key, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             let (failure_origin, failure_code) = classify_render_failure(&err);
@@ -234,7 +239,8 @@ fn truncate(s: &str, max: usize) -> String {
 async fn run(
     build_id: Uuid,
     only_story_ids: Option<Vec<String>>,
-    state: &JobState,
+    compare_handoff_key: &str,
+    state: &RenderJobState,
 ) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
@@ -250,6 +256,18 @@ async fn run(
         // Jobs queued by an older deployment already entered Rendering before
         // enqueue. Let them finish across a rolling deploy.
         BuildStatus::Rendering => build,
+        // レンダリング完了後、比較ジョブ投入前にプロセスが落ちた経路。
+        // 同じ render task の冪等キーで引き渡しだけを修復し、撮影はやり直さない。
+        BuildStatus::Processing => {
+            crate::compare_build::enqueue_idempotent(
+                &state.compare_build_storage,
+                crate::CompareBuildJob { build_id },
+                compare_handoff_key,
+            )
+            .await?;
+            tracing::info!(%build_id, "recovered render-to-compare handoff");
+            return Ok(());
+        }
         status => {
             tracing::info!(%build_id, ?status, "skipping render job outside the queued/rendering phases");
             return Ok(());
@@ -266,14 +284,7 @@ async fn run(
 
     let project = service::projects::get_project(db, build.project_id).await?;
 
-    let chromium_path = state
-        .settings
-        .chromium_path
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("storybook rendering is not configured (CHROMIUM_PATH is unset)")
-        })?;
+    let chromium_path = state.chromium_path.clone();
 
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
     // （`(build_id, name)` の UNIQUE にぶつかると 2 回目以降が必ず落ちる。）
@@ -372,9 +383,10 @@ async fn run(
 
     // レンダリングが済んだので既存の比較パイプラインへ引き渡す。
     // `github_status` を compare_build が投入するのと同じチェーンパターン。
-    crate::compare_build::enqueue(
+    crate::compare_build::enqueue_idempotent(
         &state.compare_build_storage,
         crate::CompareBuildJob { build_id },
+        compare_handoff_key,
     )
     .await?;
 
@@ -473,7 +485,7 @@ enum StoryTaskResult {
 /// 呼び出し側の [`tokio::try_join!`] で安全に 2 件まで並列実行できる。
 #[allow(clippy::too_many_arguments)]
 async fn process_story(
-    state: &JobState,
+    state: &RenderJobState,
     renderer: &StoryRenderer,
     base_url: &str,
     story: &service::render::Story,
@@ -566,7 +578,7 @@ struct RenderTallies {
 /// position を積んで警告ログだけ残す。`None`（2 巡目）では失敗として確定する。
 #[allow(clippy::too_many_arguments)]
 async fn persist_story_result(
-    state: &JobState,
+    state: &RenderJobState,
     project: &entity::projects::Model,
     build: &entity::builds::Model,
     mark_reused_flag: bool,
@@ -762,7 +774,7 @@ async fn persist_story_result(
 /// （各 story 高々 1 回で、全滅時も `stories × story_timeout` が上限）。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
-    state: &JobState,
+    state: &RenderJobState,
     project: &entity::projects::Model,
     build: &entity::builds::Model,
     renderer: &StoryRenderer,

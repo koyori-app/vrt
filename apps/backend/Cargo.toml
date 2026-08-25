@@ -72,6 +72,7 @@ apalis = { version = "1.0.0-rc.9", features = ["limit", "retry", "tracing"] }
 axum = { workspace = true, features = ["multipart"] }
 axum_session = { version = "0.20.0" }
 axum_session_redispool = { version = "0.11.0" }
+dotenvy = { workspace = true }
 sea-orm = { workspace = true, features = [
     "entity-registry",
     "schema-sync",

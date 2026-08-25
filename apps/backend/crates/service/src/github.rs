@@ -1262,6 +1262,8 @@ mod tests {
             s3_public_base_url: None,
             s3_force_path_style: None,
             chromium_path: None,
+            render_worker_enabled: true,
+            storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
         assert!(github_app(&settings, &http).is_none());
@@ -1305,6 +1307,8 @@ mod tests {
             s3_public_base_url: None,
             s3_force_path_style: None,
             chromium_path: None,
+            render_worker_enabled: true,
+            storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
         assert_eq!(settings.github_api_base_url(), "https://api.github.com");

@@ -80,6 +80,18 @@ pub struct Settings {
     /// 未設定なら Storybook レンダリング機能そのものが無効になり、
     /// `mode = storybook` のビルド作成は 400 で拒否される。
     pub chromium_path: Option<String>,
+    /// API プロセス内で RenderBuild worker を起動するか。
+    ///
+    /// 既存デプロイとの互換性のため既定は true。独立した `vrt-runner` を使う環境では
+    /// API に `RENDER_WORKER_ENABLED=false` を設定し、同じキューを二重に消費しないようにする。
+    #[serde(default = "default_render_worker_enabled")]
+    pub render_worker_enabled: bool,
+    /// Storybook ビルドの受付可否を Chromium の有無から切り離す上書き設定。
+    ///
+    /// 未指定なら従来どおり `CHROMIUM_PATH` の有無で決まる。API から runner を分離し、
+    /// API イメージに Chromium を入れない場合は `STORYBOOK_RENDER_ENABLED=true` を指定する。
+    #[serde(default, rename = "storybook_render_enabled")]
+    pub storybook_render_enabled_override: Option<bool>,
     /// e2e テスト専用のログイン口 `POST /v1/auth/test-login` を開くフラグ。
     ///
     /// **本番では絶対に有効にしないこと。** 有効にすると、認証情報なしで任意の
@@ -99,9 +111,15 @@ impl Settings {
         self.github_app_id.is_some() && self.github_app_private_key_pem.is_some()
     }
 
-    /// Storybook レンダリング（`mode = storybook`）が使えるか。
-    /// Chromium の実行ファイルが設定されているときだけ有効。
+    /// Storybook レンダリング（`mode = storybook`）を受け付けるか。
+    /// 上書きが無ければ、後方互換のため Chromium の設定有無から決める。
     pub fn storybook_render_enabled(&self) -> bool {
+        self.storybook_render_enabled_override
+            .unwrap_or_else(|| self.chromium_configured())
+    }
+
+    /// このプロセスが Chromium を実行できるか。
+    pub fn chromium_configured(&self) -> bool {
         self.chromium_path
             .as_deref()
             .is_some_and(|p| !p.trim().is_empty())
@@ -137,6 +155,10 @@ fn default_storybook_cache_dir() -> String {
     "./storybook-cache".to_string()
 }
 
+fn default_render_worker_enabled() -> bool {
+    true
+}
+
 pub fn load_settings() -> Result<Settings, anyhow::Error> {
     dotenvy::dotenv().ok();
     let config = Config::builder()
@@ -161,6 +183,15 @@ pub fn load_settings() -> Result<Settings, anyhow::Error> {
     if settings.test_login_enabled && !cfg!(debug_assertions) {
         anyhow::bail!(
             "TEST_LOGIN_ENABLED is only allowed in debug builds; refusing to start a release build with the test login endpoint enabled"
+        );
+    }
+
+    if settings.render_worker_enabled
+        && settings.storybook_render_enabled()
+        && !settings.chromium_configured()
+    {
+        anyhow::bail!(
+            "RENDER_WORKER_ENABLED=true requires CHROMIUM_PATH when Storybook rendering is enabled"
         );
     }
 
@@ -237,6 +268,8 @@ mod tests {
             s3_public_base_url: None,
             s3_force_path_style: None,
             chromium_path: None,
+            render_worker_enabled: default_render_worker_enabled(),
+            storybook_render_enabled_override: None,
             test_login_enabled: false,
         }
     }
@@ -260,5 +293,26 @@ mod tests {
     #[test]
     fn rejects_missing_slashes() {
         assert!(!check("http:localhost:3000"));
+    }
+
+    #[test]
+    fn storybook_rendering_can_be_delegated_without_local_chromium() {
+        let mut settings = base_settings("https://app.example.com");
+        assert!(!settings.storybook_render_enabled());
+
+        settings.storybook_render_enabled_override = Some(true);
+        settings.render_worker_enabled = false;
+
+        assert!(settings.storybook_render_enabled());
+        assert!(!settings.chromium_configured());
+    }
+
+    #[test]
+    fn chromium_keeps_the_legacy_rendering_default_enabled() {
+        let mut settings = base_settings("https://app.example.com");
+        settings.chromium_path = Some("/usr/bin/chromium".into());
+
+        assert!(settings.storybook_render_enabled());
+        assert!(settings.render_worker_enabled);
     }
 }
