@@ -1909,3 +1909,174 @@ async fn retrying_a_failed_build_without_a_bundle_is_rejected() {
         "the 409 should say the bundle is missing, got {message:?}"
     );
 }
+
+/// **1 回だけ失敗する story は直列リトライで救われ、ビルドは成功する**こと。
+///
+/// 撮影ホストの CPU 逼迫下では、並走する story に押されて Storybook の play
+/// （オーバーレイ遷移・Testing Library のポーリング）が時間内に進まず、
+/// story 側に欠陥が無くても `playFunctionThrewException` 等で落ちる
+/// （koyori/task の `pages-taskdetail--delete-cancel` で実発生。再実行でも
+/// 同じ story が落ち続けた）。1 巡目の story 固有失敗を並走の居ない直列で
+/// 1 回だけ撮り直すことで、この種の失敗がビルドを落とさないことを固定する。
+///
+/// fixture は localStorage（同一 Chromium profile / origin の page 間で共有）で
+/// 「初回だけ storyErrored」を再現する。リトライ導入前はこのビルドが
+/// `failed` になる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transiently_failing_story_is_retried_serially_and_succeeds() {
+    if !chromium_or_skip("a_transiently_failing_story_is_retried_serially_and_succeeds") {
+        return;
+    }
+    let fx = setup().await;
+
+    let index_json = r#"{
+  "v": 5,
+  "entries": {
+    "flaky--once": {
+      "type": "story",
+      "id": "flaky--once",
+      "title": "Flaky",
+      "name": "Once",
+      "importPath": "./src/Flaky.stories.tsx"
+    }
+  }
+}"#;
+    let iframe = r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    if (!localStorage.getItem('vrt-flaky-once')) {
+      localStorage.setItem('vrt-flaky-once', '1');
+      channel.emit('storyErrored', { message: 'transient overload' });
+      return;
+    }
+    var el = document.createElement('div');
+    el.style.width = '100vw';
+    el.style.height = '100vh';
+    el.style.background = '#00ff00';
+    document.getElementById('storybook-root').appendChild(el);
+    channel.emit('storyRendered', id);
+  }, 0);
+</script>
+</body>
+</html>"#;
+
+    let build = fx.create_storybook_build("retryflaky1").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle_zip_with_files(index_json, iframe))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_ne!(
+        terminal["status"].as_str().unwrap_or_default(),
+        "failed",
+        "a story that fails only once must be saved by the serial retry: {terminal}"
+    );
+
+    let logs = fx.build_logs(build_id).await;
+    assert!(
+        logs.iter().any(|l| l.level == "warn"
+            && l.message.contains("flaky--once")
+            && l.message.contains("will retry serially")),
+        "the first failure must be logged as a warn with the retry note: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.level == "info" && l.message.contains("rendered 1/1 flaky--once")),
+        "the retry must end in a rendered line: {logs:?}"
+    );
+}
+
+/// **2 回とも失敗する story はビルドを失敗させる**こと（リトライは 1 回で打ち止め）。
+///
+/// リトライは負荷起因の一過性の失敗を救うためのもので、恒久的に壊れた story を
+/// 隠してはならない。1 巡目の warn（リトライ予告）と 2 巡目の error（確定）が
+/// 両方ログに残り、ビルドは従来どおり fail-closed で `failed` に落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_story_failing_twice_still_fails_the_build() {
+    if !chromium_or_skip("a_story_failing_twice_still_fails_the_build") {
+        return;
+    }
+    let fx = setup().await;
+
+    let index_json = r#"{
+  "v": 5,
+  "entries": {
+    "broken--always": {
+      "type": "story",
+      "id": "broken--always",
+      "title": "Broken",
+      "name": "Always",
+      "importPath": "./src/Broken.stories.tsx"
+    }
+  }
+}"#;
+    let iframe = r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    channel.emit('storyErrored', { message: 'kaboom every time' });
+  }, 0);
+</script>
+</body>
+</html>"#;
+
+    let build = fx.create_storybook_build("retrybroke1").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle_zip_with_files(index_json, iframe))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("failed"),
+        "a persistently broken story must still fail the build: {terminal}"
+    );
+
+    let logs = fx.build_logs(build_id).await;
+    assert!(
+        logs.iter().any(|l| l.level == "warn"
+            && l.message.contains("broken--always")
+            && l.message.contains("will retry serially")),
+        "the first failure must schedule exactly one retry: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.level == "error"
+            && l.message.contains("broken--always")
+            && l.message.starts_with("story failed")),
+        "the second failure must be recorded as the final error: {logs:?}"
+    );
+}

@@ -459,6 +459,11 @@ enum StoryTaskResult {
     Failed {
         position: usize,
         failure: StoryFailure,
+        /// 直列リトライ（2 巡目）の対象にしてよいか。描画の失敗（[`is_story_scoped`]）は
+        /// 撮影ホストの負荷起因で単独実行なら通ることがあるため `true`。
+        /// スクリーンショット名の規則違反は story の title / name に起因する決定的な
+        /// 失敗で、撮り直しても結果が変わらないため `false`。
+        retryable: bool,
     },
 }
 
@@ -479,7 +484,13 @@ async fn process_story(
 ) -> Result<StoryTaskResult, anyhow::Error> {
     let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
         Ok(name) => name,
-        Err(failure) => return Ok(StoryTaskResult::Failed { position, failure }),
+        Err(failure) => {
+            return Ok(StoryTaskResult::Failed {
+                position,
+                failure,
+                retryable: false,
+            });
+        }
     };
     let screenshot_name_str = screenshot_name.as_str().to_string();
 
@@ -504,6 +515,7 @@ async fn process_story(
                     story_id: story.id.clone(),
                     message: error.to_string(),
                 },
+                retryable: true,
             }),
             Err(error) => Err(anyhow::anyhow!("render story `{}`: {error}", story.id)),
         },
@@ -528,6 +540,181 @@ async fn process_story(
     }
 }
 
+/// [`render_all`] のループ間で持ち回る集計。1 巡目（並列）と 2 巡目（直列リトライ）が
+/// 同じ [`persist_story_result`] を通るため、可変参照 1 つに束ねる。
+#[derive(Default)]
+struct RenderTallies {
+    rendered: usize,
+    reused: usize,
+    /// 並列処理の完了順にかかわらず位置を保持し、最後に index 順へ戻して
+    /// error_message を決定的にする。
+    story_failures: Vec<(usize, StoryFailure)>,
+    /// フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
+    /// 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
+    /// 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
+    /// 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
+    /// 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
+    /// ループ後の集計行（件数と初出 story）に畳む——300 story の project で
+    /// 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
+    /// 失われない。
+    font_warning_counts: std::collections::BTreeMap<String, (usize, String)>,
+}
+
+/// 1 story の処理結果を build へ永続化する（screenshot 保存・build log・集計）。
+///
+/// `retry_queue` が `Some` のとき（1 巡目）は、リトライ対象の失敗を確定させず
+/// position を積んで警告ログだけ残す。`None`（2 巡目）では失敗として確定する。
+#[allow(clippy::too_many_arguments)]
+async fn persist_story_result(
+    state: &JobState,
+    project: &entity::projects::Model,
+    build: &entity::builds::Model,
+    mark_reused_flag: bool,
+    total: usize,
+    result: StoryTaskResult,
+    tallies: &mut RenderTallies,
+    retry_queue: Option<&mut Vec<usize>>,
+) -> Result<(), anyhow::Error> {
+    match result {
+        StoryTaskResult::Rendered {
+            position,
+            story_id,
+            title,
+            screenshot_name,
+            png,
+            font_warning,
+        } => {
+            // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
+            // ここで build log に永続化して利用者へ届ける——`tracing::warn`
+            // だけではサーバー運用ログ止まりで、`passed` を受け取った
+            // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+            if let Some(warning) = &font_warning {
+                // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
+                // （集計はループ後。宣言と理由は font_warning_counts を参照）。
+                let entry = tallies
+                    .font_warning_counts
+                    .entry(warning.clone())
+                    .or_insert((0usize, story_id.clone()));
+                entry.0 += 1;
+                if entry.0 == 1 {
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Warn,
+                        font_warning_log_line(position, total, &story_id, warning),
+                    )
+                    .await?;
+                }
+            }
+
+            // `only_story_ids` モードのときだけ reused を明示する
+            // （`None` の従来経路は metadata を変えない）。
+            let metadata = if mark_reused_flag {
+                serde_json::json!({
+                    "story_id": &story_id,
+                    "title": &title,
+                    "reused": false,
+                })
+            } else {
+                serde_json::json!({
+                    "story_id": &story_id,
+                    "title": &title,
+                })
+            };
+
+            service::screenshots::store_screenshot_with_metadata(
+                &state.db,
+                &state.storage,
+                project.tenant_id,
+                project.id,
+                build.id,
+                screenshot_name,
+                bytes::Bytes::from(png),
+                Some(metadata),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("store screenshot for story `{story_id}`: {e}"))?;
+            tallies.rendered += 1;
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Info,
+                format!("rendered {position}/{total} {story_id}"),
+            )
+            .await?;
+        }
+        StoryTaskResult::Reused {
+            position,
+            story_id,
+            title,
+            screenshot_name,
+            png,
+        } => {
+            let metadata = serde_json::json!({
+                "story_id": &story_id,
+                "title": &title,
+                "reused": true,
+            });
+
+            service::screenshots::store_screenshot_with_metadata(
+                &state.db,
+                &state.storage,
+                project.tenant_id,
+                project.id,
+                build.id,
+                screenshot_name,
+                bytes::Bytes::from(png),
+                Some(metadata),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("store reused screenshot for story `{story_id}`: {e}"))?;
+            tallies.reused += 1;
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Info,
+                format!("reused {position}/{total} {story_id}"),
+            )
+            .await?;
+        }
+        StoryTaskResult::Failed {
+            position,
+            failure,
+            retryable,
+        } => {
+            if retryable && let Some(queue) = retry_queue {
+                // 失敗として確定させず、2 巡目（直列リトライ）へ回す。
+                // 撮影ホストの負荷で play・描画が時間内に進まなかった失敗は、
+                // 並走ページの居ない直列実行なら通ることがある。
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Warn,
+                    format!(
+                        "story failed {position}/{total} {} (will retry serially): {}",
+                        failure.story_id, failure.message
+                    ),
+                )
+                .await?;
+                queue.push(position);
+            } else {
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Error,
+                    format!(
+                        "story failed {position}/{total} {}: {}",
+                        failure.story_id, failure.message
+                    ),
+                )
+                .await?;
+                tallies.story_failures.push((position, failure));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 全ストーリーを最大 2 件ずつ並列レンダリングして保存する。
 ///
 /// `only_story_ids` が `None` のときは全ストーリーを撮影する（従来どおり。
@@ -541,6 +728,14 @@ async fn process_story(
 /// ビルドを失敗させる。最初の 1 件で `?` 中断すると、静止できない story が
 /// 1 つあるだけで他の全 story のスクリーンショットとログまで巻き添えで
 /// 失われ、利用者は「1 回のビルドで 1 件ずつ」しか失敗を発見できない。
+/// story に固有の失敗のうち描画のもの（下記 [`is_story_scoped`]）は、確定させる前に
+/// **2 巡目の直列リトライ**で 1 回だけ撮り直す。撮影ホストの CPU が逼迫していると、
+/// 並走する story に押されて Storybook の play（オーバーレイ遷移・Testing Library の
+/// ポーリング）が時間内に進まず、story 側に欠陥が無くても失敗する——単独実行は
+/// その競合を取り除く（koyori/task の `pages-taskdetail--delete-cancel` で実発生）。
+/// 2 回目も失敗した story だけを失敗として確定する。スクリーンショット名の
+/// 規則違反は決定的な失敗のためリトライしない。
+///
 /// story 固有と分類するのは:
 ///
 /// - レンダリングの失敗（[`is_story_scoped`] — `storyErrored` 等の
@@ -563,6 +758,8 @@ async fn process_story(
 /// 停止性: story ごとの `story_timeout` は変えず、同時実行数だけを
 /// [`STORY_RENDER_CONCURRENCY`] に制限する。1 story の停止性を維持しながら、
 /// 全体のレンダリング時間を概ね `ceil(stories / 2) × story_timeout` に抑える。
+/// 直列リトライはリトライ対象 1 件につき最大 `story_timeout` を上乗せする
+/// （各 story 高々 1 回で、全滅時も `stories × story_timeout` が上限）。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
     state: &JobState,
@@ -579,21 +776,10 @@ async fn render_all(
         only_story_ids.map(|ids| ids.iter().map(String::as_str).collect());
     let baseline_names: HashSet<&str> = baseline_entries.keys().map(String::as_str).collect();
 
-    let mut rendered = 0usize;
-    let mut reused = 0usize;
-    // 並列処理の完了順にかかわらず位置を保持し、最後に index 順へ戻して
-    // error_message を決定的にする。
-    let mut story_failures: Vec<(usize, StoryFailure)> = Vec::new();
-    // フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
-    // 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
-    // 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
-    // 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
-    // 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
-    // ループ後の集計行（件数と初出 story）に畳む——300 story の project で
-    // 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
-    // 失われない。
-    let mut font_warning_counts: std::collections::BTreeMap<String, (usize, String)> =
-        std::collections::BTreeMap::new();
+    let mut tallies = RenderTallies::default();
+    // 1 巡目で story 固有の描画失敗になった story の position（1 始まり）。
+    // 2 巡目（直列リトライ）の対象。
+    let mut retry_positions: Vec<usize> = Vec::new();
     let total = bundle.stories.len();
 
     // 2 story ずつ同じタスク上で poll する。`tokio::spawn` を使わないので参照を
@@ -631,135 +817,64 @@ async fn render_all(
         };
 
         for result in batch {
-            match result {
-                StoryTaskResult::Rendered {
-                    position,
-                    story_id,
-                    title,
-                    screenshot_name,
-                    png,
-                    font_warning,
-                } => {
-                    // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
-                    // ここで build log に永続化して利用者へ届ける——`tracing::warn`
-                    // だけではサーバー運用ログ止まりで、`passed` を受け取った
-                    // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
-                    if let Some(warning) = &font_warning {
-                        // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
-                        // （集計はループ後。宣言と理由は font_warning_counts を参照）。
-                        let entry = font_warning_counts
-                            .entry(warning.clone())
-                            .or_insert((0usize, story_id.clone()));
-                        entry.0 += 1;
-                        if entry.0 == 1 {
-                            service::build_logs::append(
-                                &state.db,
-                                build.id,
-                                LogLevel::Warn,
-                                font_warning_log_line(position, total, &story_id, warning),
-                            )
-                            .await?;
-                        }
-                    }
-
-                    // `only_story_ids` モードのときだけ reused を明示する
-                    // （`None` の従来経路は metadata を変えない）。
-                    let metadata = if only_set.is_some() {
-                        serde_json::json!({
-                            "story_id": &story_id,
-                            "title": &title,
-                            "reused": false,
-                        })
-                    } else {
-                        serde_json::json!({
-                            "story_id": &story_id,
-                            "title": &title,
-                        })
-                    };
-
-                    service::screenshots::store_screenshot_with_metadata(
-                        &state.db,
-                        &state.storage,
-                        project.tenant_id,
-                        project.id,
-                        build.id,
-                        screenshot_name,
-                        bytes::Bytes::from(png),
-                        Some(metadata),
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("store screenshot for story `{story_id}`: {e}"))?;
-                    rendered += 1;
-                    service::build_logs::append(
-                        &state.db,
-                        build.id,
-                        LogLevel::Info,
-                        format!("rendered {position}/{total} {story_id}"),
-                    )
-                    .await?;
-                }
-                StoryTaskResult::Reused {
-                    position,
-                    story_id,
-                    title,
-                    screenshot_name,
-                    png,
-                } => {
-                    let metadata = serde_json::json!({
-                        "story_id": &story_id,
-                        "title": &title,
-                        "reused": true,
-                    });
-
-                    service::screenshots::store_screenshot_with_metadata(
-                        &state.db,
-                        &state.storage,
-                        project.tenant_id,
-                        project.id,
-                        build.id,
-                        screenshot_name,
-                        bytes::Bytes::from(png),
-                        Some(metadata),
-                    )
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("store reused screenshot for story `{story_id}`: {e}")
-                    })?;
-                    reused += 1;
-                    service::build_logs::append(
-                        &state.db,
-                        build.id,
-                        LogLevel::Info,
-                        format!("reused {position}/{total} {story_id}"),
-                    )
-                    .await?;
-                }
-                StoryTaskResult::Failed { position, failure } => {
-                    service::build_logs::append(
-                        &state.db,
-                        build.id,
-                        LogLevel::Error,
-                        format!(
-                            "story failed {position}/{total} {}: {}",
-                            failure.story_id, failure.message
-                        ),
-                    )
-                    .await?;
-                    story_failures.push((position, failure));
-                }
-            }
+            persist_story_result(
+                state,
+                project,
+                build,
+                only_set.is_some(),
+                total,
+                result,
+                &mut tallies,
+                Some(&mut retry_positions),
+            )
+            .await?;
         }
     }
 
-    story_failures.sort_by_key(|(position, _)| *position);
-    let story_failures: Vec<StoryFailure> = story_failures
+    // 2 巡目: 1 巡目で story 固有の描画失敗になった story を、並走ページの居ない
+    // 直列実行で 1 回だけ撮り直す。撮影ホストの CPU が逼迫していると、並走する
+    // 重い story に押されて Storybook の play（オーバーレイ遷移・Testing Library の
+    // ポーリング）が時間内に進まず、story 側に欠陥が無くても失敗する——単独実行は
+    // その競合を取り除く。2 回目も失敗した story だけを失敗として確定する
+    // （恒久的に壊れた story は 2 回目も落ち、ビルドは従来どおり fail-closed）。
+    for position in std::mem::take(&mut retry_positions) {
+        let story = &bundle.stories[position - 1];
+        let result = process_story(
+            state,
+            renderer,
+            base_url,
+            story,
+            position,
+            only_set.as_ref(),
+            &baseline_names,
+            baseline_entries,
+        )
+        .await?;
+        persist_story_result(
+            state,
+            project,
+            build,
+            only_set.is_some(),
+            total,
+            result,
+            &mut tallies,
+            None,
+        )
+        .await?;
+    }
+
+    tallies
+        .story_failures
+        .sort_by_key(|(position, _)| *position);
+    let story_failures: Vec<StoryFailure> = tallies
+        .story_failures
         .into_iter()
         .map(|(_, failure)| failure)
         .collect();
 
     // 畳んだ同文フォント警告の集計行（初出行と対。1 story だけなら初出行が
     // 全てを言い尽くしており、集計行は出さない）。
-    for (warning, (count, first_story)) in &font_warning_counts {
+    for (warning, (count, first_story)) in &tallies.font_warning_counts {
         if *count > 1 {
             service::build_logs::append(
                 &state.db,
@@ -770,6 +885,9 @@ async fn render_all(
             .await?;
         }
     }
+
+    let rendered = tallies.rendered;
+    let reused = tallies.reused;
 
     // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
