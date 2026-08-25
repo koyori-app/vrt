@@ -1,6 +1,7 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -33,10 +34,18 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/settings")({
 
 const ROLES: TenantRole[] = ["member", "admin", "owner"];
 
+/** ロール名の訳。API 値をそのまま出すと英語のまま残る。 */
+const ROLE_LABEL_KEY = {
+  member: "tenantSettings.roles.member",
+  admin: "tenantSettings.roles.admin",
+  owner: "tenantSettings.roles.owner",
+} as const satisfies Record<TenantRole, string>;
+
 const roleTone = (role: TenantRole) =>
   role === "owner" ? "blue" : role === "admin" ? "amber" : "gray";
 
 function TenantSettings() {
+  const { t } = useTranslation();
   const { tenantSlug } = Route.useParams();
   const { me } = Route.useRouteContext();
   const { tenant, isLoading } = useResolvedTenant(tenantSlug);
@@ -45,7 +54,7 @@ function TenantSettings() {
   if (!tenant) {
     return (
       <p className="py-16 text-center text-sm text-muted-foreground">
-        {isLoading ? "Loading…" : `No tenant named “${tenantSlug}”.`}
+        {isLoading ? t("common.loading") : t("tenant.missing", { slug: tenantSlug })}
       </p>
     );
   }
@@ -54,7 +63,7 @@ function TenantSettings() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">{tenant.name}</h1>
-        <p className="text-sm text-muted-foreground">Tenant settings</p>
+        <p className="text-sm text-muted-foreground">{t("tenantSettings.subtitle")}</p>
       </div>
 
       <MembersCard tenantId={tenant.id} myUserId={me.id} myRole={role} />
@@ -75,6 +84,7 @@ function MembersCard({
   myUserId: string;
   myRole: TenantRole | undefined;
 }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const members = $api.useQuery("get", "/v1/tenants/{tenant_id}/members", {
     params: { path: { tenant_id: tenantId } },
@@ -90,25 +100,25 @@ function MembersCard({
     onSuccess: async () => {
       await invalidate();
       setUsername("");
-      toast.success("Member added");
+      toast.success(t("tenantSettings.memberAdded"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not add member")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.memberAddFailed"))),
   });
 
   const updateMember = $api.useMutation("patch", "/v1/tenants/{tenant_id}/members/{user_id}", {
     onSuccess: async () => {
       await invalidate();
-      toast.success("Role updated");
+      toast.success(t("tenantSettings.roleUpdated"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not update role")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.roleUpdateFailed"))),
   });
 
   const removeMember = $api.useMutation("delete", "/v1/tenants/{tenant_id}/members/{user_id}", {
     onSuccess: async () => {
       await invalidate();
-      toast.success("Member removed");
+      toast.success(t("tenantSettings.memberRemoved"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not remove member")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.memberRemoveFailed"))),
   });
 
   function onAdd(event: FormEvent) {
@@ -122,16 +132,16 @@ function MembersCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Members</CardTitle>
-        <CardDescription>Owners and admins can invite people and change roles.</CardDescription>
+        <CardTitle>{t("tenantSettings.members")}</CardTitle>
+        <CardDescription>{t("tenantSettings.membersDescription")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead>User</TableHead>
-              <TableHead>Role</TableHead>
-              <TableHead>Joined</TableHead>
+              <TableHead>{t("tenantSettings.columns.user")}</TableHead>
+              <TableHead>{t("tenantSettings.columns.role")}</TableHead>
+              <TableHead>{t("tenantSettings.columns.joined")}</TableHead>
               <TableHead className="w-24" />
             </TableRow>
           </TableHeader>
@@ -151,7 +161,9 @@ function MembersCard({
                       <div className="truncate text-sm font-medium">
                         {member.display_name || member.username || member.user_id}
                         {member.user_id === myUserId ? (
-                          <span className="ml-2 font-normal text-muted-foreground">(you)</span>
+                          <span className="ml-2 font-normal text-muted-foreground">
+                            {t("tenantSettings.you")}
+                          </span>
                         ) : null}
                       </div>
                       {member.username ? (
@@ -180,13 +192,15 @@ function MembersCard({
                       <SelectContent>
                         {ROLES.map((role) => (
                           <SelectItem key={role} value={role}>
-                            {role}
+                            {t(ROLE_LABEL_KEY[role])}
                           </SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
                   ) : (
-                    <ToneBadge tone={roleTone(member.role)}>{member.role}</ToneBadge>
+                    <ToneBadge tone={roleTone(member.role)}>
+                      {t(ROLE_LABEL_KEY[member.role])}
+                    </ToneBadge>
                   )}
                 </TableCell>
                 <TableCell className="text-xs text-muted-foreground">
@@ -199,13 +213,13 @@ function MembersCard({
                       size="sm"
                       disabled={removeMember.isPending}
                       onClick={() => {
-                        if (!confirm("Remove this member from the tenant?")) return;
+                        if (!confirm(t("tenantSettings.removeConfirm"))) return;
                         removeMember.mutate({
                           params: { path: { tenant_id: tenantId, user_id: member.user_id } },
                         });
                       }}
                     >
-                      Remove
+                      {t("tenantSettings.remove")}
                     </Button>
                   ) : null}
                 </TableCell>
@@ -214,7 +228,7 @@ function MembersCard({
             {!members.data?.length ? (
               <TableRow>
                 <TableCell colSpan={4} className="text-sm text-muted-foreground">
-                  {members.isLoading ? "Loading…" : "No members."}
+                  {members.isLoading ? t("common.loading") : t("tenantSettings.noMembers")}
                 </TableCell>
               </TableRow>
             ) : null}
@@ -224,7 +238,7 @@ function MembersCard({
         {canManage ? (
           <form onSubmit={onAdd} className="flex flex-wrap items-end gap-2">
             <div className="space-y-2">
-              <Label htmlFor="member-username">Add by username</Label>
+              <Label htmlFor="member-username">{t("tenantSettings.addByUsername")}</Label>
               <Input
                 id="member-username"
                 className="w-56"
@@ -235,7 +249,7 @@ function MembersCard({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="member-role">Role</Label>
+              <Label htmlFor="member-role">{t("tenantSettings.columns.role")}</Label>
               <Select value={newRole} onValueChange={(value) => setNewRole(value as TenantRole)}>
                 <SelectTrigger id="member-role" className="w-32">
                   <SelectValue />
@@ -243,14 +257,14 @@ function MembersCard({
                 <SelectContent>
                   {ROLES.map((role) => (
                     <SelectItem key={role} value={role}>
-                      {role}
+                      {t(ROLE_LABEL_KEY[role])}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
             <Button type="submit" disabled={addMember.isPending || !username.trim()}>
-              {addMember.isPending ? "Adding…" : "Add member"}
+              {addMember.isPending ? t("tenantSettings.adding") : t("tenantSettings.addMember")}
             </Button>
           </form>
         ) : null}
@@ -260,6 +274,7 @@ function MembersCard({
 }
 
 function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManage: boolean }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const claimed = $api.useQuery("get", "/v1/github/installations", {
     params: { query: { tenant_id: tenantId } },
@@ -274,15 +289,15 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
           queryKey: ["get", "/v1/github/installations/unclaimed"],
         }),
       ]);
-      toast.success("Installation linked to this tenant");
+      toast.success(t("tenantSettings.installationLinked"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not claim installation")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.claimFailed"))),
   });
 
   // claim には admin が発行した one-time state が要る。
   // ここは管理画面からの明示操作なので、押した時点で発行してそのまま使う。
   const setupState = $api.useMutation("post", "/v1/github/setup/state", {
-    onError: (error) => toast.error(errorMessage(error, "Could not claim installation")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.claimFailed"))),
   });
 
   function claimInstallation(installationId: number) {
@@ -301,14 +316,12 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
   return (
     <Card>
       <CardHeader>
-        <CardTitle>GitHub installations</CardTitle>
-        <CardDescription>
-          Link a GitHub App installation to post commit statuses back to pull requests.
-        </CardDescription>
+        <CardTitle>{t("tenantSettings.installations")}</CardTitle>
+        <CardDescription>{t("tenantSettings.installationsDescription")}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="space-y-2">
-          <h3 className="text-sm font-medium">Linked</h3>
+          <h3 className="text-sm font-medium">{t("tenantSettings.linked")}</h3>
           {claimed.data?.installations.length ? (
             <ul className="divide-y divide-border rounded-md border border-border">
               {claimed.data.installations.map((installation) => (
@@ -322,19 +335,21 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
                       #{installation.installation_id} · {installation.account_type}
                     </span>
                   </span>
-                  {installation.suspended ? <ToneBadge tone="red">Suspended</ToneBadge> : null}
+                  {installation.suspended ? (
+                    <ToneBadge tone="red">{t("tenantSettings.suspended")}</ToneBadge>
+                  ) : null}
                 </li>
               ))}
             </ul>
           ) : (
             <p className="text-sm text-muted-foreground">
-              {claimed.isLoading ? "Loading…" : "No installations linked yet."}
+              {claimed.isLoading ? t("common.loading") : t("tenantSettings.noInstallations")}
             </p>
           )}
         </div>
 
         <div className="space-y-2">
-          <h3 className="text-sm font-medium">Unclaimed</h3>
+          <h3 className="text-sm font-medium">{t("tenantSettings.unclaimed")}</h3>
           {unclaimed.data?.installations.length ? (
             <ul className="divide-y divide-border rounded-md border border-border">
               {unclaimed.data.installations.map((installation) => (
@@ -354,14 +369,14 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
                     disabled={!canManage || claim.isPending || setupState.isPending}
                     onClick={() => claimInstallation(installation.installation_id)}
                   >
-                    Claim
+                    {t("tenantSettings.claim")}
                   </Button>
                 </li>
               ))}
             </ul>
           ) : (
             <p className="text-sm text-muted-foreground">
-              {unclaimed.isLoading ? "Loading…" : "Nothing waiting to be claimed."}
+              {unclaimed.isLoading ? t("common.loading") : t("tenantSettings.noUnclaimed")}
             </p>
           )}
         </div>
@@ -371,37 +386,35 @@ function InstallationsCard({ tenantId, canManage }: { tenantId: string; canManag
 }
 
 function DangerZone({ tenantId, tenantName }: { tenantId: string; tenantName: string }) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const deleteTenant = $api.useMutation("delete", "/v1/tenants/{tenant_id}", {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["get", "/v1/tenants"] });
-      toast.success("Tenant deleted");
+      toast.success(t("tenantSettings.tenantDeleted"));
       await navigate({ to: "/" });
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not delete tenant")),
+    onError: (error) => toast.error(errorMessage(error, t("tenantSettings.tenantDeleteFailed"))),
   });
 
   return (
     <Card className="border-destructive/40">
       <CardHeader>
-        <CardTitle className="text-destructive">Danger zone</CardTitle>
-        <CardDescription>
-          Deleting a tenant removes its projects, builds and stored screenshots. This cannot be
-          undone.
-        </CardDescription>
+        <CardTitle className="text-destructive">{t("tenantSettings.dangerZone")}</CardTitle>
+        <CardDescription>{t("tenantSettings.dangerZoneDescription")}</CardDescription>
       </CardHeader>
       <CardContent>
         <Button
           variant="destructive"
           disabled={deleteTenant.isPending}
           onClick={() => {
-            const answer = prompt(`Type “${tenantName}” to confirm deletion.`);
+            const answer = prompt(t("tenantSettings.deleteConfirm", { name: tenantName }));
             if (answer !== tenantName) return;
             deleteTenant.mutate({ params: { path: { tenant_id: tenantId } } });
           }}
         >
-          Delete tenant
+          {t("tenantSettings.deleteTenant")}
         </Button>
       </CardContent>
     </Card>

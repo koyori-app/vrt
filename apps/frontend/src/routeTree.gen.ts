@@ -14,6 +14,7 @@ import { Route as LoginRouteImport } from './routes/login'
 import { Route as AuthedIndexRouteImport } from './routes/_authed/index'
 import { Route as ApiSplatRouteImport } from './routes/api.$'
 import { Route as AuthedGithubSetupRouteImport } from './routes/_authed/github.setup'
+import { Route as AuthedSettingsLanguageRouteImport } from './routes/_authed/settings.language'
 import { Route as AuthedSettingsTokensRouteImport } from './routes/_authed/settings.tokens'
 import { Route as AuthedTTenantSlugIndexRouteImport } from './routes/_authed/t.$tenantSlug.index'
 import { Route as AuthedTTenantSlugSettingsRouteImport } from './routes/_authed/t.$tenantSlug.settings'
@@ -42,6 +43,11 @@ const ApiSplatRoute = ApiSplatRouteImport.update({
 const AuthedGithubSetupRoute = AuthedGithubSetupRouteImport.update({
   id: '/github/setup',
   path: '/github/setup',
+  getParentRoute: () => AuthedRoute,
+} as any)
+const AuthedSettingsLanguageRoute = AuthedSettingsLanguageRouteImport.update({
+  id: '/settings/language',
+  path: '/settings/language',
   getParentRoute: () => AuthedRoute,
 } as any)
 const AuthedSettingsTokensRoute = AuthedSettingsTokensRouteImport.update({
@@ -78,6 +84,7 @@ export interface FileRoutesByFullPath {
   '/login': typeof LoginRoute
   '/api/$': typeof ApiSplatRoute
   '/github/setup': typeof AuthedGithubSetupRoute
+  '/settings/language': typeof AuthedSettingsLanguageRoute
   '/settings/tokens': typeof AuthedSettingsTokensRoute
   '/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/t/$tenantSlug/': typeof AuthedTTenantSlugIndexRoute
@@ -89,6 +96,7 @@ export interface FileRoutesByTo {
   '/api/$': typeof ApiSplatRoute
   '/': typeof AuthedIndexRoute
   '/github/setup': typeof AuthedGithubSetupRoute
+  '/settings/language': typeof AuthedSettingsLanguageRoute
   '/settings/tokens': typeof AuthedSettingsTokensRoute
   '/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/t/$tenantSlug': typeof AuthedTTenantSlugIndexRoute
@@ -102,6 +110,7 @@ export interface FileRoutesById {
   '/api/$': typeof ApiSplatRoute
   '/_authed/': typeof AuthedIndexRoute
   '/_authed/github/setup': typeof AuthedGithubSetupRoute
+  '/_authed/settings/language': typeof AuthedSettingsLanguageRoute
   '/_authed/settings/tokens': typeof AuthedSettingsTokensRoute
   '/_authed/t/$tenantSlug/settings': typeof AuthedTTenantSlugSettingsRoute
   '/_authed/t/$tenantSlug/': typeof AuthedTTenantSlugIndexRoute
@@ -115,6 +124,7 @@ export interface FileRouteTypes {
     | '/login'
     | '/api/$'
     | '/github/setup'
+    | '/settings/language'
     | '/settings/tokens'
     | '/t/$tenantSlug/settings'
     | '/t/$tenantSlug/'
@@ -126,6 +136,7 @@ export interface FileRouteTypes {
     | '/api/$'
     | '/'
     | '/github/setup'
+    | '/settings/language'
     | '/settings/tokens'
     | '/t/$tenantSlug/settings'
     | '/t/$tenantSlug'
@@ -138,6 +149,7 @@ export interface FileRouteTypes {
     | '/api/$'
     | '/_authed/'
     | '/_authed/github/setup'
+    | '/_authed/settings/language'
     | '/_authed/settings/tokens'
     | '/_authed/t/$tenantSlug/settings'
     | '/_authed/t/$tenantSlug/'
@@ -188,6 +200,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthedGithubSetupRouteImport
       parentRoute: typeof AuthedRoute
     }
+    '/_authed/settings/language': {
+      id: '/_authed/settings/language'
+      path: '/settings/language'
+      fullPath: '/settings/language'
+      preLoaderRoute: typeof AuthedSettingsLanguageRouteImport
+      parentRoute: typeof AuthedRoute
+    }
     '/_authed/settings/tokens': {
       id: '/_authed/settings/tokens'
       path: '/settings/tokens'
@@ -229,6 +248,7 @@ declare module '@tanstack/react-router' {
 interface AuthedRouteChildren {
   AuthedIndexRoute: typeof AuthedIndexRoute
   AuthedGithubSetupRoute: typeof AuthedGithubSetupRoute
+  AuthedSettingsLanguageRoute: typeof AuthedSettingsLanguageRoute
   AuthedSettingsTokensRoute: typeof AuthedSettingsTokensRoute
   AuthedTTenantSlugSettingsRoute: typeof AuthedTTenantSlugSettingsRoute
   AuthedTTenantSlugIndexRoute: typeof AuthedTTenantSlugIndexRoute
@@ -239,6 +259,7 @@ interface AuthedRouteChildren {
 const AuthedRouteChildren: AuthedRouteChildren = {
   AuthedIndexRoute: AuthedIndexRoute,
   AuthedGithubSetupRoute: AuthedGithubSetupRoute,
+  AuthedSettingsLanguageRoute: AuthedSettingsLanguageRoute,
   AuthedSettingsTokensRoute: AuthedSettingsTokensRoute,
   AuthedTTenantSlugSettingsRoute: AuthedTTenantSlugSettingsRoute,
   AuthedTTenantSlugIndexRoute: AuthedTTenantSlugIndexRoute,

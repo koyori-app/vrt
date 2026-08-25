@@ -1,4 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useTranslation } from "react-i18next";
 
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { buttonVariants } from "@/components/ui/button";
@@ -27,6 +28,7 @@ function providerLoginHref(provider: "github" | "gitlab", redirectTo: string) {
 }
 
 function LoginPage() {
+  const { t } = useTranslation();
   const { oauth_error, redirect_to } = Route.useSearch();
   const redirectTo = redirect_to && redirect_to.startsWith("/") ? redirect_to : "/";
 
@@ -38,7 +40,7 @@ function LoginPage() {
             {/* shadcn の CardTitle は div なので、ページ見出しはここで実タグにする */}
             <h1>VRT</h1>
           </CardTitle>
-          <CardDescription>Visual regression testing for your pull requests</CardDescription>
+          <CardDescription>{t("login.tagline")}</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           {oauth_error ? (
@@ -46,7 +48,7 @@ function LoginPage() {
               role="alert"
               className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
             >
-              Sign-in failed: {oauth_error}
+              {t("login.failed", { reason: oauth_error })}
             </div>
           ) : null}
 
@@ -54,19 +56,19 @@ function LoginPage() {
             href={providerLoginHref("github", redirectTo)}
             className={cn(buttonVariants({ size: "lg" }), "w-full")}
           >
-            Sign in with GitHub
+            {t("login.withGithub")}
           </a>
           <a
             href={providerLoginHref("gitlab", redirectTo)}
             className={cn(buttonVariants({ variant: "outline", size: "lg" }), "w-full")}
           >
-            Sign in with GitLab
+            {t("login.withGitlab")}
           </a>
 
           <p className="text-center text-xs text-muted-foreground">
-            By signing in you agree to let VRT read your public profile.{" "}
+            {t("login.consent")}{" "}
             <Link to="/" className="underline underline-offset-4">
-              Back home
+              {t("login.backHome")}
             </Link>
           </p>
         </CardContent>

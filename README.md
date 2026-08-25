@@ -129,6 +129,34 @@ pnpm build
 cd apps/frontend && pnpm openapi && git add openapi.json
 ```
 
+### 表示言語（i18n）
+
+画面の文言は `apps/frontend/src/lib/i18n/resources/` の辞書にある。
+`en.ts` が原典で、`ja.ts` は `Resources`（`typeof en`）を満たすことを型で
+要求されるため、キーの取りこぼしはコンパイルエラーになる。文言を足すときは
+`en.ts` → `ja.ts` の順に足す。
+
+表示言語の決まり方は次の優先順位。
+
+1. ユーザー設定（`users.language`。`GET /v1/users/me` の `language`）
+2. リクエスト/ブラウザの言語（SSR は `Accept-Language`、遷移後は初回 SSR の結論）
+3. `en`
+
+ユーザー設定は `/settings/language` から変更でき、`PATCH /v1/users/me` に
+`{"language": "ja" | "en" | null}` を送る。`null` は未設定へ戻す指定で、
+画面はブラウザの言語に従うようになる。フィールドを省略した PATCH は据え置き。
+DB に置いているので端末を変えても追随する。
+
+SSR は描画前に言語を決めてから HTML を返すので、英語で一瞬描いてから
+切り替わることはない。i18next のインスタンスはリクエストごとに作る
+（`createI18n`）——プロセスで 1 個を共有して `changeLanguage` を呼ぶ形は、
+並行リクエストの言語を書き換えてしまう。
+
+```bash
+cd apps/frontend
+pnpm test        # 辞書のキー・プレースホルダの一致と言語解決の単体テスト
+```
+
 ### e2e
 
 ```bash

@@ -2,6 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { PlusIcon, SettingsIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { BuildStatusBadge } from "@/components/status-badge";
@@ -26,6 +27,7 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/")({
 });
 
 function TenantDashboard() {
+  const { t } = useTranslation();
   const { tenantSlug } = Route.useParams();
   const { me } = Route.useRouteContext();
   const { tenant, isLoading: tenantsLoading } = useResolvedTenant(tenantSlug);
@@ -36,7 +38,7 @@ function TenantDashboard() {
   if (!tenant) {
     return (
       <p className="py-16 text-center text-sm text-muted-foreground">
-        {tenantsLoading ? "Loading…" : `No tenant named “${tenantSlug}”.`}
+        {tenantsLoading ? t("common.loading") : t("tenant.missing", { slug: tenantSlug })}
       </p>
     );
   }
@@ -49,27 +51,27 @@ function TenantDashboard() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">{tenant.name}</h1>
           <p className="text-sm text-muted-foreground">
-            {projects.data?.length ?? 0} project{projects.data?.length === 1 ? "" : "s"}
+            {t("tenant.projectCount", { count: projects.data?.length ?? 0 })}
           </p>
         </div>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" asChild>
             <Link to="/t/$tenantSlug/settings" params={{ tenantSlug }}>
               <SettingsIcon className="size-3.5" />
-              Settings
+              {t("tenant.settings")}
             </Link>
           </Button>
           {canCreate ? (
             <Button size="sm" onClick={() => setNewProjectOpen(true)}>
               <PlusIcon className="size-3.5" />
-              New project
+              {t("tenant.newProject")}
             </Button>
           ) : null}
         </div>
       </div>
 
       {projects.isLoading ? (
-        <p className="text-sm text-muted-foreground">Loading projects…</p>
+        <p className="text-sm text-muted-foreground">{t("tenant.loadingProjects")}</p>
       ) : projects.data?.length ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.data.map((project) => (
@@ -79,11 +81,9 @@ function TenantDashboard() {
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>No projects yet</CardTitle>
+            <CardTitle>{t("tenant.noProjects")}</CardTitle>
             <CardDescription>
-              {canCreate
-                ? "Create a project, then point your CI at it to upload screenshots."
-                : "Ask a tenant admin to create the first project."}
+              {canCreate ? t("tenant.noProjectsAdmin") : t("tenant.noProjectsMember")}
             </CardDescription>
           </CardHeader>
         </Card>
@@ -99,6 +99,7 @@ function TenantDashboard() {
 }
 
 function ProjectCard({ tenantSlug, project }: { tenantSlug: string; project: Project }) {
+  const { t } = useTranslation();
   // One small query per card: the build list endpoint is the only source of a
   // project's most recent status (there is no per-project summary endpoint).
   const builds = useBuilds(project.id, 1);
@@ -119,15 +120,15 @@ function ProjectCard({ tenantSlug, project }: { tenantSlug: string; project: Pro
           {latest ? <BuildStatusBadge status={latest.status} /> : null}
         </CardHeader>
         <CardContent className="text-xs text-muted-foreground">
-          {latest ? (
-            <>
-              Build #{latest.number} on {latest.branch} · {formatDate(latest.created_at)}
-            </>
-          ) : builds.isLoading ? (
-            "Loading…"
-          ) : (
-            "No builds yet"
-          )}
+          {latest
+            ? t("tenant.latestBuild", {
+                number: latest.number,
+                branch: latest.branch,
+                date: formatDate(latest.created_at),
+              })
+            : builds.isLoading
+              ? t("common.loading")
+              : t("tenant.noBuilds")}
         </CardContent>
       </Card>
     </Link>
@@ -143,6 +144,7 @@ function CreateProjectDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
@@ -154,13 +156,13 @@ function CreateProjectDialog({
       await queryClient.invalidateQueries({
         queryKey: ["get", "/v1/tenants/{tenant_id}/projects"],
       });
-      toast.success(`Created ${project.name}`);
+      toast.success(t("project.created", { name: project.name }));
       onOpenChange(false);
       setName("");
       setSlug("");
       setSlugTouched(false);
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not create project")),
+    onError: (error) => toast.error(errorMessage(error, t("project.createFailed"))),
   });
 
   const effectiveSlug = slugTouched ? slug : slugify(name);
@@ -182,25 +184,23 @@ function CreateProjectDialog({
       <DialogContent>
         <form onSubmit={onSubmit}>
           <DialogHeader>
-            <DialogTitle>New project</DialogTitle>
-            <DialogDescription>
-              Screenshots are grouped per project and compared against the default branch baseline.
-            </DialogDescription>
+            <DialogTitle>{t("project.newTitle")}</DialogTitle>
+            <DialogDescription>{t("project.newDescription")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label htmlFor="project-name">Name</Label>
+              <Label htmlFor="project-name">{t("project.name")}</Label>
               <Input
                 id="project-name"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="Web app"
+                placeholder={t("project.namePlaceholder")}
                 required
                 autoFocus
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="project-slug">Slug</Label>
+              <Label htmlFor="project-slug">{t("project.slug")}</Label>
               <Input
                 id="project-slug"
                 value={effectiveSlug}
@@ -212,7 +212,7 @@ function CreateProjectDialog({
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="project-branch">Default branch</Label>
+              <Label htmlFor="project-branch">{t("project.defaultBranch")}</Label>
               <Input
                 id="project-branch"
                 value={defaultBranch}
@@ -223,10 +223,10 @@ function CreateProjectDialog({
           </div>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={createProject.isPending || !name || !effectiveSlug}>
-              {createProject.isPending ? "Creating…" : "Create project"}
+              {createProject.isPending ? t("project.creating") : t("project.create")}
             </Button>
           </DialogFooter>
         </form>

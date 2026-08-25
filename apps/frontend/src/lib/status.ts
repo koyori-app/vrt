@@ -32,18 +32,22 @@ export const buildStatusTone: Record<BuildStatus, Tone> = {
   rejected: "red",
 };
 
-export const buildStatusLabel: Record<BuildStatus, string> = {
-  pending: "Pending",
-  queued: "Queued",
+/**
+ * 状態ラベルの翻訳キー。文言そのものではなくキーを持つのは、同じ状態が
+ * 一覧・詳細・バッジの複数箇所に出るため——訳を 1 箇所に集める。
+ */
+export const buildStatusLabelKey = {
+  pending: "buildStatus.pending",
+  queued: "buildStatus.queued",
   // Storybook mode only: the server is capturing stories in headless Chromium.
-  rendering: "Rendering",
-  processing: "Processing",
-  passed: "Passed",
-  changes_detected: "Changes detected",
-  failed: "Failed",
-  approved: "Approved",
-  rejected: "Rejected",
-};
+  rendering: "buildStatus.rendering",
+  processing: "buildStatus.processing",
+  passed: "buildStatus.passed",
+  changes_detected: "buildStatus.changes_detected",
+  failed: "buildStatus.failed",
+  approved: "buildStatus.approved",
+  rejected: "buildStatus.rejected",
+} as const satisfies Record<BuildStatus, string>;
 
 export const comparisonStatusTone: Record<ComparisonStatus, Tone> = {
   pending: "gray",
@@ -55,15 +59,15 @@ export const comparisonStatusTone: Record<ComparisonStatus, Tone> = {
   failed: "red",
 };
 
-export const comparisonStatusLabel: Record<ComparisonStatus, string> = {
-  pending: "Pending",
-  processing: "Processing",
-  unchanged: "Unchanged",
-  changed: "Changed",
-  added: "Added",
-  removed: "Removed",
-  failed: "Failed",
-};
+export const comparisonStatusLabelKey = {
+  pending: "comparisonStatus.pending",
+  processing: "comparisonStatus.processing",
+  unchanged: "comparisonStatus.unchanged",
+  changed: "comparisonStatus.changed",
+  added: "comparisonStatus.added",
+  removed: "comparisonStatus.removed",
+  failed: "comparisonStatus.failed",
+} as const satisfies Record<ComparisonStatus, string>;
 
 export const reviewStatusTone: Record<ReviewStatus, Tone> = {
   pending: "gray",
@@ -71,11 +75,11 @@ export const reviewStatusTone: Record<ReviewStatus, Tone> = {
   rejected: "red",
 };
 
-export const reviewStatusLabel: Record<ReviewStatus, string> = {
-  pending: "Pending review",
-  approved: "Approved",
-  rejected: "Rejected",
-};
+export const reviewStatusLabelKey = {
+  pending: "reviewStatus.pending",
+  approved: "reviewStatus.approved",
+  rejected: "reviewStatus.rejected",
+} as const satisfies Record<ReviewStatus, string>;
 
 /** Build states where a reviewer can still act. */
 export function isReviewable(status: BuildStatus) {

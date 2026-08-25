@@ -1,8 +1,11 @@
 export type FailureOrigin = "test" | "vrt" | null | undefined;
 
 export type FailurePresentation = {
-  title: string;
-  guidance: string;
+  /** 見出しの翻訳キー。 */
+  titleKey: "buildFailure.test.title" | "buildFailure.vrt.title" | "buildFailure.unknown.title";
+  /** 対処の案内の翻訳キー。 */
+  guidanceKey:
+    "buildFailure.test.guidance" | "buildFailure.vrt.guidance" | "buildFailure.unknown.guidance";
   tone: "test" | "vrt" | "unknown";
 };
 
@@ -11,21 +14,20 @@ export function failurePresentation(origin: FailureOrigin): FailurePresentation 
   switch (origin) {
     case "test":
       return {
-        title: "Story / test error",
-        guidance: "The Story, play test, or uploaded Storybook bundle needs to be fixed.",
+        titleKey: "buildFailure.test.title",
+        guidanceKey: "buildFailure.test.guidance",
         tone: "test",
       };
     case "vrt":
       return {
-        title: "VRT execution environment error",
-        guidance:
-          "The renderer or VRT infrastructure failed. Retry the build; if it happens again, check the build log.",
+        titleKey: "buildFailure.vrt.title",
+        guidanceKey: "buildFailure.vrt.guidance",
         tone: "vrt",
       };
     default:
       return {
-        title: "Unclassified build error",
-        guidance: "This older build does not contain enough information to identify the owner.",
+        titleKey: "buildFailure.unknown.title",
+        guidanceKey: "buildFailure.unknown.guidance",
         tone: "unknown",
       };
   }

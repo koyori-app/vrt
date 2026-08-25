@@ -17,6 +17,9 @@ pub struct Model {
     pub email: Option<String>,
     /// この時刻より前に発行されたセッションを一括で無効化する（グローバルログアウト）。
     pub sessions_revoked_at: Option<DateTimeWithTimeZone>,
+    /// 画面表示に使う言語（BCP 47 の言語タグ）。NULL は未設定で、
+    /// クライアントが `Accept-Language` / ブラウザ設定から決める。
+    pub language: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     #[sea_orm(has_many)]

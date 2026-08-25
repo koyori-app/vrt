@@ -2,6 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Trans, useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { buildGraph, BuildGraph } from "@/components/build-graph";
@@ -67,6 +68,7 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/")({
 });
 
 function ProjectPage() {
+  const { t } = useTranslation();
   const { tenantSlug, projectSlug } = Route.useParams();
   const {
     tab,
@@ -81,7 +83,7 @@ function ProjectPage() {
   if (!tenant || !project) {
     return (
       <p className="py-16 text-center text-sm text-muted-foreground">
-        {isLoading || !tenant ? "Loading…" : `No project named “${projectSlug}”.`}
+        {isLoading || !tenant ? t("common.loading") : t("project.missing", { slug: projectSlug })}
       </p>
     );
   }
@@ -91,15 +93,16 @@ function ProjectPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">{project.name}</h1>
         <p className="text-sm text-muted-foreground">
-          {tenantSlug}/{project.slug} · default branch {project.default_branch}
+          {tenantSlug}/{project.slug} ·{" "}
+          {t("project.defaultBranchIs", { branch: project.default_branch })}
         </p>
       </div>
 
       <Tabs defaultValue={tab ?? "builds"} className="space-y-4">
         <TabsList>
-          <TabsTrigger value="builds">Builds</TabsTrigger>
-          <TabsTrigger value="settings">Settings</TabsTrigger>
-          <TabsTrigger value="ci">CI usage</TabsTrigger>
+          <TabsTrigger value="builds">{t("project.tabs.builds")}</TabsTrigger>
+          <TabsTrigger value="settings">{t("project.tabs.settings")}</TabsTrigger>
+          <TabsTrigger value="ci">{t("project.tabs.ci")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="builds">
@@ -149,6 +152,7 @@ function BuildsTable({
   tenantSlug: string;
   projectSlug: string;
 }) {
+  const { t } = useTranslation();
   const [offset, setOffset] = useState(0);
   const builds = useBuilds(projectId, BUILD_LIMIT, offset);
   const navigate = useNavigate();
@@ -173,16 +177,16 @@ function BuildsTable({
             <TableRow>
               {/* The graph column is decorative and sized by its body cells. */}
               <TableHead className="p-0">
-                <span className="sr-only">Branch graph</span>
+                <span className="sr-only">{t("builds.columns.graph")}</span>
               </TableHead>
-              <TableHead className="w-20">Build</TableHead>
-              <TableHead>Branch</TableHead>
-              <TableHead className="w-28">Commit</TableHead>
-              <TableHead className="w-44">Status</TableHead>
-              <TableHead>Comparisons</TableHead>
-              <TableHead className="w-48">Created</TableHead>
+              <TableHead className="w-20">{t("builds.columns.build")}</TableHead>
+              <TableHead>{t("builds.columns.branch")}</TableHead>
+              <TableHead className="w-28">{t("builds.columns.commit")}</TableHead>
+              <TableHead className="w-44">{t("builds.columns.status")}</TableHead>
+              <TableHead>{t("builds.columns.comparisons")}</TableHead>
+              <TableHead className="w-48">{t("builds.columns.created")}</TableHead>
               <TableHead className="w-16">
-                <span className="sr-only">Open</span>
+                <span className="sr-only">{t("builds.columns.open")}</span>
               </TableHead>
             </TableRow>
           </TableHeader>
@@ -229,15 +233,19 @@ function BuildsTable({
                     <BuildStatusBadge status={build.status} />
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {build.total_count} total · {build.changed_count} changed · {build.added_count}{" "}
-                    added · {build.removed_count} removed
+                    {t("builds.rowCounts", {
+                      total: build.total_count,
+                      changed: build.changed_count,
+                      added: build.added_count,
+                      removed: build.removed_count,
+                    })}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {formatDate(build.created_at)}
                   </TableCell>
                   <TableCell className="text-right">
                     <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
-                      view
+                      {t("builds.view")}
                       <ArrowRightIcon className="size-3" />
                     </span>
                   </TableCell>
@@ -247,7 +255,7 @@ function BuildsTable({
             {!builds.data?.builds.length ? (
               <TableRow>
                 <TableCell colSpan={8} className="text-sm text-muted-foreground">
-                  {builds.isLoading ? "Loading…" : "No builds yet. Upload screenshots from CI."}
+                  {builds.isLoading ? t("common.loading") : t("builds.empty")}
                 </TableCell>
               </TableRow>
             ) : null}
@@ -256,7 +264,11 @@ function BuildsTable({
         {total > BUILD_LIMIT ? (
           <div className="mt-4 flex items-center justify-between gap-3">
             <p className="text-xs text-muted-foreground">
-              {offset + 1}–{Math.min(offset + BUILD_LIMIT, total)} of {total} builds
+              {t("builds.range", {
+                from: offset + 1,
+                to: Math.min(offset + BUILD_LIMIT, total),
+                total,
+              })}
             </p>
             <div className="flex gap-2">
               <Button
@@ -265,7 +277,7 @@ function BuildsTable({
                 disabled={offset === 0 || builds.isFetching}
                 onClick={() => setOffset(Math.max(0, offset - BUILD_LIMIT))}
               >
-                Newer
+                {t("builds.newer")}
               </Button>
               <Button
                 variant="outline"
@@ -273,7 +285,7 @@ function BuildsTable({
                 disabled={offset + BUILD_LIMIT >= total || builds.isFetching}
                 onClick={() => setOffset(offset + BUILD_LIMIT)}
               >
-                Older
+                {t("builds.older")}
               </Button>
             </div>
           </div>
@@ -284,6 +296,7 @@ function BuildsTable({
 }
 
 function ProjectSettings({ project, canEdit }: { project: Project; canEdit: boolean }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [name, setName] = useState(project.name);
   const [defaultBranch, setDefaultBranch] = useState(project.default_branch);
@@ -314,9 +327,9 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
       await queryClient.invalidateQueries({
         queryKey: ["get", "/v1/tenants/{tenant_id}/projects"],
       });
-      toast.success("Project updated");
+      toast.success(t("projectSettings.updated"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not update project")),
+    onError: (error) => toast.error(errorMessage(error, t("projectSettings.updateFailed"))),
   });
 
   function onSubmit(event: FormEvent) {
@@ -339,17 +352,13 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Project settings</CardTitle>
-        <CardDescription>
-          The pixel threshold controls per-pixel colour tolerance; the fail ratio is the share of
-          changed pixels that marks a comparison as changed. The viewport is the window size VRT
-          renders Storybook stories at (storybook-mode builds only).
-        </CardDescription>
+        <CardTitle>{t("projectSettings.title")}</CardTitle>
+        <CardDescription>{t("projectSettings.description")}</CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={onSubmit} className="grid max-w-xl gap-4 sm:grid-cols-2">
           <div className="space-y-2">
-            <Label htmlFor="p-name">Name</Label>
+            <Label htmlFor="p-name">{t("project.name")}</Label>
             <Input
               id="p-name"
               value={name}
@@ -358,7 +367,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="p-branch">Default branch</Label>
+            <Label htmlFor="p-branch">{t("project.defaultBranch")}</Label>
             <Input
               id="p-branch"
               value={defaultBranch}
@@ -367,7 +376,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="p-threshold">Diff threshold (0–1)</Label>
+            <Label htmlFor="p-threshold">{t("projectSettings.diffThreshold")}</Label>
             <Input
               id="p-threshold"
               type="number"
@@ -380,7 +389,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="p-ratio">Fail ratio (0–1)</Label>
+            <Label htmlFor="p-ratio">{t("projectSettings.failRatio")}</Label>
             <Input
               id="p-ratio"
               type="number"
@@ -393,7 +402,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="p-viewport-w">Storybook viewport width (px)</Label>
+            <Label htmlFor="p-viewport-w">{t("projectSettings.viewportWidth")}</Label>
             <Input
               id="p-viewport-w"
               type="number"
@@ -406,7 +415,7 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2">
-            <Label htmlFor="p-viewport-h">Storybook viewport height (px)</Label>
+            <Label htmlFor="p-viewport-h">{t("projectSettings.viewportHeight")}</Label>
             <Input
               id="p-viewport-h"
               type="number"
@@ -419,21 +428,18 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
             />
           </div>
           <div className="space-y-2 sm:col-span-2">
-            <Label htmlFor="p-retention">Build retention (blank = unlimited)</Label>
+            <Label htmlFor="p-retention">{t("projectSettings.retention")}</Label>
             <Input
               id="p-retention"
               type="number"
               step="1"
               min="1"
-              placeholder="Unlimited"
+              placeholder={t("projectSettings.retentionPlaceholder")}
               value={retention}
               disabled={!canEdit}
               onChange={(event) => setRetention(event.target.value)}
             />
-            <p className="text-xs text-muted-foreground">
-              Keep only this many completed builds per project. Older builds (and their screenshots)
-              are deleted automatically; builds referenced by the current baseline are always kept.
-            </p>
+            <p className="text-xs text-muted-foreground">{t("projectSettings.retentionHint")}</p>
           </div>
           <div className="space-y-2 sm:col-span-2">
             {/* The cost has to be readable before the box is ticked: enabling this
@@ -446,20 +452,16 @@ function ProjectSettings({ project, canEdit }: { project: Project; canEdit: bool
                 onCheckedChange={(checked) => setReducedMotion(checked === true)}
               />
               <span>
-                <span className="font-medium">Emulate prefers-reduced-motion</span>
+                <span className="font-medium">{t("projectSettings.reducedMotion")}</span>
                 <span className="block text-xs text-muted-foreground">
-                  Renders storybook-mode captures as if the viewer had asked for reduced motion.
-                  Stories that respect the preference then look different, so the baseline is
-                  replaced once — review and approve the diff on the first build after you enable
-                  this. A story where the emulation cannot be verified fails instead of being
-                  captured.
+                  {t("projectSettings.reducedMotionHint")}
                 </span>
               </span>
             </label>
           </div>
           <div className="sm:col-span-2">
             <Button type="submit" disabled={!canEdit || update.isPending}>
-              {update.isPending ? "Saving…" : "Save changes"}
+              {update.isPending ? t("common.saving") : t("projectSettings.save")}
             </Button>
           </div>
         </form>
@@ -485,6 +487,7 @@ function GithubLink({
   setupState?: string;
   canEdit: boolean;
 }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const app = $api.useQuery("get", "/v1/github/app", {});
   const installations = $api.useQuery("get", "/v1/github/installations", {
@@ -520,9 +523,9 @@ function GithubLink({
       await queryClient.invalidateQueries({
         queryKey: ["get", "/v1/tenants/{tenant_id}/projects"],
       });
-      toast.success("GitHub link updated");
+      toast.success(t("github.updated"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not update GitHub link")),
+    onError: (error) => toast.error(errorMessage(error, t("github.updateFailed"))),
   });
 
   const claim = $api.useMutation("post", "/v1/github/installations/{installation_id}/claim", {
@@ -533,10 +536,9 @@ function GithubLink({
       await queryClient.invalidateQueries({
         queryKey: ["get", "/v1/github/installations"],
       });
-      toast.success(`GitHub App installed for ${installation.account_login}`);
+      toast.success(t("github.installed", { account: installation.account_login }));
     },
-    onError: (error) =>
-      toast.error(errorMessage(error, "Could not connect the GitHub installation")),
+    onError: (error) => toast.error(errorMessage(error, t("github.connectFailed"))),
   });
 
   // claim はサーバ発行の one-time state が揃っているときだけ走る。
@@ -567,7 +569,7 @@ function GithubLink({
   }
 
   const setupStateMutation = $api.useMutation("post", "/v1/github/setup/state", {
-    onError: (error) => toast.error(errorMessage(error, "Could not start the GitHub install")),
+    onError: (error) => toast.error(errorMessage(error, t("github.startInstallFailed"))),
   });
 
   function startInstall() {
@@ -611,28 +613,25 @@ function GithubLink({
               onClick={startInstall}
               disabled={setupStateMutation.isPending}
             >
-              Install GitHub App
+              {t("github.install")}
               <ExternalLinkIcon className="size-4" />
             </Button>
           ) : null}
         </div>
-        <CardDescription>
-          Install the App, choose an Organization or account, then select a repository. VRT posts a
-          commit status for every build.
-        </CardDescription>
+        <CardDescription>{t("github.description")}</CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={onSubmit} className="grid max-w-xl gap-4">
           {!app.isLoading && !installBaseUrl ? (
             <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300">
-              The install link is not configured. Set GITHUB_APP_INSTALL_URL on the server.
+              {t("github.installUrlMissing")}
             </p>
           ) : null}
           {claim.isPending ? (
-            <p className="text-sm text-muted-foreground">Connecting the new GitHub installation…</p>
+            <p className="text-sm text-muted-foreground">{t("github.connecting")}</p>
           ) : null}
           <div className="space-y-2">
-            <Label htmlFor="gh-installation">Organization / account</Label>
+            <Label htmlFor="gh-installation">{t("github.organization")}</Label>
             <Select
               // Radix reserves the empty string, so "none" is the sentinel for
               // "no installation linked" and is mapped back to "" in state.
@@ -646,14 +645,16 @@ function GithubLink({
               }}
             >
               <SelectTrigger id="gh-installation" className="w-full">
-                <SelectValue placeholder="Choose an Organization" />
+                <SelectValue placeholder={t("github.chooseOrganization")} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value={NO_INSTALLATION}>None</SelectItem>
+                <SelectItem value={NO_INSTALLATION}>{t("github.none")}</SelectItem>
                 {installations.data?.installations.map((installation) => (
                   <SelectItem key={installation.id} value={String(installation.installation_id)}>
                     {installation.account_login}
-                    {installation.account_type === "Organization" ? " · Organization" : ""}
+                    {installation.account_type === "Organization"
+                      ? ` · ${t("github.organizationTag")}`
+                      : ""}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -661,7 +662,7 @@ function GithubLink({
           </div>
           {installationId ? (
             <div className="space-y-2">
-              <Label htmlFor="gh-repo-search">Repository</Label>
+              <Label htmlFor="gh-repo-search">{t("github.repository")}</Label>
               <div className="relative">
                 <SearchIcon className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -669,7 +670,7 @@ function GithubLink({
                   value={repoSearch}
                   disabled={!canEdit || repositories.isLoading}
                   className="pl-9"
-                  placeholder="Search repositories…"
+                  placeholder={t("github.searchRepositories")}
                   onChange={(event) => setRepoSearch(event.target.value)}
                 />
               </div>
@@ -677,7 +678,9 @@ function GithubLink({
                 <SelectTrigger className="w-full">
                   <SelectValue
                     placeholder={
-                      repositories.isLoading ? "Loading repositories…" : "Choose a repository"
+                      repositories.isLoading
+                        ? t("github.loadingRepositories")
+                        : t("github.chooseRepository")
                     }
                   />
                 </SelectTrigger>
@@ -685,18 +688,18 @@ function GithubLink({
                   {filteredRepositories?.map((repository) => (
                     <SelectItem key={repository.id} value={repository.full_name}>
                       {repository.full_name}
-                      {repository.private ? " · Private" : ""}
-                      {repository.archived ? " · Archived" : ""}
+                      {repository.private ? ` · ${t("github.private")}` : ""}
+                      {repository.archived ? ` · ${t("github.archived")}` : ""}
                     </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
               {!repositories.isLoading && filteredRepositories?.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No matching repositories.</p>
+                <p className="text-xs text-muted-foreground">{t("github.noRepositories")}</p>
               ) : null}
               {repositories.isError ? (
                 <p className="text-xs text-destructive">
-                  {errorMessage(repositories.error, "Could not load repositories")}
+                  {errorMessage(repositories.error, t("github.loadRepositoriesFailed"))}
                 </p>
               ) : null}
             </div>
@@ -706,7 +709,7 @@ function GithubLink({
               type="submit"
               disabled={!canEdit || update.isPending || (!!installationId && !repo)}
             >
-              {update.isPending ? "Saving…" : "Save GitHub link"}
+              {update.isPending ? t("common.saving") : t("github.save")}
             </Button>
           </div>
         </form>
@@ -717,13 +720,10 @@ function GithubLink({
 
 type CiMode = "screenshots" | "storybook";
 
-const CI_MODE_DESCRIPTION: Record<CiMode, string> = {
-  screenshots: "Your CI captures the PNGs and uploads them one by one.",
-  storybook:
-    "Your CI uploads a built Storybook (a zip of storybook-static) and VRT renders every story " +
-    "server-side in headless Chromium. Rendering happens between finalize and the comparison, so " +
-    "the build passes through “Queued” and “Rendering” first.",
-};
+const CI_MODE_DESCRIPTION_KEY = {
+  screenshots: "ci.modes.screenshotsDescription",
+  storybook: "ci.modes.storybookDescription",
+} as const satisfies Record<CiMode, string>;
 
 function ciSnippet(mode: CiMode, tenantSlug: string, projectSlug: string) {
   const createBuild = (body: string) => `# 1. create a build (PAT needs write:build)
@@ -770,6 +770,7 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
 }
 
 function CiUsage({ tenantSlug, projectSlug }: { tenantSlug: string; projectSlug: string }) {
+  const { t } = useTranslation();
   const [mode, setMode] = useState<CiMode>("screenshots");
   const snippet = ciSnippet(mode, tenantSlug, projectSlug);
 
@@ -777,9 +778,9 @@ function CiUsage({ tenantSlug, projectSlug }: { tenantSlug: string; projectSlug:
     <Card>
       <CardHeader className="flex-row items-start justify-between gap-3 space-y-0">
         <div>
-          <CardTitle>CI usage</CardTitle>
+          <CardTitle>{t("ci.title")}</CardTitle>
           <CardDescription>
-            Create a personal access token with the <code>write:build</code> scope first.
+            <Trans i18nKey="ci.description" components={{ code: <code /> }} />
           </CardDescription>
         </div>
         <Button
@@ -787,26 +788,26 @@ function CiUsage({ tenantSlug, projectSlug }: { tenantSlug: string; projectSlug:
           size="sm"
           onClick={async () => {
             await navigator.clipboard.writeText(snippet);
-            toast.success("Snippet copied");
+            toast.success(t("ci.copied"));
           }}
         >
           <CopyIcon className="size-3.5" />
-          Copy
+          {t("tokens.copy")}
         </Button>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="space-y-2">
-          <Label htmlFor="ci-mode">Build mode</Label>
+          <Label htmlFor="ci-mode">{t("ci.buildMode")}</Label>
           <Select value={mode} onValueChange={(value) => setMode(value as CiMode)}>
             <SelectTrigger id="ci-mode" className="w-full max-w-xs">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="screenshots">screenshots — CI uploads PNGs</SelectItem>
-              <SelectItem value="storybook">storybook — VRT renders the stories</SelectItem>
+              <SelectItem value="screenshots">{t("ci.modes.screenshots")}</SelectItem>
+              <SelectItem value="storybook">{t("ci.modes.storybook")}</SelectItem>
             </SelectContent>
           </Select>
-          <p className="text-xs text-muted-foreground">{CI_MODE_DESCRIPTION[mode]}</p>
+          <p className="text-xs text-muted-foreground">{t(CI_MODE_DESCRIPTION_KEY[mode])}</p>
         </div>
         <pre className="overflow-x-auto rounded-md bg-muted p-4 text-xs leading-relaxed">
           {snippet}

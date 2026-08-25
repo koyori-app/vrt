@@ -8,6 +8,7 @@ mod m20260802000000_build_capture_plan;
 mod m20260803000000_content_hash_decode_skip;
 mod m20260811000000_reduced_motion;
 mod m20260825000000_build_failure_classification;
+mod m20260826000000_user_language;
 
 pub struct Migrator;
 
@@ -23,6 +24,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260803000000_content_hash_decode_skip::Migration),
             Box::new(m20260811000000_reduced_motion::Migration),
             Box::new(m20260825000000_build_failure_classification::Migration),
+            Box::new(m20260826000000_user_language::Migration),
         ]
     }
 }

@@ -20,6 +20,7 @@ pub mod review_lock;
 pub mod screenshots;
 pub mod storage;
 pub mod tenants;
+pub mod users;
 
 pub use common::db;
 pub use common::validation;

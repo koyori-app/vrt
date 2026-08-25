@@ -1,13 +1,14 @@
 import type * as React from "react";
+import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
 import type { BuildStatus, ComparisonStatus, ReviewStatus } from "@/lib/api";
 import {
-  buildStatusLabel,
+  buildStatusLabelKey,
   buildStatusTone,
-  comparisonStatusLabel,
+  comparisonStatusLabelKey,
   comparisonStatusTone,
-  reviewStatusLabel,
+  reviewStatusLabelKey,
   reviewStatusTone,
   toneClass,
   toneDotClass,
@@ -40,21 +41,24 @@ export function ToneBadge({
 }
 
 export function BuildStatusBadge({ status }: { status: BuildStatus }) {
+  const { t } = useTranslation();
   return (
     <ToneBadge tone={buildStatusTone[status]} dot>
-      {buildStatusLabel[status]}
+      {t(buildStatusLabelKey[status])}
     </ToneBadge>
   );
 }
 
 export function ComparisonStatusBadge({ status }: { status: ComparisonStatus }) {
+  const { t } = useTranslation();
   return (
     <ToneBadge tone={comparisonStatusTone[status]} dot>
-      {comparisonStatusLabel[status]}
+      {t(comparisonStatusLabelKey[status])}
     </ToneBadge>
   );
 }
 
 export function ReviewStatusBadge({ status }: { status: ReviewStatus }) {
-  return <ToneBadge tone={reviewStatusTone[status]}>{reviewStatusLabel[status]}</ToneBadge>;
+  const { t } = useTranslation();
+  return <ToneBadge tone={reviewStatusTone[status]}>{t(reviewStatusLabelKey[status])}</ToneBadge>;
 }

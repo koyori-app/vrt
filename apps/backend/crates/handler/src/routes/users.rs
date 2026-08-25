@@ -4,5 +4,8 @@ use utoipa_axum::routes;
 use crate::AppState;
 
 pub fn routes() -> OpenApiRouter<AppState> {
-    OpenApiRouter::<AppState>::new().routes(routes!(crate::handlers::users::me))
+    OpenApiRouter::<AppState>::new().routes(routes!(
+        crate::handlers::users::me,
+        crate::handlers::users::update_me
+    ))
 }

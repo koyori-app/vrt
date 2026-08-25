@@ -743,6 +743,21 @@ impl TestApp {
             .expect("patch request")
     }
 
+    pub async fn patch_json_with_bearer(
+        &self,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> Response {
+        self.client
+            .patch(format!("{}{path}", self.base_url))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("bearer patch request")
+    }
+
     pub async fn post_json_with_bearer(
         &self,
         path: &str,
@@ -1015,6 +1030,7 @@ impl TestApp {
             avatar_url: Set(None),
             email: Set(Some(format!("test-{id}@example.com"))),
             sessions_revoked_at: Set(None),
+            language: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         }

@@ -1,13 +1,23 @@
 import { CheckIcon, XIcon } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { cn } from "@/lib/utils";
 import type { Comparison } from "@/lib/api";
-import { comparisonStatusTone, toneDotClass } from "@/lib/status";
+import { comparisonStatusLabelKey, comparisonStatusTone, toneDotClass } from "@/lib/status";
 
 export type ComparisonFilter = "all" | "changed" | "added" | "removed" | "unchanged";
 
 const FILTERS: ComparisonFilter[] = ["all", "changed", "added", "removed", "unchanged"];
+
+/** 絞り込みタブの文言。`capitalize` の見た目に頼らず訳語を持つ。 */
+const FILTER_LABEL_KEY = {
+  all: "comparisonFilter.all",
+  changed: "comparisonFilter.changed",
+  added: "comparisonFilter.added",
+  removed: "comparisonFilter.removed",
+  unchanged: "comparisonFilter.unchanged",
+} as const satisfies Record<ComparisonFilter, string>;
 
 export function filterComparisons(comparisons: Comparison[], filter: ComparisonFilter) {
   if (filter === "all") return comparisons;
@@ -27,6 +37,7 @@ export function ComparisonList({
   filter: ComparisonFilter;
   onFilterChange: (filter: ComparisonFilter) => void;
 }) {
+  const { t } = useTranslation();
   const counts = useMemo(() => {
     const result: Record<ComparisonFilter, number> = {
       all: comparisons.length,
@@ -54,13 +65,13 @@ export function ComparisonList({
             type="button"
             onClick={() => onFilterChange(value)}
             className={cn(
-              "rounded-md px-2 py-1 text-xs capitalize transition-colors",
+              "rounded-md px-2 py-1 text-xs transition-colors",
               value === filter
                 ? "bg-primary text-primary-foreground"
                 : "text-muted-foreground hover:bg-accent",
             )}
           >
-            {value} {counts[value]}
+            {t(FILTER_LABEL_KEY[value])} {counts[value]}
           </button>
         ))}
       </div>
@@ -81,7 +92,7 @@ export function ComparisonList({
                   "size-2 shrink-0 rounded-full",
                   toneDotClass[comparisonStatusTone[comparison.status]],
                 )}
-                title={comparison.status}
+                title={t(comparisonStatusLabelKey[comparison.status])}
               />
               <span className="min-w-0 flex-1 truncate">{comparison.name}</span>
               {comparison.review_status === "approved" ? (
@@ -94,7 +105,7 @@ export function ComparisonList({
         ))}
         {!visible.length ? (
           <li className="px-3 py-6 text-center text-xs text-muted-foreground">
-            Nothing matches this filter.
+            {t("comparisonFilter.empty")}
           </li>
         ) : null}
       </ul>

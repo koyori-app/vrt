@@ -75,7 +75,12 @@ export type PersonalToken = Schemas["PersonalTokenResponse"];
 export type Scope = Schemas["Scope"];
 export type GithubInstallation = Schemas["GithubInstallationResponse"];
 
-/** Pull a human-readable message out of an `AppError` JSON body. */
+/**
+ * Pull a human-readable message out of an `AppError` JSON body.
+ *
+ * `fallback` は呼び出し側が翻訳済みの文言を渡す（`t("...")`）。既定値は
+ * 「翻訳された文言を渡し忘れた」ときにだけ出る最後の受け皿。
+ */
 export function errorMessage(error: unknown, fallback = "Request failed"): string {
   if (error && typeof error === "object" && "message" in error) {
     const message = (error as { message?: unknown }).message;
