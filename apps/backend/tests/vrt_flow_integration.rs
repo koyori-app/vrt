@@ -228,7 +228,7 @@ impl Fixture {
             let build: Value = res.json().await.expect("build json");
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
-            if !matches!(status.as_str(), "pending" | "processing") {
+            if !matches!(status.as_str(), "pending" | "queued" | "processing") {
                 assert_completed_at_is_stamped(&build);
                 return build;
             }
@@ -602,6 +602,29 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         .map(|b| b["number"].as_i64().unwrap_or(-1))
         .collect();
     assert_eq!(numbers, vec![3, 2, 1], "builds are listed newest first");
+    let listed = list["builds"].as_array().expect("builds array");
+    assert_eq!(
+        listed[0]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build2_id,
+            "build_number": 2,
+        }),
+        "build #3 exposes the approved build whose baseline it compared against"
+    );
+    assert_eq!(
+        listed[1]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build1_id,
+            "build_number": 1,
+        }),
+        "build #2 exposes its baseline ancestry"
+    );
+    assert!(
+        listed[2]["baseline_source"].is_null(),
+        "the root build has no invented ancestry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1035,4 +1058,189 @@ async fn build_can_be_fetched_by_project_scoped_number() {
             .status(),
         StatusCode::FORBIDDEN
     );
+}
+
+/// 失敗した screenshots モードのビルドの再実行は、アップロード済み PNG の
+/// **比較から**やり直して完走する（storybook モードと違いレンダリングは無い）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+
+    let build = fx.create_build("main", "retrycmp1").await;
+    let build_id: Uuid = build["id"].as_str().expect("build id").parse().unwrap();
+    assert_eq!(
+        fx.upload(build_id, "home", png(64, 64, [200, 30, 30, 255]))
+            .await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await, StatusCode::OK);
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(done["status"].as_str(), Some("changes_detected"));
+
+    // 比較ジョブが一時障害で落ちた状況を DB 直接更新で再現する
+    // （compare の失敗を API 経由で決定的に起こす口は無い）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.error_message = Set(Some("simulated compare failure".into()));
+    active.failure_origin = Set(Some(entity::builds::BuildFailureOrigin::Vrt));
+    active.failure_code = Set(Some("compare_internal".into()));
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    // 再実行 → queued に戻り、worker が取得して比較から完走する。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "retry failed build");
+    let retried: Value = res.json().await.expect("retry json");
+    assert_eq!(
+        retried["status"].as_str(),
+        Some("queued"),
+        "screenshots-mode retry waits for the compare worker"
+    );
+    assert!(retried["error_message"].is_null());
+    assert!(retried["failure_origin"].is_null());
+    assert!(retried["failure_code"].is_null());
+
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        done["status"].as_str(),
+        Some("changes_detected"),
+        "retried build completes (error: {:?})",
+        done["error_message"]
+    );
+    // 比較は作り直されて重複しない（compare ジョブが開始時に前回分を捨てる）。
+    let comparisons = fx.comparisons(build_id).await;
+    assert_eq!(comparisons.len(), 1);
+    assert_eq!(comparisons[0]["status"].as_str(), Some("added"));
+}
+
+/// 異branch fallbackのbaselineにしか無い名前を`removed`にせず、かつ
+/// `passed`へfalse passさせない（koyori-app/vrt#38）。
+///
+/// 自分の baseline を持たない枝は default branch の baseline へ fallback する。
+/// その baseline にあってビルドに無い名前は「枝が消した」のか「分岐後に main へ
+/// 追加された」のか区別できないため、reviewableなfailed比較として保持する。
+/// 同 branch の比較では従来どおり removed になることも同時に固定する（回帰）。
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_branch_baseline_missing_entries_require_review_without_becoming_removed() {
+    let fx = setup().await;
+
+    let home = png(40, 30, [255, 255, 255, 255]);
+    let about = png(40, 30, [200, 200, 200, 255]);
+
+    // ── main #1: home + about → force 承認で main の baseline (2 件) ──────
+    let build1 = fx.create_build("main", "aaaa1111").await;
+    let build1_id = build_id_of(&build1);
+    assert_eq!(
+        fx.upload(build1_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        fx.upload(build1_id, "about", about.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build1_id).await, StatusCode::OK);
+    let build1 = fx.wait_for_terminal(build1_id).await;
+    assert_eq!(build1["status"].as_str(), Some("changes_detected"));
+    let res = fx.approve(build1_id, true).await;
+    assert_eq!(res.status(), StatusCode::OK, "force approve main build");
+
+    // ── feature #2: home だけ（about 相当は撮っていない）─────────────────
+    //
+    // feature 枝は自分の baseline を持たないので main の baseline へ fallback する。
+    // aboutをremovedと断定はできないが、比較行ごと消してPassedにすると本物の削除も
+    // required checkを通過する。曖昧な欠落としてレビュー待ちに残す。
+    let build2 = fx.create_build("feature/no-own-baseline", "bbbb2222").await;
+    let build2_id = build_id_of(&build2);
+    assert_eq!(
+        fx.upload(build2_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build2_id).await, StatusCode::OK);
+    let build2 = fx.wait_for_terminal(build2_id).await;
+    assert_eq!(
+        build2["status"].as_str(),
+        Some("changes_detected"),
+        "ambiguous missing names must keep the build pending for review: {build2:?}"
+    );
+    assert_eq!(
+        counts(&build2),
+        (2, 0, 0, 0, 1),
+        "the ambiguous row is counted in total but not as removed"
+    );
+    let cmps = fx.comparisons(build2_id).await;
+    assert_eq!(cmps.len(), 2, "the baseline-only name stays reviewable");
+    assert_eq!(find_comparison(&cmps, "home")["status"], "unchanged");
+    let ambiguous = find_comparison(&cmps, "about");
+    assert_eq!(ambiguous["status"], "failed");
+    assert_eq!(ambiguous["review_status"], "pending");
+    assert!(
+        ambiguous["error_message"].as_str().is_some_and(
+            |message| message.contains("Cannot determine whether this story was removed")
+        ),
+        "the row explains why the result is ambiguous: {ambiguous:?}"
+    );
+    let logs = fx.build_logs(build2_id).await;
+    assert!(
+        logs.iter().any(|entry| {
+            entry["message"].as_str().is_some_and(|message| {
+                message.contains("kept 1 missing entries as reviewable comparison failures")
+            })
+        }),
+        "build log records how many ambiguous entries require review: {logs:?}"
+    );
+
+    // forceだけではfailed比較を流せず、明示レビューした場合だけfeature側baselineから
+    // aboutを外せる。比較行を残すことで「本物の削除だった」場合の承認経路も維持する。
+    let res = fx.approve(build2_id, true).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "ambiguous failure must not be bulk-approved by force alone"
+    );
+    let comparison_id = ambiguous["id"].as_str().expect("comparison id");
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/comparisons/{comparison_id}/review"),
+            json!({ "action": "approve" }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "approve ambiguous missing row"
+    );
+    let res = fx.approve(build2_id, false).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "an explicitly reviewed ambiguous missing story can be accepted"
+    );
+
+    // ── main #3: home だけ → 同 branch では従来どおり about が removed ────
+    let build3 = fx.create_build("main", "cccc3333").await;
+    let build3_id = build_id_of(&build3);
+    assert_eq!(
+        fx.upload(build3_id, "home", home.clone()).await,
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build3_id).await, StatusCode::OK);
+    let build3 = fx.wait_for_terminal(build3_id).await;
+    assert_eq!(
+        build3["status"].as_str(),
+        Some("changes_detected"),
+        "same-branch comparisons still report removals"
+    );
+    assert_eq!(counts(&build3), (2, 0, 0, 1, 1));
+    let cmps = fx.comparisons(build3_id).await;
+    assert_eq!(find_comparison(&cmps, "about")["status"], "removed");
 }

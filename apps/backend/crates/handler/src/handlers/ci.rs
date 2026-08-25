@@ -386,9 +386,9 @@ pub async fn upload_storybook_bundle(
     path = "/builds/{build_id}/finalize",
     tag = "CI",
     summary = "アップロードを締めてジョブを投入する",
-    description = "`screenshots` モードは `pending → processing` に遷移して `CompareBuildJob` を、\
-                   `storybook` モードは `pending → rendering` に遷移して `RenderBuildJob` を投入する\
-                   （レンダリングが済むと自動で `processing` に繋がる）。\
+    description = "どちらのモードも `pending → queued` に遷移してジョブを投入する。\
+                   worker が取得すると `screenshots` は `processing`、`storybook` は \
+                   `rendering` に進み、レンダリング後は自動で `processing` に繋がる。\
                    以降は `GET /v1/ci/builds/{build_id}` をポーリングして結果を待つ。\
                    ボディは任意。`storybook` モードで `only_story_ids` を渡すと、\
                    そのストーリーだけを撮影し残りは baseline を流用する（TurboSnap 相当。\
@@ -402,7 +402,7 @@ pub async fn upload_storybook_bundle(
     request_body(content = FinalizeBuildRequest, description = "任意。省略・空ボディ可"),
     security(("bearerAuth" = [])),
     responses(
-        (status = 200, description = "processing / rendering に遷移したビルド", body = BuildResponse),
+        (status = 200, description = "queued に遷移したビルド", body = BuildResponse),
         (status = 400, description = "storybook バンドルが未アップロード / リストが不正 / モードとフィールドの組合せが不正 / captured_names とアップロードの不一致 / expected_baseline_commit_sha と固定済み baseline の不一致（screenshots モードのクロスチェック）", body = ServerError),
         (status = 409, description = "既に finalize 済みです / baseline が計画後に動いた（expected_baseline_commit_sha と現在の baseline の不一致。現在の baseline へ再計画すれば解消）", body = ServerError),
         CrudErrors,
@@ -557,7 +557,7 @@ pub async fn finalize_build(
         }
     };
 
-    // `processing` を GitHub の pending ステータスとして先に見せる。
+    // `queued` を GitHub の pending ステータスとして先に見せる。
     // 連携が無ければジョブ側が何もせず終わる。
     job::github_status::enqueue_best_effort(&state.github_status_storage, build.id).await;
 

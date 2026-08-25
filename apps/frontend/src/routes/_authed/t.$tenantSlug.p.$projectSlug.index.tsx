@@ -1,9 +1,10 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowRightIcon, CopyIcon, ExternalLinkIcon, SearchIcon } from "lucide-react";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { toast } from "sonner";
 
+import { buildGraph, BuildGraph } from "@/components/build-graph";
 import { CommitLink } from "@/components/commit-link";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -105,6 +106,7 @@ function ProjectPage() {
           <BuildsTable
             projectId={project.id}
             githubRepo={project.github_repo}
+            defaultBranch={project.default_branch}
             tenantSlug={tenantSlug}
             projectSlug={project.slug}
           />
@@ -131,19 +133,37 @@ function ProjectPage() {
   );
 }
 
+/** Page size for the builds table (the API caps limit at 100). */
+const BUILD_LIMIT = 50;
+
 function BuildsTable({
   projectId,
   githubRepo,
+  defaultBranch,
   tenantSlug,
   projectSlug,
 }: {
   projectId: string;
   githubRepo: string | null | undefined;
+  defaultBranch: string;
   tenantSlug: string;
   projectSlug: string;
 }) {
-  const builds = useBuilds(projectId);
+  const [offset, setOffset] = useState(0);
+  const builds = useBuilds(projectId, BUILD_LIMIT, offset);
   const navigate = useNavigate();
+  const rows = builds.data?.builds;
+  const total = builds.data?.total ?? 0;
+  const graph = useMemo(() => buildGraph(rows ?? [], defaultBranch), [rows, defaultBranch]);
+
+  // Retention pruning (or switching projects) can shrink the list below the
+  // current offset; snap back to the last page that still has rows.
+  useEffect(() => {
+    if (builds.data && offset > 0 && offset >= builds.data.total) {
+      const lastPage = Math.max(0, Math.ceil(builds.data.total / BUILD_LIMIT) - 1);
+      setOffset(lastPage * BUILD_LIMIT);
+    }
+  }, [builds.data, offset]);
 
   return (
     <Card>
@@ -151,6 +171,10 @@ function BuildsTable({
         <Table>
           <TableHeader>
             <TableRow>
+              {/* The graph column is decorative and sized by its body cells. */}
+              <TableHead className="p-0">
+                <span className="sr-only">Branch graph</span>
+              </TableHead>
               <TableHead className="w-20">Build</TableHead>
               <TableHead>Branch</TableHead>
               <TableHead className="w-28">Commit</TableHead>
@@ -163,7 +187,7 @@ function BuildsTable({
             </TableRow>
           </TableHeader>
           <TableBody>
-            {builds.data?.builds.map((build) => {
+            {graph.rows.map(({ build, cells }) => {
               const to = "/t/$tenantSlug/p/$projectSlug/builds/$number" as const;
               const params = { tenantSlug, projectSlug, number: String(build.number) };
               return (
@@ -176,6 +200,12 @@ function BuildsTable({
                     void navigate({ to, params });
                   }}
                 >
+                  <TableCell className="relative p-0">
+                    {/* The SVG is absolutely positioned, so this spacer is what
+                        actually reserves the column's width. */}
+                    <div style={{ width: graph.width }} />
+                    <BuildGraph cells={cells} />
+                  </TableCell>
                   <TableCell>
                     {/* The real, keyboard-focusable navigation. The row onClick above is
                         a mouse-only enhancement that points at the same destination. */}
@@ -216,13 +246,38 @@ function BuildsTable({
             })}
             {!builds.data?.builds.length ? (
               <TableRow>
-                <TableCell colSpan={7} className="text-sm text-muted-foreground">
+                <TableCell colSpan={8} className="text-sm text-muted-foreground">
                   {builds.isLoading ? "Loading…" : "No builds yet. Upload screenshots from CI."}
                 </TableCell>
               </TableRow>
             ) : null}
           </TableBody>
         </Table>
+        {total > BUILD_LIMIT ? (
+          <div className="mt-4 flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              {offset + 1}–{Math.min(offset + BUILD_LIMIT, total)} of {total} builds
+            </p>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={offset === 0 || builds.isFetching}
+                onClick={() => setOffset(Math.max(0, offset - BUILD_LIMIT))}
+              >
+                Newer
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={offset + BUILD_LIMIT >= total || builds.isFetching}
+                onClick={() => setOffset(offset + BUILD_LIMIT)}
+              >
+                Older
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -667,7 +722,7 @@ const CI_MODE_DESCRIPTION: Record<CiMode, string> = {
   storybook:
     "Your CI uploads a built Storybook (a zip of storybook-static) and VRT renders every story " +
     "server-side in headless Chromium. Rendering happens between finalize and the comparison, so " +
-    "the build passes through the “Rendering” state first.",
+    "the build passes through “Queued” and “Rendering” first.",
 };
 
 function ciSnippet(mode: CiMode, tenantSlug: string, projectSlug: string) {
@@ -694,7 +749,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/storybook" \\
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. poll until the build leaves "rendering"/"processing"
+# 4. poll until the build leaves "queued"/"rendering"/"processing"
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
   }
 
@@ -710,7 +765,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/screenshots" \\
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. poll until the build leaves "processing"
+# 4. poll until the build leaves "queued"/"processing"
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
 }
 

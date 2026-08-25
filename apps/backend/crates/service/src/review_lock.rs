@@ -23,7 +23,7 @@
 //!   通常の finalize（`builds::finalize_screenshots`、および全撮影＝
 //!   `only_story_ids` 無しの `builds::finalize_storybook`）は build 行だけを
 //!   排他ロックする。これにより
-//!   - finalize の「計画 == アップロード」検査と `processing` 遷移の間に、
+//!   - finalize の「計画 == アップロード」検査と `queued` 遷移の間に、
 //!     計画外ショットが紛れ込めない
 //!
 //!   を保証する。project 行は読むだけで `FOR UPDATE` しない。

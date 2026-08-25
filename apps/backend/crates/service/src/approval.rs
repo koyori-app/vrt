@@ -66,6 +66,8 @@ pub struct ComparisonFacts {
     pub name: String,
     pub status: ComparisonStatus,
     pub review_status: ReviewStatus,
+    /// 今回のスクリーンショットが無く、baseline側だけに実体がある比較か。
+    pub baseline_only: bool,
 }
 
 impl ComparisonFacts {
@@ -74,6 +76,7 @@ impl ComparisonFacts {
             name: name.into(),
             status,
             review_status: review,
+            baseline_only: false,
         }
     }
 }
@@ -84,6 +87,7 @@ impl From<&entity::comparisons::Model> for ComparisonFacts {
             name: model.name.clone(),
             status: model.status,
             review_status: model.review_status,
+            baseline_only: model.screenshot_id.is_none() && model.baseline_entry_id.is_some(),
         }
     }
 }
@@ -133,12 +137,18 @@ pub fn unexpected_missing_names(
     names
 }
 
-/// 承認済みの `removed` 比較の名前集合。
-pub fn approved_removal_names(comparisons: &[ComparisonFacts]) -> HashSet<String> {
+/// baselineから欠落してよいと明示承認された比較の名前集合。
+///
+/// 通常の`removed`に加え、異branch baseline由来で削除か後発追加かを判別できず
+/// `failed`として保持したbaseline-only比較も、個別承認または`accept_failures`後は
+/// 欠落を認める。両側に画像がある通常のfailed比較は対象にしない。
+pub fn approved_missing_names(comparisons: &[ComparisonFacts]) -> HashSet<String> {
     comparisons
         .iter()
         .filter(|c| {
-            c.status == ComparisonStatus::Removed && c.review_status == ReviewStatus::Approved
+            c.review_status == ReviewStatus::Approved
+                && (c.status == ComparisonStatus::Removed
+                    || (c.status == ComparisonStatus::Failed && c.baseline_only))
         })
         .map(|c| c.name.clone())
         .collect()
@@ -390,14 +400,24 @@ mod tests {
     }
 
     #[test]
-    fn approved_removal_names_only_collects_approved_removals() {
-        let list = facts(&[
+    fn approved_missing_names_include_reviewed_ambiguous_baseline_only_failures() {
+        let mut list = facts(&[
             ("gone", ComparisonStatus::Removed, ReviewStatus::Approved),
             ("stay", ComparisonStatus::Removed, ReviewStatus::Pending),
             ("changed", ComparisonStatus::Changed, ReviewStatus::Approved),
+            (
+                "ambiguous",
+                ComparisonStatus::Failed,
+                ReviewStatus::Approved,
+            ),
+            ("broken", ComparisonStatus::Failed, ReviewStatus::Approved),
         ]);
-        let names = approved_removal_names(&list);
-        assert_eq!(names.len(), 1);
+        list[3].baseline_only = true;
+
+        let names = approved_missing_names(&list);
+        assert_eq!(names.len(), 2);
         assert!(names.contains("gone"));
+        assert!(names.contains("ambiguous"));
+        assert!(!names.contains("broken"));
     }
 }

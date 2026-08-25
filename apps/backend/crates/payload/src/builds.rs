@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use entity::{build_logs, builds, builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{
+    build_logs, builds, builds::BuildFailureOrigin, builds::BuildMode, builds::BuildStatus,
+    screenshots,
+};
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct BuildResponse {
@@ -41,6 +44,9 @@ pub struct BuildResponse {
     /// baseline が無い、または昇格元ビルドが削除済みなら `None`。
     #[schema(nullable)]
     pub baseline_commit_sha: Option<String>,
+    /// このビルドが比較した baseline の派生元。ビルド一覧でのみ解決する。
+    #[schema(nullable)]
+    pub baseline_source: Option<BuildBaselineSourceResponse>,
     pub total_count: i32,
     pub changed_count: i32,
     pub added_count: i32,
@@ -49,6 +55,12 @@ pub struct BuildResponse {
     pub content_hash_skipped_count: i32,
     #[schema(nullable)]
     pub error_message: Option<String>,
+    /// Story / テスト側の失敗か、VRT 実行環境側の失敗か。
+    #[schema(nullable)]
+    pub failure_origin: Option<BuildFailureOrigin>,
+    /// `story_failure`、`chromium_launch` などの機械可読な詳細コード。
+    #[schema(nullable)]
+    pub failure_code: Option<String>,
     /// 危険を明示的に承知して承認した場合の証跡。
     #[schema(nullable)]
     pub approval_evidence: Option<serde_json::Value>,
@@ -80,6 +92,7 @@ impl From<builds::Model> for BuildResponse {
             // baseline のコミット SHA は DB の追加参照が必要なので From では解決しない。
             // 必要な経路（create_build）が組み立て後に明示的に埋める。
             baseline_commit_sha: None,
+            baseline_source: None,
             total_count: model.total_count,
             changed_count: model.changed_count,
             added_count: model.added_count,
@@ -87,6 +100,8 @@ impl From<builds::Model> for BuildResponse {
             unchanged_count: model.unchanged_count,
             content_hash_skipped_count: model.content_hash_skipped_count,
             error_message: model.error_message,
+            failure_origin: model.failure_origin,
+            failure_code: model.failure_code,
             approval_evidence: model.approval_evidence,
             approved_by: model.approved_by,
             approved_at: model.approved_at.map(|t| t.with_timezone(&Utc)),
@@ -100,6 +115,19 @@ impl From<builds::Model> for BuildResponse {
 pub struct BuildListResponse {
     pub builds: Vec<BuildResponse>,
     pub total: u64,
+}
+
+/// VRT baseline の昇格元。Git の親commitではなく、比較系譜を表す。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BuildBaselineSourceResponse {
+    /// baseline が属するブランチ。
+    pub branch: String,
+    /// 昇格元ビルド。保持期間で削除済みなら null。
+    #[schema(value_type = Option<String>, format = "uuid", nullable)]
+    pub build_id: Option<Uuid>,
+    /// 昇格元ビルドのプロジェクト内番号。削除済みなら null。
+    #[schema(nullable)]
+    pub build_number: Option<i64>,
 }
 
 #[derive(Validate, Debug, Deserialize, ToSchema)]

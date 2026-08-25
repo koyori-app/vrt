@@ -1132,7 +1132,7 @@ async fn build_lifecycle_posts_commit_statuses_to_github() {
         .status();
     assert_eq!(status, StatusCode::OK, "finalize");
 
-    // finalize 直後は pending（processing）。
+    // finalize 直後は pending（queued）。
     let pending = app
         .github()
         .wait_for_status(repo, &sha, "pending", POLL_TIMEOUT)
@@ -1915,7 +1915,7 @@ async fn wait_for_terminal(app: &TestApp, build_id: Uuid, token: &str) -> Value 
         assert_eq!(res.status(), StatusCode::OK, "poll build status");
         let build: Value = res.json().await.expect("build json");
         let status = build["status"].as_str().unwrap_or_default().to_string();
-        if !matches!(status.as_str(), "pending" | "processing") {
+        if !matches!(status.as_str(), "pending" | "queued" | "processing") {
             return build;
         }
         if std::time::Instant::now() >= deadline {

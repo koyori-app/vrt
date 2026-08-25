@@ -1,15 +1,18 @@
 //! アップロードされた Storybook バンドルをヘッドレス Chromium で撮影するジョブ。
 //!
 //! `POST /v1/ci/builds/{id}/finalize`（`mode = storybook`）が
-//! `pending → rendering` の遷移と同時に投入する。
+//! `pending → queued` の遷移と同時に投入し、worker が取得した時点で
+//! `queued → rendering` へ進める。
 //!
 //! 処理の流れ:
 //!
-//! 1. build / project をロードし、`rendering` でなければ何もせず終わる（重複投入の保護）
+//! 1. build / project をロードし、`queued → rendering` へ進める
+//!    （既に `rendering` の旧ジョブは後方互換で継続、それ以外は重複投入としてスキップ）
 //! 2. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリへ安全に展開
 //!    （[`service::render::bundle`] が zip-slip / zip bomb / symlink を弾く）
 //! 3. `index.json` からストーリー一覧を作り、ループバックの静的サーバーを立てる
-//! 4. ストーリーを**逐次**レンダリングして PNG を `screenshots` に保存
+//! 4. ストーリーを同じ Chromium 内で**最大 2 件ずつ並列**レンダリングして
+//!    PNG を `screenshots` に保存
 //!    （name は `{title}/{name}`、metadata に `{story_id, title}`）
 //! 5. `rendering → processing` に遷移し、`CompareBuildJob` を投入して既存の比較経路へ繋ぐ
 //!
@@ -17,23 +20,100 @@
 //! 途中で落ちて再実行されても `(build_id, name)` の UNIQUE 制約にぶつからない。
 
 use apalis::prelude::{BoxDynError, Data, TaskSink};
-use apalis_postgres::{Config, PgPool, PostgresStorage};
+use apalis_postgres::{Config, PgPool, PgTaskId, PostgresStorage};
 use sea_orm::prelude::Uuid;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use entity::{baseline_entries, builds::BuildMode, builds::BuildStatus, screenshots};
+use entity::{
+    baseline_entries,
+    builds::{BuildFailureOrigin, BuildMode, BuildStatus},
+    screenshots,
+};
 use service::build_logs::LogLevel;
-use service::render::{RenderError, RenderOptions, StaticServer, StoryRenderer};
+use service::render::{BundleError, RenderError, RenderOptions, StaticServer, StoryRenderer};
 
-use crate::JobState;
+use crate::RenderJobState;
 
 pub const QUEUE_NAME: &str = "render_build";
 pub const MAX_RETRIES: usize = 2;
 /// ワーカーの同時実行数。1 ジョブがブラウザ 1 個を丸ごと持つので控えめにする。
 pub const WORKER_CONCURRENCY: usize = 1;
+/// 1 ビルド内で同時にレンダリングする story 数。
+///
+/// Chromium 自体はジョブごとに 1 個のまま、独立した page を 2 枚まで開く。
+/// 本番の 4 CPU 環境で CPU / メモリのスパイクを抑えながら逐次処理を短縮するため、
+/// 固定値 2 とする。
+pub const STORY_RENDER_CONCURRENCY: usize = 2;
+
+/// 利用者が直せる入力・Story 側の失敗を `anyhow` の chain 内に保持する印。
+///
+/// それ以外のエラーは安全側に VRT 起因として扱う。文字列を解析して分類すると
+/// Chromium や Storybook の文言変更で判定が壊れるため、型として運ぶ。
+#[derive(Debug)]
+struct ClassifiedRenderFailure {
+    origin: BuildFailureOrigin,
+    code: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ClassifiedRenderFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedRenderFailure {}
+
+fn classified_render_failure(
+    origin: BuildFailureOrigin,
+    code: &'static str,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    ClassifiedRenderFailure {
+        origin,
+        code,
+        message: message.into(),
+    }
+    .into()
+}
+
+/// 永続化する失敗分類を、型付き原因から決める。
+fn classify_render_failure(error: &anyhow::Error) -> (BuildFailureOrigin, &'static str) {
+    if let Some(classified) = error.downcast_ref::<ClassifiedRenderFailure>() {
+        return (classified.origin, classified.code);
+    }
+
+    if let Some(render) = error.downcast_ref::<RenderError>() {
+        return match render {
+            RenderError::Story { .. } => (BuildFailureOrigin::Test, "story_failure"),
+            RenderError::Timeout { .. } => (BuildFailureOrigin::Test, "story_timeout"),
+            RenderError::Launch { .. } => (BuildFailureOrigin::Vrt, "chromium_launch"),
+            RenderError::Server(_) => (BuildFailureOrigin::Vrt, "static_server"),
+            RenderError::Cdp { .. } => (BuildFailureOrigin::Vrt, "browser_protocol"),
+        };
+    }
+
+    (BuildFailureOrigin::Vrt, "render_internal")
+}
+
+fn bundle_failure(error: BundleError) -> anyhow::Error {
+    match error {
+        // zip の内容ではなく、一時ディスクへの読み書きに失敗した経路。
+        BundleError::Io(error) => classified_render_failure(
+            BuildFailureOrigin::Vrt,
+            "storybook_bundle_io",
+            format!("io error while extracting storybook bundle: {error}"),
+        ),
+        error => classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_invalid",
+            error.to_string(),
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderBuildJob {
@@ -91,13 +171,25 @@ pub async fn enqueue(
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
 /// `Err` を返すのはビルド行にすら書き戻せなかったケースだけ。
-pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
+pub async fn process(
+    job: RenderBuildJob,
+    state: Data<RenderJobState>,
+    task_id: PgTaskId,
+) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
+    let compare_handoff_key = format!("render-build:{task_id}:compare");
 
-    match run(build_id, job.only_story_ids, &state).await {
+    match run(build_id, job.only_story_ids, &compare_handoff_key, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
-            tracing::error!(%build_id, error = %err, "render build job failed");
+            let (failure_origin, failure_code) = classify_render_failure(&err);
+            tracing::error!(
+                %build_id,
+                error = %err,
+                ?failure_origin,
+                failure_code,
+                "render build job failed"
+            );
             // 失敗理由を成果物のログにも 1 行残す（UI/CI から追える）。
             service::build_logs::append(
                 &state.db,
@@ -110,11 +202,15 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
-            service::builds::mark_failed(&state.db, build, truncate(&err.to_string(), 2000))
-                .await
-                .map_err(|e| -> BoxDynError {
-                    format!("mark build {build_id} failed: {e}").into()
-                })?;
+            service::builds::mark_failed(
+                &state.db,
+                build,
+                truncate(&err.to_string(), 2000),
+                failure_origin,
+                failure_code,
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("mark build {build_id} failed: {e}").into() })?;
 
             // レンダリング失敗もビルドの終端なので GitHub にステータスを返す。
             crate::github_status::enqueue_best_effort(&state.github_status_storage, build_id).await;
@@ -125,6 +221,7 @@ pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), B
                     &state.db,
                     &state.storage,
                     build.project_id,
+                    state.storage_min_retention_days,
                 )
                 .await;
             }
@@ -143,34 +240,52 @@ fn truncate(s: &str, max: usize) -> String {
 async fn run(
     build_id: Uuid,
     only_story_ids: Option<Vec<String>>,
-    state: &JobState,
+    compare_handoff_key: &str,
+    state: &RenderJobState,
 ) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
-    if build.status != BuildStatus::Rendering {
-        tracing::info!(%build_id, status = ?build.status, "skipping render job for non-rendering build");
+    if build.mode != BuildMode::Storybook {
+        tracing::info!(%build_id, mode = ?build.mode, "skipping render job for non-storybook build");
         return Ok(());
     }
-    if build.mode != BuildMode::Storybook {
-        anyhow::bail!("build {build_id} is not a storybook-mode build");
-    }
+    let build = match build.status {
+        BuildStatus::Queued => {
+            service::builds::transition(db, build, BuildStatus::Rendering).await?
+        }
+        // Jobs queued by an older deployment already entered Rendering before
+        // enqueue. Let them finish across a rolling deploy.
+        BuildStatus::Rendering => build,
+        // レンダリング完了後、比較ジョブ投入前にプロセスが落ちた経路。
+        // 同じ render task の冪等キーで引き渡しだけを修復し、撮影はやり直さない。
+        BuildStatus::Processing => {
+            crate::compare_build::enqueue_idempotent(
+                &state.compare_build_storage,
+                crate::CompareBuildJob { build_id },
+                compare_handoff_key,
+            )
+            .await?;
+            tracing::info!(%build_id, "recovered render-to-compare handoff");
+            return Ok(());
+        }
+        status => {
+            tracing::info!(%build_id, ?status, "skipping render job outside the queued/rendering phases");
+            return Ok(());
+        }
+    };
 
-    let storybook_key = build
-        .storybook_key
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("build {build_id} has no storybook bundle"))?;
+    let storybook_key = build.storybook_key.clone().ok_or_else(|| {
+        classified_render_failure(
+            BuildFailureOrigin::Vrt,
+            "storybook_bundle_missing",
+            format!("build {build_id} has no storybook bundle"),
+        )
+    })?;
 
     let project = service::projects::get_project(db, build.project_id).await?;
 
-    let chromium_path = state
-        .settings
-        .chromium_path
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("storybook rendering is not configured (CHROMIUM_PATH is unset)")
-        })?;
+    let chromium_path = state.chromium_path.clone();
 
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
     // （`(build_id, name)` の UNIQUE にぶつかると 2 回目以降が必ず落ちる。）
@@ -193,11 +308,16 @@ async fn run(
         // 展開は同期 IO + 解凍で CPU バウンド。ワーカーのランタイムを塞がない。
         tokio::task::spawn_blocking(move || service::render::extract_and_index(&bytes, &dest))
             .await
-            .map_err(|e| anyhow::anyhow!("bundle extraction task join: {e}"))??
+            .map_err(|e| anyhow::anyhow!("bundle extraction task join: {e}"))?
+            .map_err(bundle_failure)?
     };
 
     if bundle.stories.is_empty() {
-        anyhow::bail!("storybook bundle contains no stories (only docs entries?)");
+        return Err(classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_empty",
+            "storybook bundle contains no stories (only docs entries?)",
+        ));
     }
 
     // バンドル展開が終わり、撮影対象のストーリー数が確定した時点で開始行を残す。
@@ -264,9 +384,10 @@ async fn run(
 
     // レンダリングが済んだので既存の比較パイプラインへ引き渡す。
     // `github_status` を compare_build が投入するのと同じチェーンパターン。
-    crate::compare_build::enqueue(
+    crate::compare_build::enqueue_idempotent(
         &state.compare_build_storage,
         crate::CompareBuildJob { build_id },
+        compare_handoff_key,
     )
     .await?;
 
@@ -327,7 +448,287 @@ fn decide_story_action(
     }
 }
 
-/// 全ストーリーを逐次処理して保存する。
+/// 並列レンダリングから返す story 単位の成果物。
+///
+/// Chromium を使う処理と baseline の読み出しだけを並列化し、DB / object storage
+/// への保存と build log の追記は呼び出し側で 1 件ずつ行う。これにより、重い描画は
+/// 重ねつつ、保存失敗の扱いと集計更新を同期プリミティブ無しで一箇所に保てる。
+enum StoryTaskResult {
+    Rendered {
+        position: usize,
+        story_id: String,
+        title: String,
+        screenshot_name: common::validation::ScreenshotName,
+        png: Vec<u8>,
+        font_warning: Option<String>,
+    },
+    Reused {
+        position: usize,
+        story_id: String,
+        title: String,
+        screenshot_name: common::validation::ScreenshotName,
+        png: Vec<u8>,
+    },
+    Failed {
+        position: usize,
+        failure: StoryFailure,
+        /// 直列リトライ（2 巡目）の対象にしてよいか。描画の失敗（[`is_story_scoped`]）は
+        /// 撮影ホストの負荷起因で単独実行なら通ることがあるため `true`。
+        /// スクリーンショット名の規則違反は story の title / name に起因する決定的な
+        /// 失敗で、撮り直しても結果が変わらないため `false`。
+        retryable: bool,
+    },
+}
+
+/// 1 story をレンダリング、または baseline から読み出す。
+///
+/// この関数自体は build の集計行や screenshot 行を書かないため、
+/// 呼び出し側の [`tokio::try_join!`] で安全に 2 件まで並列実行できる。
+#[allow(clippy::too_many_arguments)]
+async fn process_story(
+    state: &RenderJobState,
+    renderer: &StoryRenderer,
+    base_url: &str,
+    story: &service::render::Story,
+    position: usize,
+    only_set: Option<&HashSet<&str>>,
+    baseline_names: &HashSet<&str>,
+    baseline_entries: &HashMap<String, baseline_entries::Model>,
+) -> Result<StoryTaskResult, anyhow::Error> {
+    let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
+        Ok(name) => name,
+        Err(failure) => {
+            return Ok(StoryTaskResult::Failed {
+                position,
+                failure,
+                retryable: false,
+            });
+        }
+    };
+    let screenshot_name_str = screenshot_name.as_str().to_string();
+
+    let action = match only_set {
+        Some(ids) => decide_story_action(&story.id, &screenshot_name_str, ids, baseline_names),
+        None => StoryAction::Render,
+    };
+
+    match action {
+        StoryAction::Render => match renderer.render_story(base_url, &story.id).await {
+            Ok(rendered_story) => Ok(StoryTaskResult::Rendered {
+                position,
+                story_id: story.id.clone(),
+                title: story.title.clone(),
+                screenshot_name,
+                png: rendered_story.png,
+                font_warning: rendered_story.font_warning,
+            }),
+            Err(error) if is_story_scoped(&error) => Ok(StoryTaskResult::Failed {
+                position,
+                failure: StoryFailure {
+                    story_id: story.id.clone(),
+                    message: error.to_string(),
+                },
+                retryable: true,
+            }),
+            Err(error) => Err(anyhow::anyhow!("render story `{}`: {error}", story.id)),
+        },
+        StoryAction::Reuse => {
+            let entry = baseline_entries.get(&screenshot_name_str).ok_or_else(|| {
+                anyhow::anyhow!("baseline entry for `{screenshot_name}` disappeared during reuse")
+            })?;
+            let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("download baseline for `{screenshot_name}`: {error}")
+                })?;
+
+            Ok(StoryTaskResult::Reused {
+                position,
+                story_id: story.id.clone(),
+                title: story.title.clone(),
+                screenshot_name,
+                png,
+            })
+        }
+    }
+}
+
+/// [`render_all`] のループ間で持ち回る集計。1 巡目（並列）と 2 巡目（直列リトライ）が
+/// 同じ [`persist_story_result`] を通るため、可変参照 1 つに束ねる。
+#[derive(Default)]
+struct RenderTallies {
+    rendered: usize,
+    reused: usize,
+    /// 並列処理の完了順にかかわらず位置を保持し、最後に index 順へ戻して
+    /// error_message を決定的にする。
+    story_failures: Vec<(usize, StoryFailure)>,
+    /// フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
+    /// 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
+    /// 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
+    /// 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
+    /// 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
+    /// ループ後の集計行（件数と初出 story）に畳む——300 story の project で
+    /// 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
+    /// 失われない。
+    font_warning_counts: std::collections::BTreeMap<String, (usize, String)>,
+}
+
+/// 1 story の処理結果を build へ永続化する（screenshot 保存・build log・集計）。
+///
+/// `retry_queue` が `Some` のとき（1 巡目）は、リトライ対象の失敗を確定させず
+/// position を積んで警告ログだけ残す。`None`（2 巡目）では失敗として確定する。
+#[allow(clippy::too_many_arguments)]
+async fn persist_story_result(
+    state: &RenderJobState,
+    project: &entity::projects::Model,
+    build: &entity::builds::Model,
+    mark_reused_flag: bool,
+    total: usize,
+    result: StoryTaskResult,
+    tallies: &mut RenderTallies,
+    retry_queue: Option<&mut Vec<usize>>,
+) -> Result<(), anyhow::Error> {
+    match result {
+        StoryTaskResult::Rendered {
+            position,
+            story_id,
+            title,
+            screenshot_name,
+            png,
+            font_warning,
+        } => {
+            // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
+            // ここで build log に永続化して利用者へ届ける——`tracing::warn`
+            // だけではサーバー運用ログ止まりで、`passed` を受け取った
+            // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
+            if let Some(warning) = &font_warning {
+                // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
+                // （集計はループ後。宣言と理由は font_warning_counts を参照）。
+                let entry = tallies
+                    .font_warning_counts
+                    .entry(warning.clone())
+                    .or_insert((0usize, story_id.clone()));
+                entry.0 += 1;
+                if entry.0 == 1 {
+                    service::build_logs::append(
+                        &state.db,
+                        build.id,
+                        LogLevel::Warn,
+                        font_warning_log_line(position, total, &story_id, warning),
+                    )
+                    .await?;
+                }
+            }
+
+            // `only_story_ids` モードのときだけ reused を明示する
+            // （`None` の従来経路は metadata を変えない）。
+            let metadata = if mark_reused_flag {
+                serde_json::json!({
+                    "story_id": &story_id,
+                    "title": &title,
+                    "reused": false,
+                })
+            } else {
+                serde_json::json!({
+                    "story_id": &story_id,
+                    "title": &title,
+                })
+            };
+
+            service::screenshots::store_screenshot_with_metadata(
+                &state.db,
+                &state.storage,
+                project.tenant_id,
+                project.id,
+                build.id,
+                screenshot_name,
+                bytes::Bytes::from(png),
+                Some(metadata),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("store screenshot for story `{story_id}`: {e}"))?;
+            tallies.rendered += 1;
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Info,
+                format!("rendered {position}/{total} {story_id}"),
+            )
+            .await?;
+        }
+        StoryTaskResult::Reused {
+            position,
+            story_id,
+            title,
+            screenshot_name,
+            png,
+        } => {
+            let metadata = serde_json::json!({
+                "story_id": &story_id,
+                "title": &title,
+                "reused": true,
+            });
+
+            service::screenshots::store_screenshot_with_metadata(
+                &state.db,
+                &state.storage,
+                project.tenant_id,
+                project.id,
+                build.id,
+                screenshot_name,
+                bytes::Bytes::from(png),
+                Some(metadata),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("store reused screenshot for story `{story_id}`: {e}"))?;
+            tallies.reused += 1;
+            service::build_logs::append(
+                &state.db,
+                build.id,
+                LogLevel::Info,
+                format!("reused {position}/{total} {story_id}"),
+            )
+            .await?;
+        }
+        StoryTaskResult::Failed {
+            position,
+            failure,
+            retryable,
+        } => {
+            if retryable && let Some(queue) = retry_queue {
+                // 失敗として確定させず、2 巡目（直列リトライ）へ回す。
+                // 撮影ホストの負荷で play・描画が時間内に進まなかった失敗は、
+                // 並走ページの居ない直列実行なら通ることがある。
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Warn,
+                    format!(
+                        "story failed {position}/{total} {} (will retry serially): {}",
+                        failure.story_id, failure.message
+                    ),
+                )
+                .await?;
+                queue.push(position);
+            } else {
+                service::build_logs::append(
+                    &state.db,
+                    build.id,
+                    LogLevel::Error,
+                    format!(
+                        "story failed {position}/{total} {}: {}",
+                        failure.story_id, failure.message
+                    ),
+                )
+                .await?;
+                tallies.story_failures.push((position, failure));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 全ストーリーを最大 2 件ずつ並列レンダリングして保存する。
 ///
 /// `only_story_ids` が `None` のときは全ストーリーを撮影する（従来どおり。
 /// metadata に `reused` は付けない）。`Some` のときは [`decide_story_action`]
@@ -340,6 +741,14 @@ fn decide_story_action(
 /// ビルドを失敗させる。最初の 1 件で `?` 中断すると、静止できない story が
 /// 1 つあるだけで他の全 story のスクリーンショットとログまで巻き添えで
 /// 失われ、利用者は「1 回のビルドで 1 件ずつ」しか失敗を発見できない。
+/// story に固有の失敗のうち描画のもの（下記 [`is_story_scoped`]）は、確定させる前に
+/// **2 巡目の直列リトライ**で 1 回だけ撮り直す。撮影ホストの CPU が逼迫していると、
+/// 並走する story に押されて Storybook の play（オーバーレイ遷移・Testing Library の
+/// ポーリング）が時間内に進まず、story 側に欠陥が無くても失敗する——単独実行は
+/// その競合を取り除く（koyori/task の `pages-taskdetail--delete-cancel` で実発生）。
+/// 2 回目も失敗した story だけを失敗として確定する。スクリーンショット名の
+/// 規則違反は決定的な失敗のためリトライしない。
+///
 /// story 固有と分類するのは:
 ///
 /// - レンダリングの失敗（[`is_story_scoped`] — `storyErrored` 等の
@@ -359,12 +768,14 @@ fn decide_story_action(
 /// 費やすだけである。分類の全経路は `service::render::browser` モジュール
 /// 先頭の「story 固有の失敗と環境の失敗」表を参照。
 ///
-/// 停止性: 隔離によって所要時間の上限は変わらない——成功する story も
-/// もともと 1 件あたり最大 `story_timeout` かけてよい契約であり、上限は
-/// 従来と同じ `stories × story_timeout` のままである。
+/// 停止性: story ごとの `story_timeout` は変えず、同時実行数だけを
+/// [`STORY_RENDER_CONCURRENCY`] に制限する。1 story の停止性を維持しながら、
+/// 全体のレンダリング時間を概ね `ceil(stories / 2) × story_timeout` に抑える。
+/// 直列リトライはリトライ対象 1 件につき最大 `story_timeout` を上乗せする
+/// （各 story 高々 1 回で、全滅時も `stories × story_timeout` が上限）。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
-    state: &JobState,
+    state: &RenderJobState,
     project: &entity::projects::Model,
     build: &entity::builds::Model,
     renderer: &StoryRenderer,
@@ -378,192 +789,105 @@ async fn render_all(
         only_story_ids.map(|ids| ids.iter().map(String::as_str).collect());
     let baseline_names: HashSet<&str> = baseline_entries.keys().map(String::as_str).collect();
 
-    let mut rendered = 0usize;
-    let mut reused = 0usize;
-    let mut story_failures: Vec<StoryFailure> = Vec::new();
-    // フォント警告の畳み込み（cmd_663 ④）: 警告文 → (件数, 初出 story)。
-    // 原因の `@font-face` は preview-head 等で project 全体に共有されるのが
-    // 典型で、全 story が**同文**の警告を出す——`story failed` 行は行ごとに
-    // 「どの story か」という異なる情報を運ぶのに対し、こちらは全行が同じ
-    // 内容になる。ゆえに同文は初出の 1 行だけ即時に永続化し、残りは数えて
-    // ループ後の集計行（件数と初出 story）に畳む——300 story の project で
-    // 約 90KB・300 INSERT が 2 行に収まり、story の識別は「初出行＋件数」で
-    // 失われない。
-    let mut font_warning_counts: std::collections::BTreeMap<String, (usize, String)> =
-        std::collections::BTreeMap::new();
+    let mut tallies = RenderTallies::default();
+    // 1 巡目で story 固有の描画失敗になった story の position（1 始まり）。
+    // 2 巡目（直列リトライ）の対象。
+    let mut retry_positions: Vec<usize> = Vec::new();
     let total = bundle.stories.len();
 
-    for (idx, story) in bundle.stories.iter().enumerate() {
-        let position = idx + 1;
-        // 名前規則（ScreenshotName——アップロード経路と同一）。storybook の
-        // title / name から生成した名前が規則に合わない場合は、黙って加工せず
-        // 失敗させて story 側の修正を促す（加工すると baseline 名との
-        // 突き合わせがずれる）。違反は story の title / name に起因する
-        // **story 固有の失敗**なので、レンダリング失敗と同じく story 単位で
-        // 隔離する——複数 story が違反していても 1 回のビルドで全件が
-        // 列挙され、「直しては次の 1 件」の反復にならない。名前は撮影にも
-        // baseline 流用にも要るため、隔離は Render / Reuse の分岐より前で行う。
-        let screenshot_name = match parse_screenshot_name(&story.id, &story.screenshot_name()) {
-            Ok(name) => name,
-            Err(failure) => {
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Error,
-                    format!(
-                        "story failed {position}/{total} {}: {}",
-                        story.id, failure.message
-                    ),
-                )
-                .await?;
-                story_failures.push(failure);
-                continue;
-            }
+    // 2 story ずつ同じタスク上で poll する。`tokio::spawn` を使わないので参照を
+    // `'static` 化する必要がなく、worker が要求する Send 境界も維持できる。
+    // 描画結果は元の index 順で永続化するため、build log と警告代表も決定的な
+    // まま。保持する PNG は最大 2 story 分に限られる。
+    let mut stories = bundle.stories.iter().enumerate();
+    while let Some((idx, story)) = stories.next() {
+        let first = process_story(
+            state,
+            renderer,
+            base_url,
+            story,
+            idx + 1,
+            only_set.as_ref(),
+            &baseline_names,
+            baseline_entries,
+        );
+
+        let batch = if let Some((second_idx, second_story)) = stories.next() {
+            let second = process_story(
+                state,
+                renderer,
+                base_url,
+                second_story,
+                second_idx + 1,
+                only_set.as_ref(),
+                &baseline_names,
+                baseline_entries,
+            );
+            let (first, second) = tokio::try_join!(first, second)?;
+            vec![first, second]
+        } else {
+            vec![first.await?]
         };
-        let screenshot_name_str = screenshot_name.as_str().to_string();
 
-        // `only_story_ids` 無しは常に撮影（後方互換）。
-        let action = match &only_set {
-            Some(ids) => decide_story_action(&story.id, &screenshot_name_str, ids, &baseline_names),
-            None => StoryAction::Render,
-        };
-
-        match action {
-            StoryAction::Render => {
-                let rendered_story = match renderer.render_story(base_url, &story.id).await {
-                    Ok(rendered_story) => rendered_story,
-                    // story 固有の失敗はその story だけをエラーにし、残りを
-                    // 撮り続ける（ビルドの成否はループ後にまとめて判定）。
-                    Err(e) if is_story_scoped(&e) => {
-                        service::build_logs::append(
-                            &state.db,
-                            build.id,
-                            LogLevel::Error,
-                            format!("story failed {position}/{total} {}: {e}", story.id),
-                        )
-                        .await?;
-                        story_failures.push(StoryFailure {
-                            story_id: story.id.clone(),
-                            message: e.to_string(),
-                        });
-                        continue;
-                    }
-                    // 環境側の失敗は従来どおり即中断（続けても同じ理由で落ちる）。
-                    Err(e) => {
-                        return Err(anyhow::anyhow!("render story `{}`: {e}", story.id));
-                    }
-                };
-
-                // フォント読み込み失敗の警告（失敗経路①の意図した fail-open）は
-                // ここで build log に永続化して利用者へ届ける——`tracing::warn`
-                // だけではサーバー運用ログ止まりで、`passed` を受け取った
-                // 利用者は代替字形で撮られたことを知りようがない（cmd_660 C）。
-                if let Some(warning) = &rendered_story.font_warning {
-                    // 同文の警告は初出だけ永続化し、二件目からは数えるだけ
-                    // （集計はループ後。宣言と理由は font_warning_counts を参照）。
-                    let entry = font_warning_counts
-                        .entry(warning.clone())
-                        .or_insert((0usize, story.id.clone()));
-                    entry.0 += 1;
-                    if entry.0 == 1 {
-                        service::build_logs::append(
-                            &state.db,
-                            build.id,
-                            LogLevel::Warn,
-                            font_warning_log_line(position, total, &story.id, warning),
-                        )
-                        .await?;
-                    }
-                }
-                let png = rendered_story.png;
-
-                // `only_story_ids` モードのときだけ reused を明示する
-                // （`None` の従来経路は metadata を変えない）。
-                let metadata = if only_set.is_some() {
-                    serde_json::json!({
-                        "story_id": story.id,
-                        "title": story.title,
-                        "reused": false,
-                    })
-                } else {
-                    serde_json::json!({
-                        "story_id": story.id,
-                        "title": story.title,
-                    })
-                };
-
-                service::screenshots::store_screenshot_with_metadata(
-                    &state.db,
-                    &state.storage,
-                    project.tenant_id,
-                    project.id,
-                    build.id,
-                    screenshot_name,
-                    bytes::Bytes::from(png),
-                    Some(metadata),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("store screenshot for story `{}`: {e}", story.id))?;
-                rendered += 1;
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Info,
-                    format!("rendered {position}/{total} {}", story.id),
-                )
-                .await?;
-            }
-            StoryAction::Reuse => {
-                // decide_story_action が Reuse を返す時点で必ず存在する。
-                let entry = baseline_entries.get(&screenshot_name_str).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "baseline entry for `{screenshot_name}` disappeared during reuse"
-                    )
-                })?;
-
-                // baseline の PNG バイト列をそのまま今回のスクリーンショットとして保存する。
-                // バイト列が同一なので、後段の compare_build が unchanged と判定する。
-                let png = service::screenshots::read_all(&state.storage, &entry.storage_key)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("download baseline for `{screenshot_name}`: {e}")
-                    })?;
-
-                let metadata = serde_json::json!({
-                    "story_id": story.id,
-                    "title": story.title,
-                    "reused": true,
-                });
-
-                service::screenshots::store_screenshot_with_metadata(
-                    &state.db,
-                    &state.storage,
-                    project.tenant_id,
-                    project.id,
-                    build.id,
-                    screenshot_name,
-                    bytes::Bytes::from(png),
-                    Some(metadata),
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("store reused screenshot for story `{}`: {e}", story.id)
-                })?;
-                reused += 1;
-                service::build_logs::append(
-                    &state.db,
-                    build.id,
-                    LogLevel::Info,
-                    format!("reused {position}/{total} {}", story.id),
-                )
-                .await?;
-            }
+        for result in batch {
+            persist_story_result(
+                state,
+                project,
+                build,
+                only_set.is_some(),
+                total,
+                result,
+                &mut tallies,
+                Some(&mut retry_positions),
+            )
+            .await?;
         }
     }
 
+    // 2 巡目: 1 巡目で story 固有の描画失敗になった story を、並走ページの居ない
+    // 直列実行で 1 回だけ撮り直す。撮影ホストの CPU が逼迫していると、並走する
+    // 重い story に押されて Storybook の play（オーバーレイ遷移・Testing Library の
+    // ポーリング）が時間内に進まず、story 側に欠陥が無くても失敗する——単独実行は
+    // その競合を取り除く。2 回目も失敗した story だけを失敗として確定する
+    // （恒久的に壊れた story は 2 回目も落ち、ビルドは従来どおり fail-closed）。
+    for position in std::mem::take(&mut retry_positions) {
+        let story = &bundle.stories[position - 1];
+        let result = process_story(
+            state,
+            renderer,
+            base_url,
+            story,
+            position,
+            only_set.as_ref(),
+            &baseline_names,
+            baseline_entries,
+        )
+        .await?;
+        persist_story_result(
+            state,
+            project,
+            build,
+            only_set.is_some(),
+            total,
+            result,
+            &mut tallies,
+            None,
+        )
+        .await?;
+    }
+
+    tallies
+        .story_failures
+        .sort_by_key(|(position, _)| *position);
+    let story_failures: Vec<StoryFailure> = tallies
+        .story_failures
+        .into_iter()
+        .map(|(_, failure)| failure)
+        .collect();
+
     // 畳んだ同文フォント警告の集計行（初出行と対。1 story だけなら初出行が
     // 全てを言い尽くしており、集計行は出さない）。
-    for (warning, (count, first_story)) in &font_warning_counts {
+    for (warning, (count, first_story)) in &tallies.font_warning_counts {
         if *count > 1 {
             service::build_logs::append(
                 &state.db,
@@ -574,6 +898,9 @@ async fn render_all(
             .await?;
         }
     }
+
+    let rendered = tallies.rendered;
+    let reused = tallies.reused;
 
     // 完了サマリ。撮影・流用・失敗の内訳を 1 行で残す。
     service::build_logs::append(
@@ -599,9 +926,10 @@ async fn render_all(
     // 残りの story は撮り終えているので、error_message とログには全失敗
     // story が一度に列挙される——「1 回のビルドで 1 件ずつ」にならない。
     if !story_failures.is_empty() {
-        return Err(anyhow::anyhow!(
-            "{}",
-            summarize_story_failures(&story_failures, total)
+        return Err(classified_render_failure(
+            BuildFailureOrigin::Test,
+            "story_failure",
+            summarize_story_failures(&story_failures, total),
         ));
     }
 
@@ -884,6 +1212,45 @@ mod tests {
         // Launch / Cdp は chromiumoxide のエラー値が要るためここでは構築しない。
         // is_story_scoped は Story / Timeout を列挙するホワイトリストなので、
         // 新しい variant が増えても既定は「中断」側へ倒れる（fail-closed）。
+    }
+
+    #[test]
+    fn persisted_failure_classification_keeps_test_and_vrt_errors_distinct() {
+        let story = anyhow::Error::new(RenderError::Story {
+            story_id: "button--primary".into(),
+            message: "play function failed".into(),
+        });
+        assert_eq!(
+            classify_render_failure(&story),
+            (BuildFailureOrigin::Test, "story_failure")
+        );
+
+        let server = anyhow::Error::new(RenderError::Server("bind failed".into()));
+        assert_eq!(
+            classify_render_failure(&server),
+            (BuildFailureOrigin::Vrt, "static_server")
+        );
+
+        let bundle = classified_render_failure(
+            BuildFailureOrigin::Test,
+            "storybook_bundle_invalid",
+            "bad zip",
+        );
+        assert_eq!(
+            classify_render_failure(&bundle),
+            (BuildFailureOrigin::Test, "storybook_bundle_invalid")
+        );
+
+        let bundle_io = bundle_failure(BundleError::Io(std::io::Error::other("disk full")));
+        assert_eq!(
+            classify_render_failure(&bundle_io),
+            (BuildFailureOrigin::Vrt, "storybook_bundle_io")
+        );
+
+        assert_eq!(
+            classify_render_failure(&anyhow::anyhow!("database unavailable")),
+            (BuildFailureOrigin::Vrt, "render_internal")
+        );
     }
 
     /// 名前規則違反が story 固有の失敗（[`StoryFailure`]）として返り、

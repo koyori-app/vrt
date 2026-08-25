@@ -201,6 +201,8 @@ pub async fn create_build<C: ConnectionTrait>(
         unchanged_count: Set(0),
         content_hash_skipped_count: Set(0),
         error_message: Set(None),
+        failure_origin: Set(None),
+        failure_code: Set(None),
         approval_evidence: Set(None),
         approved_by: Set(None),
         approved_at: Set(None),
@@ -236,6 +238,78 @@ pub async fn list_builds<C: ConnectionTrait>(
         .offset(offset)
         .all(db)
         .await?)
+}
+
+/// ビルドが実際に比較した baseline の系譜。
+///
+/// `source_build_*` は保持期間によって昇格元ビルドが削除済みなら `None` だが、
+/// baseline 自体の branch は残る。UI はこの情報だけを使い、Git の親子関係を
+/// 推測せずに VRT 上の正確な派生元を描く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildBaselineSource {
+    pub branch: String,
+    pub source_build_id: Option<Uuid>,
+    pub source_build_number: Option<i64>,
+}
+
+/// 一覧に含まれる各ビルドの baseline 昇格元をまとめて解決する。
+///
+/// baseline と昇格元 build をそれぞれ一括取得し、ビルド数に比例した N+1 query を
+/// 避ける。返り値のキーは baseline ではなく一覧側の build ID。
+pub async fn baseline_sources_for_builds<C: ConnectionTrait>(
+    db: &C,
+    list: &[builds::Model],
+) -> Result<HashMap<Uuid, BuildBaselineSource>, AppError> {
+    let baseline_ids = list
+        .iter()
+        .filter_map(|build| build.baseline_id)
+        .collect::<HashSet<_>>();
+    if baseline_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let baseline_rows = baselines::Entity::find()
+        .filter(baselines::Column::Id.is_in(baseline_ids))
+        .all(db)
+        .await?;
+    let source_ids = baseline_rows
+        .iter()
+        .filter_map(|baseline| baseline.source_build_id)
+        .collect::<HashSet<_>>();
+    let source_builds = if source_ids.is_empty() {
+        Vec::new()
+    } else {
+        builds::Entity::find()
+            .filter(builds::Column::Id.is_in(source_ids))
+            .all(db)
+            .await?
+    };
+    let source_builds = source_builds
+        .into_iter()
+        .map(|build| (build.id, build))
+        .collect::<HashMap<_, _>>();
+    let baselines = baseline_rows
+        .into_iter()
+        .map(|baseline| (baseline.id, baseline))
+        .collect::<HashMap<_, _>>();
+
+    Ok(list
+        .iter()
+        .filter_map(|build| {
+            let baseline = baselines.get(&build.baseline_id?)?;
+            let source = baseline
+                .source_build_id
+                .and_then(|source_id| source_builds.get(&source_id));
+            Some((
+                build.id,
+                BuildBaselineSource {
+                    branch: baseline.branch.clone(),
+                    source_build_id: source.map(|source| source.id),
+                    source_build_number: source.map(|source| source.number),
+                },
+            ))
+        })
+        .collect())
 }
 
 /// プロジェクト内のビルド番号でビルドを取得する。
@@ -284,12 +358,13 @@ pub async fn transition<C: ConnectionTrait>(
     Ok(active.update(db).await?)
 }
 
-/// finalize: `pending → processing`。ジョブ投入は呼び出し側（ハンドラ）が行う。
+/// finalize: `pending → queued`。ジョブ投入は呼び出し側（ハンドラ）が行い、
+/// compare worker が取得した時点で `processing` へ進める。
 pub async fn finalize<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
 ) -> Result<builds::Model, AppError> {
-    transition(db, build, BuildStatus::Processing).await
+    transition(db, build, BuildStatus::Queued).await
 }
 
 /// screenshots モードの部分アップロード計画。
@@ -523,7 +598,7 @@ pub async fn attach_capture_plan(
 /// 拒否する——申告だけの部分アップロードは、撮影が全滅したときに
 /// 「空の申告 == 空のアップロード」が成立して偽 PASS になるためである。
 ///
-/// 「計画 == アップロード」検査と `pending → processing` 遷移は build 行ロック
+/// 「計画 == アップロード」検査と `pending → queued` 遷移は build 行ロック
 /// （[`crate::review_lock::build`]）を取ったトランザクション内で行う。
 /// アップロード・計画添付も同じ行ロックを取るため、検査と遷移の間に
 /// アップロードや計画の変更が割り込むことはない（比較ジョブ側の再検証は
@@ -593,7 +668,7 @@ pub async fn finalize_screenshots(
                     }
                 }
             }
-            transition(txn, build, BuildStatus::Processing).await
+            transition(txn, build, BuildStatus::Queued).await
         })
     })
     .await
@@ -646,7 +721,7 @@ pub async fn current_baseline_commit_sha<C: ConnectionTrait>(
     baseline_source_commit_sha(db, &baseline).await
 }
 
-/// storybook モードの finalize: `pending → rendering`。
+/// storybook モードの finalize: `pending → queued`。
 ///
 /// バンドルが未アップロードなら 400（`RenderBuildJob` が拾うものが無いため）。
 /// ジョブ投入は呼び出し側（ハンドラ）が行う。
@@ -729,7 +804,7 @@ pub async fn finalize_storybook(
                 }
             };
 
-            transition(txn, build, BuildStatus::Rendering).await
+            transition(txn, build, BuildStatus::Queued).await
         })
     })
     .await
@@ -781,6 +856,8 @@ pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
     message: String,
+    failure_origin: builds::BuildFailureOrigin,
+    failure_code: impl Into<String>,
 ) -> Result<builds::Model, AppError> {
     // 既に終端状態なら何もしない（リトライ時の二重書き込み防止）。
     if build.status.is_terminal() {
@@ -789,8 +866,103 @@ pub async fn mark_failed<C: ConnectionTrait>(
     let mut active: builds::ActiveModel = build.into();
     active.status = Set(BuildStatus::Failed);
     active.error_message = Set(Some(message));
+    active.failure_origin = Set(Some(failure_origin));
+    active.failure_code = Set(Some(failure_code.into()));
     active.completed_at = Set(Some(Utc::now().fixed_offset()));
     Ok(active.update(db).await?)
+}
+
+/// 失敗ビルドの再実行でパイプラインのどこからやり直すか。
+///
+/// ジョブ投入はハンドラ側の責務（finalize と同じ分担）なので、遷移だけ行い
+/// 「どのジョブを投入すべきか」をこの型で返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryTarget {
+    /// storybook モード: バンドルの再レンダリングから（`RenderBuildJob`）。
+    Render,
+    /// screenshots モード: アップロード済みスクリーンショットの比較から
+    /// （`CompareBuildJob`）。
+    Compare,
+}
+
+/// 失敗（`failed`）ビルドをパイプラインの先頭へ戻す。ジョブ投入は
+/// 呼び出し側（ハンドラ）が戻り値の [`RetryTarget`] に従って行う。
+///
+/// - storybook モード → `queued`（worker が取得後 `rendering` へ進み、
+///   バンドルから全ストーリーを撮り直す。
+///   部分撮影計画（capture plan）付きのビルドでも再実行は全撮影——計画の
+///   story ID はビルドに保存されておらず復元できないため。計画が固定した
+///   baseline と manifest は残るので、比較の正しさ（removed 判定・比較先）は
+///   保たれる。流用のはずだった story も撮り直すだけで、決定的レンダリングの
+///   前提では同じ絵になる）
+/// - screenshots モード → `queued`（worker が取得後 `processing` へ進む。
+///   PNG はアップロード済みなので、比較だけやり直す）
+///
+/// 前回の結果はクリアする: `error_message` / 失敗分類 / `completed_at` / 差分カウント。
+/// comparisons / screenshots の途中結果は各ジョブが開始時に自分で捨てる
+/// （リトライ安全性の既存設計）ので、ここでは触らない。
+///
+/// `failed` 以外は 409（再実行の入口は failed だけ——進行中の二重投入も、
+/// レビュー済み結果の破壊もこの一点で防ぐ）。storybook モードでバンドルが
+/// 未アップロード（`storybook_key` 無し）の failed ビルドも 409。
+///
+/// 検査と遷移は build 行ロック（[`crate::review_lock::build`]）を取った
+/// 1 トランザクション内で行う（finalize / plan 添付と同じ流儀）。呼び出し側の
+/// スナップショットで検査すると retry の併走が両方 200 になり、同じビルドへ
+/// ジョブが二重投入される——2 本目はロック下の再読込で `queued` を見て
+/// 409 に倒れる。
+pub async fn retry_failed(
+    db: &DatabaseConnection,
+    build_id: Uuid,
+) -> Result<(builds::Model, RetryTarget), AppError> {
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // ロック順 1（build のみ）。状態はこの取り直した行を正とする。
+            let build = crate::review_lock::build(txn, build_id).await?;
+            if build.status != BuildStatus::Failed {
+                return Err(AppError::ConflictDetail(format!(
+                    "only failed builds can be retried (build is {})",
+                    serde_json::to_value(build.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| format!("{:?}", build.status))
+                )));
+            }
+            let target = match build.mode {
+                BuildMode::Storybook => {
+                    if build.storybook_key.is_none() {
+                        return Err(AppError::ConflictDetail(
+                            "this build has no storybook bundle to re-render \
+                             (it failed before the bundle was uploaded)"
+                                .into(),
+                        ));
+                    }
+                    RetryTarget::Render
+                }
+                BuildMode::Screenshots => RetryTarget::Compare,
+            };
+            // 遷移表（`can_transition_to`）にもこの向きが載っていることを、
+            // 一本化の規約どおり release でも検査する。
+            if !build.status.can_transition_to(BuildStatus::Queued) {
+                return Err(AppError::Conflict);
+            }
+
+            let mut active: builds::ActiveModel = build.into();
+            active.status = Set(BuildStatus::Queued);
+            active.error_message = Set(None);
+            active.failure_origin = Set(None);
+            active.failure_code = Set(None);
+            active.completed_at = Set(None);
+            active.total_count = Set(0);
+            active.changed_count = Set(0);
+            active.added_count = Set(0);
+            active.removed_count = Set(0);
+            active.unchanged_count = Set(0);
+            active.content_hash_skipped_count = Set(0);
+            Ok((active.update(txn).await?, target))
+        })
+    })
+    .await
 }
 
 /// レビュー待ち（`review_status = pending` かつ人手判断が要る）の比較件数。
@@ -1067,7 +1239,7 @@ pub async fn approve_build(
                         .collect();
                     removed_by_revert.sort();
                 }
-                let mut allowed_missing = approval::approved_removal_names(&facts);
+                let mut allowed_missing = approval::approved_missing_names(&facts);
                 allowed_missing.extend(removed_by_revert.iter().cloned());
                 let missing = approval::unexpected_missing_names(
                     &baseline_names,
@@ -1323,12 +1495,15 @@ pub async fn reject_build(
 /// 保持数の設定に従って古い完了ビルドを掃除する（ベストエフォート）。
 ///
 /// プロジェクトの `build_retention_limit` が NULL（無制限）なら何もしない。
+/// `min_retention_days` は作成からの最低保持日数で、これより新しいビルドは
+/// 件数超過していても削除しない（Wasabi 等の最低保存期間課金への対策。0 で無効）。
 /// エラーはログに残すだけで呼び出し側の処理は失敗させないため、ビルド完了処理や
 /// 設定更新の後処理からそのまま呼べる。
 pub async fn prune_project_builds_best_effort(
     db: &DatabaseConnection,
     storage: &Arc<dyn StorageBackend>,
     project_id: Uuid,
+    min_retention_days: u32,
 ) {
     let project = match projects::Entity::find_by_id(project_id).one(db).await {
         Ok(Some(project)) => project,
@@ -1341,7 +1516,7 @@ pub async fn prune_project_builds_best_effort(
     let Some(limit) = project.build_retention_limit else {
         return;
     };
-    match prune_old_builds(db, storage, project_id, limit).await {
+    match prune_old_builds(db, storage, project_id, limit, min_retention_days).await {
         Ok(0) => {}
         Ok(deleted) => tracing::info!(%project_id, deleted, "pruned old builds"),
         Err(e) => tracing::warn!(%project_id, error = %e, "build pruning failed"),
@@ -1356,6 +1531,8 @@ pub async fn prune_project_builds_best_effort(
 ///   ビルドのスクリーンショットと**同じストレージキーを共有**するため、参照元を消すと
 ///   baseline の実体まで失われる
 /// - 進行中（非 terminal）のビルド。数えも消しもしない
+/// - 作成から `min_retention_days` 日経っていないビルド。Wasabi 等は削除後も最低保存
+///   期間分を課金するため、期間内の削除はコスト削減にならない（0 で無効）
 ///
 /// 削除順序は「先に DB 行 → その後ストレージ」。DB は builds を消せば screenshots /
 /// comparisons / build_logs が FK cascade で消える。ストレージ削除はベストエフォートで、
@@ -1367,10 +1544,15 @@ pub async fn prune_old_builds(
     storage: &Arc<dyn StorageBackend>,
     project_id: Uuid,
     limit: i32,
+    min_retention_days: u32,
 ) -> Result<u64, AppError> {
     if limit < 1 {
         return Ok(0);
     }
+
+    // これより新しいビルドは件数超過でも削除しない（min_retention_days = 0 なら全許可）。
+    let retention_cutoff =
+        Utc::now().fixed_offset() - chrono::Duration::days(i64::from(min_retention_days));
 
     // terminal 状態のビルドを新しい順に取得する。changes_detected は含めない
     // （レビュー待ちでパイプラインは終わっていないため、is_terminal と揃える）。
@@ -1404,6 +1586,9 @@ pub async fn prune_old_builds(
     let mut deleted = 0u64;
     for build in builds.into_iter().skip(limit as usize) {
         if protected.contains(&build.id) {
+            continue;
+        }
+        if build.created_at > retention_cutoff {
             continue;
         }
 

@@ -66,3 +66,7 @@ jobs:
       - name: Run typecheck
         run: pnpm run typecheck
         working-directory: apps/frontend
+
+      - name: Run tests
+        run: pnpm test
+        working-directory: apps/frontend

@@ -1,6 +1,7 @@
 //! ビルドのスクリーンショットを baseline と突き合わせて差分を計算するジョブ。
 //!
-//! `POST /v1/ci/builds/{id}/finalize` が `pending → processing` の遷移と同時に投入する。
+//! `POST /v1/ci/builds/{id}/finalize` が `pending → queued` の遷移と同時に投入し、
+//! screenshots モードでは worker が取得した時点で `queued → processing` へ進める。
 //!
 //! 処理の流れ:
 //!
@@ -16,7 +17,7 @@
 //! リトライ安全性: 開始時にそのビルドの comparisons を全削除するため、
 //! 途中で落ちて再実行されても行が重複しない。
 
-use apalis::prelude::{BoxDynError, Data, TaskSink};
+use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
@@ -60,19 +61,16 @@ pub struct CompareBuildJob {
 ///   テーブルを毎回引き直すので、いつ投入されたジョブでも必ず拾える。
 ///
 /// 実際に統合テストで前者を踏んだ（並列実行で負荷が上がると
-/// `PgListener::connect_with` が finalize より遅れ、ビルドが processing のまま停止した）。
+/// `PgListener::connect_with` が finalize より遅れ、ビルドが queued のまま停止した）。
 /// 取りこぼしゼロを優先してポーリング型を採用する。
 ///
-/// ## 既知の制約（upstream）
+/// ## ポーリング間隔
 ///
-/// `Config::with_poll_interval` で渡した `poll_strategy` は
-/// apalis-postgres 1.0.0-rc.8 では**どちらのフェッチャからも読まれない**（デッドコンフィグ）。
-/// `PgFetcher` の待ち時間は `PgPollFetcher` にハードコードされた指数バックオフ
-/// （初期 1s → 2 倍ずつ → 上限 5 分。ジョブを 1 件でも拾えば 1s にリセット）で決まる。
-/// つまり「約 8.5 分以上まったくジョブが無かった直後の 1 本目」は最大 5 分待たされうる。
-/// 連続するビルドはリセット後なので即時に近い。
-/// ここを詰めるには upstream が `poll_strategy` を尊重するか、
-/// バックオフ上限を設定可能にする必要がある。
+/// upstream の apalis-postgres 1.0.0-rc.8 は `Config::with_poll_interval` を
+/// `PgPollFetcher` から読まず、アイドル時に最大 5 分まで指数バックオフする。
+/// VRT は同じ API / DB スキーマのローカルパッチ（`vendor/apalis-postgres`）で
+/// 1 秒固定にしている。これにより通知型の起動レースを持ち込まず、プロセス起動前に
+/// 投入されたジョブも拾いつつ、アイドル後の取得遅延を 1 秒程度に抑える。
 pub type CompareBuildStorage = PostgresStorage<CompareBuildJob>;
 
 /// 指定キュー名でストレージを組み立てる。
@@ -118,6 +116,36 @@ pub async fn enqueue(
     Ok(())
 }
 
+/// 同じパイプライン段からの比較ジョブ引き渡しを 1 回に畳んで投入する。
+///
+/// `render_build` が `processing` への遷移後に落ちても同じ task が再実行され、
+/// 同じキーでここへ戻る。既に投入済みなら unique violation を成功として扱い、
+/// それ以外の DB / codec エラーは呼び出し側へ返す。
+pub async fn enqueue_idempotent(
+    storage: &CompareBuildStorage,
+    job: CompareBuildJob,
+    idempotency_key: &str,
+) -> Result<(), anyhow::Error> {
+    let mut storage = storage.clone();
+    let task = TaskBuilder::new(job)
+        .with_idempotency_key(idempotency_key)
+        .build();
+
+    match storage.push_task(task).await {
+        Ok(()) => Ok(()),
+        Err(TaskSinkError::PushError(sqlx::Error::Database(error)))
+            if error.code().as_deref() == Some("23505")
+                && error.constraint() == Some("idx_jobs_idempotency_key") =>
+        {
+            tracing::info!(%idempotency_key, "compare build job was already enqueued");
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "push idempotent compare build job: {error}"
+        )),
+    }
+}
+
 /// ワーカーのエントリポイント。
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
@@ -141,11 +169,15 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
-            service::builds::mark_failed(&state.db, build, truncate(&err.to_string(), 2000))
-                .await
-                .map_err(|e| -> BoxDynError {
-                    format!("mark build {build_id} failed: {e}").into()
-                })?;
+            service::builds::mark_failed(
+                &state.db,
+                build,
+                truncate(&err.to_string(), 2000),
+                entity::builds::BuildFailureOrigin::Vrt,
+                "compare_internal",
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("mark build {build_id} failed: {e}").into() })?;
             Ok(())
         }
     };
@@ -162,6 +194,7 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
             &state.db,
             &state.storage,
             build.project_id,
+            state.settings.storage_min_retention_days,
         )
         .await;
     }
@@ -180,11 +213,20 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
-    if build.status != BuildStatus::Processing {
-        // finalize 済みでないビルドは処理しない（重複投入・遅延到着の保護）。
-        tracing::info!(%build_id, status = ?build.status, "skipping compare job for non-processing build");
-        return Ok(());
-    }
+    let build = match (build.mode, build.status) {
+        // screenshots モードのパイプライン先頭。worker が実際に取得してから
+        // processing にするため、UI はキュー待ちと処理中を区別できる。
+        (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
+            service::builds::transition(db, build, BuildStatus::Processing).await?
+        }
+        // storybook の render 完了後に積まれた compare job と、旧バージョンが
+        // finalize 時点で Processing にしたジョブはそのまま続行する。
+        (_, BuildStatus::Processing) => build,
+        (mode, status) => {
+            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            return Ok(());
+        }
+    };
 
     let project = service::projects::get_project(db, build.project_id).await?;
 
@@ -202,6 +244,9 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         Some(id) => Some(service::baselines::get_baseline(db, id).await?),
         None => service::baselines::latest_for(db, &project, &build.branch).await?,
     };
+    // baseline が別 branch からの fallback（自分の baseline をまだ持たない枝が
+    // default branch の baseline を掴んだ等）かどうか。removed の判定に使う。
+    let cross_branch_baseline = baseline.as_ref().is_some_and(|b| b.branch != build.branch);
     let baseline_entries = match &baseline {
         Some(b) => service::baselines::entries(db, b.id).await?,
         None => Vec::new(),
@@ -219,13 +264,25 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         .map_err(|e| anyhow::anyhow!("read capture plan: {e}"))?
     {
         Some(plan) => {
-            materialize_carry_forward(state, &project, &build, &baseline_entries, &plan, shots)
-                .await?
+            materialize_carry_forward(
+                state,
+                &project,
+                &build,
+                &baseline_entries,
+                &plan,
+                shots,
+                cross_branch_baseline,
+            )
+            .await?
         }
         None => shots,
     };
 
     let pairs = join_by_name(shots, baseline_entries);
+    let baseline_branch = baseline
+        .as_ref()
+        .map(|baseline| baseline.branch.as_str())
+        .unwrap_or_default();
     let total = pairs.len();
 
     // 比較対象数が確定した時点で開始行を残す。
@@ -238,6 +295,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     .await?;
 
     let mut counts = BuildCounts::default();
+    let mut ambiguous_missing_count = 0usize;
     let mut processed = 0usize;
     let now = Utc::now().fixed_offset();
 
@@ -246,6 +304,10 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
         let outcome = match (shot.as_ref(), entry.as_ref()) {
             (Some(_), None) => Outcome::added(),
+            (None, Some(_)) if cross_branch_baseline => {
+                ambiguous_missing_count += 1;
+                Outcome::ambiguous_cross_branch_missing(&build.branch, baseline_branch)
+            }
             (None, Some(_)) => Outcome::removed(),
             (Some(shot), Some(entry)) => {
                 let outcome = compare_pair(state, &project, &build, shot, entry).await?;
@@ -277,7 +339,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
             diff_storage_key: Set(outcome.diff_storage_key),
             diff_pixel_count: Set(outcome.diff_pixel_count),
             diff_ratio: Set(outcome.diff_ratio),
-            error_message: Set(None),
+            error_message: Set(outcome.error_message),
             reviewed_by: Set(None),
             reviewed_at: Set(None),
             created_at: Set(now),
@@ -299,6 +361,27 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         }
     }
 
+    if ambiguous_missing_count > 0 {
+        service::build_logs::append(
+            db,
+            build_id,
+            LogLevel::Info,
+            format!(
+                "used baseline from branch `{baseline_branch}`; kept \
+                 {ambiguous_missing_count} missing entries as reviewable comparison failures \
+                 instead of reporting them as removed"
+            ),
+        )
+        .await?;
+        tracing::info!(
+            %build_id,
+            baseline_branch,
+            build_branch = %build.branch,
+            count = ambiguous_missing_count,
+            "cross-branch baseline: ambiguous missing entries require review"
+        );
+    }
+
     // 完了サマリ。内訳を 1 行で残す。
     service::build_logs::append(
         db,
@@ -315,7 +398,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let build =
         service::builds::apply_counts(db, build, counts, baseline.as_ref().map(|b| b.id)).await?;
 
-    let next = if counts.has_differences() {
+    let next = if counts.has_differences() || ambiguous_missing_count > 0 {
         BuildStatus::ChangesDetected
     } else {
         BuildStatus::Passed
@@ -347,6 +430,7 @@ struct Outcome {
     diff_storage_key: Option<String>,
     diff_pixel_count: Option<i64>,
     diff_ratio: Option<f64>,
+    error_message: Option<String>,
     content_hash_skipped: bool,
 }
 
@@ -358,6 +442,7 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            error_message: None,
             content_hash_skipped: false,
         }
     }
@@ -369,6 +454,25 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            error_message: None,
+            content_hash_skipped: false,
+        }
+    }
+
+    /// 別branchのbaselineにしか無い名前は、削除ともmain側での後発追加とも
+    /// 断定できない。比較行を消さず、レビュー可能な失敗として保持する。
+    fn ambiguous_cross_branch_missing(build_branch: &str, baseline_branch: &str) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            status: ComparisonStatus::Failed,
+            diff_storage_key: None,
+            diff_pixel_count: None,
+            diff_ratio: None,
+            error_message: Some(format!(
+                "Cannot determine whether this story was removed: build branch \
+                 `{build_branch}` is being compared with baseline branch `{baseline_branch}`. \
+                 Review this missing story explicitly."
+            )),
             content_hash_skipped: false,
         }
     }
@@ -453,6 +557,7 @@ where
 /// - insert がリトライ後も失敗し、かつ行が存在しないと確認できた場合だけ、
 ///   アップロード済みオブジェクトを補償削除する（行が確認できないときは
 ///   消さない——既存行が参照するオブジェクトを壊さない側に倒す）
+#[allow(clippy::too_many_arguments)]
 async fn materialize_carry_forward(
     state: &JobState,
     project: &projects::Model,
@@ -460,6 +565,7 @@ async fn materialize_carry_forward(
     baseline_entries: &[baseline_entries::Model],
     plan: &service::builds::CapturePlan,
     shots: Vec<screenshots::Model>,
+    cross_branch_baseline: bool,
 ) -> Result<Vec<screenshots::Model>, anyhow::Error> {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -598,12 +704,19 @@ async fn materialize_carry_forward(
         .await?;
     }
     if vanished > 0 {
+        // 異branch fallbackの欠落はremovedと断定せず、後段でレビュー可能な
+        // failed比較として残す。capture plan側のログも同じ意味に揃える。
+        let disposition = if cross_branch_baseline {
+            "baseline is from another branch; keeping as a reviewable ambiguous comparison"
+        } else {
+            "reporting as removed"
+        };
         service::build_logs::append(
             db,
             build.id,
             LogLevel::Info,
             format!(
-                "{vanished} baseline entr{} no longer in the story manifest; reporting as removed",
+                "{vanished} baseline entr{} no longer in the story manifest; {disposition}",
                 if vanished == 1 { "y is" } else { "ies are" }
             ),
         )
@@ -614,13 +727,15 @@ async fn materialize_carry_forward(
     Ok(service::screenshots::list_for_build(db, build.id).await?)
 }
 
+/// name → (今回のスクリーンショット, baseline エントリ) の完全外部結合。
+type JoinedPairs = BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)>;
+
 /// name をキーにスクリーンショットと baseline エントリを完全外部結合する。
 fn join_by_name(
     shots: Vec<screenshots::Model>,
     entries: Vec<baseline_entries::Model>,
-) -> BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)> {
-    let mut map: BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)> =
-        BTreeMap::new();
+) -> JoinedPairs {
+    let mut map: JoinedPairs = BTreeMap::new();
     for shot in shots {
         let name = shot.name.clone();
         map.entry(name).or_default().0 = Some(shot);
@@ -672,6 +787,7 @@ async fn compare_pair(
                 diff_storage_key: None,
                 diff_pixel_count: Some(0),
                 diff_ratio: Some(0.0),
+                error_message: None,
                 content_hash_skipped: true,
             });
         }
@@ -733,6 +849,7 @@ async fn compare_pair(
         diff_storage_key,
         diff_pixel_count: Some(diff_pixel_count as i64),
         diff_ratio: Some(diff_ratio),
+        error_message: None,
         content_hash_skipped: false,
     })
 }
@@ -782,6 +899,19 @@ mod tests {
         assert!(joined["about"].0.is_some() && joined["about"].1.is_none());
         // baseline だけ → removed
         assert!(joined["legacy"].0.is_none() && joined["legacy"].1.is_some());
+    }
+
+    /// 異branch fallbackのbaselineにしか無い名前は、removedではなくレビュー可能な
+    /// failed比較として保持する。
+    #[test]
+    fn cross_branch_baseline_missing_name_becomes_a_reviewable_failure() {
+        let outcome = Outcome::ambiguous_cross_branch_missing("feature/a", "main");
+
+        assert_eq!(outcome.status, ComparisonStatus::Failed);
+        let message = outcome.error_message.expect("ambiguity explanation");
+        assert!(message.contains("feature/a"));
+        assert!(message.contains("main"));
+        assert!(message.contains("Review this missing story explicitly"));
     }
 
     #[test]

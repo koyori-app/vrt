@@ -187,7 +187,13 @@ pub async fn update_project(
 
     // 保持数設定を更新した直後にプルーニングを走らせる（超過分の掃除）。
     // 失敗しても更新自体は成功として扱う（ログのみ）。
-    service::builds::prune_project_builds_best_effort(&state.db, &state.storage, updated.id).await;
+    service::builds::prune_project_builds_best_effort(
+        &state.db,
+        &state.storage,
+        updated.id,
+        state.settings.storage_min_retention_days,
+    )
+    .await;
 
     Ok(Json(updated.into()))
 }

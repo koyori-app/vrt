@@ -6,7 +6,7 @@
 //!
 //! 投入元は 3 箇所:
 //!
-//! - `POST /v1/ci/builds/{id}/finalize`（`processing` → pending ステータス）
+//! - `POST /v1/ci/builds/{id}/finalize`（`queued` → pending ステータス）
 //! - [`crate::compare_build`] の完了時（`passed` / `changes_detected` / `failed`）
 //! - `POST /v1/builds/{id}/approve|reject`（レビュー結果）
 //!

@@ -35,6 +35,24 @@ pub struct JobState {
     pub compare_build_storage: Arc<CompareBuildStorage>,
 }
 
+/// Storybook レンダリング worker が必要とする依存だけを束ねる。
+///
+/// 外部 runner は HTTP API 用の Redis・OAuth・GitHub 資格情報を必要としない。
+/// `JobState` をそのまま共有せず、DB・成果物ストレージ・後続キューと Chromium
+/// のパスだけを渡すことで、runner に配る設定と秘密情報を最小化する。
+#[derive(Clone)]
+pub struct RenderJobState {
+    pub chromium_path: String,
+    /// ビルド自動プルーニングの最低保持日数（`Settings::storage_min_retention_days` 相当）。
+    pub storage_min_retention_days: u32,
+    pub db: DatabaseConnection,
+    pub storage: Arc<dyn StorageBackend>,
+    /// レンダリング失敗時の GitHub status 更新を投入するキュー。
+    pub github_status_storage: Arc<GithubStatusStorage>,
+    /// レンダリング成功後に比較処理を投入するキュー。
+    pub compare_build_storage: Arc<CompareBuildStorage>,
+}
+
 /// apalis 用 Postgres プールの既定上限。
 ///
 /// ワーカーが実際に使うのは「フェッチ + ack + keep_alive + 孤児再投入」程度で、

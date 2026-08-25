@@ -7,6 +7,7 @@ mod m20260801000000_build_approval_evidence;
 mod m20260802000000_build_capture_plan;
 mod m20260803000000_content_hash_decode_skip;
 mod m20260811000000_reduced_motion;
+mod m20260825000000_build_failure_classification;
 
 pub struct Migrator;
 
@@ -21,6 +22,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260802000000_build_capture_plan::Migration),
             Box::new(m20260803000000_content_hash_decode_skip::Migration),
             Box::new(m20260811000000_reduced_motion::Migration),
+            Box::new(m20260825000000_build_failure_classification::Migration),
         ]
     }
 }

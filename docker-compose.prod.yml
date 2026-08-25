@@ -120,6 +120,9 @@ services:
       - LOCAL_UPLOAD_DIR=/home/app/uploads
       # 「Open Storybook」用の展開キャッシュ。派生データなので永続化しない（イメージ内で app 所有）。
       - STORYBOOK_CACHE_DIR=/home/app/storybook-cache
+      # API は Storybook ビルドを受け付けるが、render_build キューは runner が消費する。
+      - "STORYBOOK_RENDER_ENABLED=true"
+      - "RENDER_WORKER_ENABLED=false"
       # storybook モード用 Chromium は apps/backend/Dockerfile が ENV CHROMIUM_PATH=/usr/bin/chromium を
       # 焼き込んでいるため compose では設定不要。
       # --- S3（STORAGE_BACKEND=s3 のときだけ有効。欠けると起動時に落ちる）---
@@ -132,6 +135,10 @@ services:
       - S3_SECRET_ACCESS_KEY
       # MinIO・R2 等パススタイルが要る場合は 1/true/yes を設定する。
       - S3_FORCE_PATH_STYLE
+      # ビルド自動プルーニングの最低保持日数（既定 0 = 従来どおり）。Wasabi のように
+      # 削除済みオブジェクトにも最低保存期間分を課金するストレージでは 90 を設定する。
+      # runner 側にも同じ値を渡すこと。
+      - STORAGE_MIN_RETENTION_DAYS
       # --- GitHub App（任意。PR ステータス連携）---
       # GITHUB_APP_ID と GITHUB_APP_PRIVATE_KEY_PEM の両方が揃って初めて有効。
       # 片方だけだと警告ログのみで無言で無効になる。PEM は改行を \n にエスケープして 1 行で渡す
@@ -160,6 +167,36 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+    restart: unless-stopped
+
+  # Chromium を API から分離した自社管理 Render worker。
+  # Dokploy では同じイメージを使う別サービスを作り、Start Command を
+  # `/app/vrt-runner` にすれば同じ構成になる。レプリカ数がビルド並列数になる。
+  runner:
+    image: vrt-backend:prod
+    command: ["/app/vrt-runner"]
+    # デプロイ時は新規 claim を止め、進行中の build に最大 1 時間の完走猶予を与える。
+    stop_grace_period: 1h
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+      - LOCAL_UPLOAD_DIR=/home/app/uploads
+      - "CHROMIUM_PATH=/usr/bin/chromium"
+      - S3_ENDPOINT
+      - S3_BUCKET
+      - S3_REGION
+      - S3_ACCESS_KEY_ID
+      - S3_SECRET_ACCESS_KEY
+      - S3_FORCE_PATH_STYLE
+      # backend と同じ値を設定する（レンダリング失敗時のプルーニングも同じガードに従わせる）。
+      - STORAGE_MIN_RETENTION_DAYS
+    volumes:
+      - uploads:/home/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   frontend:

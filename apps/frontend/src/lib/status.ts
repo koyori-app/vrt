@@ -22,6 +22,7 @@ export const toneDotClass: Record<Tone, string> = {
 
 export const buildStatusTone: Record<BuildStatus, Tone> = {
   pending: "gray",
+  queued: "gray",
   rendering: "blue",
   processing: "blue",
   passed: "green",
@@ -33,6 +34,7 @@ export const buildStatusTone: Record<BuildStatus, Tone> = {
 
 export const buildStatusLabel: Record<BuildStatus, string> = {
   pending: "Pending",
+  queued: "Queued",
   // Storybook mode only: the server is capturing stories in headless Chromium.
   rendering: "Rendering",
   processing: "Processing",

@@ -11,6 +11,7 @@ pub fn routes() -> OpenApiRouter<AppState> {
         .routes(routes!(crate::handlers::builds::list_comparisons))
         .routes(routes!(crate::handlers::builds::approve_build))
         .routes(routes!(crate::handlers::builds::reject_build))
+        .routes(routes!(crate::handlers::builds::retry_build))
         // Open Storybook: アップロード済みバンドルの静的配信。`{*path}` は axum の
         // キャッチオールなので `assets/foo.js` のようなネストしたパスも 1 ルートで拾える。
         .routes(routes!(crate::handlers::content::get_storybook_index))

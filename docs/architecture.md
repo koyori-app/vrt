@@ -10,11 +10,12 @@
                  ▼
              backend (axum, :3400) ──▶ Postgres
                  │                └──▶ Valkey（セッション / OAuth state）
-                 │
-                 ├─ apalis ワーカー（同一プロセス、Postgres がキュー）
-                 │    render_build / compare_build / github_status / github_webhook
-                 ├─ ヘッドレス Chromium（storybook モードのレンダリング。CHROMIUM_PATH）
+                 ├─ apalis ワーカー（compare_build / github_status / github_webhook）
                  └─ ストレージ（local ディレクトリ or S3 互換）
+
+             vrt-runner ──▶ Postgres の render_build キュー
+                 ├─ ヘッドレス Chromium（CHROMIUM_PATH）
+                 └─ backend と同じストレージ
 
 CI ──────────▶ backend /v1/ci/*（PAT の Bearer 認証。ブラウザを経由しない）
 ```
@@ -30,7 +31,7 @@ apps/backend      Rust ワークスペース（下記のクレート群 + migrat
 apps/frontend     TanStack Start + React 19 + Tailwind
 e2e               Playwright（独立した pnpm ルート）
 docs              この文書と docs/github-app.md
-docker-compose.yml  db / redis / migration / backend / frontend
+docker-compose.yml  db / redis / migration / backend / runner / frontend
 ```
 
 ## backend のクレート依存グラフ
@@ -152,13 +153,11 @@ GET /v1/auth/{provider}/callback
 ### ビルド
 
 ```
-              finalize (mode=screenshots)
-   pending ──────────────────────────────────────▶ processing
-      │                                              ▲
-      │  finalize (mode=storybook)                   │ 撮影完了
-      └────────────────────▶ rendering ──────────────┘
-                                │ 撮影失敗
-                                ▼
+   pending ── finalize ──▶ queued ── worker (screenshots) ──▶ processing
+                            │                                   ▲
+                            └── worker (storybook) ──▶ rendering┘
+                                                         │ 撮影失敗
+                                                         ▼
               ┌───────────────────┼───────────────────┐
               │                   │                   │
               ▼                   ▼                   ▼
@@ -167,17 +166,26 @@ GET /v1/auth/{provider}/callback
               │ 明示承認          ├── approve ──▶ approved (終端)
               └───────────────────┤
                                   └── reject  ──▶ rejected (終端)
+
+   failed ── retry ──▶ queued
 ```
 
 - `pending` … ビルド行を作った直後。スクリーンショット（`screenshots` モード）
   か Storybook バンドル（`storybook` モード）を受け付けている。
-- `rendering` … `storybook` モードの `finalize` 後、`render_build` ジョブが
+- `queued` … finalize または再実行でパイプライン先頭のジョブを投入済み。
+  worker が取得すると storybook は `rendering`、screenshots は `processing` に進む。
+- `rendering` … `render_build` worker がジョブを取得後、
   ヘッドレス Chromium でストーリーを撮っている。撮り終えると `processing` に
   自動で繋がる。`screenshots` モードでは通らない。
 - `processing` … `compare_build` ジョブが走っている。
 - `passed` … 差分ゼロ。レビュー不要。ただし baseline 昇格のために明示承認はできる。
 - `changes_detected` … 差分あり。人間のレビュー待ち。
-- `failed` … 比較そのものが失敗（画像が壊れている等）。
+- `failed` … 比較そのものが失敗（画像が壊れている等）。終端だが唯一の例外として
+  再実行できる（`POST /v1/builds/{build_id}/retry`、admin 以上）。storybook
+  モードはアップロード済みバンドルの再レンダリングから、`screenshots` モードは
+  比較からやり直す。どちらもまず `queued` に入り、`error_message` /
+  `completed_at` / 差分カウントはクリアされ、途中結果（screenshots /
+  comparisons）は各ジョブが開始時に捨てる。
 - `approved` … 承認済み。**このビルドの全スクリーンショットが
   `(project, branch)` の新しい baseline になる。**
 - `rejected` … 却下。baseline は更新されず、未レビューの比較は `rejected` になる。
@@ -220,8 +228,9 @@ baseline がまだ無いプロジェクトでは、全スクリーンショッ�
 
 ## 比較ジョブ
 
-`finalize` はビルドを `processing` にして `compare_build` ジョブを積むだけで、
-HTTP リクエストはそこで完了する。実際の比較は apalis ワーカーが行う:
+`finalize` はビルドを `queued` にして `compare_build` ジョブを積むだけで、
+HTTP リクエストはそこで完了する。worker が取得した時点で `processing` に進み、
+実際の比較を行う:
 
 1. `(project, branch)` の最新 baseline を引く（無ければ全件 `added`）
 2. baseline とビルドのスクリーンショットを名前で突き合わせる
@@ -236,8 +245,9 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 ## レンダリングジョブ（storybook モード）
 
 `mode = storybook` のビルドは、CI が撮った PNG ではなく **ビルド済み Storybook
-の zip** を受け取り、サーバー側で撮る（Chromatic 方式）。`finalize` はビルドを
-`rendering` にして `render_build` ジョブを積むだけで、実処理はワーカーが行う:
+の zip** を受け取り、Render worker で撮る（Chromatic 方式）。`finalize` はビルドを
+`queued` にして `render_build` ジョブを積むだけで、worker が取得した時点で
+`rendering` に進み実処理を行う:
 
 1. `builds.storybook_key` の zip をストレージから読み、一時ディレクトリに展開する。
    展開は `service::render::bundle` が担当し、**zip-slip（`..` / 絶対パス /
@@ -246,7 +256,8 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 2. `index.json`（v4/v5 の `entries`、6 系の `stories` も可）からストーリー一覧を作る。
    `type: "docs"` のエントリは撮らない
 3. 展開先を `127.0.0.1:0`（OS 任せの空きポート）でループバック配信する
-4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、ストーリーを**逐次**
+4. `CHROMIUM_PATH` の Chromium を 1 プロセス起動し、独立した page で
+   ストーリーを**最大 2 件ずつ並列**に
    `iframe.html?id=<storyId>&viewMode=story` で開く。`#storybook-root`（6 系は
    `#root`）に中身が入るまでポーリングし、settle 待ち・`document.fonts.ready` の
    条件待ち（到達可能な同一オリジン iframe の中まで再帰する）・静止・
@@ -267,8 +278,25 @@ HTTP リクエストはそこで完了する。実際の比較は apalis ワー�
 リトライされても `(build_id, name)` の UNIQUE にぶつからない。
 1 ストーリーでも撮れなければビルドは `failed` になり、`error_message` に
 どのストーリーで落ちたかが入る（Chromium が無い / 起動できない場合も同じ経路で
-`failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンスで、
-ワーカーの同時実行数は 1 に絞ってある。
+`failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンス、
+ワーカーの同時実行数は 1、ブラウザ内の story page 同時実行数は 2 に固定してある。
+
+### 独立 runner
+
+`vrt-runner` は `render_build` キューだけを消費する独立バイナリで、API と同じ
+Postgres と成果物ストレージへ接続する。API に `RENDER_WORKER_ENABLED=false` を設定すると
+API 内の Render worker は起動しない。Chromium を持たない API イメージでもStorybook
+ビルドを受け付ける場合は、併せて `STORYBOOK_RENDER_ENABLED=true` を設定する。
+
+runner に必要な環境変数は `DATABASE_URL`、`CHROMIUM_PATH`、`STORAGE_BACKEND` と
+選択したストレージの設定だけで、Redis・OAuth・GitHub資格情報は渡さない。Postgres
+キューのclaimとheartbeatはapalisが担当し、runnerが途中で停止したジョブは孤児回収後に
+再投入される。runnerは1プロセスあたり1ビルドを処理するため、Dokployでは同じイメージを
+Start Command `/app/vrt-runner` で起動し、サービスのレプリカ数でビルド並列数を調整する。
+runnerを別ホストへ置く場合、localディレクトリは共有できないためS3互換ストレージを使う。
+デプロイ停止時は runner が新しい job の取得を止め、進行中の build の完了を待つ。同梱の
+Compose は `stop_grace_period: 1h` を設定しているため、Dokploy 側でも停止猶予を同等以上に
+する。猶予を超えて強制終了された job は apalis の孤児回収後に同じ task として再実行される。
 
 ## ストレージ
 

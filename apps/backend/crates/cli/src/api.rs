@@ -83,6 +83,10 @@ pub struct BuildResponse {
     pub content_hash_skipped_count: i32,
     #[serde(default)]
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub failure_origin: Option<String>,
+    #[serde(default)]
+    pub failure_code: Option<String>,
 }
 
 /// ビルド進捗ログの 1 行（payload::builds::BuildLogEntry に一致）。

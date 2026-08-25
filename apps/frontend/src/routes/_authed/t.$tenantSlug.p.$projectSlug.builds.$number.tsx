@@ -12,6 +12,7 @@ import {
 import { ComparisonViewer } from "@/components/comparison-viewer";
 import { CommitLink } from "@/components/commit-link";
 import { BuildLogPanel } from "@/components/build-log-panel";
+import { BuildFailureAlert } from "@/components/build-failure-alert";
 import { BuildStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { $api, errorMessage, type Build, type Comparison } from "@/lib/api";
@@ -40,7 +41,12 @@ function BuildReviewPage() {
       enabled: !!project?.id && Number.isFinite(Number(number)),
       refetchInterval: (query) => {
         const status = query.state.data?.status;
-        return status === "processing" || status === "pending" ? PROCESSING_POLL_MS : false;
+        return status === "processing" ||
+          status === "pending" ||
+          status === "queued" ||
+          status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false;
       },
     },
   );
@@ -84,9 +90,24 @@ function BuildReview({
   const [filter, setFilter] = useComparisonFilter();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
 
-  const buildQuery = $api.useQuery("get", "/v1/builds/{build_id}", {
-    params: { path: { build_id: buildId } },
-  });
+  const buildQuery = $api.useQuery(
+    "get",
+    "/v1/builds/{build_id}",
+    { params: { path: { build_id: buildId } } },
+    {
+      // Keep the badge and error banner live from queueing through processing,
+      // including the rendering phase used by storybook-mode builds.
+      refetchInterval: (query) => {
+        const status = query.state.data?.status;
+        return status === "processing" ||
+          status === "pending" ||
+          status === "queued" ||
+          status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false;
+      },
+    },
+  );
   const build = buildQuery.data ?? initialBuild;
 
   const comparisonsQuery = $api.useQuery(
@@ -95,7 +116,12 @@ function BuildReview({
     { params: { path: { build_id: buildId } } },
     {
       refetchInterval:
-        build.status === "processing" || build.status === "pending" ? PROCESSING_POLL_MS : false,
+        build.status === "processing" ||
+        build.status === "pending" ||
+        build.status === "queued" ||
+        build.status === "rendering"
+          ? PROCESSING_POLL_MS
+          : false,
     },
   );
 
@@ -145,6 +171,14 @@ function BuildReview({
       toast.success("Build rejected");
     },
     onError: (error) => toast.error(errorMessage(error, "Could not reject build")),
+  });
+
+  const retryBuild = $api.useMutation("post", "/v1/builds/{build_id}/retry", {
+    onSuccess: async () => {
+      await invalidateBuild();
+      toast.success("Build retry started");
+    },
+    onError: (error) => toast.error(errorMessage(error, "Could not retry build")),
   });
 
   const review = useCallback(
@@ -299,6 +333,15 @@ function BuildReview({
             </a>
           </Button>
         ) : null}
+        {build.status === "failed" ? (
+          <Button
+            variant="outline"
+            disabled={retryBuild.isPending}
+            onClick={() => retryBuild.mutate({ params: { path: { build_id: buildId } } })}
+          >
+            Retry build
+          </Button>
+        ) : null}
         <Button variant="success" disabled={approveBuild.isPending} onClick={onApproveBuild}>
           Approve build
         </Button>
@@ -320,9 +363,11 @@ function BuildReview({
         {pendingReviews > 0 ? ` · ${pendingReviews} awaiting review` : ""}
       </p>
       {build.error_message ? (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {build.error_message}
-        </p>
+        <BuildFailureAlert
+          origin={build.failure_origin}
+          code={build.failure_code}
+          message={build.error_message}
+        />
       ) : null}
 
       <BuildLogPanel buildId={buildId} status={build.status} />

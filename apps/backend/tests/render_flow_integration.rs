@@ -22,7 +22,7 @@ mod common;
 use std::io::Write as _;
 use std::time::Duration;
 
-use common::TestApp;
+use common::{TestApp, TestAppOptions};
 use entity::scopes::Scope;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -123,6 +123,27 @@ const INDEX_JSON_WITH_EXTRA: &str = r#"{
   }
 }"#;
 
+/// 2 page が同時に開かれないと描画完了しない並列性テスト用 index。
+const CONCURRENT_INDEX_JSON: &str = r#"{
+  "v": 5,
+  "entries": {
+    "parallel--one": {
+      "type": "story",
+      "id": "parallel--one",
+      "title": "Parallel",
+      "name": "One",
+      "importPath": "./src/Parallel.stories.tsx"
+    },
+    "parallel--two": {
+      "type": "story",
+      "id": "parallel--two",
+      "title": "Parallel",
+      "name": "Two",
+      "importPath": "./src/Parallel.stories.tsx"
+    }
+  }
+}"#;
+
 /// `?id=` に対応する色でビューポート全面を塗る `iframe.html`。
 ///
 /// - フォントもアニメーションも使わない（= ピクセルが揺れない）
@@ -162,6 +183,48 @@ fn iframe_html(red: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+/// 2 story が互いの page 起動を `localStorage` で待つ fixture。
+///
+/// 同じ Chromium profile / origin の page は localStorage を共有する。逐次実行では
+/// 先頭 story が相手を永遠に待って timeout する一方、2 並列なら双方が印を置いて
+/// `storyRendered` を発火できる。時間の閾値に依存せず並列配線そのものを検証する。
+fn concurrent_iframe_html() -> &'static str {
+    r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var peer = id === 'parallel--one' ? 'parallel--two' : 'parallel--one';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+
+  var el = document.createElement('div');
+  el.style.width = '100vw';
+  el.style.height = '100vh';
+  el.style.background = id === 'parallel--one' ? '#ff0000' : '#0000ff';
+  document.getElementById('storybook-root').appendChild(el);
+
+  localStorage.setItem('vrt-parallel-' + id, 'ready');
+  (function waitForPeer() {
+    if (localStorage.getItem('vrt-parallel-' + peer) === 'ready') {
+      channel.emit('storyRendered', id);
+      return;
+    }
+    setTimeout(waitForPeer, 10);
+  })();
+</script>
+</body>
+</html>"#
 }
 
 /// バンドルに混ぜる「実バンドルらしさ」のためのダミー資産のサイズ。
@@ -248,11 +311,16 @@ struct Fixture {
     tenant_slug: String,
     project_slug: String,
     project_id: Uuid,
+    tenant_id: Uuid,
     token: String,
 }
 
 async fn setup() -> Fixture {
-    let app = TestApp::new().await;
+    setup_with_options(TestAppOptions::default()).await
+}
+
+async fn setup_with_options(options: TestAppOptions) -> Fixture {
+    let app = TestApp::new_with(options).await;
     let user = app.login_as_new_user().await;
 
     let suffix = &Uuid::new_v4().to_string()[..8];
@@ -314,6 +382,7 @@ async fn setup() -> Fixture {
         tenant_slug,
         project_slug,
         project_id,
+        tenant_id: tenant_id.parse().expect("tenant uuid"),
         token,
     }
 }
@@ -389,7 +458,10 @@ impl Fixture {
             let build = self.get_build(build_id).await;
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
-            if !matches!(status.as_str(), "pending" | "rendering" | "processing") {
+            if !matches!(
+                status.as_str(),
+                "pending" | "queued" | "rendering" | "processing"
+            ) {
                 assert_completed_at_is_stamped(&build);
                 return build;
             }
@@ -492,6 +564,40 @@ fn chromium_or_skip(test: &str) -> bool {
 
 // ── 本体 ────────────────────────────────────────────────────────────────
 
+/// render worker が同じ Chromium で 2 story を同時に進めること。
+///
+/// fixture の各 page は相手の page が起動するまで `storyRendered` を出さないため、
+/// 単に「速かった」ではなく、実際に 2 page が重なったことを一気通貫で証明する。
+#[tokio::test(flavor = "multi_thread")]
+async fn stories_are_rendered_two_at_a_time() {
+    if !chromium_or_skip("stories_are_rendered_two_at_a_time") {
+        return;
+    }
+    assert_eq!(job::render_build::STORY_RENDER_CONCURRENCY, 2);
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("parallel0001").await;
+    let build_id = build_id_of(&build);
+    let bundle = bundle_zip_with_files(CONCURRENT_INDEX_JSON, concurrent_iframe_html());
+
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("changes_detected"),
+        "both mutually waiting stories must render when two pages overlap: {terminal}"
+    );
+
+    let shots = fx.screenshots(build_id).await;
+    let names: Vec<&str> = shots.iter().map(|shot| shot.name.as_str()).collect();
+    assert_eq!(names, vec!["Parallel/One", "Parallel/Two"]);
+}
+
 /// storybook バンドルを投げてから比較結果が出るまでの一気通貫。
 #[tokio::test(flavor = "multi_thread")]
 async fn storybook_bundle_is_rendered_server_side_and_compared() {
@@ -543,8 +649,8 @@ async fn storybook_bundle_is_rendered_server_side_and_compared() {
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
         finalized["status"].as_str(),
-        Some("rendering"),
-        "storybook finalize goes to rendering, not processing"
+        Some("queued"),
+        "storybook finalize stays queued until a render worker picks it up"
     );
 
     let build1 = fx.wait_for_terminal(build1_id).await;
@@ -713,8 +819,8 @@ async fn only_story_ids_reuses_baseline_and_still_renders_new_stories() {
     let finalized: Value = res.json().await.expect("finalize json");
     assert_eq!(
         finalized["status"].as_str(),
-        Some("rendering"),
-        "storybook finalize goes to rendering"
+        Some("queued"),
+        "storybook finalize stays queued until a render worker picks it up"
     );
 
     let build_b = fx.wait_for_terminal(build_b_id).await;
@@ -1161,6 +1267,11 @@ async fn a_bundle_without_an_index_fails_the_build_with_a_reason() {
 
     let build = fx.wait_for_terminal(build_id).await;
     assert_eq!(build["status"].as_str(), Some("failed"));
+    assert_eq!(build["failure_origin"].as_str(), Some("test"));
+    assert_eq!(
+        build["failure_code"].as_str(),
+        Some("storybook_bundle_invalid")
+    );
     let message = build["error_message"].as_str().unwrap_or_default();
     assert!(
         message.contains("index.json"),
@@ -1572,4 +1683,513 @@ async fn ci_build_logs_endpoint_is_tenant_scoped() {
         .get_with_bearer(&format!("/v1/ci/builds/{build_id}/logs"), &owner.token)
         .await;
     assert_eq!(res.status(), StatusCode::OK, "owner can read its own logs");
+}
+
+// ── 失敗ビルドの再実行 ──────────────────────────────────────────────────
+
+/// 失敗した storybook ビルドは、原因（ここでは壊れたバンドル）を直したうえで
+/// 再実行すると**同じビルドのまま**完走する。前回の失敗の痕跡
+/// （error_message / 失敗分類 / completed_at）はクリアされ、進捗ログには前回の失敗ログの
+/// 後に再実行の区切り行が挟まる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_storybook_build_can_be_retried_and_completes() {
+    use sea_orm::EntityTrait;
+
+    if !chromium_or_skip("a_failed_storybook_build_can_be_retried_and_completes") {
+        return;
+    }
+    let fx = setup().await;
+
+    let build = fx.create_storybook_build("sbretry1").await;
+    let build_id = build_id_of(&build);
+
+    // index.json の無い zip でレンダリングを失敗させる。
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut buf);
+        let options = zip::write::SimpleFileOptions::default();
+        writer.start_file("iframe.html", options).expect("start");
+        writer.write_all(b"<html></html>").expect("write");
+        writer.finish().expect("finish");
+    }
+    assert_eq!(
+        fx.upload_bundle(build_id, buf.into_inner()).await.status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+    let failed = fx.wait_for_terminal(build_id).await;
+    assert_eq!(failed["status"].as_str(), Some("failed"));
+    assert_eq!(failed["failure_origin"].as_str(), Some("test"));
+    assert_eq!(
+        failed["failure_code"].as_str(),
+        Some("storybook_bundle_invalid")
+    );
+
+    // 原因を直す: 同じストレージキーへ正しいバンドルを置き直す。
+    // （バンドルの API は finalize 済みビルドへの再アップロードを許さないため、
+    //   「壊れた成果物を差し替えて再実行」の最小の代替としてストレージを直接書く。）
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let key = model.storybook_key.expect("storybook key");
+    service::render::upload_bundle(
+        &fx.app.state.storage,
+        &key,
+        bytes::Bytes::from(bundle_zip("#c00")),
+    )
+    .await
+    .expect("replace bundle");
+
+    // 再実行（セッション = テナント owner）。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "retry failed build");
+    let retried: Value = res.json().await.expect("retry json");
+    assert_eq!(retried["status"].as_str(), Some("queued"));
+    assert!(
+        retried["error_message"].is_null(),
+        "error_message is cleared on retry, got {:?}",
+        retried["error_message"]
+    );
+    assert!(retried["failure_origin"].is_null());
+    assert!(retried["failure_code"].is_null());
+    assert!(
+        retried["completed_at"].is_null(),
+        "completed_at is cleared on retry (the pipeline is running again)"
+    );
+
+    let done = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        done["status"].as_str(),
+        Some("changes_detected"),
+        "retried build completes (error: {:?})",
+        done["error_message"]
+    );
+    assert_eq!(done["total_count"].as_i64(), Some(3), "docs entry skipped");
+    assert_eq!(done["added_count"].as_i64(), Some(3));
+
+    // サーバーが撮り直したスクリーンショットが揃っている。
+    let shots = fx.screenshots(build_id).await;
+    let names: Vec<&str> = shots.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Demo/Box/Blue", "Demo/Box/Empty", "Demo/Box/Red"]
+    );
+
+    // 進捗ログ: 前回の失敗ログ → 再実行の区切り → 新しい実行のログ、の順。
+    let logs = fx.build_logs(build_id).await;
+    let marker = logs
+        .iter()
+        .position(|l| l.message.contains("build retry requested"))
+        .expect("retry marker in build logs");
+    assert!(
+        logs[..marker]
+            .iter()
+            .any(|l| l.message.contains("render failed")),
+        "the old failure log stays before the retry marker"
+    );
+    assert!(
+        logs[marker..]
+            .iter()
+            .any(|l| l.message.contains("render started")),
+        "the new run logs after the retry marker"
+    );
+
+    // 完走した（failed でない）ビルドはもう再実行できない。
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "only failed builds can be retried"
+    );
+}
+
+/// 進行中（pending）のビルドは再実行できない——二重投入の入口を塞ぐ。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_pending_build_is_rejected() {
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry2").await;
+    let build_id = build_id_of(&build);
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+}
+
+/// 再実行の認可: 非メンバーは 403（存在も漏らさない）、member ロールも
+/// 403（admin 以上が必要——approve / reject と同じ境界）。
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_requires_an_admin_of_the_owning_tenant() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry3").await;
+    let build_id = build_id_of(&build);
+
+    // DB で直接 failed にする（レンダリングまで走らせない。retry の認可は
+    // ビルドの中身と無関係で、状態だけ揃えば検査できる）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    // 非メンバー: 403。
+    let outsider = TestApp::new().await;
+    let outsider_user = outsider.login_as_new_user().await;
+    let res = outsider
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "outsider must not retry another tenant's build"
+    );
+
+    // member ロール: 招き入れても admin 未満なので 403 のまま。
+    entity::tenant_members::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(fx.tenant_id),
+        user_id: Set(outsider_user.id),
+        role: Set(entity::tenant_members::TenantRole::Member),
+        created_at: Set(chrono::Utc::now().fixed_offset()),
+    }
+    .insert(&fx.app.state.db)
+    .await
+    .expect("insert membership");
+    let res = outsider
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "member role is below the admin requirement for retry"
+    );
+}
+
+/// バンドルをアップロードする前に失敗した storybook ビルドは、撮り直す素材が
+/// 無いので再実行できない（409）。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_failed_build_without_a_bundle_is_rejected() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_storybook_build("sbretry4").await;
+    let build_id = build_id_of(&build);
+
+    // アップロード前の失敗を DB 直接更新で再現する（例: サーバー側の掃除や
+    // 手動オペレーションで failed に落ちた形。storybook_key は無いまま）。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    assert!(model.storybook_key.is_none(), "no bundle uploaded yet");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value = res.json().await.expect("error json");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("bundle"),
+        "the 409 should say the bundle is missing, got {message:?}"
+    );
+}
+
+/// Render worker / 外部 runner を使えない API では failed のまま維持し、
+/// 消費者のいない render queue へ再投入しない。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_storybook_build_is_rejected_when_rendering_is_disabled() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup_with_options(TestAppOptions {
+        storybook_render_enabled: Some(false),
+        ..TestAppOptions::default()
+    })
+    .await;
+    let build = fx.create_build("screenshots", "sbretry-disabled").await;
+    assert_eq!(build.status(), StatusCode::CREATED);
+    let body: Value = build.json().await.expect("build json");
+    let build_id = build_id_of(&body);
+
+    // disabled 構成では Storybook build の新規作成自体が拒否されるため、既存環境から
+    // 残っている failed build を DB 上で再現する。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.mode = Set(entity::builds::BuildMode::Storybook);
+    active.storybook_key = Set(Some(format!("storybook/{build_id}.zip")));
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value = res.json().await.expect("error json");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("disabled")
+    );
+
+    let build = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("reload build")
+        .expect("build row");
+    assert_eq!(build.status, entity::builds::BuildStatus::Failed);
+}
+
+/// `rendering → processing` の直後に runner が落ちても、同じ render task の再実行が
+/// 比較ジョブの引き渡しだけを復旧し、重複投入を成功として扱える。
+#[tokio::test(flavor = "multi_thread")]
+async fn processing_storybook_build_recovers_compare_handoff_idempotently() {
+    use apalis::prelude::Data;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_build("screenshots", "sbhandoff").await;
+    assert_eq!(build.status(), StatusCode::CREATED);
+    let body: Value = build.json().await.expect("build json");
+    let build_id = build_id_of(&body);
+
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.mode = Set(entity::builds::BuildMode::Storybook);
+    active.storybook_key = Set(Some(format!("storybook/{build_id}.zip")));
+    active.status = Set(entity::builds::BuildStatus::Processing);
+    active
+        .update(&fx.app.state.db)
+        .await
+        .expect("force processing");
+
+    // TestApp の compare worker が消費しない専用キューを使い、2 回目まで build を
+    // Processing に固定する。task ID が同じなら idempotency key も同じになる。
+    let compare_storage = backend::jobs::setup_compare_build_storage_with_queue(
+        &fx.app.state.pg_pool,
+        &format!("compare_handoff_test_{}", Uuid::new_v4().simple()),
+    )
+    .await
+    .expect("compare storage");
+    let render_state = job::RenderJobState {
+        chromium_path: "unused-for-handoff-recovery".into(),
+        storage_min_retention_days: 0,
+        db: fx.app.state.db.clone(),
+        storage: fx.app.state.storage.clone(),
+        github_status_storage: fx.app.state.github_status_storage.clone(),
+        compare_build_storage: compare_storage,
+    };
+    let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        .parse()
+        .expect("valid apalis task id");
+    let job = job::RenderBuildJob {
+        build_id,
+        only_story_ids: None,
+    };
+
+    job::render_build::process(job.clone(), Data::new(render_state.clone()), task_id)
+        .await
+        .expect("first recovery enqueues compare job");
+    job::render_build::process(job, Data::new(render_state), task_id)
+        .await
+        .expect("second recovery is deduplicated");
+}
+
+/// **1 回だけ失敗する story は直列リトライで救われ、ビルドは成功する**こと。
+///
+/// 撮影ホストの CPU 逼迫下では、並走する story に押されて Storybook の play
+/// （オーバーレイ遷移・Testing Library のポーリング）が時間内に進まず、
+/// story 側に欠陥が無くても `playFunctionThrewException` 等で落ちる
+/// （koyori/task の `pages-taskdetail--delete-cancel` で実発生。再実行でも
+/// 同じ story が落ち続けた）。1 巡目の story 固有失敗を並走の居ない直列で
+/// 1 回だけ撮り直すことで、この種の失敗がビルドを落とさないことを固定する。
+///
+/// fixture は localStorage（同一 Chromium profile / origin の page 間で共有）で
+/// 「初回だけ storyErrored」を再現する。リトライ導入前はこのビルドが
+/// `failed` になる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transiently_failing_story_is_retried_serially_and_succeeds() {
+    if !chromium_or_skip("a_transiently_failing_story_is_retried_serially_and_succeeds") {
+        return;
+    }
+    let fx = setup().await;
+
+    let index_json = r#"{
+  "v": 5,
+  "entries": {
+    "flaky--once": {
+      "type": "story",
+      "id": "flaky--once",
+      "title": "Flaky",
+      "name": "Once",
+      "importPath": "./src/Flaky.stories.tsx"
+    }
+  }
+}"#;
+    let iframe = r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var id = new URLSearchParams(location.search).get('id') || '';
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    if (!localStorage.getItem('vrt-flaky-once')) {
+      localStorage.setItem('vrt-flaky-once', '1');
+      channel.emit('storyErrored', { message: 'transient overload' });
+      return;
+    }
+    var el = document.createElement('div');
+    el.style.width = '100vw';
+    el.style.height = '100vh';
+    el.style.background = '#00ff00';
+    document.getElementById('storybook-root').appendChild(el);
+    channel.emit('storyRendered', id);
+  }, 0);
+</script>
+</body>
+</html>"#;
+
+    let build = fx.create_storybook_build("retryflaky1").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle_zip_with_files(index_json, iframe))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_ne!(
+        terminal["status"].as_str().unwrap_or_default(),
+        "failed",
+        "a story that fails only once must be saved by the serial retry: {terminal}"
+    );
+
+    let logs = fx.build_logs(build_id).await;
+    assert!(
+        logs.iter().any(|l| l.level == "warn"
+            && l.message.contains("flaky--once")
+            && l.message.contains("will retry serially")),
+        "the first failure must be logged as a warn with the retry note: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.level == "info" && l.message.contains("rendered 1/1 flaky--once")),
+        "the retry must end in a rendered line: {logs:?}"
+    );
+}
+
+/// **2 回とも失敗する story はビルドを失敗させる**こと（リトライは 1 回で打ち止め）。
+///
+/// リトライは負荷起因の一過性の失敗を救うためのもので、恒久的に壊れた story を
+/// 隠してはならない。1 巡目の warn（リトライ予告）と 2 巡目の error（確定）が
+/// 両方ログに残り、ビルドは従来どおり fail-closed で `failed` に落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_story_failing_twice_still_fails_the_build() {
+    if !chromium_or_skip("a_story_failing_twice_still_fails_the_build") {
+        return;
+    }
+    let fx = setup().await;
+
+    let index_json = r#"{
+  "v": 5,
+  "entries": {
+    "broken--always": {
+      "type": "story",
+      "id": "broken--always",
+      "title": "Broken",
+      "name": "Always",
+      "importPath": "./src/Broken.stories.tsx"
+    }
+  }
+}"#;
+    let iframe = r#"<!doctype html>
+<html>
+<head><meta charset="utf-8"><style>html,body{margin:0;padding:0;background:#fff}</style></head>
+<body>
+<div id="storybook-root"></div>
+<script>
+  var listeners = {};
+  var channel = {
+    on: function (event, cb) { (listeners[event] = listeners[event] || []).push(cb); },
+    emit: function (event, payload) {
+      (listeners[event] || []).forEach(function (cb) { cb(payload); });
+    }
+  };
+  setTimeout(function () {
+    window.__STORYBOOK_ADDONS_CHANNEL__ = channel;
+    channel.emit('storyErrored', { message: 'kaboom every time' });
+  }, 0);
+</script>
+</body>
+</html>"#;
+
+    let build = fx.create_storybook_build("retrybroke1").await;
+    let build_id = build_id_of(&build);
+    assert_eq!(
+        fx.upload_bundle(build_id, bundle_zip_with_files(index_json, iframe))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(fx.finalize(build_id).await.status(), StatusCode::OK);
+
+    let terminal = fx.wait_for_terminal(build_id).await;
+    assert_eq!(
+        terminal["status"].as_str(),
+        Some("failed"),
+        "a persistently broken story must still fail the build: {terminal}"
+    );
+
+    let logs = fx.build_logs(build_id).await;
+    assert!(
+        logs.iter().any(|l| l.level == "warn"
+            && l.message.contains("broken--always")
+            && l.message.contains("will retry serially")),
+        "the first failure must schedule exactly one retry: {logs:?}"
+    );
+    assert!(
+        logs.iter().any(|l| l.level == "error"
+            && l.message.contains("broken--always")
+            && l.message.starts_with("story failed")),
+        "the second failure must be recorded as the final error: {logs:?}"
+    );
 }

@@ -67,7 +67,9 @@ GitHub の **Settings → Developer settings → GitHub Apps → New GitHub App*
 
 | ビルドの状態 | commit status | description |
 |---|---|---|
-| `processing`（finalize 直後） | `pending` | Comparing screenshots against baseline |
+| `queued`（finalize 直後） | `pending` | Waiting for a build worker |
+| `rendering` | `pending` | Rendering stories from the Storybook bundle |
+| `processing` | `pending` | Comparing screenshots against baseline |
 | `passed` | `success` | Visual tests passed |
 | `changes_detected` | `pending` | N changes detected, awaiting review |
 | `approved` | `success` | Visual changes approved |
