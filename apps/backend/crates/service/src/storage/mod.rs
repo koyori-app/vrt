@@ -9,7 +9,10 @@ pub mod s3;
 pub mod r#trait;
 
 pub use local::LocalStorageBackend;
-pub use migrate::{MigrationSummary, migrate_local_directory};
+pub use migrate::{
+    MIGRATION_COMPLETION_MARKER_KEY, MigrationRunOutcome, MigrationSummary,
+    migrate_local_directory, migrate_local_directory_once,
+};
 pub use s3::S3StorageBackend;
 pub use r#trait::{ByteStream, StorageBackend, StorageError};
 

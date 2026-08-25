@@ -78,7 +78,8 @@ services:
 
   # local→S3成果物移行（one-shot）。
   # STORAGE_BACKEND=localなら即時no-op。s3へ切り替えた最初のデプロイでは、既存uploadsを
-  # Wasabi等へコピー・サイズ検証してから終了する。元Volumeは削除しないため再実行可能。
+  # Wasabi等へコピー・サイズ検証して完了マーカーをS3へ保存する。以後のデプロイでは
+  # マーカー確認だけで終了する。元Volumeは削除せず、失敗途中なら次回に再開する。
   storage-migration:
     image: vrt-backend:prod
     command: ["/app/vrt-storage-migrate"]

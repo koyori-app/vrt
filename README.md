@@ -103,10 +103,13 @@ runner のレプリカ数が同時に処理できる Storybook ビルド数に�
 が同じ `uploads` ボリュームを共有できる単一ホスト構成に限る。
 
 production Composeで`STORAGE_BACKEND`を`local`から`s3`へ変更すると、one-shotの
-`storage-migration`サービスが`uploads` VolumeをS3へ自動移行する。同じキー・サイズの
-オブジェクトはskipするため再実行可能で、元ファイルは削除しない。backendとrunnerは
-全ファイルのuploadとサイズ検証が完了するまで起動しない。並列数は
-`STORAGE_MIGRATION_CONCURRENCY`（既定4）で調整できる。
+`storage-migration`サービスが`uploads` VolumeをS3へ自動移行する。全ファイルのuploadと
+サイズ検証に成功すると、S3へ`.vrt/migrations/local-to-s3-v1.complete`を保存する。
+以後のデプロイではこのマーカー確認だけで終了し、全件走査は繰り返さない。失敗途中では
+マーカーを作らず、同じキー・サイズのオブジェクトをskipして次回に再開する。元ファイルは
+削除しない。backendとrunnerは初回移行が完了するまで起動しない。並列数は
+`STORAGE_MIGRATION_CONCURRENCY`（既定4）で調整できる。移行を意図的にやり直す場合だけ、
+バケットから上記マーカーを削除して再デプロイする。
 
 ### frontend
 

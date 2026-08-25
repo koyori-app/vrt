@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use service::storage::{S3StorageBackend, migrate_local_directory};
+use service::storage::{MigrationRunOutcome, S3StorageBackend, migrate_local_directory_once};
 
 const DEFAULT_CONCURRENCY: usize = 4;
 
@@ -31,21 +31,23 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .map_err(|error| anyhow::anyhow!("initialize S3 destination: {error}"))?;
 
-    tracing::info!(
-        source = %source.display(),
-        concurrency,
-        "starting local-to-S3 storage migration"
-    );
-    let summary = migrate_local_directory(&source, &destination, concurrency)
+    let outcome = migrate_local_directory_once(&source, &destination, concurrency)
         .await
         .map_err(|error| anyhow::anyhow!("local-to-S3 storage migration failed: {error}"))?;
-    tracing::info!(
-        discovered = summary.discovered,
-        uploaded = summary.uploaded,
-        skipped = summary.skipped,
-        bytes_uploaded = summary.bytes_uploaded,
-        "local-to-S3 storage migration completed"
-    );
+    match outcome {
+        MigrationRunOutcome::AlreadyCompleted => {
+            tracing::info!("local-to-S3 storage migration already completed; skipping scan");
+        }
+        MigrationRunOutcome::Completed(summary) => {
+            tracing::info!(
+                discovered = summary.discovered,
+                uploaded = summary.uploaded,
+                skipped = summary.skipped,
+                bytes_uploaded = summary.bytes_uploaded,
+                "local-to-S3 storage migration completed"
+            );
+        }
+    }
     Ok(())
 }
 
