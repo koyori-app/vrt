@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { CopyIcon, PlusIcon } from "lucide-react";
 import { useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { ToneBadge } from "@/components/status-badge";
@@ -33,13 +34,14 @@ export const Route = createFileRoute("/_authed/settings/tokens")({
   component: TokensPage,
 });
 
-const ALL_SCOPES: { value: Scope; description: string }[] = [
-  { value: "read:project", description: "Read projects and their settings" },
-  { value: "read:build", description: "Read builds and comparison results" },
-  { value: "write:build", description: "Create builds, upload screenshots, finalize" },
-];
+const ALL_SCOPES = [
+  { value: "read:project", descriptionKey: "tokens.scopes.readProject" },
+  { value: "read:build", descriptionKey: "tokens.scopes.readBuild" },
+  { value: "write:build", descriptionKey: "tokens.scopes.writeBuild" },
+] as const satisfies readonly { value: Scope; descriptionKey: string }[];
 
 function TokensPage() {
+  const { t, i18n } = useTranslation();
   const [createOpen, setCreateOpen] = useState(false);
   const queryClient = useQueryClient();
   const tokens = $api.useQuery("get", "/v1/personal_tokens", {});
@@ -47,23 +49,21 @@ function TokensPage() {
   const remove = $api.useMutation("delete", "/v1/personal_tokens/{id}", {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["get", "/v1/personal_tokens"] });
-      toast.success("Token revoked");
+      toast.success(t("tokens.revoked"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not revoke token")),
+    onError: (error) => toast.error(errorMessage(error, t("tokens.revokeFailed"))),
   });
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Personal access tokens</h1>
-          <p className="text-sm text-muted-foreground">
-            Used by CI to create builds and upload screenshots.
-          </p>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("tokens.title")}</h1>
+          <p className="text-sm text-muted-foreground">{t("tokens.description")}</p>
         </div>
         <Button onClick={() => setCreateOpen(true)}>
           <PlusIcon className="size-3.5" />
-          New token
+          {t("tokens.new")}
         </Button>
       </div>
 
@@ -72,10 +72,10 @@ function TokensPage() {
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Name</TableHead>
-                <TableHead className="w-28">Token</TableHead>
-                <TableHead>Scopes</TableHead>
-                <TableHead className="w-48">Last used</TableHead>
+                <TableHead>{t("tokens.columns.name")}</TableHead>
+                <TableHead className="w-28">{t("tokens.columns.token")}</TableHead>
+                <TableHead>{t("tokens.columns.scopes")}</TableHead>
+                <TableHead className="w-48">{t("tokens.columns.lastUsed")}</TableHead>
                 <TableHead className="w-24" />
               </TableRow>
             </TableHeader>
@@ -86,7 +86,7 @@ function TokensPage() {
                     {token.name}
                     {token.revoked ? (
                       <ToneBadge tone="red" className="ml-2">
-                        Revoked
+                        {t("tokens.revokedBadge")}
                       </ToneBadge>
                     ) : null}
                   </TableCell>
@@ -103,7 +103,7 @@ function TokensPage() {
                     </div>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {formatDate(token.last_used_at)}
+                    {formatDate(token.last_used_at, i18n.language)}
                   </TableCell>
                   <TableCell className="text-right">
                     <Button
@@ -111,12 +111,11 @@ function TokensPage() {
                       size="sm"
                       disabled={remove.isPending}
                       onClick={() => {
-                        if (!confirm(`Revoke “${token.name}”? CI using it will start failing.`))
-                          return;
+                        if (!confirm(t("tokens.revokeConfirm", { name: token.name }))) return;
                         remove.mutate({ params: { path: { id: token.id } } });
                       }}
                     >
-                      Revoke
+                      {t("tokens.revoke")}
                     </Button>
                   </TableCell>
                 </TableRow>
@@ -124,7 +123,7 @@ function TokensPage() {
               {!tokens.data?.length ? (
                 <TableRow>
                   <TableCell colSpan={5} className="text-sm text-muted-foreground">
-                    {tokens.isLoading ? "Loading…" : "No tokens yet."}
+                    {tokens.isLoading ? t("common.loading") : t("tokens.empty")}
                   </TableCell>
                 </TableRow>
               ) : null}
@@ -145,6 +144,7 @@ function CreateTokenDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState<Scope[]>(["read:build", "write:build"]);
@@ -156,7 +156,7 @@ function CreateTokenDialog({
       // The raw secret exists only in this response — surface it once.
       setIssued(token.token);
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not create token")),
+    onError: (error) => toast.error(errorMessage(error, t("tokens.createFailed"))),
   });
 
   function close() {
@@ -178,10 +178,8 @@ function CreateTokenDialog({
         {issued ? (
           <>
             <DialogHeader>
-              <DialogTitle>Copy your token</DialogTitle>
-              <DialogDescription>
-                This is the only time the token is shown. Store it in your CI secrets now.
-              </DialogDescription>
+              <DialogTitle>{t("tokens.copyTitle")}</DialogTitle>
+              <DialogDescription>{t("tokens.copyDescription")}</DialogDescription>
             </DialogHeader>
             <div className="flex items-center gap-2 py-4">
               <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-3 py-2 font-mono text-xs">
@@ -192,26 +190,26 @@ function CreateTokenDialog({
                 size="sm"
                 onClick={async () => {
                   await navigator.clipboard.writeText(issued);
-                  toast.success("Token copied");
+                  toast.success(t("tokens.copied"));
                 }}
               >
                 <CopyIcon className="size-3.5" />
-                Copy
+                {t("tokens.copy")}
               </Button>
             </div>
             <DialogFooter>
-              <Button onClick={close}>Done</Button>
+              <Button onClick={close}>{t("tokens.done")}</Button>
             </DialogFooter>
           </>
         ) : (
           <form onSubmit={onSubmit}>
             <DialogHeader>
-              <DialogTitle>New personal access token</DialogTitle>
-              <DialogDescription>Grant only the scopes your CI job needs.</DialogDescription>
+              <DialogTitle>{t("tokens.createTitle")}</DialogTitle>
+              <DialogDescription>{t("tokens.createDescription")}</DialogDescription>
             </DialogHeader>
             <div className="space-y-4 py-4">
               <div className="space-y-2">
-                <Label htmlFor="token-name">Name</Label>
+                <Label htmlFor="token-name">{t("tokens.columns.name")}</Label>
                 <Input
                   id="token-name"
                   value={name}
@@ -222,7 +220,7 @@ function CreateTokenDialog({
                 />
               </div>
               <fieldset className="space-y-3">
-                <legend className="text-sm font-medium">Scopes</legend>
+                <legend className="text-sm font-medium">{t("tokens.columns.scopes")}</legend>
                 {ALL_SCOPES.map((scope) => (
                   <label key={scope.value} className="flex items-start gap-3 text-sm">
                     <Checkbox
@@ -239,7 +237,7 @@ function CreateTokenDialog({
                     <span>
                       <span className="font-mono text-xs">{scope.value}</span>
                       <span className="block text-xs text-muted-foreground">
-                        {scope.description}
+                        {t(scope.descriptionKey)}
                       </span>
                     </span>
                   </label>
@@ -248,10 +246,10 @@ function CreateTokenDialog({
             </div>
             <DialogFooter>
               <Button type="button" variant="ghost" onClick={close}>
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button type="submit" disabled={create.isPending || !name.trim() || !scopes.length}>
-                {create.isPending ? "Creating…" : "Create token"}
+                {create.isPending ? t("tokens.creating") : t("tokens.create")}
               </Button>
             </DialogFooter>
           </form>

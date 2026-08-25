@@ -1,5 +1,6 @@
 import { createFileRoute, redirect } from "@tanstack/react-router";
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { CreateTenantDialog } from "@/components/create-tenant-dialog";
 import { Button } from "@/components/ui/button";
@@ -20,6 +21,7 @@ export const Route = createFileRoute("/_authed/")({
 });
 
 function IndexPage() {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
 
   return (
@@ -28,15 +30,12 @@ function IndexPage() {
         <CardHeader>
           <CardTitle>
             {/* shadcn の CardTitle は div なので、ページ見出しはここで実タグにする */}
-            <h1>Create your first tenant</h1>
+            <h1>{t("home.firstTenantTitle")}</h1>
           </CardTitle>
-          <CardDescription>
-            Projects, builds and GitHub installations all live inside a tenant. You need one before
-            you can upload screenshots.
-          </CardDescription>
+          <CardDescription>{t("home.firstTenantDescription")}</CardDescription>
         </CardHeader>
         <CardContent>
-          <Button onClick={() => setOpen(true)}>New tenant</Button>
+          <Button onClick={() => setOpen(true)}>{t("home.newTenant")}</Button>
         </CardContent>
       </Card>
       <CreateTenantDialog open={open} onOpenChange={setOpen} />

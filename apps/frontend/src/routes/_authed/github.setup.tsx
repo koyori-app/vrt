@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 import { readSetupReturnPath } from "@/lib/github-setup";
 
@@ -23,6 +24,7 @@ export const Route = createFileRoute("/_authed/github/setup")({
 });
 
 function GithubSetupPage() {
+  const { t } = useTranslation();
   const { installation_id, setup_action, state } = Route.useSearch();
 
   useEffect(() => {
@@ -42,5 +44,7 @@ function GithubSetupPage() {
     window.location.replace(`${target.pathname}${target.search}${target.hash}`);
   }, [installation_id, setup_action, state]);
 
-  return <p className="py-16 text-center text-sm text-muted-foreground">Connecting GitHub…</p>;
+  return (
+    <p className="py-16 text-center text-sm text-muted-foreground">{t("githubSetup.connecting")}</p>
+  );
 }

@@ -1,6 +1,14 @@
 import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, ChevronsUpDownIcon, KeyIcon, LogOutIcon, PlusIcon } from "lucide-react";
+import {
+  CheckIcon,
+  ChevronsUpDownIcon,
+  KeyIcon,
+  LanguagesIcon,
+  LogOutIcon,
+  PlusIcon,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -17,6 +25,7 @@ import { useTenants } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
 export function TopNav({ me, onCreateTenant }: { me: Me; onCreateTenant?: () => void }) {
+  const { t } = useTranslation();
   const tenants = useTenants();
   const params = useParams({ strict: false }) as { tenantSlug?: string };
   const activeTenant = tenants.data?.find((t) => t.slug === params.tenantSlug);
@@ -36,12 +45,12 @@ export function TopNav({ me, onCreateTenant }: { me: Me; onCreateTenant?: () => 
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="sm" className="gap-1.5">
-              {activeTenant?.name ?? "Select tenant"}
+              {activeTenant?.name ?? t("nav.selectTenant")}
               <ChevronsUpDownIcon className="size-3.5 opacity-60" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-56">
-            <DropdownMenuLabel>Tenants</DropdownMenuLabel>
+            <DropdownMenuLabel>{t("nav.tenants")}</DropdownMenuLabel>
             {tenants.data?.length ? (
               tenants.data.map((tenant) => (
                 <DropdownMenuItem key={tenant.id} asChild>
@@ -61,14 +70,14 @@ export function TopNav({ me, onCreateTenant }: { me: Me; onCreateTenant?: () => 
                 </DropdownMenuItem>
               ))
             ) : (
-              <DropdownMenuItem disabled>No tenants yet</DropdownMenuItem>
+              <DropdownMenuItem disabled>{t("nav.noTenants")}</DropdownMenuItem>
             )}
             {onCreateTenant ? (
               <>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onSelect={() => onCreateTenant()}>
                   <PlusIcon className="size-3.5" />
-                  New tenant
+                  {t("nav.newTenant")}
                 </DropdownMenuItem>
               </>
             ) : null}
@@ -84,6 +93,7 @@ export function TopNav({ me, onCreateTenant }: { me: Me; onCreateTenant?: () => 
 }
 
 function UserMenu({ me }: { me: Me }) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const logout = $api.useMutation("post", "/v1/auth/logout", {
@@ -92,7 +102,7 @@ function UserMenu({ me }: { me: Me }) {
       queryClient.clear();
       await navigate({ to: "/login", search: {} });
     },
-    onError: (error) => toast.error(errorMessage(error, "Logout failed")),
+    onError: (error) => toast.error(errorMessage(error, t("nav.signOutFailed"))),
   });
 
   return (
@@ -112,7 +122,13 @@ function UserMenu({ me }: { me: Me }) {
         <DropdownMenuItem asChild>
           <Link to="/settings/tokens">
             <KeyIcon className="size-3.5" />
-            API tokens
+            {t("nav.apiTokens")}
+          </Link>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild>
+          <Link to="/settings/language">
+            <LanguagesIcon className="size-3.5" />
+            {t("nav.language")}
           </Link>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
@@ -124,7 +140,7 @@ function UserMenu({ me }: { me: Me }) {
           }}
         >
           <LogOutIcon className="size-3.5" />
-          Sign out
+          {t("nav.signOut")}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

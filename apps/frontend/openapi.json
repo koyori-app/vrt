@@ -6133,6 +6133,111 @@
             "bearerAuth": []
           }
         ]
+      },
+      "patch": {
+        "tags": [
+          "Users"
+        ],
+        "summary": "ログイン中ユーザーを更新",
+        "description": "`language` は画面表示に使う言語。`null` を指定すると未設定へ戻り、画面はブラウザの言語設定に従う。対応していない言語タグはボディのdeserialize で弾かれ 422。フィールドを省略すると据え置き。PAT では変更できない（403）。",
+        "operationId": "update_me",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "更新後のユーザー",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "対応していない言語タグです",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     }
   },
@@ -7030,6 +7135,14 @@
           }
         }
       },
+      "Language": {
+        "type": "string",
+        "description": "画面表示に使う言語。\n\n未設定（`None`）は「クライアントに任せる」——`Accept-Language` や\nブラウザ設定から決める。ここに無い言語タグが DB に入っていた場合も\n未設定として扱う（不正な行でプロフィール取得ごと落とさない）。",
+        "enum": [
+          "en",
+          "ja"
+        ]
+      },
       "MeResponse": {
         "type": "object",
         "description": "ログイン中ユーザー自身のプロフィール。",
@@ -7058,6 +7171,17 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "language": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Language",
+                "description": "表示言語。`null` は未設定（クライアント側の判定に任せる）。"
+              }
+            ]
           },
           "username": {
             "type": "string"
@@ -7438,6 +7562,23 @@
           "username": {
             "type": "string",
             "description": "ログインするユーザー名。存在しなければ作成する。"
+          }
+        }
+      },
+      "UpdateMeRequest": {
+        "type": "object",
+        "description": "プロフィールの更新。\n\n`language` に `null` を送ると未設定へ戻る（＝ブラウザの言語に従う）。\nフィールド自体を省略したときは現在値を据え置く——他プロジェクト設定の\nPATCH と同じ約束にしてある。対応していない言語タグは enum の\ndeserialize が弾く。",
+        "properties": {
+          "language": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Language",
+                "description": "表示言語。`null` で未設定へ戻す。省略すると据え置き。"
+              }
+            ]
           }
         }
       },

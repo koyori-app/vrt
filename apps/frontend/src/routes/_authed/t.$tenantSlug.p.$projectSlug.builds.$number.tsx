@@ -2,6 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeftIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import {
@@ -27,6 +28,7 @@ export const Route = createFileRoute("/_authed/t/$tenantSlug/p/$projectSlug/buil
 const PROCESSING_POLL_MS = 3_000;
 
 function BuildReviewPage() {
+  const { t } = useTranslation();
   const { tenantSlug, projectSlug, number } = Route.useParams();
   const { tenant } = useResolvedTenant(tenantSlug);
   const { project } = useResolvedProject(tenant?.id, projectSlug);
@@ -56,7 +58,7 @@ function BuildReviewPage() {
   if (!build) {
     return (
       <p className="py-16 text-center text-sm text-muted-foreground">
-        {buildQuery.isLoading || !project ? "Loading…" : `No build #${number} in this project.`}
+        {buildQuery.isLoading || !project ? t("common.loading") : t("build.missing", { number })}
       </p>
     );
   }
@@ -86,6 +88,7 @@ function BuildReview({
   initialBuild: Build;
   githubRepo: string | null | undefined;
 }) {
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [filter, setFilter] = useComparisonFilter();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -154,31 +157,31 @@ function BuildReview({
 
   const reviewComparison = $api.useMutation("post", "/v1/comparisons/{comparison_id}/review", {
     onSuccess: invalidateBuild,
-    onError: (error) => toast.error(errorMessage(error, "Review failed")),
+    onError: (error) => toast.error(errorMessage(error, t("build.reviewFailed"))),
   });
 
   const approveBuild = $api.useMutation("post", "/v1/builds/{build_id}/approve", {
     onSuccess: async () => {
       await invalidateBuild();
-      toast.success("Build approved — screenshots promoted to the new baseline");
+      toast.success(t("build.approved"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not approve build")),
+    onError: (error) => toast.error(errorMessage(error, t("build.approveFailed"))),
   });
 
   const rejectBuild = $api.useMutation("post", "/v1/builds/{build_id}/reject", {
     onSuccess: async () => {
       await invalidateBuild();
-      toast.success("Build rejected");
+      toast.success(t("build.rejected"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not reject build")),
+    onError: (error) => toast.error(errorMessage(error, t("build.rejectFailed"))),
   });
 
   const retryBuild = $api.useMutation("post", "/v1/builds/{build_id}/retry", {
     onSuccess: async () => {
       await invalidateBuild();
-      toast.success("Build retry started");
+      toast.success(t("build.retryStarted"));
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not retry build")),
+    onError: (error) => toast.error(errorMessage(error, t("build.retryFailed"))),
   });
 
   const review = useCallback(
@@ -273,16 +276,14 @@ function BuildReview({
       return;
     }
 
-    const ok = confirm(
-      `${pendingReviews} comparison(s) are still unreviewed. Approve the whole build anyway?`,
-    );
+    const ok = confirm(t("build.confirmUnreviewed", { count: pendingReviews }));
     if (!ok) return;
 
     let acceptRemovals = false;
     if (pendingRemovals.length > 0) {
       const names = pendingRemovals.map((comparison) => comparison.name).join(", ");
       acceptRemovals = confirm(
-        `${pendingRemovals.length} story/stories will be removed from the baseline for good: ${names}. Confirm the removals?`,
+        t("build.confirmRemovals", { count: pendingRemovals.length, names }),
       );
       if (!acceptRemovals) return;
     }
@@ -291,7 +292,7 @@ function BuildReview({
     if (pendingFailures.length > 0) {
       const names = pendingFailures.map((comparison) => comparison.name).join(", ");
       acceptFailures = confirm(
-        `${pendingFailures.length} comparison(s) failed, so no trustworthy visual diff is available: ${names}. If you continue, the screenshots from these failed comparisons will become the baseline. Cancel to review each failed comparison individually first. Continue?`,
+        t("build.confirmFailures", { count: pendingFailures.length, names }),
       );
       if (!acceptFailures) return;
     }
@@ -310,14 +311,20 @@ function BuildReview({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-2xl font-semibold tracking-tight">Build #{build.number}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          {t("build.title", { number: build.number })}
+        </h1>
         <BuildStatusBadge status={build.status} />
         <span className="text-sm text-muted-foreground">
           {build.branch} ·{" "}
           <CommitLink githubRepo={githubRepo} commitSha={build.commit_sha} className="font-mono" />
-          {build.pull_request_number ? ` · PR #${build.pull_request_number}` : ""}
+          {build.pull_request_number
+            ? ` · ${t("build.pullRequest", { number: build.pull_request_number })}`
+            : ""}
         </span>
-        <span className="text-xs text-muted-foreground">{formatDate(build.created_at)}</span>
+        <span className="text-xs text-muted-foreground">
+          {formatDate(build.created_at, i18n.language)}
+        </span>
         <div className="flex-1" />
         {build.mode === "storybook" && build.storybook_uploaded ? (
           <Button variant="outline" asChild>
@@ -329,7 +336,7 @@ function BuildReview({
               target="_blank"
               rel="noopener noreferrer"
             >
-              Open Storybook
+              {t("build.openStorybook")}
             </a>
           </Button>
         ) : null}
@@ -339,28 +346,33 @@ function BuildReview({
             disabled={retryBuild.isPending}
             onClick={() => retryBuild.mutate({ params: { path: { build_id: buildId } } })}
           >
-            Retry build
+            {t("build.retry")}
           </Button>
         ) : null}
         <Button variant="success" disabled={approveBuild.isPending} onClick={onApproveBuild}>
-          Approve build
+          {t("build.approve")}
         </Button>
         <Button
           variant="destructive"
           disabled={rejectBuild.isPending}
           onClick={() => {
-            if (!confirm("Reject this build?")) return;
+            if (!confirm(t("build.confirmReject"))) return;
             rejectBuild.mutate({ params: { path: { build_id: buildId } } });
           }}
         >
-          Reject build
+          {t("build.reject")}
         </Button>
       </div>
 
       <p className="text-xs text-muted-foreground">
-        {build.total_count} comparisons · {build.changed_count} changed · {build.added_count} added
-        · {build.removed_count} removed · {build.unchanged_count} unchanged
-        {pendingReviews > 0 ? ` · ${pendingReviews} awaiting review` : ""}
+        {t("build.counts", {
+          total: build.total_count,
+          changed: build.changed_count,
+          added: build.added_count,
+          removed: build.removed_count,
+          unchanged: build.unchanged_count,
+        })}
+        {pendingReviews > 0 ? ` · ${t("build.awaitingReview", { count: pendingReviews })}` : ""}
       </p>
       {build.error_message ? (
         <BuildFailureAlert
@@ -383,9 +395,9 @@ function BuildReview({
           />
           <p className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
             <kbd className="rounded border border-border px-1">j</kbd>/
-            <kbd className="rounded border border-border px-1">k</kbd> navigate ·{" "}
-            <kbd className="rounded border border-border px-1">a</kbd> approve ·{" "}
-            <kbd className="rounded border border-border px-1">x</kbd> reject
+            <kbd className="rounded border border-border px-1">k</kbd> {t("build.shortcutMove")} ·{" "}
+            <kbd className="rounded border border-border px-1">a</kbd> {t("build.shortcutApprove")}{" "}
+            · <kbd className="rounded border border-border px-1">x</kbd> {t("build.shortcutReject")}
           </p>
         </aside>
 
@@ -398,7 +410,7 @@ function BuildReview({
             />
           ) : (
             <p className="grid h-full place-items-center p-8 text-sm text-muted-foreground">
-              {comparisonsQuery.isLoading ? "Loading comparisons…" : "No comparison selected."}
+              {comparisonsQuery.isLoading ? t("build.loadingComparisons") : t("build.noSelection")}
             </p>
           )}
         </section>

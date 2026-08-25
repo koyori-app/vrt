@@ -313,6 +313,9 @@ pub async fn upsert_test_user(
         avatar_url: Set(None),
         email: Set(None),
         sessions_revoked_at: Set(None),
+        // 表示言語は未設定で作る——画面はブラウザの言語に従い、
+        // ユーザーが明示的に選んだときだけ固定される。
+        language: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -382,6 +385,7 @@ async fn create_user_with_connection(
                 avatar_url: Set(avatar_url),
                 email: Set(email),
                 sessions_revoked_at: Set(None),
+                language: Set(None),
                 created_at: Set(now),
                 updated_at: Set(now),
             }

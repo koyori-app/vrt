@@ -1,6 +1,7 @@
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
+import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -24,6 +25,7 @@ export function CreateTenantDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const { t } = useTranslation();
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [slugTouched, setSlugTouched] = useState(false);
@@ -37,10 +39,10 @@ export function CreateTenantDialog({
       setName("");
       setSlug("");
       setSlugTouched(false);
-      toast.success(`Created ${tenant.name}`);
+      toast.success(t("createTenant.created", { name: tenant.name }));
       await navigate({ to: "/t/$tenantSlug", params: { tenantSlug: tenant.slug } });
     },
-    onError: (error) => toast.error(errorMessage(error, "Could not create tenant")),
+    onError: (error) => toast.error(errorMessage(error, t("createTenant.failed"))),
   });
 
   const effectiveSlug = slugTouched ? slug : slugify(name);
@@ -57,25 +59,23 @@ export function CreateTenantDialog({
       <DialogContent>
         <form onSubmit={onSubmit}>
           <DialogHeader>
-            <DialogTitle>New tenant</DialogTitle>
-            <DialogDescription>
-              A tenant groups projects, members and GitHub installations.
-            </DialogDescription>
+            <DialogTitle>{t("createTenant.title")}</DialogTitle>
+            <DialogDescription>{t("createTenant.description")}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label htmlFor="tenant-name">Name</Label>
+              <Label htmlFor="tenant-name">{t("createTenant.name")}</Label>
               <Input
                 id="tenant-name"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="Acme Inc"
+                placeholder={t("createTenant.namePlaceholder")}
                 required
                 autoFocus
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="tenant-slug">Slug</Label>
+              <Label htmlFor="tenant-slug">{t("createTenant.slug")}</Label>
               <Input
                 id="tenant-slug"
                 value={effectiveSlug}
@@ -83,20 +83,20 @@ export function CreateTenantDialog({
                   setSlugTouched(true);
                   setSlug(event.target.value);
                 }}
-                placeholder="acme"
+                placeholder={t("createTenant.slugPlaceholder")}
                 required
               />
               <p className="text-xs text-muted-foreground">
-                Used in URLs: /t/{effectiveSlug || "…"}
+                {t("createTenant.slugHint", { slug: effectiveSlug || "…" })}
               </p>
             </div>
           </div>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
-              Cancel
+              {t("common.cancel")}
             </Button>
             <Button type="submit" disabled={createTenant.isPending || !name || !effectiveSlug}>
-              {createTenant.isPending ? "Creating…" : "Create tenant"}
+              {createTenant.isPending ? t("createTenant.submitting") : t("createTenant.submit")}
             </Button>
           </DialogFooter>
         </form>

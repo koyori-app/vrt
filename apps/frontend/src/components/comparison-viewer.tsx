@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { ComparisonStatusBadge, ReviewStatusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
@@ -16,6 +17,8 @@ function Frame({
   src: string | null;
   className?: string;
 }) {
+  const { t } = useTranslation();
+
   return (
     <figure className={cn("min-w-0 space-y-2", className)}>
       <figcaption className="text-xs font-medium text-muted-foreground">{label}</figcaption>
@@ -27,7 +30,7 @@ function Frame({
         />
       ) : (
         <div className="grid h-40 place-items-center rounded-md border border-dashed border-border text-xs text-muted-foreground">
-          Not available
+          {t("comparison.notAvailable")}
         </div>
       )}
     </figure>
@@ -41,6 +44,7 @@ function SwipeView({
   baselineSrc: string | null;
   currentSrc: string | null;
 }) {
+  const { t } = useTranslation();
   const [position, setPosition] = useState(50);
   const [dragging, setDragging] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -48,7 +52,7 @@ function SwipeView({
   if (!baselineSrc || !currentSrc) {
     return (
       <div className="grid h-40 place-items-center rounded-md border border-dashed border-border text-xs text-muted-foreground">
-        Not available
+        {t("comparison.notAvailable")}
       </div>
     );
   }
@@ -101,23 +105,23 @@ function SwipeView({
     >
       <img
         src={baselineSrc}
-        alt="Baseline"
+        alt={t("comparison.baseline")}
         draggable={false}
         className="w-full object-contain object-top"
       />
       <img
         src={currentSrc}
-        alt="Current"
+        alt={t("comparison.current")}
         draggable={false}
         style={{ clipPath: `inset(0 ${100 - position}% 0 0)` }}
         className="absolute inset-0 h-full w-full object-contain object-top"
       />
 
       <span className="pointer-events-none absolute left-2 top-2 rounded bg-background/80 px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
-        Current
+        {t("comparison.current")}
       </span>
       <span className="pointer-events-none absolute right-2 top-2 rounded bg-background/80 px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
-        Baseline
+        {t("comparison.baseline")}
       </span>
 
       <div
@@ -129,7 +133,7 @@ function SwipeView({
           aria-valuenow={Math.round(position)}
           aria-valuemin={0}
           aria-valuemax={100}
-          aria-label="Comparison position"
+          aria-label={t("comparison.sliderLabel")}
           tabIndex={0}
           onKeyDown={handleKeyDown}
           className="pointer-events-auto absolute left-1/2 top-1/2 grid h-6 w-6 -translate-x-1/2 -translate-y-1/2 cursor-col-resize place-items-center rounded-full border border-border bg-background shadow"
@@ -150,6 +154,7 @@ export function ComparisonViewer({
   onReview: (action: "approve" | "reject") => void;
   reviewPending: boolean;
 }) {
+  const { t } = useTranslation();
   const [opacity, setOpacity] = useState(50);
 
   const baselineSrc = comparison.baseline_entry_id
@@ -178,7 +183,7 @@ export function ComparisonViewer({
             disabled={reviewPending}
             onClick={() => onReview("approve")}
           >
-            Approve
+            {t("comparison.approve")}
           </Button>
           <Button
             size="sm"
@@ -186,7 +191,7 @@ export function ComparisonViewer({
             disabled={reviewPending}
             onClick={() => onReview("reject")}
           >
-            Reject
+            {t("comparison.reject")}
           </Button>
         </div>
       </div>
@@ -199,16 +204,16 @@ export function ComparisonViewer({
 
       <Tabs defaultValue="side-by-side" className="min-h-0 flex-1 overflow-y-auto p-4">
         <TabsList>
-          <TabsTrigger value="side-by-side">Side-by-side</TabsTrigger>
-          <TabsTrigger value="swipe">Swipe</TabsTrigger>
-          <TabsTrigger value="diff">Diff</TabsTrigger>
-          <TabsTrigger value="onion">Onion-skin</TabsTrigger>
+          <TabsTrigger value="side-by-side">{t("comparison.sideBySide")}</TabsTrigger>
+          <TabsTrigger value="swipe">{t("comparison.swipe")}</TabsTrigger>
+          <TabsTrigger value="diff">{t("comparison.diff")}</TabsTrigger>
+          <TabsTrigger value="onion">{t("comparison.onion")}</TabsTrigger>
         </TabsList>
 
         <TabsContent value="side-by-side" className="pt-4">
           <div className="grid gap-4 lg:grid-cols-2">
-            <Frame label="Baseline" src={baselineSrc} />
-            <Frame label="Current" src={currentSrc} />
+            <Frame label={t("comparison.baseline")} src={baselineSrc} />
+            <Frame label={t("comparison.current")} src={currentSrc} />
           </div>
         </TabsContent>
 
@@ -217,12 +222,12 @@ export function ComparisonViewer({
         </TabsContent>
 
         <TabsContent value="diff" className="pt-4">
-          <Frame label="Diff" src={diffSrc} />
+          <Frame label={t("comparison.diff")} src={diffSrc} />
         </TabsContent>
 
         <TabsContent value="onion" className="space-y-4 pt-4">
           <div className="flex items-center gap-3">
-            <span className="text-xs text-muted-foreground">Baseline</span>
+            <span className="text-xs text-muted-foreground">{t("comparison.baseline")}</span>
             <Slider
               className="max-w-sm"
               value={[opacity]}
@@ -231,25 +236,27 @@ export function ComparisonViewer({
               step={1}
               onValueChange={([value]) => setOpacity(value ?? 50)}
             />
-            <span className="text-xs text-muted-foreground">Current ({opacity}%)</span>
+            <span className="text-xs text-muted-foreground">
+              {t("comparison.currentWithOpacity", { opacity })}
+            </span>
           </div>
           {/* Current is stacked over baseline; the slider drives its opacity. */}
           <div className="relative w-full">
             {baselineSrc ? (
               <img
                 src={baselineSrc}
-                alt="Baseline"
+                alt={t("comparison.baseline")}
                 className="vrt-checkerboard w-full rounded-md border border-border"
               />
             ) : (
               <div className="grid h-40 place-items-center rounded-md border border-dashed border-border text-xs text-muted-foreground">
-                No baseline
+                {t("comparison.noBaseline")}
               </div>
             )}
             {currentSrc ? (
               <img
                 src={currentSrc}
-                alt="Current"
+                alt={t("comparison.current")}
                 style={{ opacity: opacity / 100 }}
                 className="absolute inset-0 h-full w-full rounded-md object-contain object-top"
               />

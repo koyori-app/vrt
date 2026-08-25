@@ -1,8 +1,15 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRouter as createTanStackRouter } from "@tanstack/react-router";
 import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 
 import { routeTree } from "./routeTree.gen";
+
+/** ルーターの既定 404。文言は i18n プロバイダ配下で解決する。 */
+function NotFound() {
+  const { t } = useTranslation();
+  return <div className="p-8 text-sm">{t("common.notFound")}</div>;
+}
 
 export function getRouter() {
   const queryClient = new QueryClient({
@@ -26,7 +33,7 @@ export function getRouter() {
     context: { queryClient },
     defaultPreload: "intent",
     scrollRestoration: true,
-    defaultNotFoundComponent: () => <div className="p-8 text-sm">Not found.</div>,
+    defaultNotFoundComponent: NotFound,
     Wrap: ({ children }: { children: ReactNode }) => (
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     ),

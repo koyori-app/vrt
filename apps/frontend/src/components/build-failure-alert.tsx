@@ -1,3 +1,5 @@
+import { useTranslation } from "react-i18next";
+
 import type { Build } from "@/lib/api";
 import { failurePresentation } from "@/lib/build-failure";
 import { cn } from "@/lib/utils";
@@ -11,6 +13,7 @@ export function BuildFailureAlert({
   code: Build["failure_code"];
   message: string;
 }) {
+  const { t } = useTranslation();
   const presentation = failurePresentation(origin);
 
   return (
@@ -24,14 +27,14 @@ export function BuildFailureAlert({
       )}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <p className="font-medium">{presentation.title}</p>
+        <p className="font-medium">{t(presentation.titleKey)}</p>
         {code ? (
           <code className="rounded bg-background/70 px-1.5 py-0.5 text-xs text-muted-foreground">
             {code}
           </code>
         ) : null}
       </div>
-      <p className="text-xs text-muted-foreground">{presentation.guidance}</p>
+      <p className="text-xs text-muted-foreground">{t(presentation.guidanceKey)}</p>
       <p className="whitespace-pre-wrap break-words">{message}</p>
     </div>
   );

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 import { client, type BuildLogEntry, type BuildStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -35,6 +36,7 @@ function levelClass(level: string): string {
  * up; returning to the bottom re-enables following.
  */
 export function BuildLogPanel({ buildId, status }: { buildId: string; status: BuildStatus }) {
+  const { t } = useTranslation();
   const [entries, setEntries] = useState<BuildLogEntry[]>([]);
   const [error, setError] = useState<string | undefined>(undefined);
   // Cursor lives in a ref so the poll callback never closes over a stale value
@@ -48,7 +50,7 @@ export function BuildLogPanel({ buildId, status }: { buildId: string; status: Bu
       params: { path: { build_id: buildId }, query: { after: cursorRef.current } },
     });
     if (fetchError) {
-      setError("Could not load build logs");
+      setError(t("buildLog.loadFailed"));
       return;
     }
     setError(undefined);
@@ -56,7 +58,7 @@ export function BuildLogPanel({ buildId, status }: { buildId: string; status: Bu
     if (data.entries.length > 0) {
       setEntries((prev) => [...prev, ...data.entries]);
     }
-  }, [buildId]);
+  }, [buildId, t]);
 
   // Reset when switching to a different build.
   useEffect(() => {
@@ -103,9 +105,9 @@ export function BuildLogPanel({ buildId, status }: { buildId: string; status: Bu
   return (
     <section className="space-y-2">
       <div className="flex items-center gap-2">
-        <h2 className="text-sm font-semibold tracking-tight">Progress log</h2>
+        <h2 className="text-sm font-semibold tracking-tight">{t("buildLog.title")}</h2>
         {isRunning(status) ? (
-          <span className="text-xs text-muted-foreground">live · updating every 2s</span>
+          <span className="text-xs text-muted-foreground">{t("buildLog.live")}</span>
         ) : null}
       </div>
       <div
@@ -115,7 +117,7 @@ export function BuildLogPanel({ buildId, status }: { buildId: string; status: Bu
       >
         {entries.length === 0 ? (
           <p className="text-zinc-500">
-            {error ?? (isRunning(status) ? "Waiting for the first log line…" : "No logs recorded.")}
+            {error ?? (isRunning(status) ? t("buildLog.waiting") : t("buildLog.empty"))}
           </p>
         ) : (
           entries.map((entry) => (
