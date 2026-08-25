@@ -304,10 +304,6 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
         let outcome = match (shot.as_ref(), entry.as_ref()) {
             (Some(_), None) => Outcome::added(),
-            (None, Some(_)) if cross_branch_baseline => {
-                ambiguous_missing_count += 1;
-                Outcome::ambiguous_cross_branch_missing(&build.branch, baseline_branch)
-            }
             (None, Some(_)) => Outcome::removed(),
             (Some(shot), Some(entry)) => {
                 let outcome = compare_pair(state, &project, &build, shot, entry).await?;
