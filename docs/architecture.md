@@ -10,11 +10,12 @@
                  ▼
              backend (axum, :3400) ──▶ Postgres
                  │                └──▶ Valkey（セッション / OAuth state）
-                 │
-                 ├─ apalis ワーカー（同一プロセス、Postgres がキュー）
-                 │    render_build / compare_build / github_status / github_webhook
-                 ├─ ヘッドレス Chromium（storybook モードのレンダリング。CHROMIUM_PATH）
+                 ├─ apalis ワーカー（compare_build / github_status / github_webhook）
                  └─ ストレージ（local ディレクトリ or S3 互換）
+
+             vrt-runner ──▶ Postgres の render_build キュー
+                 ├─ ヘッドレス Chromium（CHROMIUM_PATH）
+                 └─ backend と同じストレージ
 
 CI ──────────▶ backend /v1/ci/*（PAT の Bearer 認証。ブラウザを経由しない）
 ```
@@ -30,7 +31,7 @@ apps/backend      Rust ワークスペース（下記のクレート群 + migrat
 apps/frontend     TanStack Start + React 19 + Tailwind
 e2e               Playwright（独立した pnpm ルート）
 docs              この文書と docs/github-app.md
-docker-compose.yml  db / redis / migration / backend / frontend
+docker-compose.yml  db / redis / migration / backend / runner / frontend
 ```
 
 ## backend のクレート依存グラフ
@@ -244,7 +245,7 @@ HTTP リクエストはそこで完了する。worker が取得した時点で `
 ## レンダリングジョブ（storybook モード）
 
 `mode = storybook` のビルドは、CI が撮った PNG ではなく **ビルド済み Storybook
-の zip** を受け取り、サーバー側で撮る（Chromatic 方式）。`finalize` はビルドを
+の zip** を受け取り、Render worker で撮る（Chromatic 方式）。`finalize` はビルドを
 `queued` にして `render_build` ジョブを積むだけで、worker が取得した時点で
 `rendering` に進み実処理を行う:
 
@@ -279,6 +280,20 @@ HTTP リクエストはそこで完了する。worker が取得した時点で `
 どのストーリーで落ちたかが入る（Chromium が無い / 起動できない場合も同じ経路で
 `failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンス、
 ワーカーの同時実行数は 1、ブラウザ内の story page 同時実行数は 2 に固定してある。
+
+### 独立 runner
+
+`vrt-runner` は `render_build` キューだけを消費する独立バイナリで、API と同じ
+Postgres と成果物ストレージへ接続する。API に `RENDER_WORKER_ENABLED=false` を設定すると
+API 内の Render worker は起動しない。Chromium を持たない API イメージでもStorybook
+ビルドを受け付ける場合は、併せて `STORYBOOK_RENDER_ENABLED=true` を設定する。
+
+runner に必要な環境変数は `DATABASE_URL`、`CHROMIUM_PATH`、`STORAGE_BACKEND` と
+選択したストレージの設定だけで、Redis・OAuth・GitHub資格情報は渡さない。Postgres
+キューのclaimとheartbeatはapalisが担当し、runnerが途中で停止したジョブは孤児回収後に
+再投入される。runnerは1プロセスあたり1ビルドを処理するため、Dokployでは同じイメージを
+Start Command `/app/vrt-runner` で起動し、サービスのレプリカ数でビルド並列数を調整する。
+runnerを別ホストへ置く場合、localディレクトリは共有できないためS3互換ストレージを使う。
 
 ## ストレージ
 

@@ -35,7 +35,7 @@ use entity::{
 use service::build_logs::LogLevel;
 use service::render::{BundleError, RenderError, RenderOptions, StaticServer, StoryRenderer};
 
-use crate::JobState;
+use crate::RenderJobState;
 
 pub const QUEUE_NAME: &str = "render_build";
 pub const MAX_RETRIES: usize = 2;
@@ -171,7 +171,7 @@ pub async fn enqueue(
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
 /// `Err` を返すのはビルド行にすら書き戻せなかったケースだけ。
-pub async fn process(job: RenderBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
+pub async fn process(job: RenderBuildJob, state: Data<RenderJobState>) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
 
     match run(build_id, job.only_story_ids, &state).await {
@@ -234,7 +234,7 @@ fn truncate(s: &str, max: usize) -> String {
 async fn run(
     build_id: Uuid,
     only_story_ids: Option<Vec<String>>,
-    state: &JobState,
+    state: &RenderJobState,
 ) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
@@ -266,14 +266,7 @@ async fn run(
 
     let project = service::projects::get_project(db, build.project_id).await?;
 
-    let chromium_path = state
-        .settings
-        .chromium_path
-        .clone()
-        .filter(|p| !p.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("storybook rendering is not configured (CHROMIUM_PATH is unset)")
-        })?;
+    let chromium_path = state.chromium_path.clone();
 
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
     // （`(build_id, name)` の UNIQUE にぶつかると 2 回目以降が必ず落ちる。）
@@ -473,7 +466,7 @@ enum StoryTaskResult {
 /// 呼び出し側の [`tokio::try_join!`] で安全に 2 件まで並列実行できる。
 #[allow(clippy::too_many_arguments)]
 async fn process_story(
-    state: &JobState,
+    state: &RenderJobState,
     renderer: &StoryRenderer,
     base_url: &str,
     story: &service::render::Story,
@@ -566,7 +559,7 @@ struct RenderTallies {
 /// position を積んで警告ログだけ残す。`None`（2 巡目）では失敗として確定する。
 #[allow(clippy::too_many_arguments)]
 async fn persist_story_result(
-    state: &JobState,
+    state: &RenderJobState,
     project: &entity::projects::Model,
     build: &entity::builds::Model,
     mark_reused_flag: bool,
@@ -762,7 +755,7 @@ async fn persist_story_result(
 /// （各 story 高々 1 回で、全滅時も `stories × story_timeout` が上限）。
 #[allow(clippy::too_many_arguments)]
 async fn render_all(
-    state: &JobState,
+    state: &RenderJobState,
     project: &entity::projects::Model,
     build: &entity::builds::Model,
     renderer: &StoryRenderer,

@@ -89,6 +89,9 @@ services:
       # 「Open Storybook」がアップロード済みバンドルを展開して配信するためのキャッシュ先。
       # 派生データなので永続化しない（イメージ内で app 所有に作ってある。Dockerfile 参照）。
       STORYBOOK_CACHE_DIR: /home/app/storybook-cache
+      # Storybook ビルドは受け付けるが、Chromium worker は下の runner サービスへ分離する。
+      STORYBOOK_RENDER_ENABLED: "true"
+      RENDER_WORKER_ENABLED: "false"
       # storybook モード（サーバーサイドレンダリング）に使う Chromium。
       # イメージに同梱してある（そのぶんイメージが ~450MB 太っている。
       # 詳細は apps/backend/Dockerfile の runtime-base のコメント）。
@@ -132,6 +135,23 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+
+  runner:
+    image: vrt-backend:dev
+    command: ["/app/vrt-runner"]
+    environment:
+      DATABASE_URL: postgresql://vrt:vrt@db:5432/vrt
+      STORAGE_BACKEND: local
+      LOCAL_UPLOAD_DIR: /home/app/uploads
+      CHROMIUM_PATH: /usr/bin/chromium
+    volumes:
+      - uploads:/home/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   frontend:
     build:
