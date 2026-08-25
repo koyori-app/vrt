@@ -9,7 +9,9 @@
 //!    （project 設定で有効な場合は、ナビゲーション前に
 //!    `Emulation.setEmulatedMedia` で `prefers-reduced-motion: reduce` を
 //!    エミュレートし、撮影直前に適用を実測する——効いていなければ撮らない）
-//! 3. Storybook 自身の描画完了シグナル（アドオンチャンネルの `storyRendered`）を待ち、
+//! 3. Storybook 自身の描画シグナル（アドオンチャンネルの `storyRendered`）と
+//!    preview の render phase（play が走っている間は待ち、終わった phase で
+//!    初めて READY とする）を待ち、
 //!    短い settle 待ちのあと [`FREEZE_SCRIPT`] でキャレットとアニメーションを
 //!    決定的に静止させてから、ビューポートを PNG で撮る
 //!
@@ -25,7 +27,9 @@
 //!
 //! 1. **Storybook のシグナル（主）**: ナビゲーション前に [`READY_HOOK_SCRIPT`] を注入し、
 //!    `window.__STORYBOOK_ADDONS_CHANNEL__` に生えた瞬間へリスナーを差し込む。
-//!    `storyRendered` で完了、`storyErrored` / `storyThrewException` /
+//!    `storyRendered` は描画済みの印とし、preview が `storyRenders[].phase` を
+//!    公開する構成では phase が play の最中（`playing` まで）でない
+//!    ことも併せて要求する。`storyErrored` / `storyThrewException` /
 //!    `playFunctionThrewException` / `storyMissing` はそのストーリーのエラーとして扱う
 //!    （30 秒待たされずに理由が出る）。rendered / error の印には観測時の
 //!    `documentElement`（世代）を併記し、現在の document と一致するものだけを
@@ -71,7 +75,8 @@
 //! | 層 | 失敗を検知できるか | 検知したらどう倒れるか / 検知できぬ理由 |
 //! |----|----|----|
 //! | [`READY_HOOK_SCRIPT`] 注入 | CDP エラーは検知 | Rust 側 `Err`（fail-closed）。`defineProperty` 失敗は JS 内で握るが、`storyRenders` 保険が外れれば pending のままタイムアウトへ倒れる（fail-closed） |
-//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない（cmd_661 ①）。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定） |
+//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない（cmd_661 ①）。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定）。phase を読むのは**いま待っている story id を名乗るレンダー**だけ——`storyRenders` には docs の埋め込みレンダーや別 story のレンダーも並びうるため、末尾を無条件に読むと他所のレンダーの phase で自分の story を判定してしまう（`a_foreign_render_does_not_decide_our_story_readiness`）。id を名乗る要素が一つも無い形だけ従来どおり末尾を読む |
+//! | play の失敗 | `playFunctionThrewException` / `unhandledErrorsWhilePlaying` を検知 | 例外は世代内の先着 error として [`RenderError::Story`] へ倒し、文言を診断に載せて撮影しない（fail-closed）。撮影が play を追い越さないよう、preview の phase が `playing` までの間は rendered 印があっても READY にしない（判定対象は待っている story id を名乗るレンダー）。**判定を `completed` phase だけに絞ってはならない**——SB 9 の `StoryRender` は `completed` の中で `storyRendered` を emit した直後に `afterEach` → `finished` へ進むため、[`POLL_INTERVAL`]（100ms）で観測される定常値は `finished` であり、`completed` だけを ready の条件にすると正常な story が全て Timeout に倒れる（cmd_693。`a_story_that_settles_in_the_finished_phase_is_captured` が固定）。知らない phase 名は phase で判定せず、世代つきの rendered 印へ落とす |
 //! | 静止 CSS 注入（`freezeRoot`） | throw・API 欠落を検知 | constructed stylesheet（CSSOM）で注入する。構築・`replaceSync`・`adoptedStyleSheets` 代入の throw、`CSSStyleSheet` コンストラクタの欠落は `errors` → `ok: false`（fail-closed）。CSSOM 操作は CSP `style-src` の管轄外なので、旧 `<style>` 注入が持っていた「CSP による例外なしの黙殺」という検知不能経路は**構造ごと消えている** |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
 //! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を READY 待ちと共有の deadline（`started + story_timeout`）の残余の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
@@ -375,6 +380,9 @@ const READY_HOOK_SCRIPT: &str = r#"
 ///
 /// `absent` は「Storybook ランタイムが見当たらない」。呼び出し側が
 /// [`SIGNAL_GRACE`] 経過後に `dom_ready` を見て判断する。
+///
+/// `__VRT_STORY_ID__` は [`ready_probe`] が JSON 文字列リテラルへ差し替える
+/// 差し込み口。そのまま `evaluate` に渡してはならない。
 const READY_PROBE: &str = r#"
 JSON.stringify((() => {
   const loaded = document.readyState === 'complete' || document.readyState === 'interactive';
@@ -390,35 +398,43 @@ JSON.stringify((() => {
   if (hook && hook.error && hook.errorRoot === current) {
     return { state: 'error', message: String(hook.error) };
   }
-  if (hook && hook.rendered && hook.renderedRoot === current) return { state: 'ready' };
-
-  // フックがチャンネルを掴めなかったときの保険。SB 8〜10 のプレビューは
+  // Storybook の StoryRender は preparing → loading → beforeEach → rendering →
+  // playing → played → completing → completed → afterEach → finished と phase を
+  // 進め、`storyRendered` は **`completed` phase の中で** emit する（SB 9.0.0 の
+  // `StoryRender.ts` で確認。play が投げたときは `errored` へ倒れ `storyRendered`
+  // は出ない）。play が走っている間の phase は `playing` までなので、rendered 印
+  // より先に phase を見れば play の完了前に撮るのを防げる（cmd_692）。
+  //
+  // ただし `completed` は afterEach へ抜けるまでの 1 マイクロタスクしか続かず、
+  // 100ms 間隔の [`POLL_INTERVAL`] が実際に観測する定常値は `finished` である。
+  // ready の条件を `completed` だけに絞ると、正常な story が一つも READY に
+  // ならず全て 30 秒の Timeout に倒れる（cmd_693）。待つ phase と終わった
+  // phase の両方を名前で挙げ、知らない名前は phase で判定しない。
+  //
+  // フックがチャンネルを掴めなかったときの保険も兼ねる。SB 8〜10 のプレビューは
   // 進行中/完了したレンダーを storyRenders に持ち、phase で状態を出す。
   try {
     const renders = window.__STORYBOOK_PREVIEW__ && window.__STORYBOOK_PREVIEW__.storyRenders;
+    // storyRenders には docs の埋め込みレンダーや前の story のレンダーも
+    // 並びうる。`StoryRender` は自分が描く story id を `id` に持つので
+    // （SB 10.0.0 の `StoryRender.ts` で `public id: StoryId` を確認）、
+    // **いま待っている story のレンダー**だけを見る。id を名乗る要素が
+    // 一つも無い形（古い実装・最小 fixture）に限り、従来どおり末尾を見る。
+    let render = null;
     if (Array.isArray(renders) && renders.length > 0) {
-      const phase = renders[renders.length - 1].phase;
-      if (phase === 'completed') {
-        // storyRenders は Storybook 自身が window に置く状態で、hook と違い
-        // 世代を刻んでいない（内部実装への書き込みは採らない判断——モジュール
-        // doc の常駐状態表を参照）——前 document の completed が差し替えを
-        // 生き延びる。現在の document の root に描画結果があることを併せて
-        // 要求する（root つきの内容へ差し替える形は依然すり抜ける。既知の
-        // 限界としてモジュール doc の失敗経路表に明記）。
-        //
-        // この門の代償（cmd_663 ⑤・errored 分岐の判断の逆向きの帰結）:
-        // 何も描かず終える story は正当（このモジュールの出発点の
-        // PasswordStrengthBar）だが、保険経路にしか乗れない構成（channel を
-        // 掴み損ねた等）では null を返す story・portal で body 直下へ描く
-        // story の domReady が永久に false になり、門の導入前は撮れていた
-        // ものが 30 秒 Timeout に倒れる。向きは fail-closed（stale completed
-        // で未検証の絵を撮る fail-open を塞ぐ側）だが巻き添えである——
-        // root の中身に依存しない突き合わせ（completed 観測時の世代を Rust
-        // 側で覚える等）は検証世代の一般化そのもので、#27 の範囲外として
-        // 併記に留める（モジュール doc「本 PR で扱わないもの」）。
-        if (domReady) return { state: 'ready' };
-        return { state: 'pending', dom_ready: domReady };
+      let identified = false;
+      for (let i = renders.length - 1; i >= 0; i--) {
+        const entry = renders[i];
+        if (!entry || typeof entry.id !== 'string') continue;
+        identified = true;
+        if (entry.id === __VRT_STORY_ID__) { render = entry; break; }
       }
+      // id を名乗るのに我々の story が居ないなら、それは他所のレンダー——
+      // phase では判定せず、世代つきの rendered 印を見る下の経路へ落とす。
+      if (!render && !identified) render = renders[renders.length - 1];
+    }
+    if (render) {
+      const phase = render.phase;
       if (phase === 'errored' || phase === 'aborted') {
         // こちらには completed 側の domReady のような門を**掛けない**（判断。
         // cmd_662 ③）。理由は二つ。(1) 失敗の向き: 前 document の stale な
@@ -433,17 +449,73 @@ JSON.stringify((() => {
         // completed と同じ（モジュール doc の常駐状態の表を参照）。
         return { state: 'error', message: 'render phase: ' + String(phase) };
       }
-      return { state: 'pending', dom_ready: domReady };
+      // 絵がまだ確定していない phase。世代の合う rendered 印があっても
+      // READY にしない——これが play の完了を待つ門である。`played` /
+      // `completing` は play を抜けた後の短い区間だが、`completed` だけを
+      // ready としていた従来と同じ側（pending）へ倒しておく。
+      if (
+        phase === 'preparing' || phase === 'loading' || phase === 'beforeEach' ||
+        phase === 'rendering' || phase === 'playing' || phase === 'played' ||
+        phase === 'completing'
+      ) {
+        return { state: 'pending', dom_ready: domReady };
+      }
+      if (phase === 'completed' || phase === 'afterEach' || phase === 'finished') {
+        // channel で現 document の storyRendered も観測済みなら、
+        // 世代は hook 側で固定できている。空 story も正当なので
+        // domReady を要求しない。
+        if (hook && hook.rendered && hook.renderedRoot === current) {
+          return { state: 'ready' };
+        }
+        // storyRenders は Storybook 自身が window に置く状態で、hook と違い
+        // 世代を刻んでいない（内部実装への書き込みは採らない判断——モジュール
+        // doc の常駐状態表を参照）——前 document の完了 phase が差し替えを
+        // 生き延びる。現在の document の root に描画結果があることを併せて
+        // 要求する（root つきの内容へ差し替える形は依然すり抜ける。既知の
+        // 限界としてモジュール doc の失敗経路表に明記）。
+        //
+        // この門の代償（cmd_663 ⑤・errored 分岐の判断の逆向きの帰結）:
+        // 何も描かず終える story は正当（このモジュールの出発点の
+        // PasswordStrengthBar）だが、保険経路にしか乗れない構成（channel を
+        // 掴み損ねた等）では null を返す story・portal で body 直下へ描く
+        // story の domReady が永久に false になり、門の導入前は撮れていた
+        // ものが 30 秒 Timeout に倒れる。向きは fail-closed（stale な完了 phase
+        // で未検証の絵を撮る fail-open を塞ぐ側）だが巻き添えである——
+        // root の中身に依存しない突き合わせ（完了 phase 観測時の世代を Rust
+        // 側で覚える等）は検証世代の一般化そのもので、#27 の範囲外として
+        // 併記に留める（モジュール doc「本 PR で扱わないもの」）。
+        if (domReady) return { state: 'ready' };
+        return { state: 'pending', dom_ready: domReady };
+      }
+      // 知らない phase 名（将来の SB が足したもの）は phase では判定せず、
+      // 世代つきの rendered 印だけを見る下の経路へ落とす——名前が一つ
+      // 増えただけで全 story が Timeout になる形にはしない。
     }
   } catch (e) {
     // プレビュー内部形が変わっていても致命ではない。シグナル待ちを続ける。
   }
+
+  // preview phase を公開しない古い構成と cargo 最小 fixture、レンダーが
+  // storyRenders に登録される前後の窓、そして知らない phase 名は、
+  // 従来どおり世代つきの channel の rendered 印を信じる。
+  if (hook && hook.rendered && hook.renderedRoot === current) return { state: 'ready' };
 
   const runtime = !!(window.__STORYBOOK_ADDONS_CHANNEL__ || window.__STORYBOOK_PREVIEW__);
   if (runtime) return { state: 'pending', dom_ready: domReady };
   return { state: 'absent', dom_ready: domReady && loaded };
 })())
 "#;
+
+/// [`READY_PROBE`] の `__VRT_STORY_ID__` を、いま待っている story の id へ
+/// 差し替えた式を返す。
+///
+/// id は JSON 文字列リテラルとして埋める——`'` や改行を含む story id でも
+/// 式が壊れない。`var` や `const` の宣言を前置きしない: `evaluate` は同じ
+/// realm で繰り返し走るため、宣言を残す形は二巡目に再宣言で落ちる。
+fn ready_probe(story_id: &str) -> String {
+    let literal = serde_json::to_string(story_id).unwrap_or_else(|_| "\"\"".to_string());
+    READY_PROBE.replace("__VRT_STORY_ID__", &literal)
+}
 
 /// 撮影直前にページを**決定的な静止状態**へ持ち込むスクリプト。
 ///
@@ -1778,8 +1850,9 @@ impl StoryRenderer {
         // その巡だけ判定が緩くなる。deadline は従来どおり story 全体で共有
         // （引数のまま受け取る——猶予と期限は別の時計である）。
         let round_started = std::time::Instant::now();
+        let probe = ready_probe(story_id);
         loop {
-            match page.evaluate(READY_PROBE).await {
+            match page.evaluate(probe.as_str()).await {
                 Ok(result) => match Readiness::parse(result.value()) {
                     Readiness::Ready => return Ok(()),
                     Readiness::Error(message) => {
@@ -2650,6 +2723,112 @@ mod tests {
         document.getElementById('storybook-root').appendChild(el);
       }
       channel.emit('storyRendered', id);"#,
+        );
+    }
+
+    /// Storybook の実際の順序を最小化した play fixture。
+    ///
+    /// `storyRendered` は play の開始より前に出る。その後、preview の phase は
+    /// `playing` となり、成功時だけ `completed` へ進む。失敗時は
+    /// `playFunctionThrewException` が出る。play の開始時に背景を緑へ変えるので、
+    /// 撮影結果から play 自体が実行されたことも観測できる。
+    fn write_play_runtime_bundle(root: &Path) {
+        write_story_html(
+            root,
+            "html,body{margin:0;padding:0;background:#fff}",
+            r#"<div id="play-target" style="width:100%;height:100vh;background:#ff0000"></div>"#,
+            r#"      window.__STORYBOOK_PREVIEW__ = {
+        storyRenders: [{ phase: 'rendering' }]
+      };
+      window.__VRT_PLAY_ORDER__ = ['storyRendered'];
+      channel.emit('storyRendered', id);
+      window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'playing';
+      window.__VRT_PLAY_ORDER__.push('play-started');
+      document.getElementById('play-target').style.background = '#00ff00';
+
+      if (id === 'demo-play--immediate-throws') {
+        window.__VRT_PLAY_ORDER__.push('play-threw');
+        channel.emit('playFunctionThrewException', {
+          message: 'immediate play assertion failed (storyRendered -> play-started -> play-threw)'
+        });
+        return;
+      }
+
+      (async function play() {
+        await new Promise(function (resolve) { setTimeout(resolve, 900); });
+        if (id === 'demo-play--throws') {
+          throw new Error(
+            'delayed play assertion failed (storyRendered -> play-started -> play-threw)'
+          );
+        }
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        window.__VRT_PLAY_ORDER__.push('play-completed');
+      })().catch(function (error) {
+        window.__VRT_PLAY_ORDER__.push('play-threw');
+        channel.emit('playFunctionThrewException', error);
+      });"#,
+        );
+    }
+
+    /// 本物の `StoryRender` と同じ phase 順を再現する play fixture。
+    ///
+    /// SB 9 の `StoryRender` は preparing → loading → beforeEach → rendering →
+    /// playing → played → completing → completed → afterEach → finished と進み、
+    /// `storyRendered` は **`completed` phase の中で** emit される。`completed`
+    /// に留まるのは afterEach へ抜けるまでの一瞬なので、[`POLL_INTERVAL`] で
+    /// 覗く READY probe が実際に見る定常値は `finished` である。
+    ///
+    /// `storyRenders` の各要素は本物と同じく自分の story id を名乗る。
+    ///
+    /// - `demo-phase--passes`         : play が 400ms 走ってから完了まで進む
+    /// - `demo-phase--play-throws`    : play が投げ、`errored` を経て `finished` へ
+    /// - `demo-phase--foreign-render` : 上に加えて、**他所の story** のレンダーが
+    ///   `playing` のまま末尾に居座る（docs の埋め込みレンダー相当）
+    fn write_storybook_phase_order_bundle(root: &Path) {
+        write_story_html(
+            root,
+            "html,body{margin:0;padding:0;background:#fff}",
+            r#"<div id="play-target" style="width:100%;height:100vh;background:#ff0000"></div>"#,
+            r#"      window.__STORYBOOK_PREVIEW__ = { storyRenders: [{ id: id, phase: 'preparing' }] };
+      var render = window.__STORYBOOK_PREVIEW__.storyRenders[0];
+      window.__VRT_PHASE_ORDER__ = ['preparing'];
+      if (id === 'demo-phase--foreign-render') {
+        // 我々の story のレンダーの**後ろ**に、別 story の止まったレンダーを
+        // 置く。末尾だけを見る判定はここで play 待ちのまま動けなくなる。
+        window.__STORYBOOK_PREVIEW__.storyRenders.push({
+          id: 'demo-other--stuck', phase: 'playing'
+        });
+      }
+      render.phase = 'loading';
+      render.phase = 'beforeEach';
+      render.phase = 'rendering';
+      // play の開始で背景を緑へ変える。撮れた絵から play の実行が観測できる。
+      render.phase = 'playing';
+      window.__VRT_PHASE_ORDER__.push('playing');
+      document.getElementById('play-target').style.background = '#00ff00';
+
+      setTimeout(function () {
+        if (id === 'demo-phase--play-throws') {
+          render.phase = 'errored';
+          channel.emit('playFunctionThrewException', {
+            message: 'phase-order play assertion failed'
+          });
+          // errored の後も render は finished phase へ抜ける。
+          render.phase = 'finished';
+          window.__VRT_PHASE_ORDER__.push('errored-then-finished');
+          return;
+        }
+        render.phase = 'played';
+        render.phase = 'completing';
+        // storyRendered は completed phase の中で出る。
+        render.phase = 'completed';
+        channel.emit('storyRendered', id);
+        // その直後に afterEach → finished。probe が completed を観測できる
+        // 窓は事実上ない。
+        render.phase = 'afterEach';
+        render.phase = 'finished';
+        window.__VRT_PHASE_ORDER__.push('finished');
+      }, 400);"#,
         );
     }
 
@@ -6150,6 +6329,208 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "an error signal must not wait for the timeout, took {elapsed:?}"
         );
+    }
+
+    /// 【cmd_692・修正前の陽性対照から反転】Storybook の順序どおり
+    /// `storyRendered` の後に play が走って遅れて投げる story は撮らない。
+    /// 修正前は緑の PNG を `Ok` で返したことを先に実測済み。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_play_failure_fails_after_the_play_started() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_late_play_failure_fails_after_the_play_started: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "demo-play--throws")
+            .await
+            .expect_err("a delayed play failure must stop the capture");
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("playFunctionThrewException")
+                && message.contains("delayed play assertion failed")
+                && message.contains("storyRendered -> play-started -> play-threw"),
+            "the error must preserve the play reason and measured order, got {message:?}"
+        );
+    }
+
+    /// play 例外イベント自体が READY 経路で観測される直接対照。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_play_exception_event_is_observed_with_its_message() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_play_exception_event_is_observed_with_its_message: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "demo-play--immediate-throws")
+            .await
+            .expect_err("playFunctionThrewException must fail the story");
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("playFunctionThrewException")
+                && message.contains("immediate play assertion failed"),
+            "the play event and message must reach RenderError, got {message:?}"
+        );
+    }
+
+    /// 完了する play は `completed` まで待って従来どおり撮る。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_passing_play_is_captured_after_completion() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_passing_play_is_captured_after_completion: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let started = std::time::Instant::now();
+        let png = renderer
+            .render_story(&server.base_url(), "demo-play--passes")
+            .await
+            .expect("a passing play must still capture")
+            .png;
+        let elapsed = started.elapsed();
+        renderer.close().await;
+
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "capture must wait for the play completion, took {elapsed:?}"
+        );
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
+    }
+
+    /// 【cmd_693・回帰】本物の phase 順（`storyRendered` は `completed` phase の
+    /// 中で出て、直後に `afterEach` → `finished` へ抜ける）で撮れること。
+    ///
+    /// ready の条件を `completed` phase だけに絞った形では、100ms 間隔の probe が
+    /// 観測できるのは定常値 `finished` だけで、世代の合う rendered 印を持つ
+    /// **正常な story が一つも READY にならず**、全て 30 秒の Timeout に倒れて
+    /// いた（READY probe を抜き出して `phase: 'finished'`・rendered 印あり・
+    /// root に子ありで評価すると `pending` を返した）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_story_that_settles_in_the_finished_phase_is_captured() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_story_that_settles_in_the_finished_phase_is_captured: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_phase_order_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let started = std::time::Instant::now();
+        let png = renderer
+            .render_story(&server.base_url(), "demo-phase--passes")
+            .await
+            .expect("a story that settles in the finished phase must be captured")
+            .png;
+        let elapsed = started.elapsed();
+        renderer.close().await;
+
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "capture must wait for the play to finish, took {elapsed:?}"
+        );
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
+    }
+
+    /// 同じ phase 順で play が投げたときは、その後 render が `finished` phase へ
+    /// 抜けても撮らない——世代内の先着 error が完了 phase に上書きされない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_play_failure_is_not_masked_by_the_finished_phase() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_play_failure_is_not_masked_by_the_finished_phase: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_phase_order_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let err = renderer
+            .render_story(&server.base_url(), "demo-phase--play-throws")
+            .await
+            .expect_err("a play failure must stop the capture even after the render settles");
+        renderer.close().await;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("playFunctionThrewException")
+                && message.contains("phase-order play assertion failed"),
+            "the play reason must survive the later finished phase, got {message:?}"
+        );
+    }
+
+    /// preview の `storyRenders` に**他所の story**のレンダーが混じっていても、
+    /// いま待っている story のレンダーの phase で判定すること。
+    ///
+    /// docs の埋め込みレンダーのように、末尾が別 story の（しかも `playing` で
+    /// 止まった）レンダーになる形はありうる。末尾だけを見る判定は、自分の
+    /// story が終わっていても play 待ちのまま deadline まで動けない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreign_render_does_not_decide_our_story_readiness() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_foreign_render_does_not_decide_our_story_readiness: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_phase_order_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let png = renderer
+            .render_story(&server.base_url(), "demo-phase--foreign-render")
+            .await
+            .expect("another story's stuck render must not hold our capture")
+            .png;
+        renderer.close().await;
+
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
     }
 
     /// Chromium が無い環境では「ハングせずにエラーを返す」こと。
