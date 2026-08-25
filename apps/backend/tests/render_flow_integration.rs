@@ -22,7 +22,7 @@ mod common;
 use std::io::Write as _;
 use std::time::Duration;
 
-use common::TestApp;
+use common::{TestApp, TestAppOptions};
 use entity::scopes::Scope;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -316,7 +316,11 @@ struct Fixture {
 }
 
 async fn setup() -> Fixture {
-    let app = TestApp::new().await;
+    setup_with_options(TestAppOptions::default()).await
+}
+
+async fn setup_with_options(options: TestAppOptions) -> Fixture {
+    let app = TestApp::new_with(options).await;
     let user = app.login_as_new_user().await;
 
     let suffix = &Uuid::new_v4().to_string()[..8];
@@ -1908,6 +1912,114 @@ async fn retrying_a_failed_build_without_a_bundle_is_rejected() {
         message.contains("bundle"),
         "the 409 should say the bundle is missing, got {message:?}"
     );
+}
+
+/// Render worker / 外部 runner を使えない API では failed のまま維持し、
+/// 消費者のいない render queue へ再投入しない。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_storybook_build_is_rejected_when_rendering_is_disabled() {
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup_with_options(TestAppOptions {
+        storybook_render_enabled: Some(false),
+        ..TestAppOptions::default()
+    })
+    .await;
+    let build = fx.create_build("screenshots", "sbretry-disabled").await;
+    assert_eq!(build.status(), StatusCode::CREATED);
+    let body: Value = build.json().await.expect("build json");
+    let build_id = build_id_of(&body);
+
+    // disabled 構成では Storybook build の新規作成自体が拒否されるため、既存環境から
+    // 残っている failed build を DB 上で再現する。
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.mode = Set(entity::builds::BuildMode::Storybook);
+    active.storybook_key = Set(Some(format!("storybook/{build_id}.zip")));
+    active.status = Set(entity::builds::BuildStatus::Failed);
+    active.update(&fx.app.state.db).await.expect("force failed");
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+        .await;
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let body: Value = res.json().await.expect("error json");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("disabled")
+    );
+
+    let build = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("reload build")
+        .expect("build row");
+    assert_eq!(build.status, entity::builds::BuildStatus::Failed);
+}
+
+/// `rendering → processing` の直後に runner が落ちても、同じ render task の再実行が
+/// 比較ジョブの引き渡しだけを復旧し、重複投入を成功として扱える。
+#[tokio::test(flavor = "multi_thread")]
+async fn processing_storybook_build_recovers_compare_handoff_idempotently() {
+    use apalis::prelude::Data;
+    use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+
+    let fx = setup().await;
+    let build = fx.create_build("screenshots", "sbhandoff").await;
+    assert_eq!(build.status(), StatusCode::CREATED);
+    let body: Value = build.json().await.expect("build json");
+    let build_id = build_id_of(&body);
+
+    let model = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build row");
+    let mut active: entity::builds::ActiveModel = model.into();
+    active.mode = Set(entity::builds::BuildMode::Storybook);
+    active.storybook_key = Set(Some(format!("storybook/{build_id}.zip")));
+    active.status = Set(entity::builds::BuildStatus::Processing);
+    active
+        .update(&fx.app.state.db)
+        .await
+        .expect("force processing");
+
+    // TestApp の compare worker が消費しない専用キューを使い、2 回目まで build を
+    // Processing に固定する。task ID が同じなら idempotency key も同じになる。
+    let compare_storage = backend::jobs::setup_compare_build_storage_with_queue(
+        &fx.app.state.pg_pool,
+        &format!("compare_handoff_test_{}", Uuid::new_v4().simple()),
+    )
+    .await
+    .expect("compare storage");
+    let render_state = job::RenderJobState {
+        chromium_path: "unused-for-handoff-recovery".into(),
+        db: fx.app.state.db.clone(),
+        storage: fx.app.state.storage.clone(),
+        github_status_storage: fx.app.state.github_status_storage.clone(),
+        compare_build_storage: compare_storage,
+    };
+    let task_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        .parse()
+        .expect("valid apalis task id");
+    let job = job::RenderBuildJob {
+        build_id,
+        only_story_ids: None,
+    };
+
+    job::render_build::process(job.clone(), Data::new(render_state.clone()), task_id)
+        .await
+        .expect("first recovery enqueues compare job");
+    job::render_build::process(job, Data::new(render_state), task_id)
+        .await
+        .expect("second recovery is deduplicated");
 }
 
 /// **1 回だけ失敗する story は直列リトライで救われ、ビルドは成功する**こと。

@@ -20,7 +20,7 @@
 //! 途中で落ちて再実行されても `(build_id, name)` の UNIQUE 制約にぶつからない。
 
 use apalis::prelude::{BoxDynError, Data, TaskSink};
-use apalis_postgres::{Config, PgPool, PostgresStorage};
+use apalis_postgres::{Config, PgPool, PgTaskId, PostgresStorage};
 use sea_orm::prelude::Uuid;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
@@ -171,10 +171,15 @@ pub async fn enqueue(
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
 /// `Err` を返すのはビルド行にすら書き戻せなかったケースだけ。
-pub async fn process(job: RenderBuildJob, state: Data<RenderJobState>) -> Result<(), BoxDynError> {
+pub async fn process(
+    job: RenderBuildJob,
+    state: Data<RenderJobState>,
+    task_id: PgTaskId,
+) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
+    let compare_handoff_key = format!("render-build:{task_id}:compare");
 
-    match run(build_id, job.only_story_ids, &state).await {
+    match run(build_id, job.only_story_ids, &compare_handoff_key, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             let (failure_origin, failure_code) = classify_render_failure(&err);
@@ -234,6 +239,7 @@ fn truncate(s: &str, max: usize) -> String {
 async fn run(
     build_id: Uuid,
     only_story_ids: Option<Vec<String>>,
+    compare_handoff_key: &str,
     state: &RenderJobState,
 ) -> Result<(), anyhow::Error> {
     let db = &state.db;
@@ -250,6 +256,18 @@ async fn run(
         // Jobs queued by an older deployment already entered Rendering before
         // enqueue. Let them finish across a rolling deploy.
         BuildStatus::Rendering => build,
+        // レンダリング完了後、比較ジョブ投入前にプロセスが落ちた経路。
+        // 同じ render task の冪等キーで引き渡しだけを修復し、撮影はやり直さない。
+        BuildStatus::Processing => {
+            crate::compare_build::enqueue_idempotent(
+                &state.compare_build_storage,
+                crate::CompareBuildJob { build_id },
+                compare_handoff_key,
+            )
+            .await?;
+            tracing::info!(%build_id, "recovered render-to-compare handoff");
+            return Ok(());
+        }
         status => {
             tracing::info!(%build_id, ?status, "skipping render job outside the queued/rendering phases");
             return Ok(());
@@ -365,9 +383,10 @@ async fn run(
 
     // レンダリングが済んだので既存の比較パイプラインへ引き渡す。
     // `github_status` を compare_build が投入するのと同じチェーンパターン。
-    crate::compare_build::enqueue(
+    crate::compare_build::enqueue_idempotent(
         &state.compare_build_storage,
         crate::CompareBuildJob { build_id },
+        compare_handoff_key,
     )
     .await?;
 

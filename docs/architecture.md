@@ -294,6 +294,9 @@ runner に必要な環境変数は `DATABASE_URL`、`CHROMIUM_PATH`、`STORAGE_B
 再投入される。runnerは1プロセスあたり1ビルドを処理するため、Dokployでは同じイメージを
 Start Command `/app/vrt-runner` で起動し、サービスのレプリカ数でビルド並列数を調整する。
 runnerを別ホストへ置く場合、localディレクトリは共有できないためS3互換ストレージを使う。
+デプロイ停止時は runner が新しい job の取得を止め、進行中の build の完了を待つ。同梱の
+Compose は `stop_grace_period: 1h` を設定しているため、Dokploy 側でも停止猶予を同等以上に
+する。猶予を超えて強制終了された job は apalis の孤児回収後に同じ task として再実行される。
 
 ## ストレージ
 

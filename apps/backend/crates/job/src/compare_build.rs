@@ -17,7 +17,7 @@
 //! リトライ安全性: 開始時にそのビルドの comparisons を全削除するため、
 //! 途中で落ちて再実行されても行が重複しない。
 
-use apalis::prelude::{BoxDynError, Data, TaskSink};
+use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
@@ -114,6 +114,36 @@ pub async fn enqueue(
         .await
         .map_err(|e| anyhow::anyhow!("push compare build job: {e}"))?;
     Ok(())
+}
+
+/// 同じパイプライン段からの比較ジョブ引き渡しを 1 回に畳んで投入する。
+///
+/// `render_build` が `processing` への遷移後に落ちても同じ task が再実行され、
+/// 同じキーでここへ戻る。既に投入済みなら unique violation を成功として扱い、
+/// それ以外の DB / codec エラーは呼び出し側へ返す。
+pub async fn enqueue_idempotent(
+    storage: &CompareBuildStorage,
+    job: CompareBuildJob,
+    idempotency_key: &str,
+) -> Result<(), anyhow::Error> {
+    let mut storage = storage.clone();
+    let task = TaskBuilder::new(job)
+        .with_idempotency_key(idempotency_key)
+        .build();
+
+    match storage.push_task(task).await {
+        Ok(()) => Ok(()),
+        Err(TaskSinkError::PushError(sqlx::Error::Database(error)))
+            if error.code().as_deref() == Some("23505")
+                && error.constraint() == Some("idx_jobs_idempotency_key") =>
+        {
+            tracing::info!(%idempotency_key, "compare build job was already enqueued");
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "push idempotent compare build job: {error}"
+        )),
+    }
 }
 
 /// ワーカーのエントリポイント。

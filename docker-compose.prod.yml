@@ -171,6 +171,8 @@ services:
   runner:
     image: vrt-backend:prod
     command: ["/app/vrt-runner"]
+    # デプロイ時は新規 claim を止め、進行中の build に最大 1 時間の完走猶予を与える。
+    stop_grace_period: 1h
     environment:
       - DATABASE_URL=${DATABASE_URL}
       - STORAGE_BACKEND=${STORAGE_BACKEND:-local}

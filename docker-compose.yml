@@ -139,6 +139,9 @@ services:
   runner:
     image: vrt-backend:dev
     command: ["/app/vrt-runner"]
+    # SIGTERM 後も進行中の Storybook build を完走させる。既定 10 秒では Chromium
+    # 撮影中に強制終了され、孤児回収まで同じ build が止まって見える。
+    stop_grace_period: 1h
     environment:
       DATABASE_URL: postgresql://vrt:vrt@db:5432/vrt
       STORAGE_BACKEND: local

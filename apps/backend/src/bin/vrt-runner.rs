@@ -3,12 +3,12 @@
 //! HTTP API、Redis、OAuth/GitHub の資格情報は不要。API と同じ DATABASE_URL と
 //! STORAGE_BACKEND 設定、レンダリング用 CHROMIUM_PATH だけを受け取る。
 
-use std::env;
+use std::{env, future::Future};
 
 use backend::server::spawn_render_build_worker_with_state;
 use job::RenderJobState;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn required_env(name: &str) -> Result<String, std::io::Error> {
@@ -55,17 +55,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = spawn_render_build_worker_with_state(render_build_storage, state, shutdown_rx);
 
     info!(%chromium_path, "vrt-runner ready; polling render_build queue");
-    shutdown_signal().await;
-    let _ = shutdown_tx.send(true);
-    info!("vrt-runner shutting down; waiting for in-flight build");
-
-    match handle.await {
-        Ok(Ok(())) => info!("render worker stopped"),
-        Ok(Err(error)) => warn!(%error, "render worker stopped with an error"),
-        Err(error) => warn!(%error, "render worker task failed"),
-    }
-
+    supervise_worker(handle, shutdown_tx, shutdown_signal()).await?;
     Ok(())
+}
+
+/// OS の停止通知と worker 自身の終了を同時に監視する。
+///
+/// worker が先に止まった場合に PID だけ残すと、Compose / Dokploy の restart policy が
+/// 発火せずキューが永久に止まる。正常終了に見えても runner にとっては異常なので、
+/// エラーを返してプロセスを非ゼロ終了させる。
+async fn supervise_worker<E, F>(
+    mut handle: tokio::task::JoinHandle<Result<(), E>>,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown: F,
+) -> Result<(), std::io::Error>
+where
+    E: std::fmt::Display,
+    F: Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+
+    tokio::select! {
+        result = &mut handle => match result {
+            Ok(Ok(())) => Err(std::io::Error::other("render worker stopped unexpectedly")),
+            Ok(Err(error)) => Err(std::io::Error::other(format!(
+                "render worker stopped with an error: {error}"
+            ))),
+            Err(error) => Err(std::io::Error::other(format!(
+                "render worker task failed: {error}"
+            ))),
+        },
+        () = &mut shutdown => {
+            let _ = shutdown_tx.send(true);
+            info!("vrt-runner shutting down; waiting for in-flight build");
+            match handle.await {
+                Ok(Ok(())) => {
+                    info!("render worker stopped");
+                    Ok(())
+                }
+                Ok(Err(error)) => Err(std::io::Error::other(format!(
+                    "render worker stopped with an error during shutdown: {error}"
+                ))),
+                Err(error) => Err(std::io::Error::other(format!(
+                    "render worker task failed during shutdown: {error}"
+                ))),
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() {
@@ -89,5 +125,36 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_exit_before_shutdown_is_an_error() {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+
+        let error = supervise_worker(handle, shutdown_tx, std::future::pending())
+            .await
+            .expect_err("a runner must not outlive its worker");
+
+        assert!(error.to_string().contains("stopped unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_stops_the_worker_gracefully() {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            shutdown_rx.changed().await.expect("shutdown sender");
+            assert!(*shutdown_rx.borrow());
+            Ok::<(), std::io::Error>(())
+        });
+
+        supervise_worker(handle, shutdown_tx, std::future::ready(()))
+            .await
+            .expect("signal-driven shutdown is successful");
     }
 }
