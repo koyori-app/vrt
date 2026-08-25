@@ -1239,7 +1239,7 @@ pub async fn approve_build(
                         .collect();
                     removed_by_revert.sort();
                 }
-                let mut allowed_missing = approval::approved_removal_names(&facts);
+                let mut allowed_missing = approval::approved_missing_names(&facts);
                 allowed_missing.extend(removed_by_revert.iter().cloned());
                 let missing = approval::unexpected_missing_names(
                     &baseline_names,
