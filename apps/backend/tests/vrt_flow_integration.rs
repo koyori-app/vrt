@@ -1122,14 +1122,15 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     assert_eq!(comparisons[0]["status"].as_str(), Some("added"));
 }
 
-/// 異 branch fallback の baseline にしか無い名前を `removed` にしない（koyori-app/vrt#38）。
+/// 異branch fallbackのbaselineにしか無い名前を`removed`にせず、かつ
+/// `passed`へfalse passさせない（koyori-app/vrt#38）。
 ///
 /// 自分の baseline を持たない枝は default branch の baseline へ fallback する。
 /// その baseline にあってビルドに無い名前は「枝が消した」のか「分岐後に main へ
-/// 追加された」のか区別できないため、removed として報告してはならない。
+/// 追加された」のか区別できないため、reviewableなfailed比較として保持する。
 /// 同 branch の比較では従来どおり removed になることも同時に固定する（回帰）。
 #[tokio::test(flavor = "multi_thread")]
-async fn cross_branch_baseline_does_not_report_missing_entries_as_removed() {
+async fn cross_branch_baseline_missing_entries_require_review_without_becoming_removed() {
     let fx = setup().await;
 
     let home = png(40, 30, [255, 255, 255, 255]);
@@ -1155,8 +1156,8 @@ async fn cross_branch_baseline_does_not_report_missing_entries_as_removed() {
     // ── feature #2: home だけ（about 相当は撮っていない）─────────────────
     //
     // feature 枝は自分の baseline を持たないので main の baseline へ fallback する。
-    // 修正前はここで about が removed=1 と誤検知され changes_detected になっていた
-    // （陽性対照: 修正前のコードではこのテストは必ず落ちる）。
+    // aboutをremovedと断定はできないが、比較行ごと消してPassedにすると本物の削除も
+    // required checkを通過する。曖昧な欠落としてレビュー待ちに残す。
     let build2 = fx.create_build("feature/no-own-baseline", "bbbb2222").await;
     let build2_id = build_id_of(&build2);
     assert_eq!(
@@ -1167,29 +1168,62 @@ async fn cross_branch_baseline_does_not_report_missing_entries_as_removed() {
     let build2 = fx.wait_for_terminal(build2_id).await;
     assert_eq!(
         build2["status"].as_str(),
-        Some("passed"),
-        "missing names against a cross-branch baseline must not be removed: {build2:?}"
+        Some("changes_detected"),
+        "ambiguous missing names must keep the build pending for review: {build2:?}"
     );
     assert_eq!(
         counts(&build2),
-        (1, 0, 0, 0, 1),
-        "only the uploaded screenshot is compared; nothing is removed"
+        (2, 0, 0, 0, 1),
+        "the ambiguous row is counted in total but not as removed"
     );
     let cmps = fx.comparisons(build2_id).await;
-    assert_eq!(
-        cmps.len(),
-        1,
-        "the baseline-only name has no comparison row"
-    );
+    assert_eq!(cmps.len(), 2, "the baseline-only name stays reviewable");
     assert_eq!(find_comparison(&cmps, "home")["status"], "unchanged");
+    let ambiguous = find_comparison(&cmps, "about");
+    assert_eq!(ambiguous["status"], "failed");
+    assert_eq!(ambiguous["review_status"], "pending");
+    assert!(
+        ambiguous["error_message"].as_str().is_some_and(
+            |message| message.contains("Cannot determine whether this story was removed")
+        ),
+        "the row explains why the result is ambiguous: {ambiguous:?}"
+    );
     let logs = fx.build_logs(build2_id).await;
     assert!(
         logs.iter().any(|entry| {
             entry["message"].as_str().is_some_and(|message| {
-                message.contains("did not report 1 missing entries as removed")
+                message.contains("kept 1 missing entries as reviewable comparison failures")
             })
         }),
-        "build log records how many missing entries were not reported as removed: {logs:?}"
+        "build log records how many ambiguous entries require review: {logs:?}"
+    );
+
+    // forceだけではfailed比較を流せず、明示レビューした場合だけfeature側baselineから
+    // aboutを外せる。比較行を残すことで「本物の削除だった」場合の承認経路も維持する。
+    let res = fx.approve(build2_id, true).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "ambiguous failure must not be bulk-approved by force alone"
+    );
+    let comparison_id = ambiguous["id"].as_str().expect("comparison id");
+    let res = fx
+        .app
+        .post_json(
+            &format!("/v1/comparisons/{comparison_id}/review"),
+            json!({ "action": "approve" }),
+        )
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "approve ambiguous missing row"
+    );
+    let res = fx.approve(build2_id, false).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "an explicitly reviewed ambiguous missing story can be accepted"
     );
 
     // ── main #3: home だけ → 同 branch では従来どおり about が removed ────

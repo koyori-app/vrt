@@ -277,36 +277,11 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         None => shots,
     };
 
-    let mut pairs = join_by_name(shots, baseline_entries);
-    let not_reported_as_removed = if cross_branch_baseline {
-        drop_baseline_only_pairs(&mut pairs)
-    } else {
-        0
-    };
-    if not_reported_as_removed > 0 {
-        let baseline_branch = baseline
-            .as_ref()
-            .map(|b| b.branch.as_str())
-            .unwrap_or_default();
-        service::build_logs::append(
-            db,
-            build_id,
-            LogLevel::Info,
-            format!(
-                "used baseline from branch `{baseline_branch}`; did not report \
-                 {not_reported_as_removed} missing entries as removed \
-                 (別 branch の baseline を使ったため {not_reported_as_removed} 件の欠落を removed にしなかった)"
-            ),
-        )
-        .await?;
-        tracing::info!(
-            %build_id,
-            baseline_branch,
-            build_branch = %build.branch,
-            count = not_reported_as_removed,
-            "cross-branch baseline: missing entries not reported as removed"
-        );
-    }
+    let pairs = join_by_name(shots, baseline_entries);
+    let baseline_branch = baseline
+        .as_ref()
+        .map(|baseline| baseline.branch.as_str())
+        .unwrap_or_default();
     let total = pairs.len();
 
     // 比較対象数が確定した時点で開始行を残す。
@@ -319,6 +294,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     .await?;
 
     let mut counts = BuildCounts::default();
+    let mut ambiguous_missing_count = 0usize;
     let mut processed = 0usize;
     let now = Utc::now().fixed_offset();
 
@@ -327,6 +303,10 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
         let outcome = match (shot.as_ref(), entry.as_ref()) {
             (Some(_), None) => Outcome::added(),
+            (None, Some(_)) if cross_branch_baseline => {
+                ambiguous_missing_count += 1;
+                Outcome::ambiguous_cross_branch_missing(&build.branch, baseline_branch)
+            }
             (None, Some(_)) => Outcome::removed(),
             (Some(shot), Some(entry)) => {
                 let outcome = compare_pair(state, &project, &build, shot, entry).await?;
@@ -358,7 +338,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
             diff_storage_key: Set(outcome.diff_storage_key),
             diff_pixel_count: Set(outcome.diff_pixel_count),
             diff_ratio: Set(outcome.diff_ratio),
-            error_message: Set(None),
+            error_message: Set(outcome.error_message),
             reviewed_by: Set(None),
             reviewed_at: Set(None),
             created_at: Set(now),
@@ -380,6 +360,27 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         }
     }
 
+    if ambiguous_missing_count > 0 {
+        service::build_logs::append(
+            db,
+            build_id,
+            LogLevel::Info,
+            format!(
+                "used baseline from branch `{baseline_branch}`; kept \
+                 {ambiguous_missing_count} missing entries as reviewable comparison failures \
+                 instead of reporting them as removed"
+            ),
+        )
+        .await?;
+        tracing::info!(
+            %build_id,
+            baseline_branch,
+            build_branch = %build.branch,
+            count = ambiguous_missing_count,
+            "cross-branch baseline: ambiguous missing entries require review"
+        );
+    }
+
     // 完了サマリ。内訳を 1 行で残す。
     service::build_logs::append(
         db,
@@ -396,7 +397,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let build =
         service::builds::apply_counts(db, build, counts, baseline.as_ref().map(|b| b.id)).await?;
 
-    let next = if counts.has_differences() {
+    let next = if counts.has_differences() || ambiguous_missing_count > 0 {
         BuildStatus::ChangesDetected
     } else {
         BuildStatus::Passed
@@ -428,6 +429,7 @@ struct Outcome {
     diff_storage_key: Option<String>,
     diff_pixel_count: Option<i64>,
     diff_ratio: Option<f64>,
+    error_message: Option<String>,
     content_hash_skipped: bool,
 }
 
@@ -439,6 +441,7 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            error_message: None,
             content_hash_skipped: false,
         }
     }
@@ -450,6 +453,25 @@ impl Outcome {
             diff_storage_key: None,
             diff_pixel_count: None,
             diff_ratio: None,
+            error_message: None,
+            content_hash_skipped: false,
+        }
+    }
+
+    /// 別branchのbaselineにしか無い名前は、削除ともmain側での後発追加とも
+    /// 断定できない。比較行を消さず、レビュー可能な失敗として保持する。
+    fn ambiguous_cross_branch_missing(build_branch: &str, baseline_branch: &str) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            status: ComparisonStatus::Failed,
+            diff_storage_key: None,
+            diff_pixel_count: None,
+            diff_ratio: None,
+            error_message: Some(format!(
+                "Cannot determine whether this story was removed: build branch \
+                 `{build_branch}` is being compared with baseline branch `{baseline_branch}`. \
+                 Review this missing story explicitly."
+            )),
             content_hash_skipped: false,
         }
     }
@@ -681,10 +703,10 @@ async fn materialize_carry_forward(
         .await?;
     }
     if vanished > 0 {
-        // 異 branch fallback のときは、この欠落を removed と断定できない
-        // （後段の drop_baseline_only_pairs が比較対象から外す）。ログも合わせる。
+        // 異branch fallbackの欠落はremovedと断定せず、後段でレビュー可能な
+        // failed比較として残す。capture plan側のログも同じ意味に揃える。
         let disposition = if cross_branch_baseline {
-            "baseline is from another branch; not reporting as removed"
+            "baseline is from another branch; keeping as a reviewable ambiguous comparison"
         } else {
             "reporting as removed"
         };
@@ -706,30 +728,6 @@ async fn materialize_carry_forward(
 
 /// name → (今回のスクリーンショット, baseline エントリ) の完全外部結合。
 type JoinedPairs = BTreeMap<String, (Option<screenshots::Model>, Option<baseline_entries::Model>)>;
-
-/// 異 branch の baseline（fallback）を使う比較で、今回のビルド側に無い名前を
-/// 比較対象から外し、外した件数を返す。
-///
-/// baseline がビルドと同じ branch なら、baseline にだけある名前は「この枝で
-/// story を消した」と断定できる。だが自分の baseline を持たない枝が別 branch
-/// （通常は default branch）の baseline へ fallback したとき、その欠落は
-///
-/// - この枝が本当に story を消した
-/// - 分岐後に baseline 側の branch へ追加された story を、この枝がまだ持っていない
-///
-/// の 2 つを区別できない。区別できないものを「消した」と断ずるほうが誤りなので、
-/// removed として報告しない（実害: 別 branch baseline の誤検知 removed が
-/// 35 件 × 複数 PR を汚した。koyori-app/vrt#38）。
-///
-/// 代償: 枝の初回ビルド（自分の baseline を持つ前）における本物の削除は、
-/// このビルドでは報告されない。枝が承認で自分の baseline を持った後の同 branch
-/// 比較と、main へマージされた後のビルドが同じ削除を removed として捕まえるため、
-/// 恒久的な見逃しにはならない。根治（git 系譜で baseline を選ぶ）は #38 で別途。
-fn drop_baseline_only_pairs(pairs: &mut JoinedPairs) -> usize {
-    let before = pairs.len();
-    pairs.retain(|_, (shot, _)| shot.is_some());
-    before - pairs.len()
-}
 
 /// name をキーにスクリーンショットと baseline エントリを完全外部結合する。
 fn join_by_name(
@@ -788,6 +786,7 @@ async fn compare_pair(
                 diff_storage_key: None,
                 diff_pixel_count: Some(0),
                 diff_ratio: Some(0.0),
+                error_message: None,
                 content_hash_skipped: true,
             });
         }
@@ -849,6 +848,7 @@ async fn compare_pair(
         diff_storage_key,
         diff_pixel_count: Some(diff_pixel_count as i64),
         diff_ratio: Some(diff_ratio),
+        error_message: None,
         content_hash_skipped: false,
     })
 }
@@ -900,36 +900,17 @@ mod tests {
         assert!(joined["legacy"].0.is_none() && joined["legacy"].1.is_some());
     }
 
-    /// 異 branch fallback の baseline にしか無い名前は比較対象から外れる（#38 誤検知対策）。
+    /// 異branch fallbackのbaselineにしか無い名前は、removedではなくレビュー可能な
+    /// failed比較として保持する。
     #[test]
-    fn cross_branch_baseline_missing_names_are_dropped_not_removed() {
-        let mut joined = join_by_name(
-            vec![shot("home")],
-            vec![entry("home"), entry("main-only-a"), entry("main-only-b")],
-        );
+    fn cross_branch_baseline_missing_name_becomes_a_reviewable_failure() {
+        let outcome = Outcome::ambiguous_cross_branch_missing("feature/a", "main");
 
-        let dropped = drop_baseline_only_pairs(&mut joined);
-
-        assert_eq!(dropped, 2, "baseline 側にしか無い 2 件を外した数が返る");
-        assert_eq!(joined.len(), 1);
-        assert!(
-            joined["home"].0.is_some() && joined["home"].1.is_some(),
-            "両側にあるペアは比較対象に残る"
-        );
-        assert!(!joined.contains_key("main-only-a"));
-        assert!(!joined.contains_key("main-only-b"));
-    }
-
-    /// 両側にある・今回だけの名前は外されない（added / changed / unchanged は不変）。
-    #[test]
-    fn drop_baseline_only_pairs_keeps_added_and_matched() {
-        let mut joined = join_by_name(vec![shot("home"), shot("new-page")], vec![entry("home")]);
-
-        let dropped = drop_baseline_only_pairs(&mut joined);
-
-        assert_eq!(dropped, 0);
-        assert_eq!(joined.len(), 2);
-        assert!(joined["new-page"].0.is_some() && joined["new-page"].1.is_none());
+        assert_eq!(outcome.status, ComparisonStatus::Failed);
+        let message = outcome.error_message.expect("ambiguity explanation");
+        assert!(message.contains("feature/a"));
+        assert!(message.contains("main"));
+        assert!(message.contains("Review this missing story explicitly"));
     }
 
     #[test]

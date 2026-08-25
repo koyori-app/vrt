@@ -509,6 +509,12 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
     use builds::BuildStatus::*;
 
     let changes = build.changed_count + build.added_count + build.removed_count;
+    let unresolved = (build.total_count
+        - build.changed_count
+        - build.added_count
+        - build.removed_count
+        - build.unchanged_count)
+        .max(0);
 
     match build.status {
         Pending => (CommitState::Pending, "Waiting for screenshots".to_string()),
@@ -525,10 +531,21 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
             "Comparing screenshots against baseline".to_string(),
         ),
         Passed => (CommitState::Success, "Visual tests passed".to_string()),
-        ChangesDetected => (
-            CommitState::Pending,
-            format!("{changes} {} detected, awaiting review", plural(changes)),
-        ),
+        ChangesDetected => {
+            let description = match (changes, unresolved) {
+                (0, unresolved) if unresolved > 0 => format!(
+                    "{unresolved} unresolved {}, awaiting review",
+                    comparison_plural(unresolved)
+                ),
+                (changes, unresolved) if unresolved > 0 => format!(
+                    "{changes} {} and {unresolved} unresolved {}, awaiting review",
+                    plural(changes),
+                    comparison_plural(unresolved)
+                ),
+                _ => format!("{changes} {} detected, awaiting review", plural(changes)),
+            };
+            (CommitState::Pending, description)
+        }
         Approved => (CommitState::Success, "Visual changes approved".to_string()),
         Rejected => (CommitState::Failure, "Visual changes rejected".to_string()),
         Failed => {
@@ -544,6 +561,14 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
 
 fn plural(count: i32) -> &'static str {
     if count == 1 { "change" } else { "changes" }
+}
+
+fn comparison_plural(count: i32) -> &'static str {
+    if count == 1 {
+        "comparison"
+    } else {
+        "comparisons"
+    }
 }
 
 /// レビュー UI のビルド詳細ページ（フロントエンドのルート形状は Phase 7）。
@@ -1134,6 +1159,27 @@ mod tests {
 
         let (_, singular) = status_for_build(&build(builds::BuildStatus::ChangesDetected, 1, 0, 0));
         assert_eq!(singular, "1 change detected, awaiting review");
+    }
+
+    #[test]
+    fn changes_detected_description_keeps_unresolved_comparisons_pending() {
+        let mut unresolved = build(builds::BuildStatus::ChangesDetected, 0, 0, 0);
+        unresolved.total_count = 2;
+        unresolved.unchanged_count = 1;
+        assert_eq!(
+            status_for_build(&unresolved),
+            (
+                CommitState::Pending,
+                "1 unresolved comparison, awaiting review".into()
+            )
+        );
+
+        unresolved.changed_count = 2;
+        unresolved.total_count = 4;
+        assert_eq!(
+            status_for_build(&unresolved).1,
+            "2 changes and 1 unresolved comparison, awaiting review"
+        );
     }
 
     #[test]
