@@ -133,7 +133,7 @@ function ProjectPage() {
   );
 }
 
-/** Matches the limit passed to useBuilds for the builds table. */
+/** Page size for the builds table (the API caps limit at 100). */
 const BUILD_LIMIT = 50;
 
 function BuildsTable({
@@ -149,10 +149,21 @@ function BuildsTable({
   tenantSlug: string;
   projectSlug: string;
 }) {
-  const builds = useBuilds(projectId, BUILD_LIMIT);
+  const [offset, setOffset] = useState(0);
+  const builds = useBuilds(projectId, BUILD_LIMIT, offset);
   const navigate = useNavigate();
   const rows = builds.data?.builds;
+  const total = builds.data?.total ?? 0;
   const graph = useMemo(() => buildGraph(rows ?? [], defaultBranch), [rows, defaultBranch]);
+
+  // Retention pruning (or switching projects) can shrink the list below the
+  // current offset; snap back to the last page that still has rows.
+  useEffect(() => {
+    if (builds.data && offset > 0 && offset >= builds.data.total) {
+      const lastPage = Math.max(0, Math.ceil(builds.data.total / BUILD_LIMIT) - 1);
+      setOffset(lastPage * BUILD_LIMIT);
+    }
+  }, [builds.data, offset]);
 
   return (
     <Card>
@@ -242,6 +253,31 @@ function BuildsTable({
             ) : null}
           </TableBody>
         </Table>
+        {total > BUILD_LIMIT ? (
+          <div className="mt-4 flex items-center justify-between gap-3">
+            <p className="text-xs text-muted-foreground">
+              {offset + 1}–{Math.min(offset + BUILD_LIMIT, total)} of {total} builds
+            </p>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={offset === 0 || builds.isFetching}
+                onClick={() => setOffset(Math.max(0, offset - BUILD_LIMIT))}
+              >
+                Newer
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={offset + BUILD_LIMIT >= total || builds.isFetching}
+                onClick={() => setOffset(offset + BUILD_LIMIT)}
+              >
+                Older
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );

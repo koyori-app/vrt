@@ -1,3 +1,5 @@
+import { keepPreviousData } from "@tanstack/react-query";
+
 import { $api, type Build, type Project, type Tenant, type TenantRole } from "@/lib/api";
 
 /** `/users/me` is the auth source of truth; keep it warm but not stale. */
@@ -70,12 +72,13 @@ export function useMyRole(tenantId: string | undefined) {
   return { role, isLoading: tenants.isLoading };
 }
 
-export function useBuilds(projectId: string | undefined, limit = 50) {
+export function useBuilds(projectId: string | undefined, limit = 50, offset = 0) {
   return $api.useQuery(
     "get",
     "/v1/projects/{project_id}/builds",
-    { params: { path: { project_id: projectId ?? "" }, query: { limit } } },
-    { enabled: !!projectId },
+    { params: { path: { project_id: projectId ?? "" }, query: { limit, offset } } },
+    // keepPreviousData: ページ送りで前ページの行を出したまま次ページを読む。
+    { enabled: !!projectId, placeholderData: keepPreviousData },
   );
 }
 
