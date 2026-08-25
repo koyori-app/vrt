@@ -303,7 +303,12 @@ Compose は `stop_grace_period: 1h` を設定しているため、Dokploy 側で
 `STORAGE_BACKEND` で切り替える trait 実装（`service::storage`）:
 
 - `local` … `LOCAL_UPLOAD_DIR` 配下に置き、backend 自身が配信する
-- `s3` … S3 互換にアップロードし、`S3_PUBLIC_BASE_URL` の URL を返す
+- `s3` … S3互換へ保存し、private objectをbackend経由でプロキシ配信する
+
+production Composeでlocalからs3へ切り替えると、`vrt-storage-migrate` one-shotが
+`LOCAL_UPLOAD_DIR`を再帰走査し、相対パスをそのままS3 keyとしてコピーする。同じkey・sizeは
+skipし、upload後のsizeも再取得して検証する。元ファイルは削除せず、移行が失敗した場合は
+backend/runnerの起動を止めるため、設定を直した再デプロイで安全に再開できる。
 
 スクリーンショットのアップロードは 1 枚 25MB まで。frontend の `/api` プロキシも
 同じ上限を持つ（超過は転送せず 413）。

@@ -102,6 +102,12 @@ runner のレプリカ数が同時に処理できる Storybook ビルド数に�
 別ホストへ配置する場合は `STORAGE_BACKEND=s3` を使う。`local` は backend と runner
 が同じ `uploads` ボリュームを共有できる単一ホスト構成に限る。
 
+production Composeで`STORAGE_BACKEND`を`local`から`s3`へ変更すると、one-shotの
+`storage-migration`サービスが`uploads` VolumeをS3へ自動移行する。同じキー・サイズの
+オブジェクトはskipするため再実行可能で、元ファイルは削除しない。backendとrunnerは
+全ファイルのuploadとサイズ検証が完了するまで起動しない。並列数は
+`STORAGE_MIGRATION_CONCURRENCY`（既定4）で調整できる。
+
 ### frontend
 
 ```bash

@@ -35,6 +35,11 @@ pub trait StorageBackend: Send + Sync {
 
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
 
+    /// オブジェクトが存在すればサイズを返す。存在しない場合は`None`。
+    ///
+    /// local→S3移行では同じサイズのオブジェクトを再送せず、途中から安全に再開するために使う。
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, StorageError>;
+
     /// ストリーミングダウンロード（プロキシ配信用）。
     async fn get_stream(&self, key: &str) -> Result<ByteStream, StorageError>;
 }

@@ -8,6 +8,7 @@
 #   1. /app/run-migration.sh   … migration up
 #   2. /app/backend            … API サーバー起動（既定の CMD）
 #   3. /app/vrt-runner         … 独立 Render worker（別サービスの command で指定）
+#   4. /app/vrt-storage-migrate … local→S3 one-shot（Composeが切替時に自動実行）
 # ─────────────────────────────────────────────────
 #
 # Rust のバージョンはリポジトリルートの rust-toolchain.toml と合わせること。
@@ -36,9 +37,10 @@ FROM builder-base AS builder-debug
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     mkdir -p /out \
-    && cargo build --bin backend --bin vrt-runner \
+    && cargo build --bin backend --bin vrt-runner --bin vrt-storage-migrate \
     && cp target/debug/backend /out/backend \
-    && cp target/debug/vrt-runner /out/vrt-runner
+    && cp target/debug/vrt-runner /out/vrt-runner \
+    && cp target/debug/vrt-storage-migrate /out/vrt-storage-migrate
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/migration/target \
@@ -50,9 +52,10 @@ FROM builder-base AS builder-release
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     mkdir -p /out \
-    && cargo build --release --bin backend --bin vrt-runner \
+    && cargo build --release --bin backend --bin vrt-runner --bin vrt-storage-migrate \
     && cp target/release/backend /out/backend \
-    && cp target/release/vrt-runner /out/vrt-runner
+    && cp target/release/vrt-runner /out/vrt-runner \
+    && cp target/release/vrt-storage-migrate /out/vrt-storage-migrate
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/migration/target \
@@ -115,6 +118,7 @@ COPY --chown=app:app --chmod=755 docker/run-migration.sh /app/run-migration.sh
 FROM runtime-base AS runtime
 COPY --from=builder-debug --chown=app:app /out/backend /app/backend
 COPY --from=builder-debug --chown=app:app /out/vrt-runner /app/vrt-runner
+COPY --from=builder-debug --chown=app:app /out/vrt-storage-migrate /app/vrt-storage-migrate
 COPY --from=builder-debug --chown=app:app /out/migration /app/migration
 
 USER app
@@ -125,6 +129,7 @@ CMD ["/app/backend"]
 FROM runtime-base AS production
 COPY --from=builder-release --chown=app:app /out/backend /app/backend
 COPY --from=builder-release --chown=app:app /out/vrt-runner /app/vrt-runner
+COPY --from=builder-release --chown=app:app /out/vrt-storage-migrate /app/vrt-storage-migrate
 COPY --from=builder-release --chown=app:app /out/migration /app/migration
 
 USER app

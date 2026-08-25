@@ -95,6 +95,15 @@ impl StorageBackend for LocalStorageBackend {
         }
     }
 
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        let path = self.resolve_path(key)?;
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(StorageError::Io(error)),
+        }
+    }
+
     async fn get_stream(&self, key: &str) -> Result<ByteStream, StorageError> {
         let path = self.resolve_path(key)?;
         let file = File::open(&path).await?;
@@ -147,6 +156,18 @@ mod tests {
             validate_key("tenants/"),
             Err(StorageError::InvalidKey)
         ));
+    }
+
+    #[tokio::test]
+    async fn object_size_distinguishes_missing_and_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalStorageBackend::new(dir.path());
+
+        assert_eq!(backend.object_size("missing.png").await.unwrap(), None);
+        tokio::fs::write(dir.path().join("image.png"), b"png")
+            .await
+            .unwrap();
+        assert_eq!(backend.object_size("image.png").await.unwrap(), Some(3));
     }
 
     #[test]

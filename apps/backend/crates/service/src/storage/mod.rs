@@ -4,10 +4,12 @@ use std::env;
 use std::sync::Arc;
 
 pub mod local;
+pub mod migrate;
 pub mod s3;
 pub mod r#trait;
 
 pub use local::LocalStorageBackend;
+pub use migrate::{MigrationSummary, migrate_local_directory};
 pub use s3::S3StorageBackend;
 pub use r#trait::{ByteStream, StorageBackend, StorageError};
 

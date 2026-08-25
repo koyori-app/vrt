@@ -63,6 +63,7 @@ edition = "2024"
 default-run = "backend"
 
 [dependencies]
+anyhow = { workspace = true }
 entity = { path = "crates/entity" }
 common = { path = "crates/common" }
 service = { path = "crates/service" }

@@ -202,6 +202,19 @@ impl StorageBackend for S3StorageBackend {
         Ok(())
     }
 
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, StorageError> {
+        let path = to_path(key)?;
+        match self.store.head(&path).await {
+            Ok(metadata) => u64::try_from(metadata.size)
+                .map(Some)
+                .map_err(|_| StorageError::Other("S3 object size does not fit in u64".into())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(StorageError::Other(format!(
+                "S3 HeadObject failed: {error}"
+            ))),
+        }
+    }
+
     async fn get_stream(&self, key: &str) -> Result<ByteStream, StorageError> {
         let path = to_path(key)?;
         let result = self

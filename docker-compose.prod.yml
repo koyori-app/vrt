@@ -76,6 +76,27 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # local→S3成果物移行（one-shot）。
+  # STORAGE_BACKEND=localなら即時no-op。s3へ切り替えた最初のデプロイでは、既存uploadsを
+  # Wasabi等へコピー・サイズ検証してから終了する。元Volumeは削除しないため再実行可能。
+  storage-migration:
+    image: vrt-backend:prod
+    command: ["/app/vrt-storage-migrate"]
+    environment:
+      - STORAGE_BACKEND=${STORAGE_BACKEND:-local}
+      - LOCAL_UPLOAD_DIR=/home/app/uploads
+      - S3_ENDPOINT
+      - S3_BUCKET
+      - S3_REGION
+      - S3_ACCESS_KEY_ID
+      - S3_SECRET_ACCESS_KEY
+      - S3_FORCE_PATH_STYLE
+      - STORAGE_MIGRATION_CONCURRENCY=${STORAGE_MIGRATION_CONCURRENCY:-4}
+    volumes:
+      # 移行元は絶対に変更・削除しない。失敗時は環境変数を直して再デプロイすれば再開する。
+      - uploads:/home/app/uploads:ro
+    restart: "no"
+
   backend:
     build:
       context: ./apps/backend
@@ -150,9 +171,8 @@ services:
       # GitHub Enterprise のときだけ設定（既定は https://api.github.com）。
       - GITHUB_API_BASE_URL
     volumes:
-      # アップロード永続化。STORAGE_BACKEND=local のときのみ必要。s3 運用なら不要
-      # （その場合この volumes 行と下の uploads ボリューム定義は消してよい）。
-      # マウント先はイメージ内で app 所有に作ってあるので非 root でも書ける。
+      # local運用の保存先兼、S3自動移行の原本。S3切替後も検証・rollback用に残す。
+      # マウント先はイメージ内でapp所有に作ってあるので非rootでも書ける。
       - uploads:/home/app/uploads
     depends_on:
       db:
@@ -160,6 +180,8 @@ services:
       redis:
         condition: service_healthy
       migration:
+        condition: service_completed_successfully
+      storage-migration:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3400"]
@@ -196,6 +218,8 @@ services:
       db:
         condition: service_healthy
       migration:
+        condition: service_completed_successfully
+      storage-migration:
         condition: service_completed_successfully
     restart: unless-stopped
 
