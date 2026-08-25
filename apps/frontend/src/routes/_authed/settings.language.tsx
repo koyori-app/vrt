@@ -46,7 +46,10 @@ function LanguagePage() {
       // キャッシュを捨てて取り直す。
       await queryClient.invalidateQueries({ queryKey: ["get", "/v1/users/me"] });
       await i18n.changeLanguage(resolveLanguage(user.language, detectBrowserLanguage()));
-      toast.success(t("language.saved"));
+      // `useTranslation` の `t` は取得時の言語に固定される（`getFixedT`）。この
+      // クロージャが握っているのは切り替え**前**の `t` なので、成功トーストだけ
+      // 旧言語で出てしまう。切り替え後の言語で出すためインスタンス側から引く。
+      toast.success(i18n.t("language.saved"));
     },
     onError: (error) => toast.error(errorMessage(error, t("language.failed"))),
   });

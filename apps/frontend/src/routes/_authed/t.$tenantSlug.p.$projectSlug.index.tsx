@@ -152,7 +152,7 @@ function BuildsTable({
   tenantSlug: string;
   projectSlug: string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [offset, setOffset] = useState(0);
   const builds = useBuilds(projectId, BUILD_LIMIT, offset);
   const navigate = useNavigate();
@@ -241,7 +241,7 @@ function BuildsTable({
                     })}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {formatDate(build.created_at)}
+                    {formatDate(build.created_at, i18n.language)}
                   </TableCell>
                   <TableCell className="text-right">
                     <span className="inline-flex items-center gap-1 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">

@@ -88,7 +88,7 @@ function BuildReview({
   initialBuild: Build;
   githubRepo: string | null | undefined;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const [filter, setFilter] = useComparisonFilter();
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -322,7 +322,9 @@ function BuildReview({
             ? ` · ${t("build.pullRequest", { number: build.pull_request_number })}`
             : ""}
         </span>
-        <span className="text-xs text-muted-foreground">{formatDate(build.created_at)}</span>
+        <span className="text-xs text-muted-foreground">
+          {formatDate(build.created_at, i18n.language)}
+        </span>
         <div className="flex-1" />
         {build.mode === "storybook" && build.storybook_uploaded ? (
           <Button variant="outline" asChild>

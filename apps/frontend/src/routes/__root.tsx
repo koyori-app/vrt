@@ -3,6 +3,7 @@ import { createRootRouteWithContext, HeadContent, Outlet, Scripts } from "@tanst
 import { useEffect, useState, type ReactNode } from "react";
 import { I18nextProvider, useTranslation } from "react-i18next";
 
+import type { Me } from "@/lib/api";
 import { Toaster } from "@/components/ui/sonner";
 import { detectBrowserLanguage, rememberBrowserLanguage } from "@/lib/i18n/detect";
 import { createI18n, resolveLanguage, type Language } from "@/lib/i18n";
@@ -14,24 +15,54 @@ export interface RouterContext {
   queryClient: QueryClient;
 }
 
+/**
+ * 言語のためだけの `/me` 待ちに与える上限。
+ *
+ * この待ちは**全ページ**の描画の前に入る。バックエンドが「接続は受けるが
+ * 応答しない」状態（デプロイ中・DB ロック等）だと、`/api` クライアントには
+ * タイムアウトが無いため、復旧導線であるログイン画面ごと返らなくなる。
+ * 言語は外しても読めるが、ページが出ないのは外せない——上限を超えたら
+ * ブラウザの言語で描く。
+ */
+const LANGUAGE_LOOKUP_TIMEOUT_MS = 1_500;
+
+/**
+ * 表示言語のためのユーザー設定の取得。
+ *
+ * すでにキャッシュにあれば通信しない（`_authed` の認可判定が先に埋めている
+ * 場合はこれで足りる）。未ログインの `/me` は 401 になるが、ここでは言語の
+ * ためだけに読むので「設定なし」として扱い、認可の判断は `_authed` に任せる。
+ * リクエストは中断せず、結果はキャッシュに載って後続の判定に使われる。
+ */
+async function userLanguageSetting(queryClient: QueryClient): Promise<string | null | undefined> {
+  const options = meQueryOptions();
+  const cached = queryClient.getQueryData<Me>(options.queryKey);
+  if (cached) return cached.language;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const me = await Promise.race([
+      queryClient.ensureQueryData(options).catch(() => undefined),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), LANGUAGE_LOOKUP_TIMEOUT_MS);
+      }),
+    ]);
+    return me?.language;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export const Route = createRootRouteWithContext<RouterContext>()({
   /**
    * 表示言語は描画より前に決める。SSR で決めた値がローダーデータとして
    * クライアントへ渡るので、ハイドレーションが別の言語で始まることはない。
-   *
-   * `/me` は未ログインだと 401 になる。ここでは言語のためだけに読むので、
-   * 失敗は「ユーザー設定なし」として扱い、認可の判断は `_authed` に任せる。
    */
   loader: async ({
     context,
   }): Promise<{ language: Language; browserLanguage: Language | undefined }> => {
-    let userLanguage: string | null | undefined;
-    try {
-      userLanguage = (await context.queryClient.ensureQueryData(meQueryOptions())).language;
-    } catch {
-      userLanguage = undefined;
-    }
     const browserLanguage = detectBrowserLanguage();
+    const userLanguage = await userLanguageSetting(context.queryClient);
     return { language: resolveLanguage(userLanguage, browserLanguage), browserLanguage };
   },
   head: () => ({

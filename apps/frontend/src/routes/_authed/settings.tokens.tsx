@@ -41,7 +41,7 @@ const ALL_SCOPES = [
 ] as const satisfies readonly { value: Scope; descriptionKey: string }[];
 
 function TokensPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [createOpen, setCreateOpen] = useState(false);
   const queryClient = useQueryClient();
   const tokens = $api.useQuery("get", "/v1/personal_tokens", {});
@@ -103,7 +103,7 @@ function TokensPage() {
                     </div>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
-                    {formatDate(token.last_used_at)}
+                    {formatDate(token.last_used_at, i18n.language)}
                   </TableCell>
                   <TableCell className="text-right">
                     <Button

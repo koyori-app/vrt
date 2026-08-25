@@ -84,7 +84,7 @@ function MembersCard({
   myUserId: string;
   myRole: TenantRole | undefined;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const members = $api.useQuery("get", "/v1/tenants/{tenant_id}/members", {
     params: { path: { tenant_id: tenantId } },
@@ -204,7 +204,7 @@ function MembersCard({
                   )}
                 </TableCell>
                 <TableCell className="text-xs text-muted-foreground">
-                  {formatDate(member.created_at)}
+                  {formatDate(member.created_at, i18n.language)}
                 </TableCell>
                 <TableCell className="text-right">
                   {canManage && member.user_id !== myUserId ? (

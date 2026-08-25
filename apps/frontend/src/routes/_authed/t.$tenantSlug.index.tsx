@@ -99,7 +99,7 @@ function TenantDashboard() {
 }
 
 function ProjectCard({ tenantSlug, project }: { tenantSlug: string; project: Project }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   // One small query per card: the build list endpoint is the only source of a
   // project's most recent status (there is no per-project summary endpoint).
   const builds = useBuilds(project.id, 1);
@@ -124,7 +124,7 @@ function ProjectCard({ tenantSlug, project }: { tenantSlug: string; project: Pro
             ? t("tenant.latestBuild", {
                 number: latest.number,
                 branch: latest.branch,
-                date: formatDate(latest.created_at),
+                date: formatDate(latest.created_at, i18n.language),
               })
             : builds.isLoading
               ? t("common.loading")
