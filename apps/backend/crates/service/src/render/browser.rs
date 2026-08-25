@@ -75,8 +75,8 @@
 //! | 層 | 失敗を検知できるか | 検知したらどう倒れるか / 検知できぬ理由 |
 //! |----|----|----|
 //! | [`READY_HOOK_SCRIPT`] 注入 | CDP エラーは検知 | Rust 側 `Err`（fail-closed）。`defineProperty` 失敗は JS 内で握るが、`storyRenders` 保険が外れれば pending のままタイムアウトへ倒れる（fail-closed） |
-//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない（cmd_661 ①）。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定） |
-//! | play の失敗 | `playFunctionThrewException` / `unhandledErrorsWhilePlaying` を検知 | 例外は世代内の先着 error として [`RenderError::Story`] へ倒し、文言を診断に載せて撮影しない（fail-closed）。撮影が play を追い越さないよう、preview の phase が `playing` までの間は rendered 印があっても READY にしない。**判定を `completed` phase だけに絞ってはならない**——SB 9 の `StoryRender` は `completed` の中で `storyRendered` を emit した直後に `afterEach` → `finished` へ進むため、[`POLL_INTERVAL`]（100ms）で観測される定常値は `finished` であり、`completed` だけを ready の条件にすると正常な story が全て Timeout に倒れる（cmd_693。`a_story_that_settles_in_the_finished_phase_is_captured` が固定）。知らない phase 名は phase で判定せず、世代つきの rendered 印へ落とす |
+//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない（cmd_661 ①）。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定）。phase を読むのは**いま待っている story id を名乗るレンダー**だけ——`storyRenders` には docs の埋め込みレンダーや別 story のレンダーも並びうるため、末尾を無条件に読むと他所のレンダーの phase で自分の story を判定してしまう（`a_foreign_render_does_not_decide_our_story_readiness`）。id を名乗る要素が一つも無い形だけ従来どおり末尾を読む |
+//! | play の失敗 | `playFunctionThrewException` / `unhandledErrorsWhilePlaying` を検知 | 例外は世代内の先着 error として [`RenderError::Story`] へ倒し、文言を診断に載せて撮影しない（fail-closed）。撮影が play を追い越さないよう、preview の phase が `playing` までの間は rendered 印があっても READY にしない（判定対象は待っている story id を名乗るレンダー）。**判定を `completed` phase だけに絞ってはならない**——SB 9 の `StoryRender` は `completed` の中で `storyRendered` を emit した直後に `afterEach` → `finished` へ進むため、[`POLL_INTERVAL`]（100ms）で観測される定常値は `finished` であり、`completed` だけを ready の条件にすると正常な story が全て Timeout に倒れる（cmd_693。`a_story_that_settles_in_the_finished_phase_is_captured` が固定）。知らない phase 名は phase で判定せず、世代つきの rendered 印へ落とす |
 //! | 静止 CSS 注入（`freezeRoot`） | throw・API 欠落を検知 | constructed stylesheet（CSSOM）で注入する。構築・`replaceSync`・`adoptedStyleSheets` 代入の throw、`CSSStyleSheet` コンストラクタの欠落は `errors` → `ok: false`（fail-closed）。CSSOM 操作は CSP `style-src` の管轄外なので、旧 `<style>` 注入が持っていた「CSP による例外なしの黙殺」という検知不能経路は**構造ごと消えている** |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
 //! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を READY 待ちと共有の deadline（`started + story_timeout`）の残余の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
@@ -380,6 +380,9 @@ const READY_HOOK_SCRIPT: &str = r#"
 ///
 /// `absent` は「Storybook ランタイムが見当たらない」。呼び出し側が
 /// [`SIGNAL_GRACE`] 経過後に `dom_ready` を見て判断する。
+///
+/// `__VRT_STORY_ID__` は [`ready_probe`] が JSON 文字列リテラルへ差し替える
+/// 差し込み口。そのまま `evaluate` に渡してはならない。
 const READY_PROBE: &str = r#"
 JSON.stringify((() => {
   const loaded = document.readyState === 'complete' || document.readyState === 'interactive';
@@ -412,8 +415,26 @@ JSON.stringify((() => {
   // 進行中/完了したレンダーを storyRenders に持ち、phase で状態を出す。
   try {
     const renders = window.__STORYBOOK_PREVIEW__ && window.__STORYBOOK_PREVIEW__.storyRenders;
+    // storyRenders には docs の埋め込みレンダーや前の story のレンダーも
+    // 並びうる。`StoryRender` は自分が描く story id を `id` に持つので
+    // （SB 10.0.0 の `StoryRender.ts` で `public id: StoryId` を確認）、
+    // **いま待っている story のレンダー**だけを見る。id を名乗る要素が
+    // 一つも無い形（古い実装・最小 fixture）に限り、従来どおり末尾を見る。
+    let render = null;
     if (Array.isArray(renders) && renders.length > 0) {
-      const phase = renders[renders.length - 1].phase;
+      let identified = false;
+      for (let i = renders.length - 1; i >= 0; i--) {
+        const entry = renders[i];
+        if (!entry || typeof entry.id !== 'string') continue;
+        identified = true;
+        if (entry.id === __VRT_STORY_ID__) { render = entry; break; }
+      }
+      // id を名乗るのに我々の story が居ないなら、それは他所のレンダー——
+      // phase では判定せず、世代つきの rendered 印を見る下の経路へ落とす。
+      if (!render && !identified) render = renders[renders.length - 1];
+    }
+    if (render) {
+      const phase = render.phase;
       if (phase === 'errored' || phase === 'aborted') {
         // こちらには completed 側の domReady のような門を**掛けない**（判断。
         // cmd_662 ③）。理由は二つ。(1) 失敗の向き: 前 document の stale な
@@ -484,6 +505,17 @@ JSON.stringify((() => {
   return { state: 'absent', dom_ready: domReady && loaded };
 })())
 "#;
+
+/// [`READY_PROBE`] の `__VRT_STORY_ID__` を、いま待っている story の id へ
+/// 差し替えた式を返す。
+///
+/// id は JSON 文字列リテラルとして埋める——`'` や改行を含む story id でも
+/// 式が壊れない。`var` や `const` の宣言を前置きしない: `evaluate` は同じ
+/// realm で繰り返し走るため、宣言を残す形は二巡目に再宣言で落ちる。
+fn ready_probe(story_id: &str) -> String {
+    let literal = serde_json::to_string(story_id).unwrap_or_else(|_| "\"\"".to_string());
+    READY_PROBE.replace("__VRT_STORY_ID__", &literal)
+}
 
 /// 撮影直前にページを**決定的な静止状態**へ持ち込むスクリプト。
 ///
@@ -1818,8 +1850,9 @@ impl StoryRenderer {
         // その巡だけ判定が緩くなる。deadline は従来どおり story 全体で共有
         // （引数のまま受け取る——猶予と期限は別の時計である）。
         let round_started = std::time::Instant::now();
+        let probe = ready_probe(story_id);
         loop {
-            match page.evaluate(READY_PROBE).await {
+            match page.evaluate(probe.as_str()).await {
                 Ok(result) => match Readiness::parse(result.value()) {
                     Readiness::Ready => return Ok(()),
                     Readiness::Error(message) => {
@@ -2745,16 +2778,27 @@ mod tests {
     /// に留まるのは afterEach へ抜けるまでの一瞬なので、[`POLL_INTERVAL`] で
     /// 覗く READY probe が実際に見る定常値は `finished` である。
     ///
-    /// - `demo-phase--passes`      : play が 400ms 走ってから完了まで進む
-    /// - `demo-phase--play-throws` : play が投げ、`errored` を経て `finished` へ
+    /// `storyRenders` の各要素は本物と同じく自分の story id を名乗る。
+    ///
+    /// - `demo-phase--passes`         : play が 400ms 走ってから完了まで進む
+    /// - `demo-phase--play-throws`    : play が投げ、`errored` を経て `finished` へ
+    /// - `demo-phase--foreign-render` : 上に加えて、**他所の story** のレンダーが
+    ///   `playing` のまま末尾に居座る（docs の埋め込みレンダー相当）
     fn write_storybook_phase_order_bundle(root: &Path) {
         write_story_html(
             root,
             "html,body{margin:0;padding:0;background:#fff}",
             r#"<div id="play-target" style="width:100%;height:100vh;background:#ff0000"></div>"#,
-            r#"      window.__STORYBOOK_PREVIEW__ = { storyRenders: [{ phase: 'preparing' }] };
+            r#"      window.__STORYBOOK_PREVIEW__ = { storyRenders: [{ id: id, phase: 'preparing' }] };
       var render = window.__STORYBOOK_PREVIEW__.storyRenders[0];
       window.__VRT_PHASE_ORDER__ = ['preparing'];
+      if (id === 'demo-phase--foreign-render') {
+        // 我々の story のレンダーの**後ろ**に、別 story の止まったレンダーを
+        // 置く。末尾だけを見る判定はここで play 待ちのまま動けなくなる。
+        window.__STORYBOOK_PREVIEW__.storyRenders.push({
+          id: 'demo-other--stuck', phase: 'playing'
+        });
+      }
       render.phase = 'loading';
       render.phase = 'beforeEach';
       render.phase = 'rendering';
@@ -6454,6 +6498,39 @@ mod tests {
                 && message.contains("phase-order play assertion failed"),
             "the play reason must survive the later finished phase, got {message:?}"
         );
+    }
+
+    /// preview の `storyRenders` に**他所の story**のレンダーが混じっていても、
+    /// いま待っている story のレンダーの phase で判定すること。
+    ///
+    /// docs の埋め込みレンダーのように、末尾が別 story の（しかも `playing` で
+    /// 止まった）レンダーになる形はありうる。末尾だけを見る判定は、自分の
+    /// story が終わっていても play 待ちのまま deadline まで動けない。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreign_render_does_not_decide_our_story_readiness() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!("SKIP a_foreign_render_does_not_decide_our_story_readiness: no chromium");
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_storybook_phase_order_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let png = renderer
+            .render_story(&server.base_url(), "demo-phase--foreign-render")
+            .await
+            .expect("another story's stuck render must not hold our capture")
+            .png;
+        renderer.close().await;
+
+        let image = decode_png(&png);
+        let center = image.get_pixel(160, 120);
+        assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
     }
 
     /// Chromium が無い環境では「ハングせずにエラーを返す」こと。
