@@ -496,6 +496,8 @@ pub struct TestAppOptions {
     pub github: Option<MockGithub>,
     /// e2e 用のテスト専用ログイン口を開くか（既定 false = 本番と同じく 404）。
     pub test_login: bool,
+    /// Storybook 受付可否をテストごとに明示する。`None` は通常設定のまま。
+    pub storybook_render_enabled: Option<bool>,
 }
 
 pub struct TestApp {
@@ -552,6 +554,9 @@ impl TestApp {
         settings.app_url = base_url.clone();
         settings.gitlab_instance_url = Some(provider.instance_url());
         settings.test_login_enabled = options.test_login;
+        if let Some(enabled) = options.storybook_render_enabled {
+            settings.storybook_render_enabled_override = Some(enabled);
+        }
 
         // GitHub App は「設定されていれば有効」。既定（`TestApp::new`）では未設定のまま
         // 起動して、連携が無効なときにフローが壊れないことも同時に確かめる。
@@ -656,7 +661,7 @@ impl TestApp {
         });
 
         // 本番の server::run と同じ形でワーカーを走らせる。
-        // これが無いと finalize したビルドが processing のまま止まる。
+        // これが無いと finalize したビルドが queued のまま止まる。
         let (worker_shutdown, worker_shutdown_rx) = watch::channel(false);
         backend::server::spawn_compare_build_worker(&state, worker_shutdown_rx.clone());
         backend::server::spawn_github_status_worker(&state, worker_shutdown_rx.clone());

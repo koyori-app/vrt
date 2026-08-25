@@ -15,7 +15,7 @@ use utoipa_scalar::{Scalar, Servable};
 
 use handler::AppState;
 use handler::middlewares::logging::logging_middleware;
-use job::JobState;
+use job::{JobState, RenderBuildStorage, RenderJobState};
 use job::{compare_build, github_status, github_webhook, render_build};
 
 /// `AppState` からワーカー用の依存だけを取り出す。
@@ -32,6 +32,26 @@ pub fn job_state_from(state: &AppState) -> JobState {
         github_status_storage: state.github_status_storage.clone(),
         compare_build_storage: state.compare_build_storage.clone(),
     }
+}
+
+/// `AppState` から Render worker 専用の依存だけを取り出す。
+///
+/// Chromium が無い API プロセスでは呼ばない。独立 `vrt-runner` は HTTP API の
+/// state を組み立てず、同じ [`RenderJobState`] を直接生成する。
+pub fn render_job_state_from(state: &AppState) -> Option<RenderJobState> {
+    let chromium_path = state
+        .settings
+        .chromium_path
+        .clone()
+        .filter(|path| !path.trim().is_empty())?;
+
+    Some(RenderJobState {
+        chromium_path,
+        db: state.db.clone(),
+        storage: state.storage.clone(),
+        github_status_storage: state.github_status_storage.clone(),
+        compare_build_storage: state.compare_build_storage.clone(),
+    })
 }
 
 /// ワーカー名（= `apalis.workers.id`）を組み立てる。
@@ -112,14 +132,25 @@ pub fn spawn_github_status_worker(
 
 /// `RenderBuildJob` のワーカーを spawn する（ワーカー名の一意性は [`worker_name`] 参照）。
 ///
-/// Chromium を起動するため 1 ジョブが重い。同時実行数は
-/// [`render_build::WORKER_CONCURRENCY`]（= 1）に絞る。
+/// Chromium を起動するため 1 ジョブが重い。ジョブの同時実行数は
+/// [`render_build::WORKER_CONCURRENCY`]（= 1）に絞り、ジョブ内の story だけを
+/// [`render_build::STORY_RENDER_CONCURRENCY`]（= 2）で並列化する。
 pub fn spawn_render_build_worker(
     state: &AppState,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<(), apalis::prelude::WorkerError>> {
-    let storage = state.render_build_storage.as_ref().clone();
-    let job_state = job_state_from(state);
+    let job_state = render_job_state_from(state)
+        .expect("spawn_render_build_worker requires a configured CHROMIUM_PATH");
+    spawn_render_build_worker_with_state(state.render_build_storage.clone(), job_state, shutdown)
+}
+
+/// HTTP API から独立した runner も利用できる Render worker の共通起動口。
+pub fn spawn_render_build_worker_with_state(
+    storage: Arc<RenderBuildStorage>,
+    job_state: RenderJobState,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<Result<(), apalis::prelude::WorkerError>> {
+    let storage = storage.as_ref().clone();
 
     let queue = storage.config().queue().to_string();
     let name = worker_name(&queue);
@@ -215,18 +246,40 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
         .allow_credentials(true);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let compare_worker_handle = spawn_compare_build_worker(&state, shutdown_rx.clone());
-    let github_status_worker_handle = spawn_github_status_worker(&state, shutdown_rx.clone());
-    let github_webhook_worker_handle = spawn_github_webhook_worker(&state, shutdown_rx.clone());
-    let render_worker_handle = spawn_render_build_worker(&state, shutdown_rx);
+    let mut worker_handles = vec![
+        (
+            "compare build",
+            spawn_compare_build_worker(&state, shutdown_rx.clone()),
+        ),
+        (
+            "github status",
+            spawn_github_status_worker(&state, shutdown_rx.clone()),
+        ),
+        (
+            "github webhook",
+            spawn_github_webhook_worker(&state, shutdown_rx.clone()),
+        ),
+    ];
 
-    if state.settings.storybook_render_enabled() {
-        info!(
-            chromium = %state.settings.chromium_path.clone().unwrap_or_default(),
-            "storybook rendering enabled"
-        );
-    } else {
-        warn!("CHROMIUM_PATH is not set; storybook-mode builds will be rejected at creation");
+    if state.settings.render_worker_enabled && state.settings.storybook_render_enabled() {
+        if state.settings.chromium_configured() {
+            worker_handles.push((
+                "render build",
+                spawn_render_build_worker(&state, shutdown_rx.clone()),
+            ));
+            info!(
+                chromium = %state.settings.chromium_path.clone().unwrap_or_default(),
+                "storybook rendering enabled in API process"
+            );
+        } else {
+            warn!("render worker enabled without CHROMIUM_PATH; render worker was not started");
+        }
+    } else if !state.settings.render_worker_enabled && state.settings.storybook_render_enabled() {
+        info!("API render worker disabled; waiting for external vrt-runner instances");
+    }
+
+    if !state.settings.storybook_render_enabled() {
+        warn!("Storybook rendering disabled; storybook-mode builds will be rejected at creation");
     }
 
     let api = router
@@ -253,12 +306,7 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
-    for (label, handle) in [
-        ("compare build", compare_worker_handle),
-        ("github status", github_status_worker_handle),
-        ("github webhook", github_webhook_worker_handle),
-        ("render build", render_worker_handle),
-    ] {
+    for (label, handle) in worker_handles {
         match handle.await {
             Ok(Ok(())) => info!("{label} worker stopped"),
             Ok(Err(e)) => warn!("{label} worker error: {e}"),

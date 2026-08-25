@@ -228,7 +228,7 @@ impl Fixture {
             let build: Value = res.json().await.expect("build json");
             let status = build["status"].as_str().unwrap_or_default().to_string();
 
-            if !matches!(status.as_str(), "pending" | "processing") {
+            if !matches!(status.as_str(), "pending" | "queued" | "processing") {
                 assert_completed_at_is_stamped(&build);
                 return build;
             }
@@ -602,6 +602,29 @@ async fn vrt_full_flow_from_first_build_to_stable_baseline() {
         .map(|b| b["number"].as_i64().unwrap_or(-1))
         .collect();
     assert_eq!(numbers, vec![3, 2, 1], "builds are listed newest first");
+    let listed = list["builds"].as_array().expect("builds array");
+    assert_eq!(
+        listed[0]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build2_id,
+            "build_number": 2,
+        }),
+        "build #3 exposes the approved build whose baseline it compared against"
+    );
+    assert_eq!(
+        listed[1]["baseline_source"],
+        json!({
+            "branch": "main",
+            "build_id": build1_id,
+            "build_number": 1,
+        }),
+        "build #2 exposes its baseline ancestry"
+    );
+    assert!(
+        listed[2]["baseline_source"].is_null(),
+        "the root build has no invented ancestry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1066,9 +1089,11 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     let mut active: entity::builds::ActiveModel = model.into();
     active.status = Set(entity::builds::BuildStatus::Failed);
     active.error_message = Set(Some("simulated compare failure".into()));
+    active.failure_origin = Set(Some(entity::builds::BuildFailureOrigin::Vrt));
+    active.failure_code = Set(Some("compare_internal".into()));
     active.update(&fx.app.state.db).await.expect("force failed");
 
-    // 再実行 → processing（比較から）に戻り、そのまま完走する。
+    // 再実行 → queued に戻り、worker が取得して比較から完走する。
     let res = fx
         .app
         .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
@@ -1077,10 +1102,12 @@ async fn a_failed_screenshots_build_can_be_retried_from_the_compare_step() {
     let retried: Value = res.json().await.expect("retry json");
     assert_eq!(
         retried["status"].as_str(),
-        Some("processing"),
-        "screenshots-mode retry restarts at the compare step"
+        Some("queued"),
+        "screenshots-mode retry waits for the compare worker"
     );
     assert!(retried["error_message"].is_null());
+    assert!(retried["failure_origin"].is_null());
+    assert!(retried["failure_code"].is_null());
 
     let done = fx.wait_for_terminal(build_id).await;
     assert_eq!(

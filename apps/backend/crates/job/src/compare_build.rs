@@ -1,6 +1,7 @@
 //! ビルドのスクリーンショットを baseline と突き合わせて差分を計算するジョブ。
 //!
-//! `POST /v1/ci/builds/{id}/finalize` が `pending → processing` の遷移と同時に投入する。
+//! `POST /v1/ci/builds/{id}/finalize` が `pending → queued` の遷移と同時に投入し、
+//! screenshots モードでは worker が取得した時点で `queued → processing` へ進める。
 //!
 //! 処理の流れ:
 //!
@@ -16,7 +17,7 @@
 //! リトライ安全性: 開始時にそのビルドの comparisons を全削除するため、
 //! 途中で落ちて再実行されても行が重複しない。
 
-use apalis::prelude::{BoxDynError, Data, TaskSink};
+use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
@@ -60,19 +61,16 @@ pub struct CompareBuildJob {
 ///   テーブルを毎回引き直すので、いつ投入されたジョブでも必ず拾える。
 ///
 /// 実際に統合テストで前者を踏んだ（並列実行で負荷が上がると
-/// `PgListener::connect_with` が finalize より遅れ、ビルドが processing のまま停止した）。
+/// `PgListener::connect_with` が finalize より遅れ、ビルドが queued のまま停止した）。
 /// 取りこぼしゼロを優先してポーリング型を採用する。
 ///
-/// ## 既知の制約（upstream）
+/// ## ポーリング間隔
 ///
-/// `Config::with_poll_interval` で渡した `poll_strategy` は
-/// apalis-postgres 1.0.0-rc.8 では**どちらのフェッチャからも読まれない**（デッドコンフィグ）。
-/// `PgFetcher` の待ち時間は `PgPollFetcher` にハードコードされた指数バックオフ
-/// （初期 1s → 2 倍ずつ → 上限 5 分。ジョブを 1 件でも拾えば 1s にリセット）で決まる。
-/// つまり「約 8.5 分以上まったくジョブが無かった直後の 1 本目」は最大 5 分待たされうる。
-/// 連続するビルドはリセット後なので即時に近い。
-/// ここを詰めるには upstream が `poll_strategy` を尊重するか、
-/// バックオフ上限を設定可能にする必要がある。
+/// upstream の apalis-postgres 1.0.0-rc.8 は `Config::with_poll_interval` を
+/// `PgPollFetcher` から読まず、アイドル時に最大 5 分まで指数バックオフする。
+/// VRT は同じ API / DB スキーマのローカルパッチ（`vendor/apalis-postgres`）で
+/// 1 秒固定にしている。これにより通知型の起動レースを持ち込まず、プロセス起動前に
+/// 投入されたジョブも拾いつつ、アイドル後の取得遅延を 1 秒程度に抑える。
 pub type CompareBuildStorage = PostgresStorage<CompareBuildJob>;
 
 /// 指定キュー名でストレージを組み立てる。
@@ -118,6 +116,36 @@ pub async fn enqueue(
     Ok(())
 }
 
+/// 同じパイプライン段からの比較ジョブ引き渡しを 1 回に畳んで投入する。
+///
+/// `render_build` が `processing` への遷移後に落ちても同じ task が再実行され、
+/// 同じキーでここへ戻る。既に投入済みなら unique violation を成功として扱い、
+/// それ以外の DB / codec エラーは呼び出し側へ返す。
+pub async fn enqueue_idempotent(
+    storage: &CompareBuildStorage,
+    job: CompareBuildJob,
+    idempotency_key: &str,
+) -> Result<(), anyhow::Error> {
+    let mut storage = storage.clone();
+    let task = TaskBuilder::new(job)
+        .with_idempotency_key(idempotency_key)
+        .build();
+
+    match storage.push_task(task).await {
+        Ok(()) => Ok(()),
+        Err(TaskSinkError::PushError(sqlx::Error::Database(error)))
+            if error.code().as_deref() == Some("23505")
+                && error.constraint() == Some("idx_jobs_idempotency_key") =>
+        {
+            tracing::info!(%idempotency_key, "compare build job was already enqueued");
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "push idempotent compare build job: {error}"
+        )),
+    }
+}
+
 /// ワーカーのエントリポイント。
 ///
 /// 回復不能なエラーはビルドを `failed` に落として `Ok(())` を返す（無限リトライ回避）。
@@ -141,11 +169,15 @@ pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), 
             let build = service::builds::get_build(&state.db, build_id)
                 .await
                 .map_err(|e| -> BoxDynError { format!("reload build {build_id}: {e}").into() })?;
-            service::builds::mark_failed(&state.db, build, truncate(&err.to_string(), 2000))
-                .await
-                .map_err(|e| -> BoxDynError {
-                    format!("mark build {build_id} failed: {e}").into()
-                })?;
+            service::builds::mark_failed(
+                &state.db,
+                build,
+                truncate(&err.to_string(), 2000),
+                entity::builds::BuildFailureOrigin::Vrt,
+                "compare_internal",
+            )
+            .await
+            .map_err(|e| -> BoxDynError { format!("mark build {build_id} failed: {e}").into() })?;
             Ok(())
         }
     };
@@ -180,11 +212,20 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
-    if build.status != BuildStatus::Processing {
-        // finalize 済みでないビルドは処理しない（重複投入・遅延到着の保護）。
-        tracing::info!(%build_id, status = ?build.status, "skipping compare job for non-processing build");
-        return Ok(());
-    }
+    let build = match (build.mode, build.status) {
+        // screenshots モードのパイプライン先頭。worker が実際に取得してから
+        // processing にするため、UI はキュー待ちと処理中を区別できる。
+        (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
+            service::builds::transition(db, build, BuildStatus::Processing).await?
+        }
+        // storybook の render 完了後に積まれた compare job と、旧バージョンが
+        // finalize 時点で Processing にしたジョブはそのまま続行する。
+        (_, BuildStatus::Processing) => build,
+        (mode, status) => {
+            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            return Ok(());
+        }
+    };
 
     let project = service::projects::get_project(db, build.project_id).await?;
 

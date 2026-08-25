@@ -9,12 +9,14 @@ const LOG_POLL_MS = 2_000;
 const FOLLOW_THRESHOLD_PX = 40;
 
 /**
- * A build is still producing logs while it is pending / rendering / processing.
+ * A build can still produce logs while it is pending / queued / rendering / processing.
  * Once it reaches any other state the render + compare jobs are done, so polling
  * stops (one final fetch flushes the lines written alongside the transition).
  */
 function isRunning(status: BuildStatus): boolean {
-  return status === "pending" || status === "rendering" || status === "processing";
+  return (
+    status === "pending" || status === "queued" || status === "rendering" || status === "processing"
+  );
 }
 
 function levelClass(level: string): string {

@@ -512,6 +512,10 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
 
     match build.status {
         Pending => (CommitState::Pending, "Waiting for screenshots".to_string()),
+        Queued => (
+            CommitState::Pending,
+            "Waiting for a build worker".to_string(),
+        ),
         Rendering => (
             CommitState::Pending,
             "Rendering stories from the Storybook bundle".to_string(),
@@ -527,7 +531,14 @@ pub fn status_for_build(build: &builds::Model) -> (CommitState, String) {
         ),
         Approved => (CommitState::Success, "Visual changes approved".to_string()),
         Rejected => (CommitState::Failure, "Visual changes rejected".to_string()),
-        Failed => (CommitState::Error, "Visual test run failed".to_string()),
+        Failed => {
+            let description = match build.failure_origin {
+                Some(builds::BuildFailureOrigin::Test) => "Story or test failed",
+                Some(builds::BuildFailureOrigin::Vrt) => "VRT execution environment failed",
+                None => "Visual test run failed",
+            };
+            (CommitState::Error, description.to_string())
+        }
     }
 }
 
@@ -1071,6 +1082,8 @@ mod tests {
             unchanged_count: 0,
             content_hash_skipped_count: 0,
             error_message: None,
+            failure_origin: None,
+            failure_code: None,
             approval_evidence: None,
             approved_by: None,
             approved_at: None,
@@ -1082,6 +1095,10 @@ mod tests {
     #[test]
     fn maps_build_status_to_commit_state() {
         use builds::BuildStatus::*;
+        assert_eq!(
+            status_for_build(&build(Queued, 0, 0, 0)).0,
+            CommitState::Pending
+        );
         assert_eq!(
             status_for_build(&build(Processing, 0, 0, 0)).0,
             CommitState::Pending
@@ -1117,6 +1134,19 @@ mod tests {
 
         let (_, singular) = status_for_build(&build(builds::BuildStatus::ChangesDetected, 1, 0, 0));
         assert_eq!(singular, "1 change detected, awaiting review");
+    }
+
+    #[test]
+    fn failed_description_identifies_who_needs_to_fix_it() {
+        let mut failed = build(builds::BuildStatus::Failed, 0, 0, 0);
+        failed.failure_origin = Some(builds::BuildFailureOrigin::Test);
+        assert_eq!(status_for_build(&failed).1, "Story or test failed");
+
+        failed.failure_origin = Some(builds::BuildFailureOrigin::Vrt);
+        assert_eq!(
+            status_for_build(&failed).1,
+            "VRT execution environment failed"
+        );
     }
 
     #[test]
@@ -1232,6 +1262,8 @@ mod tests {
             s3_public_base_url: None,
             s3_force_path_style: None,
             chromium_path: None,
+            render_worker_enabled: true,
+            storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
         assert!(github_app(&settings, &http).is_none());
@@ -1275,6 +1307,8 @@ mod tests {
             s3_public_base_url: None,
             s3_force_path_style: None,
             chromium_path: None,
+            render_worker_enabled: true,
+            storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
         assert_eq!(settings.github_api_base_url(), "https://api.github.com");

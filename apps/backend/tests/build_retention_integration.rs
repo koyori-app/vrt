@@ -80,6 +80,9 @@ async fn make_passed_build(
     .await
     .expect("store screenshot");
 
+    let build = service::builds::transition(db, build, BuildStatus::Queued)
+        .await
+        .expect("to queued");
     let build = service::builds::transition(db, build, BuildStatus::Processing)
         .await
         .expect("to processing");

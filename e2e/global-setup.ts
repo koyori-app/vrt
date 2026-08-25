@@ -58,7 +58,7 @@ export async function waitForTerminalBuild(
     });
     expect(response.status(), await response.text()).toBe(200);
     last = await response.json();
-    if (last.status !== "pending" && last.status !== "processing") {
+    if (last.status !== "pending" && last.status !== "queued" && last.status !== "processing") {
       return last;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));

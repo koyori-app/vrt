@@ -152,13 +152,7 @@ function BuildsTable({
   const builds = useBuilds(projectId, BUILD_LIMIT);
   const navigate = useNavigate();
   const rows = builds.data?.builds;
-  const total = builds.data?.total;
-  // The response includes the authoritative total, so a page with exactly BUILD_LIMIT
-  // builds is not mistaken for a truncated result when there are no older builds.
-  const graph = useMemo(
-    () => buildGraph(rows ?? [], defaultBranch, total !== undefined && (rows?.length ?? 0) < total),
-    [rows, defaultBranch, total],
-  );
+  const graph = useMemo(() => buildGraph(rows ?? [], defaultBranch), [rows, defaultBranch]);
 
   return (
     <Card>
@@ -692,7 +686,7 @@ const CI_MODE_DESCRIPTION: Record<CiMode, string> = {
   storybook:
     "Your CI uploads a built Storybook (a zip of storybook-static) and VRT renders every story " +
     "server-side in headless Chromium. Rendering happens between finalize and the comparison, so " +
-    "the build passes through the “Rendering” state first.",
+    "the build passes through “Queued” and “Rendering” first.",
 };
 
 function ciSnippet(mode: CiMode, tenantSlug: string, projectSlug: string) {
@@ -719,7 +713,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/storybook" \\
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. poll until the build leaves "rendering"/"processing"
+# 4. poll until the build leaves "queued"/"rendering"/"processing"
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
   }
 
@@ -735,7 +729,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/screenshots" \\
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \\
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. poll until the build leaves "processing"
+# 4. poll until the build leaves "queued"/"processing"
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"`;
 }
 

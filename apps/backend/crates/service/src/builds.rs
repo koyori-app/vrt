@@ -201,6 +201,8 @@ pub async fn create_build<C: ConnectionTrait>(
         unchanged_count: Set(0),
         content_hash_skipped_count: Set(0),
         error_message: Set(None),
+        failure_origin: Set(None),
+        failure_code: Set(None),
         approval_evidence: Set(None),
         approved_by: Set(None),
         approved_at: Set(None),
@@ -236,6 +238,78 @@ pub async fn list_builds<C: ConnectionTrait>(
         .offset(offset)
         .all(db)
         .await?)
+}
+
+/// ビルドが実際に比較した baseline の系譜。
+///
+/// `source_build_*` は保持期間によって昇格元ビルドが削除済みなら `None` だが、
+/// baseline 自体の branch は残る。UI はこの情報だけを使い、Git の親子関係を
+/// 推測せずに VRT 上の正確な派生元を描く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildBaselineSource {
+    pub branch: String,
+    pub source_build_id: Option<Uuid>,
+    pub source_build_number: Option<i64>,
+}
+
+/// 一覧に含まれる各ビルドの baseline 昇格元をまとめて解決する。
+///
+/// baseline と昇格元 build をそれぞれ一括取得し、ビルド数に比例した N+1 query を
+/// 避ける。返り値のキーは baseline ではなく一覧側の build ID。
+pub async fn baseline_sources_for_builds<C: ConnectionTrait>(
+    db: &C,
+    list: &[builds::Model],
+) -> Result<HashMap<Uuid, BuildBaselineSource>, AppError> {
+    let baseline_ids = list
+        .iter()
+        .filter_map(|build| build.baseline_id)
+        .collect::<HashSet<_>>();
+    if baseline_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let baseline_rows = baselines::Entity::find()
+        .filter(baselines::Column::Id.is_in(baseline_ids))
+        .all(db)
+        .await?;
+    let source_ids = baseline_rows
+        .iter()
+        .filter_map(|baseline| baseline.source_build_id)
+        .collect::<HashSet<_>>();
+    let source_builds = if source_ids.is_empty() {
+        Vec::new()
+    } else {
+        builds::Entity::find()
+            .filter(builds::Column::Id.is_in(source_ids))
+            .all(db)
+            .await?
+    };
+    let source_builds = source_builds
+        .into_iter()
+        .map(|build| (build.id, build))
+        .collect::<HashMap<_, _>>();
+    let baselines = baseline_rows
+        .into_iter()
+        .map(|baseline| (baseline.id, baseline))
+        .collect::<HashMap<_, _>>();
+
+    Ok(list
+        .iter()
+        .filter_map(|build| {
+            let baseline = baselines.get(&build.baseline_id?)?;
+            let source = baseline
+                .source_build_id
+                .and_then(|source_id| source_builds.get(&source_id));
+            Some((
+                build.id,
+                BuildBaselineSource {
+                    branch: baseline.branch.clone(),
+                    source_build_id: source.map(|source| source.id),
+                    source_build_number: source.map(|source| source.number),
+                },
+            ))
+        })
+        .collect())
 }
 
 /// プロジェクト内のビルド番号でビルドを取得する。
@@ -284,12 +358,13 @@ pub async fn transition<C: ConnectionTrait>(
     Ok(active.update(db).await?)
 }
 
-/// finalize: `pending → processing`。ジョブ投入は呼び出し側（ハンドラ）が行う。
+/// finalize: `pending → queued`。ジョブ投入は呼び出し側（ハンドラ）が行い、
+/// compare worker が取得した時点で `processing` へ進める。
 pub async fn finalize<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
 ) -> Result<builds::Model, AppError> {
-    transition(db, build, BuildStatus::Processing).await
+    transition(db, build, BuildStatus::Queued).await
 }
 
 /// screenshots モードの部分アップロード計画。
@@ -523,7 +598,7 @@ pub async fn attach_capture_plan(
 /// 拒否する——申告だけの部分アップロードは、撮影が全滅したときに
 /// 「空の申告 == 空のアップロード」が成立して偽 PASS になるためである。
 ///
-/// 「計画 == アップロード」検査と `pending → processing` 遷移は build 行ロック
+/// 「計画 == アップロード」検査と `pending → queued` 遷移は build 行ロック
 /// （[`crate::review_lock::build`]）を取ったトランザクション内で行う。
 /// アップロード・計画添付も同じ行ロックを取るため、検査と遷移の間に
 /// アップロードや計画の変更が割り込むことはない（比較ジョブ側の再検証は
@@ -593,7 +668,7 @@ pub async fn finalize_screenshots(
                     }
                 }
             }
-            transition(txn, build, BuildStatus::Processing).await
+            transition(txn, build, BuildStatus::Queued).await
         })
     })
     .await
@@ -646,7 +721,7 @@ pub async fn current_baseline_commit_sha<C: ConnectionTrait>(
     baseline_source_commit_sha(db, &baseline).await
 }
 
-/// storybook モードの finalize: `pending → rendering`。
+/// storybook モードの finalize: `pending → queued`。
 ///
 /// バンドルが未アップロードなら 400（`RenderBuildJob` が拾うものが無いため）。
 /// ジョブ投入は呼び出し側（ハンドラ）が行う。
@@ -729,7 +804,7 @@ pub async fn finalize_storybook(
                 }
             };
 
-            transition(txn, build, BuildStatus::Rendering).await
+            transition(txn, build, BuildStatus::Queued).await
         })
     })
     .await
@@ -781,6 +856,8 @@ pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
     message: String,
+    failure_origin: builds::BuildFailureOrigin,
+    failure_code: impl Into<String>,
 ) -> Result<builds::Model, AppError> {
     // 既に終端状態なら何もしない（リトライ時の二重書き込み防止）。
     if build.status.is_terminal() {
@@ -789,6 +866,8 @@ pub async fn mark_failed<C: ConnectionTrait>(
     let mut active: builds::ActiveModel = build.into();
     active.status = Set(BuildStatus::Failed);
     active.error_message = Set(Some(message));
+    active.failure_origin = Set(Some(failure_origin));
+    active.failure_code = Set(Some(failure_code.into()));
     active.completed_at = Set(Some(Utc::now().fixed_offset()));
     Ok(active.update(db).await?)
 }
@@ -809,15 +888,17 @@ pub enum RetryTarget {
 /// 失敗（`failed`）ビルドをパイプラインの先頭へ戻す。ジョブ投入は
 /// 呼び出し側（ハンドラ）が戻り値の [`RetryTarget`] に従って行う。
 ///
-/// - storybook モード → `rendering`（バンドルから全ストーリーを撮り直す。
+/// - storybook モード → `queued`（worker が取得後 `rendering` へ進み、
+///   バンドルから全ストーリーを撮り直す。
 ///   部分撮影計画（capture plan）付きのビルドでも再実行は全撮影——計画の
 ///   story ID はビルドに保存されておらず復元できないため。計画が固定した
 ///   baseline と manifest は残るので、比較の正しさ（removed 判定・比較先）は
 ///   保たれる。流用のはずだった story も撮り直すだけで、決定的レンダリングの
 ///   前提では同じ絵になる）
-/// - screenshots モード → `processing`（PNG はアップロード済み。比較だけやり直す）
+/// - screenshots モード → `queued`（worker が取得後 `processing` へ進む。
+///   PNG はアップロード済みなので、比較だけやり直す）
 ///
-/// 前回の結果はクリアする: `error_message` / `completed_at` / 差分カウント。
+/// 前回の結果はクリアする: `error_message` / 失敗分類 / `completed_at` / 差分カウント。
 /// comparisons / screenshots の途中結果は各ジョブが開始時に自分で捨てる
 /// （リトライ安全性の既存設計）ので、ここでは触らない。
 ///
@@ -828,8 +909,8 @@ pub enum RetryTarget {
 /// 検査と遷移は build 行ロック（[`crate::review_lock::build`]）を取った
 /// 1 トランザクション内で行う（finalize / plan 添付と同じ流儀）。呼び出し側の
 /// スナップショットで検査すると retry の併走が両方 200 になり、同じビルドへ
-/// ジョブが二重投入される——2 本目はロック下の再読込で `rendering` /
-/// `processing` を見て 409 に倒れる。
+/// ジョブが二重投入される——2 本目はロック下の再読込で `queued` を見て
+/// 409 に倒れる。
 pub async fn retry_failed(
     db: &DatabaseConnection,
     build_id: Uuid,
@@ -847,7 +928,7 @@ pub async fn retry_failed(
                         .unwrap_or_else(|| format!("{:?}", build.status))
                 )));
             }
-            let (to, target) = match build.mode {
+            let target = match build.mode {
                 BuildMode::Storybook => {
                     if build.storybook_key.is_none() {
                         return Err(AppError::ConflictDetail(
@@ -856,19 +937,21 @@ pub async fn retry_failed(
                                 .into(),
                         ));
                     }
-                    (BuildStatus::Rendering, RetryTarget::Render)
+                    RetryTarget::Render
                 }
-                BuildMode::Screenshots => (BuildStatus::Processing, RetryTarget::Compare),
+                BuildMode::Screenshots => RetryTarget::Compare,
             };
             // 遷移表（`can_transition_to`）にもこの向きが載っていることを、
             // 一本化の規約どおり release でも検査する。
-            if !build.status.can_transition_to(to) {
+            if !build.status.can_transition_to(BuildStatus::Queued) {
                 return Err(AppError::Conflict);
             }
 
             let mut active: builds::ActiveModel = build.into();
-            active.status = Set(to);
+            active.status = Set(BuildStatus::Queued);
             active.error_message = Set(None);
+            active.failure_origin = Set(None);
+            active.failure_code = Set(None);
             active.completed_at = Set(None);
             active.total_count = Set(0);
             active.changed_count = Set(0);

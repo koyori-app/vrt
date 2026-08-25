@@ -87,6 +87,21 @@ storybook モード（サーバーサイドレンダリング）を動かすに�
 （`~/.cache/ms-playwright`。e2e の `pnpm exec playwright install chromium` が入れる）
 の順に探し、どこにも無ければスキップする。
 
+Render worker は API から独立して起動できる。`RENDER_WORKER_ENABLED=false` と
+`STORYBOOK_RENDER_ENABLED=true` を API に設定し、同じ `DATABASE_URL` と
+`STORAGE_BACKEND` を持つ別プロセスで次を実行する。
+
+```bash
+cargo run --bin vrt-runner
+```
+
+runner は `render_build` キューだけを消費し、Redis・OAuth・GitHub の資格情報を
+必要としない。Docker Compose はこの分離構成が既定で、Dokploy では backend と
+同じイメージの別サービスを作り、Start Command を `/app/vrt-runner` にする。
+runner のレプリカ数が同時に処理できる Storybook ビルド数になる（各ビルド内は2並列）。
+別ホストへ配置する場合は `STORAGE_BACKEND=s3` を使う。`local` は backend と runner
+が同じ `uploads` ボリュームを共有できる単一ホスト構成に限る。
+
 ### frontend
 
 ```bash
@@ -159,7 +174,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/screenshots" \
 curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
   -H "Authorization: Bearer $VRT_TOKEN"
 
-# 4. processing を抜けるまでポーリングする
+# 4. queued / processing を抜けるまでポーリングする
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 ```
 
@@ -919,7 +934,7 @@ curl -sS -X POST "$VRT_URL/v1/ci/builds/$BUILD/finalize" \
   -H "Authorization: Bearer $VRT_TOKEN"
 # 撮り直しを絞りたいときは only_story_ids を渡す（下の補足を参照）
 
-# 4. rendering / processing を抜けるまでポーリングする
+# 4. queued / rendering / processing を抜けるまでポーリングする
 curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 ```
 
@@ -940,7 +955,7 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
   全撮影ビルドは固定されず、比較時点の最新 baseline と比較される
 - `storybook` モードのビルドに `POST .../screenshots` すると 409。バンドルは
   1 ビルドにつき 1 本だけで、2 回目のアップロードも 409
-- finalize 後は `pending → rendering → processing → …` と進む。
+- finalize 後は `pending → queued → rendering → processing → …` と進む。
   `rendering` 中に 1 ストーリーでも撮れなければビルドは `failed` になり、
   `error_message` にどのストーリーで落ちたかが入る
 - `failed` のビルドは UI の **Retry build**（`POST /v1/builds/{build_id}/retry`、
@@ -950,9 +965,10 @@ curl -sS "$VRT_URL/v1/ci/builds/$BUILD" -H "Authorization: Bearer $VRT_TOKEN"
 - 撮影サイズはプロジェクト設定の **Storybook viewport**（既定 1280x720）。
   UI の **Settings** タブか `PATCH /v1/projects/{id}` の
   `viewport_width` / `viewport_height` で変えられる
-- サーバー側に Chromium が必要（`CHROMIUM_PATH`）。未設定のサーバーでは
-  `mode=storybook` のビルド作成が 400 で拒否される。同梱の Docker イメージには
-  Chromium が入っている
+- 内蔵worker構成ではサーバー側に Chromium が必要（`CHROMIUM_PATH`）。外部runner構成は
+  API に `STORYBOOK_RENDER_ENABLED=true` / `RENDER_WORKER_ENABLED=false` を設定し、
+  `CHROMIUM_PATH` は `/app/vrt-runner` を動かすサービス側へ設定する。同梱のDocker
+  イメージには両バイナリと Chromium が入っている
 
 ### content hash による比較省略の安全境界
 

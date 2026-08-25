@@ -1,6 +1,13 @@
 [workspace]
 members = ["crates/entity", "crates/common", "crates/payload", "crates/service", "crates/job", "crates/handler", "crates/cli"]
-exclude = ["migration"]
+exclude = ["migration", "vendor/apalis-postgres"]
+
+# apalis-postgres 1.0.0-rc.8 ignores Config::with_poll_interval in its regular
+# PostgreSQL fetcher and instead backs off to five minutes. Keep the released
+# API/SQL schema, but patch the fetcher locally so idle queues are polled every
+# second and newly queued builds start promptly.
+[patch.crates-io]
+apalis-postgres = { path = "vendor/apalis-postgres" }
 
 [workspace.dependencies]
 anyhow = "1.0.102"
@@ -65,6 +72,7 @@ apalis = { version = "1.0.0-rc.9", features = ["limit", "retry", "tracing"] }
 axum = { workspace = true, features = ["multipart"] }
 axum_session = { version = "0.20.0" }
 axum_session_redispool = { version = "0.11.0" }
+dotenvy = { workspace = true }
 sea-orm = { workspace = true, features = [
     "entity-registry",
     "schema-sync",

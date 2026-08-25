@@ -176,7 +176,7 @@ impl Fixture {
             assert_eq!(res.status(), StatusCode::OK, "poll build status");
             let build: Value = res.json().await.expect("build json");
             let status = build["status"].as_str().unwrap_or_default().to_string();
-            if !matches!(status.as_str(), "pending" | "processing") {
+            if !matches!(status.as_str(), "pending" | "queued" | "processing") {
                 return build;
             }
             assert!(
