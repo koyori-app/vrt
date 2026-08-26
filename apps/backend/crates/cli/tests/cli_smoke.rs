@@ -72,6 +72,36 @@ fn is_full_oid(sha: &str) -> bool {
 // 依存させず、一時リポジトリで自己完結させる。`git archive` で展開した
 // .git 無しの配布ソースでも通ることを保証するため（検証手順は
 // リポジトリ README「配布ソース（.git 無し）での検証」を参照）。
+/// 値を省いた `--exit-zero-on-changes` が、後ろのフラグを値として飲み込まないこと。
+/// 飲み込むと `--json` が消え、呼び出し元が結果 JSON を受け取れなくなる。
+/// 引数解析を抜けた証拠として、ビルド作成の通信エラーまで進むことを見る。
+#[test]
+fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let output = vrt()
+        .args([
+            "upload",
+            // 接続だけ失敗させたいので、閉じているポートを指す。
+            "--url",
+            "http://127.0.0.1:1",
+            "--token",
+            "t",
+            "--project",
+            "acme/web",
+            "--exit-zero-on-changes",
+            "--json",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn vrt");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("create build request failed"),
+        "the bare flag must not consume --json; stderr={stderr}"
+    );
+}
+
 /// PR 番号は 1 以上でなければ意味がないので、引数解析の段階で弾く。
 /// 素通しすると不正な番号のまま create_build まで進み、失敗が CI の後半へずれる。
 #[test]

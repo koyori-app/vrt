@@ -105,6 +105,20 @@ struct UploadArgs {
     #[arg(long)]
     wait: bool,
 
+    /// 変化検知（`changes_detected`）を成功として終える。
+    ///
+    /// 値を省くと常に、`--exit-zero-on-changes=main` のようにブランチ名を渡すと
+    /// そのブランチのときだけ終了コードを 0 にする（`true` / `false` も書ける）。
+    /// 差分は人の承認待ちであって壊れてはいないので、チェック一覧の赤を
+    /// 本物の失敗だけに絞れる。壊れたビルド（`failed` / `rejected` = 2）には効かない。
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL_OR_BRANCH"
+    )]
+    exit_zero_on_changes: Option<String>,
+
     /// 機械可読な結果を stdout へ JSON で 1 行出力する。
     #[arg(long)]
     json: bool,
@@ -463,7 +477,11 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
             return Err(e);
         }
     };
-    let code = exit_code_for(&final_build.status);
+    let code = resolved_exit_code(
+        &final_build.status,
+        args.exit_zero_on_changes.as_deref(),
+        &branch,
+    );
     if !args.json {
         report(&final_build);
     } else {
@@ -896,6 +914,31 @@ fn exit_code_for(status: &str) -> u8 {
     }
 }
 
+/// `--exit-zero-on-changes` の値と実際のブランチから、変化検知を緑にするか決める。
+///
+/// - 未指定・空・`false` は従来どおり（変化は 1）
+/// - `true`（値を省いた場合を含む）は常に緑
+/// - それ以外はブランチ名として完全一致で照合する。`main` を渡せば main では緑、
+///   PR ブランチでは赤のままにできる
+fn exit_zero_on_changes(flag: Option<&str>, branch: &str) -> bool {
+    match flag.map(str::trim) {
+        None | Some("") | Some("false") => false,
+        Some("true") => true,
+        Some(target) => target == branch,
+    }
+}
+
+/// 最終状態と `--exit-zero-on-changes` から実際の終了コードを決める。
+///
+/// 旗が効くのは変化検知（1）だけ。壊れたビルド（2）は握り潰さない
+/// ——そこまで隠すと、この旗が本物の失敗を見えなくする。
+fn resolved_exit_code(status: &str, exit_zero_flag: Option<&str>, branch: &str) -> u8 {
+    match exit_code_for(status) {
+        1 if exit_zero_on_changes(exit_zero_flag, branch) => 0,
+        code => code,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -925,6 +968,88 @@ mod tests {
     fn unknown_status_is_not_treated_as_success() {
         assert_eq!(exit_code_for("some_future_status"), 2);
         assert_eq!(exit_code_for(""), 2);
+    }
+
+    /// 旗を指定しなければ、どの状態でも従来の割り当てのまま。
+    #[test]
+    fn exit_zero_flag_is_off_by_default() {
+        for (status, code) in [
+            ("passed", 0),
+            ("changes_detected", 1),
+            ("failed", 2),
+            ("rejected", 2),
+        ] {
+            assert_eq!(resolved_exit_code(status, None, "main"), code, "{status}");
+        }
+    }
+
+    /// 値なしの `--exit-zero-on-changes` は、ブランチを問わず変化検知だけを 0 にする。
+    #[test]
+    fn bare_exit_zero_flag_greens_changes_on_any_branch() {
+        for branch in ["main", "feat/x"] {
+            assert_eq!(
+                resolved_exit_code("changes_detected", Some("true"), branch),
+                0,
+                "{branch}"
+            );
+        }
+    }
+
+    /// ブランチ名を渡すと、そのブランチだけが緑になる。
+    /// 部分一致で広がると、意図しない PR まで緑になって旗の意味が消える。
+    #[test]
+    fn branch_valued_flag_matches_the_branch_exactly() {
+        assert_eq!(
+            resolved_exit_code("changes_detected", Some("main"), "main"),
+            0
+        );
+        for other in ["feat/x", "main-2", "feature/main", "MAIN", ""] {
+            assert_eq!(
+                resolved_exit_code("changes_detected", Some("main"), other),
+                1,
+                "branch {other} must stay red"
+            );
+        }
+    }
+
+    /// 壊れたビルドは旗があっても 2 のまま。ここを緑にすると、
+    /// この旗が本物の失敗まで隠すことになる。
+    #[test]
+    fn exit_zero_flag_never_hides_a_broken_build() {
+        for status in ["failed", "rejected", "some_future_status", ""] {
+            for flag in [Some("true"), Some("main")] {
+                assert_eq!(
+                    resolved_exit_code(status, flag, "main"),
+                    2,
+                    "{status} with {flag:?}"
+                );
+            }
+        }
+    }
+
+    /// 明示的な false と空値は「旗なし」と同じ扱いにする。
+    /// `--exit-zero-on-changes=false` を書いた人の意図は「緑にしない」。
+    #[test]
+    fn explicit_false_and_empty_values_keep_changes_red() {
+        for flag in [Some("false"), Some(""), Some("  "), None] {
+            assert_eq!(
+                resolved_exit_code("changes_detected", flag, "main"),
+                1,
+                "{flag:?}"
+            );
+        }
+    }
+
+    /// 成功はもともと 0 なので、旗があってもなくても変わらない。
+    #[test]
+    fn passing_builds_are_unaffected_by_the_flag() {
+        for status in ["passed", "approved"] {
+            assert_eq!(
+                resolved_exit_code(status, Some("true"), "main"),
+                0,
+                "{status}"
+            );
+        }
     }
 
     /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。

@@ -901,6 +901,14 @@ vrt upload --dir ./storybook-static --only-changed --wait
 コメントは 1 件に集約され、新しいビルドで更新される）。省略すると PR コメントは
 出ない。コミットステータスは PR 番号が無くても付く。
 
+`--exit-zero-on-changes` を付けると `changes_detected` の終了コードが 1 から 0 に
+なる。差分の出たビルドは承認待ちであって壊れてはいないので、チェック一覧の赤を
+本物の失敗だけに絞れる。値にブランチ名を渡すと（`--exit-zero-on-changes=main`）
+そのブランチのときだけ緑にでき、main は緑・PR は赤という運用ができる。
+`true` / `false` も書ける（値なしは `true` と同じ）。ブランチ名は完全一致で、
+`failed` / `rejected`（終了コード 2）には効かない——壊れたビルドまで隠すと、
+この旗が本物の失敗を見えなくするため。
+
 `--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
 stdout へ JSON で 1 行だけ出す（例
 `{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
