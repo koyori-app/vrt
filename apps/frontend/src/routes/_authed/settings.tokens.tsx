@@ -27,7 +27,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { $api, errorMessage, type Scope } from "@/lib/api";
+import { $api, errorMessage, type PersonalToken, type Scope } from "@/lib/api";
+import { isExpired, partitionTokens } from "@/lib/personal-tokens";
 import { formatDate } from "@/lib/utils";
 
 export const Route = createFileRoute("/_authed/settings/tokens")({
@@ -41,10 +42,11 @@ const ALL_SCOPES = [
 ] as const satisfies readonly { value: Scope; descriptionKey: string }[];
 
 function TokensPage() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const [createOpen, setCreateOpen] = useState(false);
   const queryClient = useQueryClient();
   const tokens = $api.useQuery("get", "/v1/personal_tokens", {});
+  const { active, revoked } = partitionTokens(tokens.data);
 
   const remove = $api.useMutation("delete", "/v1/personal_tokens/{id}", {
     onSuccess: async () => {
@@ -68,72 +70,132 @@ function TokensPage() {
       </div>
 
       <Card>
+        <CardHeader>
+          <CardTitle>{t("tokens.activeTitle")}</CardTitle>
+        </CardHeader>
         <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>{t("tokens.columns.name")}</TableHead>
-                <TableHead className="w-28">{t("tokens.columns.token")}</TableHead>
-                <TableHead>{t("tokens.columns.scopes")}</TableHead>
-                <TableHead className="w-48">{t("tokens.columns.lastUsed")}</TableHead>
-                <TableHead className="w-24" />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {tokens.data?.map((token) => (
-                <TableRow key={token.id}>
-                  <TableCell>
-                    {token.name}
-                    {token.revoked ? (
-                      <ToneBadge tone="red" className="ml-2">
-                        {t("tokens.revokedBadge")}
-                      </ToneBadge>
-                    ) : null}
-                  </TableCell>
-                  <TableCell className="font-mono text-xs text-muted-foreground">
-                    ····{token.token_last_four}
-                  </TableCell>
-                  <TableCell>
-                    <div className="flex flex-wrap gap-1">
-                      {token.scopes.map((scope) => (
-                        <ToneBadge key={scope} tone="blue">
-                          {scope}
-                        </ToneBadge>
-                      ))}
-                    </div>
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {formatDate(token.last_used_at, i18n.language)}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      disabled={remove.isPending}
-                      onClick={() => {
-                        if (!confirm(t("tokens.revokeConfirm", { name: token.name }))) return;
-                        remove.mutate({ params: { path: { id: token.id } } });
-                      }}
-                    >
-                      {t("tokens.revoke")}
-                    </Button>
-                  </TableCell>
-                </TableRow>
-              ))}
-              {!tokens.data?.length ? (
-                <TableRow>
-                  <TableCell colSpan={5} className="text-sm text-muted-foreground">
-                    {tokens.isLoading ? t("common.loading") : t("tokens.empty")}
-                  </TableCell>
-                </TableRow>
-              ) : null}
-            </TableBody>
-          </Table>
+          <TokenTable
+            tokens={active}
+            emptyMessage={tokens.isLoading ? t("common.loading") : t("tokens.noActive")}
+            onRevoke={(token) => {
+              if (!confirm(t("tokens.revokeConfirm", { name: token.name }))) return;
+              remove.mutate({ params: { path: { id: token.id } } });
+            }}
+            revokePending={remove.isPending}
+          />
         </CardContent>
       </Card>
 
+      {/* 失効済みは別の表に落とす。同じ表に混ぜると「使えるトークン」を数える
+          のに目で選り分ける必要があり、失効の操作も残ってしまう。1 件も無ければ
+          カードごと出さない——空の見出しは読む手がかりにならない。 */}
+      {revoked.length > 0 ? (
+        <Card className="border-dashed">
+          <CardHeader>
+            <CardTitle className="text-muted-foreground">{t("tokens.revokedTitle")}</CardTitle>
+            <CardDescription>{t("tokens.revokedDescription")}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {/* onRevoke を渡さない = 操作列ごと出ない。失効済みに押せる失効ボタンを
+                残さないための形（disabled ではなく不在にする）。 */}
+            <TokenTable tokens={revoked} emptyMessage={null} muted />
+          </CardContent>
+        </Card>
+      ) : null}
+
       <CreateTokenDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
+  );
+}
+
+/**
+ * トークンの表。`onRevoke` を渡した表だけが操作列を持つ。
+ *
+ * 失効済みの表は同じ列構成のまま操作列を落とす——ボタンを `disabled` で残すと
+ * 「押せそうに見えるが何も起きない」状態になり、失効済みかどうかの手がかりにも
+ * ならない。
+ */
+function TokenTable({
+  tokens,
+  emptyMessage,
+  onRevoke,
+  revokePending,
+  muted,
+}: {
+  tokens: PersonalToken[];
+  /** 0 件のときに出す文言。`null` なら行ごと出さない。 */
+  emptyMessage: string | null;
+  onRevoke?: (token: PersonalToken) => void;
+  revokePending?: boolean;
+  muted?: boolean;
+}) {
+  const { t, i18n } = useTranslation();
+  const columnCount = onRevoke ? 5 : 4;
+
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("tokens.columns.name")}</TableHead>
+          <TableHead className="w-28">{t("tokens.columns.token")}</TableHead>
+          <TableHead>{t("tokens.columns.scopes")}</TableHead>
+          <TableHead className="w-48">{t("tokens.columns.lastUsed")}</TableHead>
+          {onRevoke ? <TableHead className="w-24" /> : null}
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {tokens.map((token) => (
+          <TableRow key={token.id} className={muted ? "text-muted-foreground" : undefined}>
+            <TableCell>
+              {token.name}
+              {/* 期限切れは失効ではないが、backend の認証は同じく弾く。使えない
+                  ことが名前の隣で分かるようにする。 */}
+              {isExpired(token) ? (
+                <ToneBadge tone="amber" className="ml-2">
+                  {t("tokens.expiredBadge")}
+                </ToneBadge>
+              ) : null}
+            </TableCell>
+            <TableCell className="font-mono text-xs text-muted-foreground">
+              ····{token.token_last_four}
+            </TableCell>
+            <TableCell>
+              <div className="flex flex-wrap gap-1">
+                {token.scopes.map((scope) => (
+                  <ToneBadge key={scope} tone={muted ? "gray" : "blue"}>
+                    {scope}
+                  </ToneBadge>
+                ))}
+              </div>
+            </TableCell>
+            <TableCell className="text-xs text-muted-foreground">
+              {formatDate(token.last_used_at, i18n.language)}
+            </TableCell>
+            {onRevoke ? (
+              <TableCell className="text-right">
+                {/* 破壊的な操作なので destructive で出す。ghost のままだと
+                    「表示を切り替えるだけ」の操作と見分けが付かない。 */}
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  disabled={revokePending}
+                  onClick={() => onRevoke(token)}
+                >
+                  {t("tokens.revoke")}
+                </Button>
+              </TableCell>
+            ) : null}
+          </TableRow>
+        ))}
+        {tokens.length === 0 && emptyMessage !== null ? (
+          <TableRow>
+            <TableCell colSpan={columnCount} className="text-sm text-muted-foreground">
+              {emptyMessage}
+            </TableCell>
+          </TableRow>
+        ) : null}
+      </TableBody>
+    </Table>
   );
 }
 
