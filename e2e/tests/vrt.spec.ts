@@ -225,8 +225,9 @@ test("full VRT flow: tenant, project, PAT, CI upload, review, approve", async ({
   const approvalRequest = await approvalRequestPromise;
 
   await expect.poll(() => dialogs.length).toBe(2);
-  expect(dialogs[1]).toContain("screenshots from these failed comparisons will become the baseline");
-  expect(dialogs[1]).toContain("review each failed comparison individually first");
+  expect(dialogs[1]).toBe(
+    "1 comparison failed, so no trustworthy visual diff is available: home. If you continue, the screenshot from this failed comparison will become the baseline. Cancel to review it individually first. Continue?",
+  );
   expect(approvalRequest.postDataJSON()).toMatchObject({ force: true, accept_failures: true });
   await expect(page.getByText("Approved", { exact: true }).first()).toBeVisible();
 });
