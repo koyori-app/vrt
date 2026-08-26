@@ -72,6 +72,34 @@ fn is_full_oid(sha: &str) -> bool {
 // 依存させず、一時リポジトリで自己完結させる。`git archive` で展開した
 // .git 無しの配布ソースでも通ることを保証するため（検証手順は
 // リポジトリ README「配布ソース（.git 無し）での検証」を参照）。
+/// PR 番号は 1 以上でなければ意味がないので、引数解析の段階で弾く。
+/// 素通しすると不正な番号のまま create_build まで進み、失敗が CI の後半へずれる。
+#[test]
+fn upload_rejects_non_positive_pull_request_numbers() {
+    for invalid in ["0", "-1"] {
+        let output = vrt()
+            .args([
+                "upload",
+                "--url",
+                "http://127.0.0.1:1",
+                "--token",
+                "t",
+                "--project",
+                "acme/web",
+                "--pull-request",
+                invalid,
+            ])
+            .output()
+            .expect("spawn vrt");
+
+        assert!(
+            !output.status.success(),
+            "--pull-request {invalid} must be rejected, stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[test]
 fn plan_without_credentials_exits_2() {
     let (tmp, _c1, _c2, head) = init_linear_repo();

@@ -896,6 +896,11 @@ vrt upload --dir ./storybook-static --only-changed --wait
 落とせる。`--url` / `--token` / `--project` はフラグでも環境変数
 （`VRT_URL` / `VRT_TOKEN` / `VRT_PROJECT`）でも渡せる。トークンはログに出さない。
 
+`--pull-request <番号>`（env `VRT_PULL_REQUEST`）を渡すと、そのビルドが PR に
+紐付き、レビュー UI へのリンクが PR コメントとして掲示される（同じ PR の
+コメントは 1 件に集約され、新しいビルドで更新される）。省略すると PR コメントは
+出ない。コミットステータスは PR 番号が無くても付く。
+
 `--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
 stdout へ JSON で 1 行だけ出す（例
 `{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。

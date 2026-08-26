@@ -79,6 +79,12 @@ struct UploadArgs {
     #[arg(long)]
     commit: Option<String>,
 
+    /// 紐付ける PR 番号。渡すと VRT がレビュー UI へのリンクを PR コメントとして掲示する。
+    ///
+    /// 省略すると PR コメントは出ない（コミットステータスは PR 番号なしでも付く）。
+    #[arg(long, env = "VRT_PULL_REQUEST", value_parser = clap::value_parser!(i32).range(1..))]
+    pull_request: Option<i32>,
+
     /// 変更されたストーリーだけ撮り直す（Chromatic の --only-changed 相当）。
     #[arg(long)]
     only_changed: bool,
@@ -357,7 +363,12 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
         Some(c) => git::resolve_commit(&c).context("failed to resolve --commit")?,
         None => git::head_commit().context("failed to resolve commit from git")?,
     };
-    tracing::info!(%branch, commit = %commit, "resolved build coordinates");
+    tracing::info!(
+        %branch,
+        commit = %commit,
+        pull_request = ?args.pull_request,
+        "resolved build coordinates"
+    );
 
     let client = Client::new(args.url, args.token)?;
 
@@ -369,7 +380,7 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
             branch: &branch,
             commit_sha: &commit,
             commit_message: None,
-            pull_request_number: None,
+            pull_request_number: args.pull_request,
             mode: "storybook",
         })
         .await?;

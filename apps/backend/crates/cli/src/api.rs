@@ -282,4 +282,43 @@ mod tests {
             serde_json::json!({ "expected_baseline_commit_sha": "abc123" })
         );
     }
+
+    fn create_body(pull_request_number: Option<i32>) -> serde_json::Value {
+        let body = CreateBuildBody {
+            branch: "main",
+            commit_sha: "abc123",
+            commit_message: None,
+            pull_request_number,
+            mode: "storybook",
+        };
+        serde_json::to_value(&body).expect("serialize")
+    }
+
+    /// PR 番号を渡したビルドだけがサーバー側で PR コメントの対象になるため、
+    /// ボディに載ることを固定する。載らないと GitHub 連携が無言で欠ける。
+    #[test]
+    fn create_body_carries_the_pull_request_number() {
+        assert_eq!(
+            create_body(Some(42)),
+            serde_json::json!({
+                "branch": "main",
+                "commit_sha": "abc123",
+                "pull_request_number": 42,
+                "mode": "storybook",
+            })
+        );
+    }
+
+    /// PR 以外（push ビルド等）では従来どおりキーごと省く。
+    #[test]
+    fn create_body_omits_the_pull_request_number_when_absent() {
+        assert_eq!(
+            create_body(None),
+            serde_json::json!({
+                "branch": "main",
+                "commit_sha": "abc123",
+                "mode": "storybook",
+            })
+        );
+    }
 }
