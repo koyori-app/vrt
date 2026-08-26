@@ -72,6 +72,81 @@ fn is_full_oid(sha: &str) -> bool {
 // 依存させず、一時リポジトリで自己完結させる。`git archive` で展開した
 // .git 無しの配布ソースでも通ることを保証するため（検証手順は
 // リポジトリ README「配布ソース（.git 無し）での検証」を参照）。
+/// 値を省いた `--exit-zero-on-changes` が、後ろのフラグを値として飲み込まないこと。
+/// 飲み込むと `--json` のような後続フラグが消え、呼び出し元が結果 JSON を
+/// 受け取れなくなる。
+///
+/// 見分けは**後続フラグ自身の検証エラー**で取る。`--pull-request 0` は
+/// 範囲外として `invalid value '0' for '--pull-request'` で落ちるが、旗が
+/// `--pull-request` を値として飲み込むと `0` が余った語になり
+/// `unexpected argument '0'` に変わる。エラーの種類が違うので、飲み込みが
+/// 起きた瞬間にこのテストが落ちる（通信エラーまで進むことを見る形では、
+/// 飲み込まれても同じ `create build request failed` になって区別できない）。
+#[test]
+fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let output = vrt()
+        .args([
+            "upload",
+            // 接続だけ失敗させたいので、閉じているポートを指す。
+            "--url",
+            "http://127.0.0.1:1",
+            "--token",
+            "t",
+            "--project",
+            "acme/web",
+            "--exit-zero-on-changes",
+            "--pull-request",
+            "0",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn vrt");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value '0' for '--pull-request"),
+        "the bare flag must leave the following flag alone; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "the following flag was swallowed as the value; stderr={stderr}"
+    );
+}
+
+/// 値は `=` 区切りだけを受ける。空白区切りを許すと、値を省いた `--exit-zero-on-changes`
+/// が後ろの語を値として飲み込み、綴り間違いがエラーにも警告にもならないまま
+/// 旗だけ無効になる（`--exit-zero-on-changes garbage` が素通りしていた）。
+#[test]
+fn exit_zero_on_changes_does_not_swallow_a_following_word() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let output = vrt()
+        .args([
+            "upload",
+            "--url",
+            "http://127.0.0.1:1",
+            "--token",
+            "t",
+            "--project",
+            "acme/web",
+            "--exit-zero-on-changes",
+            "garbage",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn vrt");
+
+    assert!(
+        !output.status.success(),
+        "a stray word must not be accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument 'garbage'"),
+        "the stray word must be reported, stderr={stderr}"
+    );
+}
+
 /// PR 番号は 1 以上でなければ意味がないので、引数解析の段階で弾く。
 /// 素通しすると不正な番号のまま create_build まで進み、失敗が CI の後半へずれる。
 #[test]

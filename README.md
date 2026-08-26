@@ -901,6 +901,24 @@ vrt upload --dir ./storybook-static --only-changed --wait
 コメントは 1 件に集約され、新しいビルドで更新される）。省略すると PR コメントは
 出ない。コミットステータスは PR 番号が無くても付く。
 
+`--exit-zero-on-changes` を付けると `changes_detected` の終了コードが 1 から 0 に
+なる。差分の出たビルドは承認待ちであって壊れてはいないので、チェック一覧の赤を
+本物の失敗だけに絞れる。値にブランチ名を渡すと（`--exit-zero-on-changes=main`）
+PR 以外でそのブランチのときだけ緑にでき、main は緑・PR は赤という運用ができる。
+PR の実行では `--pull-request <番号>` または `VRT_PULL_REQUEST` を必ず渡す。これにより
+PR の head ブランチを `main` と名付けても、保護対象の main として扱われない。
+`true` / `false` も書ける（値なしは `true` と同じ）。`true` は PR を含めて常に有効。
+ブランチ名は完全一致で、
+`failed` / `rejected`（終了コード 2）には効かない——壊れたビルドまで隠すと、
+この旗が本物の失敗を見えなくするため。
+
+値は `--exit-zero-on-changes=main` のように `=` で繋ぐ。空白区切り
+（`--exit-zero-on-changes main`）は受け付けない。許すと、値を省いたときに後ろの語を
+値として飲み込み、書き間違いがエラーにならないまま旗だけ無効になるため。
+`true` / `false` 以外はすべてブランチ名として扱うので、`TRUE` のような綴り違いは
+「一致しないブランチ名」になる。差分が出たのに旗が効かなかったときは、解釈した値と
+実際のブランチを警告ログに出す。
+
 `--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
 stdout へ JSON で 1 行だけ出す（例
 `{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
