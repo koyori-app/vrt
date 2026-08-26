@@ -111,9 +111,14 @@ struct UploadArgs {
     /// そのブランチのときだけ終了コードを 0 にする（`true` / `false` も書ける）。
     /// 差分は人の承認待ちであって壊れてはいないので、チェック一覧の赤を
     /// 本物の失敗だけに絞れる。壊れたビルド（`failed` / `rejected` = 2）には効かない。
+    ///
+    /// 値は `=` で繋ぐ（`require_equals`）。空白区切りを許すと、値を省いたときに
+    /// 後ろの語を値として飲み込み、`--exit-zero-on-changes upload-arg` が
+    /// エラーにならず旗も無言で効かなくなる。
     #[arg(
         long,
         num_args = 0..=1,
+        require_equals = true,
         default_missing_value = "true",
         value_name = "BOOL_OR_BRANCH"
     )]
@@ -482,6 +487,14 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
         args.exit_zero_on_changes.as_deref(),
         &branch,
     );
+    // 旗を指定したのに効かなかったときは、黙って 1 で終えず理由を出す。
+    // 値の綴り違い（`TRUE` など）やブランチの取り違えは、どちらも
+    // 「ブランチ名として一致しなかった」という同じ形で現れて気付けない。
+    if code == 1
+        && let Some(reason) = exit_zero_skip_reason(args.exit_zero_on_changes.as_deref(), &branch)
+    {
+        tracing::warn!("{reason}");
+    }
     if !args.json {
         report(&final_build);
     } else {
@@ -928,6 +941,24 @@ fn exit_zero_on_changes(flag: Option<&str>, branch: &str) -> bool {
     }
 }
 
+/// 旗を指定したのに効かなかった理由。効いた場合と未指定・明示的な無効化では `None`。
+///
+/// `true` / `false` 以外はすべてブランチ名として扱う仕様上、綴り違いも
+/// 存在しないブランチ名も「一致しなかった」に潰れる。区別できない以上、
+/// 解釈した値と実際のブランチをそのまま見せて利用者に判断してもらう。
+fn exit_zero_skip_reason(flag: Option<&str>, branch: &str) -> Option<String> {
+    match flag.map(str::trim)? {
+        // 未指定と同じ意味で書いた `false` / 空値は、意図どおりなので黙る。
+        "" | "false" => None,
+        // 効いている場合は説明する理由が無い。
+        "true" => None,
+        target if target == branch => None,
+        target => Some(format!(
+            "--exit-zero-on-changes={target} was read as a branch name and does not match              the current branch `{branch}`, so changes_detected still exits 1              (pass `true` to always exit 0)"
+        )),
+    }
+}
+
 /// 最終状態と `--exit-zero-on-changes` から実際の終了コードを決める。
 ///
 /// 旗が効くのは変化検知（1）だけ。壊れたビルド（2）は握り潰さない
@@ -1049,6 +1080,37 @@ mod tests {
                 0,
                 "{status}"
             );
+        }
+    }
+
+    /// 効いているとき・そもそも切っているときは、余計な警告を出さない。
+    #[test]
+    fn no_skip_reason_when_the_flag_applies_or_is_off() {
+        for (flag, branch) in [
+            (None, "main"),
+            (Some("true"), "feat/x"),
+            (Some("main"), "main"),
+            (Some("false"), "main"),
+            (Some(""), "main"),
+            (Some("  "), "main"),
+        ] {
+            assert_eq!(
+                exit_zero_skip_reason(flag, branch),
+                None,
+                "{flag:?} on {branch}"
+            );
+        }
+    }
+
+    /// 一致しなかったときは、解釈した値と実際のブランチの両方を見せる。
+    /// 綴り違い（`TRUE`）もブランチの取り違えも、ここでしか気付けない。
+    #[test]
+    fn skip_reason_names_the_value_and_the_branch() {
+        for (flag, branch) in [("main", "feat/x"), ("TRUE", "main"), ("yes", "main")] {
+            let reason = exit_zero_skip_reason(Some(flag), branch)
+                .unwrap_or_else(|| panic!("{flag} on {branch} must explain itself"));
+            assert!(reason.contains(flag), "{reason}");
+            assert!(reason.contains(branch), "{reason}");
         }
     }
 

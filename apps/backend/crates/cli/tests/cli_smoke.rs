@@ -102,6 +102,39 @@ fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
     );
 }
 
+/// 値は `=` 区切りだけを受ける。空白区切りを許すと、値を省いた `--exit-zero-on-changes`
+/// が後ろの語を値として飲み込み、綴り間違いがエラーにも警告にもならないまま
+/// 旗だけ無効になる（`--exit-zero-on-changes garbage` が素通りしていた）。
+#[test]
+fn exit_zero_on_changes_does_not_swallow_a_following_word() {
+    let (tmp, _c1, _c2, _head) = init_linear_repo();
+    let output = vrt()
+        .args([
+            "upload",
+            "--url",
+            "http://127.0.0.1:1",
+            "--token",
+            "t",
+            "--project",
+            "acme/web",
+            "--exit-zero-on-changes",
+            "garbage",
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn vrt");
+
+    assert!(
+        !output.status.success(),
+        "a stray word must not be accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument 'garbage'"),
+        "the stray word must be reported, stderr={stderr}"
+    );
+}
+
 /// PR 番号は 1 以上でなければ意味がないので、引数解析の段階で弾く。
 /// 素通しすると不正な番号のまま create_build まで進み、失敗が CI の後半へずれる。
 #[test]

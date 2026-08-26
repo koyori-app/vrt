@@ -909,6 +909,13 @@ vrt upload --dir ./storybook-static --only-changed --wait
 `failed` / `rejected`（終了コード 2）には効かない——壊れたビルドまで隠すと、
 この旗が本物の失敗を見えなくするため。
 
+値は `--exit-zero-on-changes=main` のように `=` で繋ぐ。空白区切り
+（`--exit-zero-on-changes main`）は受け付けない。許すと、値を省いたときに後ろの語を
+値として飲み込み、書き間違いがエラーにならないまま旗だけ無効になるため。
+`true` / `false` 以外はすべてブランチ名として扱うので、`TRUE` のような綴り違いは
+「一致しないブランチ名」になる。差分が出たのに旗が効かなかったときは、解釈した値と
+実際のブランチを警告ログに出す。
+
 `--json` を付けると、build ID・build 番号・slug・最終ステータス・終了コードを
 stdout へ JSON で 1 行だけ出す（例
 `{"build_id":"…","build_number":123,"tenant_slug":"koyori","project_slug":"task","status":"changes_detected","exit_code":1}`）。
