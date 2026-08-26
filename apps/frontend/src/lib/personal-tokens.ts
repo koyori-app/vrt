@@ -6,12 +6,16 @@ import type { PersonalToken } from "@/lib/api";
  * backend の PAT 認証は `revoked` と「`expires_at` が過去」の両方を弾く
  * （`service/src/auth.rs`）。画面もその判定に合わせる——期限切れを「使える
  * トークン」の顔で並べると、認証が通らない理由が画面から読み取れない。
+ *
+ * 境界は backend と同じ**厳密な過去**（`expires < now`）にする。`<=` にすると
+ * 期限とちょうど同時刻の一瞬だけ、backend は通すのに画面は「期限切れ」と
+ * 名乗る——実害の窓は狭いが、判定を合わせるという前提そのものが崩れる。
  */
 export function isExpired(token: PersonalToken, now: Date = new Date()): boolean {
   if (!token.expires_at) return false;
   const expires = new Date(token.expires_at);
   if (Number.isNaN(expires.getTime())) return false;
-  return expires.getTime() <= now.getTime();
+  return expires.getTime() < now.getTime();
 }
 
 /**

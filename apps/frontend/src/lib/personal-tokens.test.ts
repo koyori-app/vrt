@@ -58,8 +58,13 @@ describe("isExpired", () => {
     expect(isExpired(token({ expires_at: "2026-08-26T23:59:59Z" }), now)).toBe(true);
   });
 
-  it("is true exactly at the expiry — the backend rejects it from that instant", () => {
-    expect(isExpired(token({ expires_at: "2026-08-27T00:00:00Z" }), now)).toBe(true);
+  it("is not expired exactly at the expiry — the backend still accepts it there", () => {
+    // backend は `expires < now`（`service/src/auth.rs`）。同時刻はまだ通る。
+    expect(isExpired(token({ expires_at: "2026-08-27T00:00:00Z" }), now)).toBe(false);
+  });
+
+  it("is expired one millisecond past the expiry", () => {
+    expect(isExpired(token({ expires_at: "2026-08-26T23:59:59.999Z" }), now)).toBe(true);
   });
 
   it("is false while the expiry is still ahead", () => {
