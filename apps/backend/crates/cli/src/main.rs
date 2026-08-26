@@ -108,7 +108,7 @@ struct UploadArgs {
     /// 変化検知（`changes_detected`）を成功として終える。
     ///
     /// 値を省くと常に、`--exit-zero-on-changes=main` のようにブランチ名を渡すと
-    /// そのブランチのときだけ終了コードを 0 にする（`true` / `false` も書ける）。
+    /// PR 以外でそのブランチのときだけ終了コードを 0 にする（`true` / `false` も書ける）。
     /// 差分は人の承認待ちであって壊れてはいないので、チェック一覧の赤を
     /// 本物の失敗だけに絞れる。壊れたビルド（`failed` / `rejected` = 2）には効かない。
     ///
@@ -372,6 +372,7 @@ fn split_project(project: &str) -> Result<(&str, &str)> {
 
 async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
     let (tenant_slug, project_slug) = split_project(&args.project)?;
+    let is_pull_request = args.pull_request.is_some();
 
     // 1. branch / commit を解決（フラグ優先、無ければ git）。
     let branch = match args.branch {
@@ -486,12 +487,17 @@ async fn run_upload(args: UploadArgs) -> Result<ExitCode> {
         &final_build.status,
         args.exit_zero_on_changes.as_deref(),
         &branch,
+        is_pull_request,
     );
     // 旗を指定したのに効かなかったときは、黙って 1 で終えず理由を出す。
     // 値の綴り違い（`TRUE` など）やブランチの取り違えは、どちらも
     // 「ブランチ名として一致しなかった」という同じ形で現れて気付けない。
     if code == 1
-        && let Some(reason) = exit_zero_skip_reason(args.exit_zero_on_changes.as_deref(), &branch)
+        && let Some(reason) = exit_zero_skip_reason(
+            args.exit_zero_on_changes.as_deref(),
+            &branch,
+            is_pull_request,
+        )
     {
         tracing::warn!("{reason}");
     }
@@ -927,17 +933,17 @@ fn exit_code_for(status: &str) -> u8 {
     }
 }
 
-/// `--exit-zero-on-changes` の値と実際のブランチから、変化検知を緑にするか決める。
+/// `--exit-zero-on-changes` の値とビルドのコンテキストから、変化検知を緑にするか決める。
 ///
 /// - 未指定・空・`false` は従来どおり（変化は 1）
 /// - `true`（値を省いた場合を含む）は常に緑
-/// - それ以外はブランチ名として完全一致で照合する。`main` を渡せば main では緑、
-///   PR ブランチでは赤のままにできる
-fn exit_zero_on_changes(flag: Option<&str>, branch: &str) -> bool {
+/// - それ以外は PR 以外のビルドでだけブランチ名として完全一致で照合する。
+///   PR の head ブランチ名は信頼できないため、`main` と名付けた PR も赤のままにする
+fn exit_zero_on_changes(flag: Option<&str>, branch: &str, is_pull_request: bool) -> bool {
     match flag.map(str::trim) {
         None | Some("") | Some("false") => false,
         Some("true") => true,
-        Some(target) => target == branch,
+        Some(target) => !is_pull_request && target == branch,
     }
 }
 
@@ -946,12 +952,21 @@ fn exit_zero_on_changes(flag: Option<&str>, branch: &str) -> bool {
 /// `true` / `false` 以外はすべてブランチ名として扱う仕様上、綴り違いも
 /// 存在しないブランチ名も「一致しなかった」に潰れる。区別できない以上、
 /// 解釈した値と実際のブランチをそのまま見せて利用者に判断してもらう。
-fn exit_zero_skip_reason(flag: Option<&str>, branch: &str) -> Option<String> {
+fn exit_zero_skip_reason(
+    flag: Option<&str>,
+    branch: &str,
+    is_pull_request: bool,
+) -> Option<String> {
     match flag.map(str::trim)? {
         // 未指定と同じ意味で書いた `false` / 空値は、意図どおりなので黙る。
         "" | "false" => None,
         // 効いている場合は説明する理由が無い。
         "true" => None,
+        target if is_pull_request => Some(format!(
+            "--exit-zero-on-changes={target} was read as a branch name, but branch-restricted \
+             mode does not apply to pull request builds, so changes_detected still exits 1 \
+             (pass `true` to intentionally always exit 0)"
+        )),
         target if target == branch => None,
         target => Some(format!(
             "--exit-zero-on-changes={target} was read as a branch name and does not match \
@@ -965,9 +980,14 @@ fn exit_zero_skip_reason(flag: Option<&str>, branch: &str) -> Option<String> {
 ///
 /// 旗が効くのは変化検知（1）だけ。壊れたビルド（2）は握り潰さない
 /// ——そこまで隠すと、この旗が本物の失敗を見えなくする。
-fn resolved_exit_code(status: &str, exit_zero_flag: Option<&str>, branch: &str) -> u8 {
+fn resolved_exit_code(
+    status: &str,
+    exit_zero_flag: Option<&str>,
+    branch: &str,
+    is_pull_request: bool,
+) -> u8 {
     match exit_code_for(status) {
-        1 if exit_zero_on_changes(exit_zero_flag, branch) => 0,
+        1 if exit_zero_on_changes(exit_zero_flag, branch, is_pull_request) => 0,
         code => code,
     }
 }
@@ -1012,7 +1032,11 @@ mod tests {
             ("failed", 2),
             ("rejected", 2),
         ] {
-            assert_eq!(resolved_exit_code(status, None, "main"), code, "{status}");
+            assert_eq!(
+                resolved_exit_code(status, None, "main", false),
+                code,
+                "{status}"
+            );
         }
     }
 
@@ -1021,11 +1045,16 @@ mod tests {
     fn bare_exit_zero_flag_greens_changes_on_any_branch() {
         for branch in ["main", "feat/x"] {
             assert_eq!(
-                resolved_exit_code("changes_detected", Some("true"), branch),
+                resolved_exit_code("changes_detected", Some("true"), branch, false),
                 0,
                 "{branch}"
             );
         }
+        assert_eq!(
+            resolved_exit_code("changes_detected", Some("true"), "main", true),
+            0,
+            "explicit true stays unconditional on pull requests"
+        );
     }
 
     /// ブランチ名を渡すと、そのブランチだけが緑になる。
@@ -1033,14 +1062,27 @@ mod tests {
     #[test]
     fn branch_valued_flag_matches_the_branch_exactly() {
         assert_eq!(
-            resolved_exit_code("changes_detected", Some("main"), "main"),
+            resolved_exit_code("changes_detected", Some("main"), "main", false),
             0
         );
         for other in ["feat/x", "main-2", "feature/main", "MAIN", ""] {
             assert_eq!(
-                resolved_exit_code("changes_detected", Some("main"), other),
+                resolved_exit_code("changes_detected", Some("main"), other, false),
                 1,
                 "branch {other} must stay red"
+            );
+        }
+    }
+
+    /// PR の head ブランチ名は投稿者が選べるため、保護対象と同じ `main` でも
+    /// ブランチ限定の旗を適用しない。これが PR から main を偽装する回帰テスト。
+    #[test]
+    fn branch_valued_flag_does_not_green_pull_requests() {
+        for branch in ["main", "feat/x"] {
+            assert_eq!(
+                resolved_exit_code("changes_detected", Some("main"), branch, true),
+                1,
+                "pull request branch {branch} must stay red"
             );
         }
     }
@@ -1052,9 +1094,14 @@ mod tests {
         for status in ["failed", "rejected", "some_future_status", ""] {
             for flag in [Some("true"), Some("main")] {
                 assert_eq!(
-                    resolved_exit_code(status, flag, "main"),
+                    resolved_exit_code(status, flag, "main", false),
                     2,
                     "{status} with {flag:?}"
+                );
+                assert_eq!(
+                    resolved_exit_code(status, flag, "main", true),
+                    2,
+                    "PR {status} with {flag:?}"
                 );
             }
         }
@@ -1066,7 +1113,7 @@ mod tests {
     fn explicit_false_and_empty_values_keep_changes_red() {
         for flag in [Some("false"), Some(""), Some("  "), None] {
             assert_eq!(
-                resolved_exit_code("changes_detected", flag, "main"),
+                resolved_exit_code("changes_detected", flag, "main", false),
                 1,
                 "{flag:?}"
             );
@@ -1078,7 +1125,7 @@ mod tests {
     fn passing_builds_are_unaffected_by_the_flag() {
         for status in ["passed", "approved"] {
             assert_eq!(
-                resolved_exit_code(status, Some("true"), "main"),
+                resolved_exit_code(status, Some("true"), "main", false),
                 0,
                 "{status}"
             );
@@ -1097,7 +1144,7 @@ mod tests {
             (Some("  "), "main"),
         ] {
             assert_eq!(
-                exit_zero_skip_reason(flag, branch),
+                exit_zero_skip_reason(flag, branch, false),
                 None,
                 "{flag:?} on {branch}"
             );
@@ -1109,7 +1156,7 @@ mod tests {
     #[test]
     fn skip_reason_names_the_value_and_the_branch() {
         for (flag, branch) in [("main", "feat/x"), ("TRUE", "main"), ("yes", "main")] {
-            let reason = exit_zero_skip_reason(Some(flag), branch)
+            let reason = exit_zero_skip_reason(Some(flag), branch, false)
                 .unwrap_or_else(|| panic!("{flag} on {branch} must explain itself"));
             assert!(reason.contains(flag), "{reason}");
             assert!(reason.contains(branch), "{reason}");
@@ -1123,12 +1170,23 @@ mod tests {
     /// 効かなかったか」を伝えるためだけの出力なので、崩れると目的を失う。
     #[test]
     fn skip_reason_reads_as_one_line() {
-        let reason = exit_zero_skip_reason(Some("main"), "feat/x").expect("must explain itself");
+        let reason =
+            exit_zero_skip_reason(Some("main"), "feat/x", false).expect("must explain itself");
         assert!(!reason.contains('\n'), "{reason:?}");
         assert!(
             !reason.contains("  "),
             "collapsed indentation leaked: {reason:?}"
         );
+    }
+
+    /// ブランチ名が一致しても PR では適用しない理由を明示する。
+    #[test]
+    fn skip_reason_explains_pull_request_restriction() {
+        let reason = exit_zero_skip_reason(Some("main"), "main", true)
+            .expect("pull request restriction must explain itself");
+        assert!(reason.contains("pull request"), "{reason}");
+        assert!(reason.contains("main"), "{reason}");
+        assert!(!reason.contains('\n'), "{reason:?}");
     }
 
     /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。

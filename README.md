@@ -904,8 +904,11 @@ vrt upload --dir ./storybook-static --only-changed --wait
 `--exit-zero-on-changes` を付けると `changes_detected` の終了コードが 1 から 0 に
 なる。差分の出たビルドは承認待ちであって壊れてはいないので、チェック一覧の赤を
 本物の失敗だけに絞れる。値にブランチ名を渡すと（`--exit-zero-on-changes=main`）
-そのブランチのときだけ緑にでき、main は緑・PR は赤という運用ができる。
-`true` / `false` も書ける（値なしは `true` と同じ）。ブランチ名は完全一致で、
+PR 以外でそのブランチのときだけ緑にでき、main は緑・PR は赤という運用ができる。
+PR の実行では `--pull-request <番号>` または `VRT_PULL_REQUEST` を必ず渡す。これにより
+PR の head ブランチを `main` と名付けても、保護対象の main として扱われない。
+`true` / `false` も書ける（値なしは `true` と同じ）。`true` は PR を含めて常に有効。
+ブランチ名は完全一致で、
 `failed` / `rejected`（終了コード 2）には効かない——壊れたビルドまで隠すと、
 この旗が本物の失敗を見えなくするため。
 
