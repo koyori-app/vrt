@@ -954,7 +954,9 @@ fn exit_zero_skip_reason(flag: Option<&str>, branch: &str) -> Option<String> {
         "true" => None,
         target if target == branch => None,
         target => Some(format!(
-            "--exit-zero-on-changes={target} was read as a branch name and does not match              the current branch `{branch}`, so changes_detected still exits 1              (pass `true` to always exit 0)"
+            "--exit-zero-on-changes={target} was read as a branch name and does not match \
+             the current branch `{branch}`, so changes_detected still exits 1 \
+             (pass `true` to always exit 0)"
         )),
     }
 }
@@ -1112,6 +1114,21 @@ mod tests {
             assert!(reason.contains(flag), "{reason}");
             assert!(reason.contains(branch), "{reason}");
         }
+    }
+
+    /// 理由は 1 行の散文として読める形で出す。
+    ///
+    /// 複数行にまたがる文字列リテラルは、行継続（`\\`）を落とすとソースの
+    /// インデントがそのまま文中の空白の塊になる。この警告は「なぜ旗が
+    /// 効かなかったか」を伝えるためだけの出力なので、崩れると目的を失う。
+    #[test]
+    fn skip_reason_reads_as_one_line() {
+        let reason = exit_zero_skip_reason(Some("main"), "feat/x").expect("must explain itself");
+        assert!(!reason.contains('\n'), "{reason:?}");
+        assert!(
+            !reason.contains("  "),
+            "collapsed indentation leaked: {reason:?}"
+        );
     }
 
     /// `--json` 出力のフィールド検証用に、既知の値を持つ BuildResponse を作る。

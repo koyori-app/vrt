@@ -73,8 +73,15 @@ fn is_full_oid(sha: &str) -> bool {
 // .git 無しの配布ソースでも通ることを保証するため（検証手順は
 // リポジトリ README「配布ソース（.git 無し）での検証」を参照）。
 /// 値を省いた `--exit-zero-on-changes` が、後ろのフラグを値として飲み込まないこと。
-/// 飲み込むと `--json` が消え、呼び出し元が結果 JSON を受け取れなくなる。
-/// 引数解析を抜けた証拠として、ビルド作成の通信エラーまで進むことを見る。
+/// 飲み込むと `--json` のような後続フラグが消え、呼び出し元が結果 JSON を
+/// 受け取れなくなる。
+///
+/// 見分けは**後続フラグ自身の検証エラー**で取る。`--pull-request 0` は
+/// 範囲外として `invalid value '0' for '--pull-request'` で落ちるが、旗が
+/// `--pull-request` を値として飲み込むと `0` が余った語になり
+/// `unexpected argument '0'` に変わる。エラーの種類が違うので、飲み込みが
+/// 起きた瞬間にこのテストが落ちる（通信エラーまで進むことを見る形では、
+/// 飲み込まれても同じ `create build request failed` になって区別できない）。
 #[test]
 fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
     let (tmp, _c1, _c2, _head) = init_linear_repo();
@@ -89,7 +96,8 @@ fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
             "--project",
             "acme/web",
             "--exit-zero-on-changes",
-            "--json",
+            "--pull-request",
+            "0",
         ])
         .current_dir(tmp.path())
         .output()
@@ -97,8 +105,12 @@ fn bare_exit_zero_on_changes_does_not_swallow_the_next_flag() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("create build request failed"),
-        "the bare flag must not consume --json; stderr={stderr}"
+        stderr.contains("invalid value '0' for '--pull-request"),
+        "the bare flag must leave the following flag alone; stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "the following flag was swallowed as the value; stderr={stderr}"
     );
 }
 
