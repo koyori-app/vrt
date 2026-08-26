@@ -35,7 +35,7 @@
 //!    `documentElement`（世代）を併記し、現在の document と一致するものだけを
 //!    信じる——state は window 上で `document.open()` / `document.write()` を
 //!    生き延びるため、世代なしでは前 document の印でやり直しの巡が素通りする
-//!    。チャンネルを掴み損ねた場合の保険として
+//!    （PR #27 ①）。チャンネルを掴み損ねた場合の保険として
 //!    `__STORYBOOK_PREVIEW__.storyRenders[].phase` も見る——こちらは世代を
 //!    刻む口が無いので、現在の document の root に描画結果があることを併せて
 //!    要求する（root つきの内容へ差し替える形は依然すり抜ける。既知の限界）
@@ -44,7 +44,7 @@
 //!    [`SIGNAL_GRACE`] の猶予を置いてから、旧ヒューリスティックで判定する。
 //!    猶予は**検証列の巡ごと**に測り直す——story 全体の開始から測ると、
 //!    やり直しの巡では猶予が最初から尽きており、入れ替わった document の
-//!    途中の絵を ready と誤判定する（deadline は従来どおり
+//!    途中の絵を ready と誤判定する（PR #27 ③。deadline は従来どおり
 //!    story 全体で共有）
 //!
 //! ## window に常駐する判定状態（世代の扱い）
@@ -53,12 +53,12 @@
 //! story（reload・`document.open()`）では「前 document の状態が生き残って
 //! いないか」が常に問題になる——系統ごとに、置く理由・世代を刻めるか・
 //! 刻めなければ何が起きるかを揃えて管理する（**window 常駐の判定状態を
-//! 足したら、この表にも行を足すこと**。）。
+//! 足したら、この表にも行を足すこと**。PR #27 ⑥）。
 //!
 //! | 常駐状態 | 置く理由 | 世代を刻めるか | 刻めなければ／刻むまで何が起きたか |
 //! |----|----|----|----|
-//! | `window.__VRT_READY__`（rendered / error） | channel の accessor は window にしか張れない。state **自体**は document 側へも置ける（accessor は window・state は document という分担は、フォントの印 `dataset` で実装済みの形）が、window に置いたままにした——document 側へ移す道は取らなかった。理由: errorRoot / renderedRoot は documentElement への**参照**で `dataset`（文字列のみ）には刻めず、世代印だけで `document.open()` の生き残りは既に塞がっている——置き場を移しても同じ検知を別の形で得るだけで、検知の強度は上がらない | **刻める**——イベント発火時の documentElement を rendered / error 各々に併記し、読む側（[`READY_PROBE`]）は現在の document と一致する印だけを信じる。error の「先着固定」も**世代の中で閉じる**——前 document の error が新 document の error の記録を塞がない | 世代なしの rendered は前 document の印でやり直しの READY 待ちを素通りさせ、未描画の絵を撮った（実測）。書く側が世代を見ない error は、新 document の二度目のエラーを記録せず、rendered だけが新世代で立って撮影が通った（実測。fail-open） |
-//! | `__STORYBOOK_PREVIEW__.storyRenders`（保険経路） | Storybook 自身が window に置く内部状態——我々の設計物ではない | **刻んでいない**（採らなかった判断。証明されているのは「現状の実装が刻まない」まで——Storybook の内部状態へ書き込んで世代を刻む改変は原理的には可能かもしれないが、他所の内部実装への書き込みはバージョン差で壊れる面を増やすため採らない。） | completed: 現在の document の root に描画結果があることを併せて要求して緩和（root つき内容への差し替えは依然すり抜け——既知の限界）。**この門の代償**: 保険経路にしか乗れない構成（channel を掴み損ねた・`__STORYBOOK_ADDONS_CHANNEL__` を経由しない等）では、中身が空になる**正当な** story（null を返す story・portal で body 直下へ描く story——root は空のまま）が `domReady` を永久に満たせず、門の導入前は撮れていたものが 30 秒 Timeout になる——倒れる向きは fail-closed（未検証の絵は撮らない）だが巻き添えであり、既知の限界として併記（「root つき差し替えのすり抜け」と逆方向の対）。errored / aborted: 門なし——stale が読まれても「誤った理由での story 失敗」（fail-closed 側）にしか倒れず、domReady は error の門として意味を成さない（[`READY_PROBE`] 内の判断コメント。） |
+//! | `window.__VRT_READY__`（rendered / error） | channel の accessor は window にしか張れない。state **自体**は document 側へも置ける（accessor は window・state は document という分担は、フォントの印 `dataset` で実装済みの形）が、window に置いたままにした——document 側へ移す道は取らなかった。理由: errorRoot / renderedRoot は documentElement への**参照**で `dataset`（文字列のみ）には刻めず、世代印だけで `document.open()` の生き残りは既に塞がっている——置き場を移しても同じ検知を別の形で得るだけで、検知の強度は上がらない（PR #27 ⑧） | **刻める**——イベント発火時の documentElement を rendered / error 各々に併記し、読む側（[`READY_PROBE`]）は現在の document と一致する印だけを信じる。error の「先着固定」も**世代の中で閉じる**——前 document の error が新 document の error の記録を塞がない（PR #27 ①・PR #27 ②） | 世代なしの rendered は前 document の印でやり直しの READY 待ちを素通りさせ、未描画の絵を撮った（PR #27 ① 実測）。書く側が世代を見ない error は、新 document の二度目のエラーを記録せず、rendered だけが新世代で立って撮影が通った（PR #27 ② 実測。fail-open） |
+//! | `__STORYBOOK_PREVIEW__.storyRenders`（保険経路） | Storybook 自身が window に置く内部状態——我々の設計物ではない | **刻んでいない**（採らなかった判断。証明されているのは「現状の実装が刻まない」まで——Storybook の内部状態へ書き込んで世代を刻む改変は原理的には可能かもしれないが、他所の内部実装への書き込みはバージョン差で壊れる面を増やすため採らない。PR #27 ⑧） | completed: 現在の document の root に描画結果があることを併せて要求して緩和（root つき内容への差し替えは依然すり抜け——既知の限界）。**この門の代償**: 保険経路にしか乗れない構成（channel を掴み損ねた・`__STORYBOOK_ADDONS_CHANNEL__` を経由しない等）では、中身が空になる**正当な** story（null を返す story・portal で body 直下へ描く story——root は空のまま）が `domReady` を永久に満たせず、門の導入前は撮れていたものが 30 秒 Timeout になる——倒れる向きは fail-closed（未検証の絵は撮らない）だが巻き添えであり、既知の限界として併記（PR #27 ⑤。「root つき差し替えのすり抜け」と逆方向の対）。errored / aborted: 門なし——stale が読まれても「誤った理由での story 失敗」（fail-closed 側）にしか倒れず、domReady は error の門として意味を成さない（[`READY_PROBE`] 内の判断コメント。PR #27 ③） |
 //! | `__STORYBOOK_ADDONS_CHANNEL__`・`__STORYBOOK_PREVIEW__` の**存在自体**（runtime 判定） | Storybook が代入する。hook は accessor で捕捉するだけで、存在の有無を「ランタイムがいるか」の判定に使う | **不要／不可**（イベント側の世代は hook が刻む。存在の有無に世代は無い） | 差し替え後も window に残るため、Storybook を持たない document へ差し替えると probe は runtime ありと誤認して永久に `pending`——DOM ヒューリスティック（Absent 経路）へは二度と落ちず、共有 deadline の Timeout へ倒れる（fail-closed。未検証の絵を撮る方向には壊れない。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が同型の到達側を固定） |
 //!
 //! ## 層ごとの失敗経路
@@ -75,8 +75,8 @@
 //! | 層 | 失敗を検知できるか | 検知したらどう倒れるか / 検知できぬ理由 |
 //! |----|----|----|
 //! | [`READY_HOOK_SCRIPT`] 注入 | CDP エラーは検知 | Rust 側 `Err`（fail-closed）。`defineProperty` 失敗は JS 内で握るが、`storyRenders` 保険が外れれば pending のままタイムアウトへ倒れる（fail-closed） |
-//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定）。phase を読むのは**いま待っている story id を名乗るレンダー**だけ——`storyRenders` には docs の埋め込みレンダーや別 story のレンダーも並びうるため、末尾を無条件に読むと他所のレンダーの phase で自分の story を判定してしまう（`a_foreign_render_does_not_decide_our_story_readiness`）。id を名乗る要素が一つも無い形だけ従来どおり末尾を読む |
-//! | play の失敗 | `playFunctionThrewException` / `unhandledErrorsWhilePlaying` を検知 | 例外は世代内の先着 error として [`RenderError::Story`] へ倒し、文言を診断に載せて撮影しない（fail-closed）。撮影が play を追い越さないよう、preview の phase が `playing` までの間は rendered 印があっても READY にしない（判定対象は待っている story id を名乗るレンダー）。**判定を `completed` phase だけに絞ってはならない**——SB 9 の `StoryRender` は `completed` の中で `storyRendered` を emit した直後に `afterEach` → `finished` へ進むため、[`POLL_INTERVAL`]（100ms）で観測される定常値は `finished` であり、`completed` だけを ready の条件にすると正常な story が全て Timeout に倒れる（`a_story_that_settles_in_the_finished_phase_is_captured` が固定）。知らない phase 名は phase で判定せず、世代つきの rendered 印へ落とす |
+//! | [`READY_PROBE`] | 検知 | evaluate 失敗はリトライし期限で `Timeout`。JSON が壊れて/想定外なら [`Readiness::parse`] が「まだ待つ」へ倒しタイムアウト（fail-closed。誤って完了扱いにしない）。hook の rendered / error は世代（観測時の documentElement）が現在の document と一致するものだけ読む——`document.open()` を生き延びた前 document の印では判定しない（PR #27 ①）。`storyRenders` 保険には世代を刻む口が無いため、現在の document の root に描画結果があることを併せて要求する——**root つきの内容へ差し替える形は依然すり抜ける**（既知の限界。`a_stale_storyrenders_phase_does_not_ready_the_swapped_document` が到達できる側を固定）。phase を読むのは**いま待っている story id を名乗るレンダー**だけ——`storyRenders` には docs の埋め込みレンダーや別 story のレンダーも並びうるため、末尾を無条件に読むと他所のレンダーの phase で自分の story を判定してしまう（`a_foreign_render_does_not_decide_our_story_readiness`）。id を名乗る要素が一つも無い形だけ従来どおり末尾を読む |
+//! | play の失敗 | `playFunctionThrewException` / `unhandledErrorsWhilePlaying` を検知 | 例外は世代内の先着 error として [`RenderError::Story`] へ倒し、文言を診断に載せて撮影しない（fail-closed）。撮影が play を追い越さないよう、preview の phase が `playing` までの間は rendered 印があっても READY にしない（判定対象は待っている story id を名乗るレンダー）。**判定を `completed` phase だけに絞ってはならない**——SB 9 の `StoryRender` は `completed` の中で `storyRendered` を emit した直後に `afterEach` → `finished` へ進むため、[`POLL_INTERVAL`]（100ms）で観測される定常値は `finished` であり、`completed` だけを ready の条件にすると正常な story が全て Timeout に倒れる（PR #36。`a_story_that_settles_in_the_finished_phase_is_captured` が固定）。知らない phase 名は phase で判定せず、世代つきの rendered 印へ落とす |
 //! | 静止 CSS 注入（`freezeRoot`） | throw・API 欠落を検知 | constructed stylesheet（CSSOM）で注入する。構築・`replaceSync`・`adoptedStyleSheets` 代入の throw、`CSSStyleSheet` コンストラクタの欠落は `errors` → `ok: false`（fail-closed）。CSSOM 操作は CSP `style-src` の管轄外なので、旧 `<style>` 注入が持っていた「CSP による例外なしの黙殺」という検知不能経路は**構造ごと消えている** |
 //! | seek・pause | throw は検知 | `errors` → `ok: false`（fail-closed） |
 //! | 収束反復 | running 残は検知 | `MAX_SWEEPS` 内に running=0 とならねば `ok: false`。rAF が返らないハングは JS 内では検知できぬ（promise が解決せず evaluate が返らない）が、Rust 側で evaluate を READY 待ちと共有の deadline（`started + story_timeout`）の残余の `tokio::time::timeout` に載せてあり、時間内に静止が終わらねば失敗（fail-closed） |
@@ -90,12 +90,12 @@
 //! | reduced-motion 適用（`Emulation.setEmulatedMedia`） | 検知（CDP エラー・無応答とも） | project 設定で有効なときだけ `new_page` 直後（ナビゲーション前）に一度呼ぶ。CDP エラーは Rust 側 `Err` → [`RenderError::Cdp`]（環境分類・即中断。story のスクリプトを待たない一往復で、失敗の原因はブラウザ側——`new_page` と同じ分類）。無応答は chromiumoxide の request timeout（既定 30 秒）が `CdpError::Timeout` を返し、同じ `Cdp` へ倒れる（fail-closed） |
 //! | reduced-motion 適用の検証（[`REDUCED_MOTION_PROBE`]） | 部分的に検知 | 「呼び出しは成功したが実際にはメディアクエリが変わっていない」を撮影直前に実測する——constructed stylesheet の `@media (prefers-reduced-motion: reduce)` が効いたかのプローブ（`--vrt-reduced-motion`）と `matchMedia().matches` の**両輪**。どちらかが不成立なら `ok: false` → [`RenderError::Story`]（fail-closed。reduce を返さない壊れた/モックされた `matchMedia`——polyfill やテストダブルの事故——はここで落ちる）。evaluate の CDP エラーは READY probe と同様 deadline までリトライし期限で [`RenderError::Timeout`]。**ページが両方の観測を偽装する積極的な偽りは原理的に検知不能**——検証はページの JS realm で走り、CDP に emulated media 状態を読み戻す API が無い。脅威モデルは一貫して事故であり悪意ではない（README「検証層自身の失敗も fail-closed である」と同じ契約） |
 //! | reduced-motion 有効なのに呼び出し自体が漏れる | 実行時には検知不能 | 検知器の不在そのものがこの失敗であり、実行時観測では塞げない（「呼ばれなかったこと」を観測する層は、それ自身も呼ばれない）。構造で塞ぐ——適用は [`StoryRenderer::render_story`] の単一チョークポイントにだけ置き、分岐は `RenderOptions::emulate_reduced_motion` の一つ、project 列からの配線は `render_build` の単体テストで固定、経路全体は「ON で絵が変わる」positive control テスト（`reduced_motion_emulation_changes_the_picture_and_is_deterministic`）が貫通して固定する |
-//! | フォント条件待ち① 読み込みの**失敗**（[`FONTS_WAIT_SCRIPT`]） | 検知する（波が尽きた時点で個々の `FontFace.status === 'error'` を列挙し、family を Set で一意化） | **意図した fail-open**——撮って、[`fonts_verdict`] が有界の警告に整形し、[`RenderedStory::font_warning`] として成功値に載せる——`render_all` が build log（`LogLevel::Warn`）へ永続化して利用者に届く（`tracing::warn` はサーバー運用ログ止まりで利用者には見えない。 C）。 は (a) fail-closed（1 つでも error なら story 失敗）を採ったが、（yupix レビュー）の新しい実証で (b) 撮って警告へ転換した——`document.fonts` は document 全体の集合で、原因の `@font-face` は preview-head 等で **project 全体に共有**される。(a) では、egress の無いワーカーで外部フォントを参照する project・`local('Helvetica Neue')` を Linux で撮る project が「全 story 失敗・スクリーンショット 0 枚」になり、そのフォントを一切表示しない story まで道連れになる（修正前は fallback で決定的に緑だった）。**(b) が救うのは 404・接続拒否・`local()` 不在のように読み込みが error へ確定する場合だけ**である——無応答（blackhole された CDN 等）では FontFace が `loading` のまま `ready` が解決せず、(b) でも経路④の Timeout に倒れる。(a) と挙動は同一で、300 story × 30 秒＝約 2.5 時間かけて全滅する費用は **(a)(b) 共通の限界**（/660 で将軍の誤帰属を訂正。時間上限の考えは「層ごとの手当て」表とREADME を参照）。 の (a) は当時の材料（断続 CDN が二つの baseline を生む）では妥当で、(b) は が明示的に許した道——覆したのは新しい実証であって後戻りではない。代償: 断続的にしか届く外部フォントは run ごとに違う絵を作りうる——「同じビルドから同じ絵」は**外部依存の応答が同じ場合**の保証となる（README・docs/architecture.md に同じ限定を明記。警告本文にもこの旨を書く）。恒久対処はフォントの同梱か `@font-face` 参照の除去（警告が名指しする）。厳格側（(a) を project 設定でオプトイン）は後日の選択肢として残す。`a_failing_font_load_captures_with_a_warning_and_stays_deterministic` が固定する（警告が成功値に載ることも assert——`FONTS_WAIT_SCRIPT` が `failed` を返す契約の script 側の固定を兼ねる。 F）——黙って fail-closed へ戻す変更・`failed` を落とす変更はこの試験を落とす |
-//! | フォント条件待ち② `ready` 解決後の新たなフォント要求 | 応答前の波は検知 | 応答の直前に `status` を読み直し、`'loading'` へ戻っていれば失敗にせず `ready` を**待ち直す**——二段以上でフォントを読むページは各波が有限なら収束し、そこから先は決定的に撮れる。読み込み**中**は失敗ではない——ここで即失敗にすると、フォントが問題なく届く二波ページを恒久的に撮影不能へ誤分類する（実測: 旧実装で二波 fixture が 8/8 失敗）。①の失敗検知は波が尽きた後に行うので、待ち直しと衝突しない。待ち直しに回数上限は設けない——上限値はどんな数でも根拠がなく、停止性は共有 deadline が担う。収束しないページは経路④の Timeout へ倒れる（`a_second_font_wave_after_ready_is_awaited_not_failed`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。応答から撮影までの窓に始まる要求・document の入れ替わりは、検証列の最後（静止の後・撮影の直前）の再確認（[`FONTS_RECHECK_PROBE`]——経路⑤）が検知し、検証列をやり直す。再確認から撮影までの**最後の一往復**に始まる変化だけは原理的に検知できぬ——スクリーンショットは JS を走らせない一往復の CDP コマンドで、その瞬間のフォント状態を読み戻す API が無い（README「届かない範囲」と同じ契約） |
-//! | フォント条件待ち⑤ 検証後の document 入れ替わり・新しい波（[`FONTS_RECHECK_PROBE`]） | 検知する（撮影の直前に、[`FONTS_WAIT_SCRIPT`] が成功時に検証した各 document へ残す印 `documentElement.dataset.vrtFontsVerified` と `document.fonts.status` を、FREEZE の `freezeRoot` と同じ範囲——open shadow root へ潜り `iframe` と `frame` の両方——で同一オリジン iframe まで再帰して 1 往復で読む。）。`dataset` を持たない documentElement（素の XML document）には印を刻む口が無く、両側で要求しない——その document の入れ替わりは印では捉えられない（fonts.status の検査は残る。 追送）。**印が消えるのはナビゲーションと `document.open()` / `document.write()`**——どちらも documentElement を作り直す（印を window に置くと `document.open()` がグローバルオブジェクトを維持するため生き残り、入れ替わりを見逃す—— 実測で訂正）。**同一 document 内の DOM 全面置換（`body.replaceChildren` 等）では documentElement が残るため印も残り、捉えられない**（下の「本 PR で扱わないもの」を参照） | 不成立なら失敗ではなく検証列を**READY 待ちと `SETTLE_DELAY` から**やり直す——Blink の `FontFaceSet.ready` は「load イベント完了＋読み込み中フォント無し」で解決するため、reload 後の document では story 未描画の時点で fonts 待ちが通ってしまい、fonts 待ちからのやり直しでは `storyRendered` 前の未描画の絵を撮る（実測: reload 後の再描画が遅い fixture で白い絵が撮れた。既存 reload fixture は reload 後 40ms で `storyRendered` を出すためこの経路を踏まなかった）。READY 待ちから回すことで二巡目の `storyErrored` / `storyThrewException` も観測される（実測: 修正前は黙殺して撮れていた）。ただし READY の印が世代を持つことが前提——`document.open()` はグローバルオブジェクトを維持するため、世代なしの `window.__VRT_READY__.rendered` は前 document の `true` のまま生き残り、やり直しの READY 待ちが新 document を一度も待たずに素通りしていた（実測: 差し替え後の再描画が遅い fixture で未描画の白い絵が撮れ、二巡目の `storyThrewException` は黙殺された。世代印で修正）。storyRendered 後に自分を reload する story は、fonts 待ちが前 document で ok を返し FREEZE が navigated or closed のリトライを経て後 document で成功するため、修正前はフォント未検証の document がそのまま撮れた（実測。窓はリトライ全長＝数十秒になりうる）。フォント待ちを FREEZE の後ろへ動かす形は採らない（FREEZE は最終レイアウトを見る必要があり、フォント適用で始まる CSS transition も静止の対象）。常に二度待つ形も採らない——再待ちは窓が開いたと検知された時だけ。停止性は共有 deadline（やり直しが尽きねば [`RenderError::Timeout`]・fail-closed）。応答の解析不能は [`RenderError::Story`]（fail-closed）。`a_story_that_reloads_after_the_fonts_wait_is_not_captured_unverified`（陽性対照つき）・`a_reloading_story_whose_fonts_arrive_recovers_and_captures_verified`・`a_document_swapped_via_document_open_is_recaptured_verified`・`a_slowly_rerendering_reload_waits_for_its_second_ready`・`a_story_error_after_reload_is_observed_by_the_redo`・`a_document_open_swap_with_a_slow_rerender_waits_for_its_second_ready`・`a_story_error_after_a_document_open_swap_is_observed_by_the_redo`・`a_second_error_in_the_swapped_document_is_recorded_not_masked`・`a_stale_storyrenders_phase_does_not_ready_the_swapped_document`・`a_redo_round_regrants_the_dom_heuristic_its_signal_grace`・`fonts_inside_a_shadow_dom_iframe_are_awaited_before_the_capture`・`fonts_inside_a_frameset_frame_are_awaited_before_the_capture`・`a_same_origin_xml_iframe_does_not_break_the_fonts_wait` が固定 |
+//! | フォント条件待ち① 読み込みの**失敗**（[`FONTS_WAIT_SCRIPT`]） | 検知する（波が尽きた時点で個々の `FontFace.status === 'error'` を列挙し、family を Set で一意化） | **意図した fail-open**——撮って、[`fonts_verdict`] が有界の警告に整形し、[`RenderedStory::font_warning`] として成功値に載せる——`render_all` が build log（`LogLevel::Warn`）へ永続化して利用者に届く（`tracing::warn` はサーバー運用ログ止まりで利用者には見えない。PR #27 C）。PR #27 は (a) fail-closed（1 つでも error なら story 失敗）を採ったが、PR #27（yupix レビュー）の新しい実証で (b) 撮って警告へ転換した——`document.fonts` は document 全体の集合で、原因の `@font-face` は preview-head 等で **project 全体に共有**される。(a) では、egress の無いワーカーで外部フォントを参照する project・`local('Helvetica Neue')` を Linux で撮る project が「全 story 失敗・スクリーンショット 0 枚」になり、そのフォントを一切表示しない story まで道連れになる（修正前は fallback で決定的に緑だった）。**(b) が救うのは 404・接続拒否・`local()` 不在のように読み込みが error へ確定する場合だけ**である——無応答（blackhole された CDN 等）では FontFace が `loading` のまま `ready` が解決せず、(b) でも経路④の Timeout に倒れる。(a) と挙動は同一で、300 story × 30 秒＝約 2.5 時間かけて全滅する費用は **(a)(b) 共通の限界**（PR #27 で将軍の誤帰属を訂正。時間上限の考えは「層ごとの手当て」表とREADME を参照）。PR #27 の (a) は当時の材料（断続 CDN が二つの baseline を生む）では妥当で、(b) は PR #27 が明示的に許した道——覆したのは新しい実証であって後戻りではない。代償: 断続的にしか届く外部フォントは run ごとに違う絵を作りうる——「同じビルドから同じ絵」は**外部依存の応答が同じ場合**の保証となる（README・docs/architecture.md に同じ限定を明記。警告本文にもこの旨を書く）。恒久対処はフォントの同梱か `@font-face` 参照の除去（警告が名指しする）。厳格側（(a) を project 設定でオプトイン）は後日の選択肢として残す。`a_failing_font_load_captures_with_a_warning_and_stays_deterministic` が固定する（警告が成功値に載ることも assert——`FONTS_WAIT_SCRIPT` が `failed` を返す契約の script 側の固定を兼ねる。PR #27 F）——黙って fail-closed へ戻す変更・`failed` を落とす変更はこの試験を落とす |
+//! | フォント条件待ち② `ready` 解決後の新たなフォント要求 | 応答前の波は検知 | 応答の直前に `status` を読み直し、`'loading'` へ戻っていれば失敗にせず `ready` を**待ち直す**——二段以上でフォントを読むページは各波が有限なら収束し、そこから先は決定的に撮れる。読み込み**中**は失敗ではない——ここで即失敗にすると、フォントが問題なく届く二波ページを恒久的に撮影不能へ誤分類する（PR #27 実測: 旧実装で二波 fixture が 8/8 失敗）。①の失敗検知は波が尽きた後に行うので、待ち直しと衝突しない。待ち直しに回数上限は設けない——上限値はどんな数でも根拠がなく、停止性は共有 deadline が担う。収束しないページは経路④の Timeout へ倒れる（`a_second_font_wave_after_ready_is_awaited_not_failed`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。応答から撮影までの窓に始まる要求・document の入れ替わりは、検証列の最後（静止の後・撮影の直前）の再確認（[`FONTS_RECHECK_PROBE`]——経路⑤）が検知し、検証列をやり直す。再確認から撮影までの**最後の一往復**に始まる変化だけは原理的に検知できぬ——スクリーンショットは JS を走らせない一往復の CDP コマンドで、その瞬間のフォント状態を読み戻す API が無い（README「届かない範囲」と同じ契約） |
+//! | フォント条件待ち⑤ 検証後の document 入れ替わり・新しい波（[`FONTS_RECHECK_PROBE`]） | 検知する（撮影の直前に、[`FONTS_WAIT_SCRIPT`] が成功時に検証した各 document へ残す印 `documentElement.dataset.vrtFontsVerified` と `document.fonts.status` を、FREEZE の `freezeRoot` と同じ範囲——open shadow root へ潜り `iframe` と `frame` の両方——で同一オリジン iframe まで再帰して 1 往復で読む。PR #27 ②）。`dataset` を持たない documentElement（素の XML document）には印を刻む口が無く、両側で要求しない——その document の入れ替わりは印では捉えられない（fonts.status の検査は残る。PR #27 追送）。**印が消えるのはナビゲーションと `document.open()` / `document.write()`**——どちらも documentElement を作り直す（印を window に置くと `document.open()` がグローバルオブジェクトを維持するため生き残り、入れ替わりを見逃す——PR #27 実測で訂正）。**同一 document 内の DOM 全面置換（`body.replaceChildren` 等）では documentElement が残るため印も残り、捉えられない**（下の「本 PR で扱わないもの」を参照） | 不成立なら失敗ではなく検証列を**READY 待ちと `SETTLE_DELAY` から**やり直す（PR #27）——Blink の `FontFaceSet.ready` は「load イベント完了＋読み込み中フォント無し」で解決するため、reload 後の document では story 未描画の時点で fonts 待ちが通ってしまい、fonts 待ちからのやり直しでは `storyRendered` 前の未描画の絵を撮る（PR #27 実測: reload 後の再描画が遅い fixture で白い絵が撮れた。既存 reload fixture は reload 後 40ms で `storyRendered` を出すためこの経路を踏まなかった）。READY 待ちから回すことで二巡目の `storyErrored` / `storyThrewException` も観測される（PR #27 実測: 修正前は黙殺して撮れていた）。ただし READY の印が世代を持つことが前提——`document.open()` はグローバルオブジェクトを維持するため、世代なしの `window.__VRT_READY__.rendered` は前 document の `true` のまま生き残り、やり直しの READY 待ちが新 document を一度も待たずに素通りしていた（PR #27 ① 実測: 差し替え後の再描画が遅い fixture で未描画の白い絵が撮れ、二巡目の `storyThrewException` は黙殺された。世代印で修正）。storyRendered 後に自分を reload する story は、fonts 待ちが前 document で ok を返し FREEZE が navigated or closed のリトライを経て後 document で成功するため、修正前はフォント未検証の document がそのまま撮れた（PR #27 実測。窓はリトライ全長＝数十秒になりうる）。フォント待ちを FREEZE の後ろへ動かす形は採らない（FREEZE は最終レイアウトを見る必要があり、フォント適用で始まる CSS transition も静止の対象）。常に二度待つ形も採らない——再待ちは窓が開いたと検知された時だけ。停止性は共有 deadline（やり直しが尽きねば [`RenderError::Timeout`]・fail-closed）。応答の解析不能は [`RenderError::Story`]（fail-closed）。`a_story_that_reloads_after_the_fonts_wait_is_not_captured_unverified`（陽性対照つき）・`a_reloading_story_whose_fonts_arrive_recovers_and_captures_verified`・`a_document_swapped_via_document_open_is_recaptured_verified`・`a_slowly_rerendering_reload_waits_for_its_second_ready`・`a_story_error_after_reload_is_observed_by_the_redo`・`a_document_open_swap_with_a_slow_rerender_waits_for_its_second_ready`・`a_story_error_after_a_document_open_swap_is_observed_by_the_redo`・`a_second_error_in_the_swapped_document_is_recorded_not_masked`・`a_stale_storyrenders_phase_does_not_ready_the_swapped_document`・`a_redo_round_regrants_the_dom_heuristic_its_signal_grace`・`fonts_inside_a_shadow_dom_iframe_are_awaited_before_the_capture`・`fonts_inside_a_frameset_frame_are_awaited_before_the_capture`・`a_same_origin_xml_iframe_does_not_break_the_fonts_wait` が固定 |
 //! | フォント条件待ち③ ページが `document.fonts` を差し替える | 形の壊れは検知 | FontFaceSet らしい形（`status` が文字列・`ready.then` が関数）でなければ**待たずに** `ok: false`（fail-closed。無いものは待てないが、無いことを黙って通さない）。仕様どおりの顔で即解決を返す偽物は原理的に検知不能——脅威モデルは一貫して事故であり悪意ではない（reduced-motion 検証と同じ契約）。判定は `fonts_verdict_accepts_only_a_verified_ok_true`・`fonts_verdict_rejects_unparseable_results`（単体。手書き JSON への受理条件のみ）が固定し、実ブラウザ貫通は `a_page_that_replaces_document_fonts_fails_the_shape_check`（形チェック分岐——`document.fonts` を非 FontFaceSet 形へ差し替えて [`RenderError::Story`] と `errors` の文言まで実測）と `garbled_fonts_result_fails_instead_of_silently_succeeding`（unparseable 分岐）が固定 |
-//! | フォント条件待ち④ `ready` が期限内に解決しない | 検知 | evaluate が返らないので、READY 待ちと共有の deadline の残余（`tokio::time::timeout`）が期限で [`RenderError::Timeout`] へ倒す（fail-closed——**撮らない**。修正前は 250ms 経過後に代替字形のまま撮れてしまい、揺れる絵が baseline に混ざった）。②の待ち直しが収束しない場合の安全弁もこの経路（`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。**`ready` が解決しない原因はフォントに限らない**——`ready` は仕様上 load イベント完了にも門を掛けられており、到達不能な非フォント subresource 1 本・load の終わらない同一オリジン iframe 1 つでも同じ Timeout に倒れる（既知の限界＝費用。。[`DEFAULT_STORY_TIMEOUT`] doc と README のフォント節に明記） |
-//! | フォント条件待ち⑥ 待ちの**最中**の document の切り離し（iframe の DOM からの除去・`location.replace`） | 検知する（各 `ready` を切り離し検知の race に載せる。走査（[`COLLECT_DOCUMENTS_JS`]）自体も `defaultView` の無い document を集めない——FREEZE の `freezeRoot` と同じ門。） | 切り離された document は描画されず `fonts.ready` は二度と settle しない——race が検知して**待ちからも判定からも捨てる**（撮る絵に影響しない document のために story を落とさない）。修正前はこの門が写されておらず、`Promise.all` が永久 pending となり story_timeout（既定 30 秒。実測 30.31s）を丸ごと消費して④の Timeout に倒れていた。検知の setTimeout ポーリングは fake timers で止まる——その場合は従来どおり deadline の Timeout（fail-closed）。検知の読み（`defaultView` getter）自体の throw は帰属の印つきで `errors` → `ok: false`（fail-closed。。`a_throwing_defaultview_getter_fails_fast_with_the_reason` が固定）。`location.replace` で入れ替わった新 document は次の巡・撮影直前の再確認が拾う。`a_detached_iframe_mid_fonts_wait_does_not_time_out_the_story` が固定 |
+//! | フォント条件待ち④ `ready` が期限内に解決しない | 検知 | evaluate が返らないので、READY 待ちと共有の deadline の残余（`tokio::time::timeout`）が期限で [`RenderError::Timeout`] へ倒す（fail-closed——**撮らない**。修正前は 250ms 経過後に代替字形のまま撮れてしまい、揺れる絵が baseline に混ざった）。②の待ち直しが収束しない場合の安全弁もこの経路（`a_font_that_never_arrives_fails_instead_of_capturing_fallback_glyphs`・`a_second_wave_that_never_ends_times_out_without_capturing` が固定）。**`ready` が解決しない原因はフォントに限らない**——`ready` は仕様上 load イベント完了にも門を掛けられており、到達不能な非フォント subresource 1 本・load の終わらない同一オリジン iframe 1 つでも同じ Timeout に倒れる（既知の限界＝費用。PR #27 ⑥。[`DEFAULT_STORY_TIMEOUT`] doc と README のフォント節に明記） |
+//! | フォント条件待ち⑥ 待ちの**最中**の document の切り離し（iframe の DOM からの除去・`location.replace`） | 検知する（各 `ready` を切り離し検知の race に載せる。走査（[`COLLECT_DOCUMENTS_JS`]）自体も `defaultView` の無い document を集めない——FREEZE の `freezeRoot` と同じ門。PR #27 ②） | 切り離された document は描画されず `fonts.ready` は二度と settle しない——race が検知して**待ちからも判定からも捨てる**（撮る絵に影響しない document のために story を落とさない）。修正前はこの門が写されておらず、`Promise.all` が永久 pending となり story_timeout（既定 30 秒。実測 30.31s）を丸ごと消費して④の Timeout に倒れていた。検知の setTimeout ポーリングは fake timers で止まる——その場合は従来どおり deadline の Timeout（fail-closed）。検知の読み（`defaultView` getter）自体の throw は帰属の印つきで `errors` → `ok: false`（fail-closed。PR #32。`a_throwing_defaultview_getter_fails_fast_with_the_reason` が固定）。`location.replace` で入れ替わった新 document は次の巡・撮影直前の再確認（⑤）が拾う。`a_detached_iframe_mid_fonts_wait_does_not_time_out_the_story` が固定 |
 //!
 //! 残る fail-open は二種に分けて管理する。
 //!
@@ -117,7 +117,7 @@
 //!   読み込まれないまま残る）、`loading` は集合 status が `'loaded'` の時点で
 //!   仕様上ありえず、未知の値は仕様外。列挙は「`error` があるか」だけを見る
 //!
-//! **本 PR（#27）で扱わないもの**（捉えられぬもの・別途扱うもの。 G）:
+//! **本 PR（#27）で扱わないもの**（捉えられぬもの・別途扱うもの。PR #27 G）:
 //!
 //! - **同一 document 内の DOM 全面置換**（`body.replaceChildren` /
 //!   `documentElement.innerHTML` 差し替え等）——documentElement が残るため
@@ -136,7 +136,7 @@
 //! 積まれるため、後から足した層は先の層が当然に持つ手当て（時間上限・判定への
 //! 反映・テストでの固定）を欠いたまま生まれやすい。実例: READY 待ちには最初から
 //! deadline があったが、後から足した FREEZE evaluate には時間上限が無く、rAF を
-//! 発火させないページで render がハングした（で story_timeout を移した）。
+//! 発火させないページで render がハングした（PR #19 で story_timeout を移した）。
 //! この表は各層の手当てを横に並べ、欠けを目視できるようにする——空欄を見つけたら
 //! 埋めるか、埋められぬ理由を書くこと。
 //!
@@ -155,7 +155,7 @@
 //! ## 走査と門の対応表（揃えた対象の付随物）
 //!
 //! 「既存の X に揃えた」は、走査の**形**（どこへ降りるか）だけでなく X が持つ
-//! **門**（除外条件・前提）まで写して初めて成り立つ（defaultView の
+//! **門**（除外条件・前提）まで写して初めて成り立つ（PR #27 ①。defaultView の
 //! 門が六巡のあいだ fonts 側に写されていなかった）。**走査・検知の層を
 //! 足したらこの表に行を足すこと**——document・root を歩く走査だけでなく、
 //! それらの状態を読み続ける検知（ポーリング・race）も同じ列（門・throw の
@@ -164,10 +164,10 @@
 //!
 //! | 走査 | 担い手 | 降下（shadow / iframe / frame） | cross-origin | 切り離し（`defaultView`）の門 | 切断（`isConnected`）の門 | 走査自身の throw |
 //! |----|----|----|----|----|----|----|
-//! | `walkRoots`（freezeRoot＝凍らせる側と collectRunning＝数える側が共有。で一本化） | [`FREEZE_SCRIPT`] | 全部降りる | `contentDocument` が null / throw——意図した握りつぶし（原理的に触れない。README 契約） | 注入は `defaultView` の無い document を対象外（描画されない）。シーク・収集は切り離し root にも走るが、描画されないので絵に影響しない | ——（root 単位の門は下の検証行が担う） | `collectAnimations` 内で `errors` → `ok: false`（fail-closed） |
+//! | `walkRoots`（freezeRoot＝凍らせる側と collectRunning＝数える側が共有。PR #27 ⑦で一本化） | [`FREEZE_SCRIPT`] | 全部降りる | `contentDocument` が null / throw——意図した握りつぶし（原理的に触れない。README 契約） | 注入は `defaultView` の無い document を対象外（描画されない）。シーク・収集は切り離し root にも走るが、描画されないので絵に影響しない | ——（root 単位の門は下の検証行が担う） | `collectAnimations` 内で `errors` → `ok: false`（fail-closed） |
 //! | 適用検証ループ（`frozenRoots`） | [`FREEZE_SCRIPT`] | 走査済み root の線形走査（降下なし） | ——（frozenRoots に載るのは到達できた root のみ） | document root は `defaultView` の無いものを検証対象外 | shadow root は `isConnected` でない host のものを検証対象外 | `errors` → `ok: false`（fail-closed） |
-//! | [`COLLECT_DOCUMENTS_JS`]（検証側 [`FONTS_WAIT_SCRIPT`] と再確認側 [`FONTS_RECHECK_PROBE`] が共有。） | フォント待ち・再確認 | 全部降りる | 同上（契約） | **`defaultView` の無い document を集めない＋待ちの最中の切り離しは `ready` との race が捨てる（——この列が空欄だった）** | ——（document 単位の走査。shadow root を root として扱わない） | 各利用側の try → fail-closed |
-//! | `readyOrDetached`（切り離し検知の setTimeout ポーリング） | [`FONTS_WAIT_SCRIPT`] | 降下なし（`COLLECT_DOCUMENTS_JS` が集めた document ごとに 1 本） | ——（走査しない） | 検知そのものが門——`defaultView` の消えた document は待ちからも判定からも捨てる | —— | `defaultView` 読みの throw は帰属の印つき reject → `errors` → `ok: false`（fail-closed。——修正前は setTimeout コールバック内の uncaught throw で検知が黙って死に、原因を失った deadline の Timeout に化けた。「切り離し扱い」へ黙って倒す形は未検証のまま撮る fail-open なので採らない） |
+//! | [`COLLECT_DOCUMENTS_JS`]（検証側 [`FONTS_WAIT_SCRIPT`] と再確認側 [`FONTS_RECHECK_PROBE`] が共有。PR #27 ④） | フォント待ち・再確認 | 全部降りる（PR #27 ②） | 同上（契約） | **`defaultView` の無い document を集めない＋待ちの最中の切り離しは `ready` との race が捨てる（PR #27 ②——この列が空欄だった）** | ——（document 単位の走査。shadow root を root として扱わない） | 各利用側の try → fail-closed |
+//! | `readyOrDetached`（切り離し検知の setTimeout ポーリング） | [`FONTS_WAIT_SCRIPT`] | 降下なし（`COLLECT_DOCUMENTS_JS` が集めた document ごとに 1 本） | ——（走査しない） | 検知そのものが門——`defaultView` の消えた document は待ちからも判定からも捨てる | —— | `defaultView` 読みの throw は帰属の印つき reject → `errors` → `ok: false`（fail-closed。PR #32——修正前は setTimeout コールバック内の uncaught throw で検知が黙って死に、原因を失った deadline の Timeout に化けた。「切り離し扱い」へ黙って倒す形は未検証のまま撮る fail-open なので採らない） |
 //!
 //! ## story 固有の失敗と環境の失敗（隔離の分類・全経路）
 //!
@@ -212,7 +212,7 @@
 //! 同じ環境異常なら `new_page` の環境分類で中断する——失う最大は
 //! 1 story あたり 2 試行分（[`retry_once_on_cdp`] の 1 回やり直しを含む）の
 //! 時間予算。逆に story の失敗を環境と誤分類すると「1 ビルドで 1 件ずつ」しか
-//! 発見できない劣化になる（/632 が潰した形）。どちらの向きも
+//! 発見できない劣化になる（PR #19 が潰した形）。どちらの向きも
 //! 「環境起因をビルド緑で通す」経路にはならない。
 //!
 //! ## 後始末
@@ -243,7 +243,7 @@ use tokio::task::JoinHandle;
 
 /// 1 ストーリーあたりの描画待ちタイムアウト。
 ///
-/// **既知の限界（フォント待ちの累積費用。 E）**: 解決しない
+/// **既知の限界（フォント待ちの累積費用。PR #27 E）**: 解決しない
 /// フォント（無応答の CDN・`local()` 不在等で `document.fonts.ready` が
 /// 確定しないもの）は、story ごとに最大でこの時間を丸ごと消費してから
 /// Timeout に倒れる。原因の `@font-face` は preview-head 等で project
@@ -254,7 +254,7 @@ use tokio::task::JoinHandle;
 /// （例: 数秒）を持たせて被害を読みやすくするのは**未着手**である
 /// （README のフォント節にも同じ限界を明記）。
 ///
-/// **既知の限界（load イベントの門。）**: `document.fonts.ready` は
+/// **既知の限界（load イベントの門。PR #27 ⑥）**: `document.fonts.ready` は
 /// 仕様上「document の load イベント完了＋読み込み中フォント無し」で解決
 /// する——費用はフォントの無応答に限らない。フォントが全て `loaded` でも、
 /// 到達不能なホストへの `<script src>` / `<img>` / beacon が 1 本あるだけで
@@ -268,14 +268,14 @@ pub const DEFAULT_STORY_TIMEOUT: Duration = Duration::from_secs(30);
 /// かつての注記は「フォント・アニメーションの初期化ぶん」だったが、どちらも
 /// もうこの時間待ちの担当ではない——アニメーションは #19 の条件つき静止
 /// （`FREEZE_SCRIPT`・fail-closed）、フォントは [`FONTS_WAIT_SCRIPT`] の
-/// `document.fonts.ready` 条件待ち（fail-closed）がそれぞれ
+/// `document.fonts.ready` 条件待ち（PR #27・fail-closed）がそれぞれ
 /// 引き受けた。時間待ちは「間に合ったか」がキャッシュの温度や負荷で変わり、
-/// 同じビルドから違う絵を作る（で実測）。
+/// 同じビルドから違う絵を作る（PR #27 で実測）。
 ///
 /// 残しているのは、完了シグナルも条件待ちも未整備の非同期初期化——画像の
 /// 読み込み・デコードなど、`storyRendered` の後に絵を変えうるがどの層も
 /// まだ待っていないもの——への暫定の緩衝としてである。これを外すのは、
-/// それらにも「何を待つか」が明示された条件待ちを整えてから（と
+/// それらにも「何を待つか」が明示された条件待ちを整えてから（PR #27 と
 /// 同型の実測つきで）行うこと。時間待ちを条件待ちの代わりに数えてはならない。
 pub const SETTLE_DELAY: Duration = Duration::from_millis(250);
 /// 描画完了判定のポーリング間隔。
@@ -307,12 +307,12 @@ const READY_HOOK_SCRIPT: &str = r#"
   // rendered / error には「どの document で観測したか」の世代
   // （その時点の documentElement への参照）を併記する。accessor は window に
   // しか張れないが、state 自体は document 側へも置ける（フォントの印 dataset
-  // と同じ分担）——window に置いたままにしたのは判断である:
+  // と同じ分担）——window に置いたままにしたのは判断である（PR #27 ⑧）:
   // errorRoot / renderedRoot は documentElement への参照で dataset（文字列
   // のみ）には刻めず、世代印だけで差し替えの生き残りは塞がっている。
   // `document.open()` / `document.write()` はグローバルオブジェクトを維持
   // したまま document を差し替えるため、印だけ window に残ると、やり直しの
-  // READY 待ちが前 document の rendered: true で素通りする（
+  // READY 待ちが前 document の rendered: true で素通りする（PR #27 ①。
   // フォントの印を document 側へ移したのと同じ前提から導かれる）。イベントは
   // 発火のたびにその時点の documentElement を刻むので、差し替え後に生き残った
   // channel へ再シグナルが来れば新しい世代で立ち直る。
@@ -334,7 +334,7 @@ const READY_HOOK_SCRIPT: &str = r#"
   // の error の記録を塞ぐ——読む側（READY probe）は世代不一致の error を
   // 読まないので、新 document の error は誰にも観測されず、rendered だけが
   // 新世代で立って撮影が通る（rendered は書く側も読む側も世代を見るのに、
-  // error は読む側だけが見る非対称だった。）。
+  // error は読む側だけが見る非対称だった。PR #27 ②）。
   const recordError = (message) => {
     const current = document.documentElement;
     if (!state.error || state.errorRoot !== current) {
@@ -396,7 +396,7 @@ JSON.stringify((() => {
   // rendered / error は「現在の document で観測したもの」だけを信じる。
   // hook の state は window 上で document.open() / document.write() を
   // 生き延びるため、世代（観測時の documentElement）が現在と一致しない印は
-  // 前 document の残骸——読まずに待ち続ける。
+  // 前 document の残骸——読まずに待ち続ける（PR #27 ①）。
   const hook = window.__VRT_READY__;
   const current = document.documentElement;
   if (hook && hook.error && hook.errorRoot === current) {
@@ -407,12 +407,12 @@ JSON.stringify((() => {
   // 進め、`storyRendered` は **`completed` phase の中で** emit する（SB 9.0.0 の
   // `StoryRender.ts` で確認。play が投げたときは `errored` へ倒れ `storyRendered`
   // は出ない）。play が走っている間の phase は `playing` までなので、rendered 印
-  // より先に phase を見れば play の完了前に撮るのを防げる。
+  // より先に phase を見れば play の完了前に撮るのを防げる（PR #36）。
   //
   // ただし `completed` は afterEach へ抜けるまでの 1 マイクロタスクしか続かず、
   // 100ms 間隔の [`POLL_INTERVAL`] が実際に観測する定常値は `finished` である。
   // ready の条件を `completed` だけに絞ると、正常な story が一つも READY に
-  // ならず全て 30 秒の Timeout に倒れる。待つ phase と終わった
+  // ならず全て 30 秒の Timeout に倒れる（PR #36）。待つ phase と終わった
   // phase の両方を名前で挙げ、知らない名前は phase で判定しない。
   //
   // フックがチャンネルを掴めなかったときの保険も兼ねる。SB 8〜10 のプレビューは
@@ -441,7 +441,7 @@ JSON.stringify((() => {
       const phase = render.phase;
       if (phase === 'errored' || phase === 'aborted') {
         // こちらには completed 側の domReady のような門を**掛けない**（判断。
-        // ）。理由は二つ。(1) 失敗の向き: 前 document の stale な
+        // PR #27 ③）。理由は二つ。(1) 失敗の向き: 前 document の stale な
         // errored が読まれても、起きるのは「誤った理由での story 失敗」で
         // あって未検証の絵の撮影ではない——fail-closed 側にしか倒れない
         // （completed 側の門は fail-open——未描画の差し替え document を撮る
@@ -478,7 +478,7 @@ JSON.stringify((() => {
         // 要求する（root つきの内容へ差し替える形は依然すり抜ける。既知の
         // 限界としてモジュール doc の失敗経路表に明記）。
         //
-        // この門の代償（errored 分岐の判断の逆向きの帰結）:
+        // この門の代償（PR #27 ⑤・errored 分岐の判断の逆向きの帰結）:
         // 何も描かず終える story は正当（このモジュールの出発点の
         // PasswordStrengthBar）だが、保険経路にしか乗れない構成（channel を
         // 掴み損ねた等）では null を返す story・portal で body 直下へ描く
@@ -710,8 +710,8 @@ const FREEZE_SCRIPT: &str = r#"
   // 走査（open shadow root への降下・`iframe` / `frame` の contentDocument への
   // 降下）の共有ヘルパ。凍らせる側（freezeRoot）と数える側（collectRunning）は
   // 従来この walk を各自に持つ写しで、片側だけ狭まる退行——「凍らせていないのに
-  // 数えもしない」fail-open——をどの試験も赤くできなかった。
-  // fonts 側の走査を COLLECT_DOCUMENTS_JS へ一本化したのと同じ
+  // 数えもしない」fail-open——をどの試験も赤くできなかった（PR #27 ⑦）。
+  // fonts 側の走査を COLLECT_DOCUMENTS_JS へ一本化した（PR #27 ④）のと同じ
   // 理由で、降下はこの一箇所だけが担う。perRoot が root ごとの仕事（注入＋
   // シーク／running の収集）を行い、collectAnimations が走査済みの全要素を返す。
   const walkRoots = (root, perRoot) => {
@@ -795,7 +795,7 @@ const FREEZE_SCRIPT: &str = r#"
   // 全 root から running な animation を集める。収集の視野は freezeRoot と
   // 同じ collectAnimations——収集失敗・API 欠落はそこで errors に積まれ、
   // 「残っていない」と「数えられなかった」が混ざらない（fail-closed）。
-  // 降下は freezeRoot と共有の walkRoots。
+  // 降下は freezeRoot と共有の walkRoots（PR #27 ⑦）。
   const collectRunning = (root) => {
     const running = [];
     walkRoots(root, (r) => {
@@ -957,7 +957,7 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// 要求してから走る非同期処理で、描画完了シグナルの管轄外にある。かつては
 /// [`SETTLE_DELAY`]（250ms の時間待ち）がこれを吸収するつもりでいたが、
 /// 「間に合えば本来の字形・間に合わねば代替字形」という競争をそのまま
-/// 撮っていた（で実測。同じバンドルを同じブラウザで繰り返し撮ると
+/// 撮っていた（PR #27 で実測。同じバンドルを同じブラウザで繰り返し撮ると
 /// 序盤の撮影だけがバイト不一致になり、不一致の絵はすべて
 /// `document.fonts.check()` 不成立＝フォント未着だった）。時間待ちは
 /// キャッシュの温度で勝敗が変わる。`document.fonts.ready` は時間ではなく
@@ -969,12 +969,12 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// `ready` を**待ち直す**——二段以上でフォントを読むページ（本文フォントの
 /// 後にアイコンフォント等）は各波が有限なら間もなく収束し、そこから先は
 /// 決定的に撮れる。ここで即失敗にすると、そうしたページを**毎回・恒久的に**
-/// 撮影不能へ誤分類する（で実測: 二波 fixture は旧実装で 8/8 失敗した）。
+/// 撮影不能へ誤分類する（PR #27 で実測: 二波 fixture は旧実装で 8/8 失敗した）。
 ///
 /// 波が尽きたら、個々の `FontFace.status === 'error'` を列挙する。読み込みに
 /// **失敗**したフォントがあっても撮影は止めず、family を Set で一意化した
 /// 一覧を `failed` として返す——Rust 側（[`fonts_verdict`]）が警告に整形する
-/// （意図した fail-open。 の (a) fail-closed から で (b) へ
+/// （意図した fail-open。PR #27 の (a) fail-closed から PR #27 で (b) へ
 /// 転換した。理由: 原因の `@font-face` は preview-head 等で **project 全体に
 /// 共有**され、失敗判定にすると egress の無いワーカーの外部フォント参照や
 /// `local()` 前提の宣言ひとつで、そのフォントを表示しない story まで全 story
@@ -985,10 +985,10 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// 到達可能な**同一オリジン iframe を再帰**し、top document と各
 /// `contentDocument` の fonts をまとめて待つ——走査範囲は FREEZE の
 /// `freezeRoot` と同じ（open shadow root へ潜り、`localName` で `iframe` と
-/// `frame` の両方を見る。）であり、フォント検証はその鏡である。
+/// `frame` の両方を見る。PR #27 ②）であり、フォント検証はその鏡である。
 /// クロスオリジン iframe は `contentDocument` が null で**原理的に観測
 /// できない**（README「届かない範囲」の契約。FREEZE の書き方に揃える）。
-/// 走査は freezeRoot の **`defaultView` の門**も写す——
+/// 走査は freezeRoot の **`defaultView` の門**も写す（PR #27 ②）——
 /// browsing context の無い document（切り離された iframe 等）は描画されず、
 /// その `fonts.ready` は二度と settle しないので、集めない。待ちの**最中**に
 /// 切り離された document は、各 `ready` と race するポーリングが検知して
@@ -1001,7 +1001,7 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// window ではなく **document 側**に置くのは、`document.open()` /
 /// `document.write()` がグローバルオブジェクトを維持したまま document を
 /// 差し替えるため——window の印は差し替えを生き延びてしまい、撮影直前の
-/// 再確認（[`FONTS_RECHECK_PROBE`]）が入れ替わりを見逃す（実測）。
+/// 再確認（[`FONTS_RECHECK_PROBE`]）が入れ替わりを見逃す（PR #27 実測）。
 /// documentElement は ナビゲーションでも `document.open()` でも作り直される
 /// ので、どちらの入れ替わりでも印は消える。**同一 document 内の DOM 全面
 /// 置換（`body.replaceChildren` 等）では documentElement が残るため印も
@@ -1018,13 +1018,13 @@ const REDUCED_MOTION_PROBE: &str = r#"
 /// 検証側（[`FONTS_WAIT_SCRIPT`]）と再確認側（[`FONTS_RECHECK_PROBE`]）が
 /// **同じ文字列を注入して**共有する document 走査。到達可能な同一オリジン
 /// iframe を再帰して document を集める。走査範囲は FREEZE の `freezeRoot` と
-/// 同じ——`querySelectorAll` は shadow 境界を越えないため
+/// 同じ（PR #27 ②）——`querySelectorAll` は shadow 境界を越えないため
 /// open shadow root ごとに潜り、`localName` で `iframe` と `frame` の両方を
 /// 見る。cross-origin は `contentDocument` が null（観測不能——README
 /// 「届かない範囲」の契約）。走査自体の throw は各利用側の try に届いて
 /// 失敗へ倒れる（fail-closed）。
 ///
-/// 二本のスクリプトへ**別々に写す形は採らない**。待った範囲と
+/// 二本のスクリプトへ**別々に写す形は採らない**（PR #27 ④）。待った範囲と
 /// 確かめる範囲の一致は再確認の前提だが、`wait_for_fonts = false` の陽性対照は
 /// 待ちと再確認を同時に外すため、**片側だけ**走査が狭まる退行（＝検証済みで
 /// ない document を再確認が見逃す fail-open）をどの試験も赤くできない。
@@ -1036,7 +1036,7 @@ const REDUCED_MOTION_PROBE: &str = r#"
 const COLLECT_DOCUMENTS_JS: &str = r#"const collectDocuments = (doc, out) => {
     // browsing context を持たない document（切り離された iframe 等）は描画に
     // 影響せず、その fonts.ready は二度と settle しない——FREEZE の freezeRoot
-    // が持つ defaultView の門をここにも写す（走査は検証側と
+    // が持つ defaultView の門をここにも写す（PR #27 ②。走査は検証側と
     // 再確認側で共有されるので、門も一箇所で両側に効く）。待ちの**最中**の
     // 切り離しはこの門では捉えられない——そちらは settle() の race が担う。
     if (!doc.defaultView) return;
@@ -1104,7 +1104,7 @@ const FONTS_WAIT_BODY: &str = r#"
   // settle せず Promise.all が永久に pending になる——settle() の再帰は
   // Promise.all の解決後にしか走らないため、「巡ごとに再収集する」はこの
   // 局面では一度も回らず、story は共有 deadline の Timeout へ倒れていた
-  // 。そこで各 ready を「切り離しの検知」と race させ、外れた
+  // （PR #27 ②）。そこで各 ready を「切り離しの検知」と race させ、外れた
   // document は待ちからも判定からも捨てる——描画されない document のために
   // story を落とさない（FREEZE の freezeRoot が持つ defaultView の門と同じ
   // 強度）。検知は setTimeout ポーリング——fake timers で setTimeout を
@@ -1152,7 +1152,7 @@ const FONTS_WAIT_BODY: &str = r#"
     // ready の二度目の読み（一度目は gather の形チェック）も try で囲む——
     // 初回は形チェックを通り後の読みで throw する stateful getter では、裸の
     // 読みが settle 自体の throw になり、evaluate のリトライへ化けて原因と
-    // 食い違う phase の Timeout になる（印の書き込みと同じ理由。）。
+    // 食い違う phase の Timeout になる（印の書き込みと同じ理由。PR #27 ③）。
     let races;
     try {
       races = sets.map((s) => readyOrDetached(s));
@@ -1166,13 +1166,13 @@ const FONTS_WAIT_BODY: &str = r#"
         // とも限らない）。この絞りが読むのは defaultView なので、throw の帰属も
         // defaultView と名指す——status の try に同居させると、defaultView の
         // getter の throw が「fonts.status threw」と食い違って報告される
-        // （の誤帰属修正）。
+        // （PR #32 の誤帰属修正）。
         try {
           sets = sets.filter((s) => s.doc.defaultView);
         } catch (e) {
           return JSON.stringify({ ok: false, errors: ['reading document.defaultView threw: ' + String(e)] });
         }
-        // status の二度目の読みも同じ理由で try に倒す。
+        // status の二度目の読みも同じ理由で try に倒す（PR #27 ③）。切り離しを
         try {
           if (sets.some((s) => s.fonts.status !== 'loaded')) {
             return new Promise((resolve) => setTimeout(resolve, 0)).then(settle);
@@ -1205,7 +1205,7 @@ const FONTS_WAIT_BODY: &str = r#"
         // dataset は HTMLOrSVGElement mixin——素の XML document（feed.xml を
         // 読んだ同一オリジン iframe 等）の documentElement は持たない。印を
         // 刻む口が無い document はスキップする（再確認側も同じ条件で印を
-        // 要求しない——両側で揃える。 追送）。スキップした document は
+        // 要求しない——両側で揃える。PR #27 追送）。スキップした document は
         // 差し替わっても印では検知できない（fonts.status の検査は残る）。
         // 書き込み自体の想定外の throw は、gather やフォント列挙と同じく
         // ok: false と errors へ倒す（fail-closed。印を書けたか不明のまま
@@ -1246,13 +1246,13 @@ const FONTS_WAIT_BODY: &str = r#"
 /// story では「検証した document」と「撮影される document」が別物になりうる
 /// （fonts 待ちが前 document で ok → FREEZE が navigated or closed の
 /// リトライを経て後 document で成功——窓は evaluate 二往復ではなく
-/// **deadline までのリトライ全長**で、数十秒になりうる。 実測）。
+/// **deadline までのリトライ全長**で、数十秒になりうる。PR #27 実測）。
 ///
 /// そこで検証列の最後・撮影の直前にこのプローブを置く。
 /// [`FONTS_WAIT_SCRIPT`] と同じ範囲——FREEZE の `freezeRoot` と同じく
 /// open shadow root へ潜り `iframe` と `frame` の両方を見る走査——で到達
 /// 可能な同一オリジン iframe を再帰し（検証の鏡——待った範囲と確かめる
-/// 範囲を揃える。）、各 document で二点を読む:
+/// 範囲を揃える。PR #27 ②）、各 document で二点を読む:
 ///
 /// - `documentElement.dataset.vrtFontsVerified`——[`FONTS_WAIT_SCRIPT`] が
 ///   成功時に残す印。document が入れ替われば（ナビゲーションでも
@@ -1262,7 +1262,7 @@ const FONTS_WAIT_BODY: &str = r#"
 ///   `dataset` を持たない documentElement（素の XML document）には検証側が
 ///   印を刻めないため、ここでも要求しない——そうした document の
 ///   入れ替わりは印では捉えられない（fonts.status の検査は行う。
-///   追送）
+///   PR #27 追送）
 /// - `document.fonts.status`——同じ document のまま新しい読み込み波が
 ///   始まっていれば `'loading'` に戻っている
 ///
@@ -1278,7 +1278,7 @@ static FONTS_RECHECK_PROBE: LazyLock<String> = LazyLock::new(|| {
         COLLECT_DOCUMENTS_JS,
         r#"
   // 走査は検証側（FONTS_WAIT_SCRIPT）と共有の COLLECT_DOCUMENTS_JS——
-  // 待った範囲と確かめる範囲は同じ一本の走査で揃う（
+  // 待った範囲と確かめる範囲は同じ一本の走査で揃う（PR #27 ②・PR #27 ④。
   // 別々に写すと片側だけ狭まる退行をどの試験も赤くできない）。走査の throw は
   // 下の try に届いて未検証へ倒れる（fail-closed）。
   let verified = true;
@@ -1291,7 +1291,7 @@ static FONTS_RECHECK_PROBE: LazyLock<String> = LazyLock::new(|| {
   for (const doc of docs) {
     // dataset を持たない documentElement（素の XML document 等）には印を
     // 刻む口が無い——検証側（FONTS_WAIT_SCRIPT）も同じ条件でスキップした
-    // ので、ここでも印を要求しない（両側で揃える。 追送）。その
+    // ので、ここでも印を要求しない（両側で揃える。PR #27 追送）。その
     // document の fonts.status の検査は下で行う。documentElement 自体が
     // 無い document は検証のしようがないので未検証に倒す（fail-closed）。
     const el = doc.documentElement;
@@ -1409,7 +1409,7 @@ impl Readiness {
 /// `tracing::warn` はサーバーの運用ログにしか出ず、ビルドを眺める利用者には
 /// 届かない——警告を成功値に載せることで、呼び出し側（`render_build` の
 /// `render_all`）が build log（`build_logs::append` / `LogLevel::Warn`）へ
-/// 永続化できる（C）。
+/// 永続化できる（PR #27 C）。
 #[derive(Debug)]
 pub struct RenderedStory {
     /// 撮影された PNG バイト列。
@@ -1761,21 +1761,21 @@ impl StoryRenderer {
         // document** で成立していなければ意味がない。story が storyRendered の
         // 後に自分を reload すると、フォント待ちが前 document で ok を返し、
         // FREEZE が navigated or closed のリトライを経て後 document で成功し、
-        // フォント未検証の document が撮れてしまう（実測。窓は
+        // フォント未検証の document が撮れてしまう（PR #27 実測。窓は
         // deadline までのリトライ全長＝数十秒になりうる）。そこで検証列の
         // 最後に軽い再確認（[`FONTS_RECHECK_PROBE`]）を置き、入れ替わり・
         // 新しい読み込み波を検知したら検証列をやり直す。
         //
-        // やり直しは **READY 待ちと SETTLE_DELAY から**回す（
+        // やり直しは **READY 待ちと SETTLE_DELAY から**回す（PR #27。
         // yupix レビューの機序）: Blink の `FontFaceSet.ready` は「load
         // イベント完了＋読み込み中フォント無し」で解決するため、reload 後の
         // document では story がまだ描画されていない時点で解決しうる。
         // やり直しを fonts 待ちからしか回さないと、fonts ok → freeze ok →
         // 再確認 ok が全て通り、`storyRendered` **前**の未描画の絵をそのまま
-        // 撮ってしまう（実測: reload 後の再描画が遅い fixture で
+        // 撮ってしまう（PR #27 実測: reload 後の再描画が遅い fixture で
         // 未描画の白い絵が撮れた）。READY 待ちから回すことで、二巡目の
         // document の `storyErrored` / `storyThrewException` もここで
-        // 観測される（実測）。
+        // 観測される（PR #27 実測）。
         //
         // フォント待ちを FREEZE の後ろへ動かす形は採らない——FREEZE は最終
         // レイアウトを見る必要があり、フォント適用で始まった CSS transition
@@ -1878,7 +1878,7 @@ impl StoryRenderer {
         // Absent（ランタイム無し）の DOM ヒューリスティックに与える
         // [`SIGNAL_GRACE`] は**この巡の開始**から測る。story 全体の開始時刻から
         // 測ると、やり直しの巡では猶予が最初から尽きており、root に子が一つ
-        // 入った瞬間の**途中の絵**を ready と誤判定する——
+        // 入った瞬間の**途中の絵**を ready と誤判定する（PR #27 ③）——
         // やり直しは「入れ替わった document を最初から待ち直す」機構なのに、
         // その巡だけ判定が緩くなる。deadline は従来どおり story 全体で共有
         // （引数のまま受け取る——猶予と期限は別の時計である）。
@@ -1970,7 +1970,7 @@ impl StoryRenderer {
             // タイムアウト」という README の契約を裏切るためである。
             //
             // evaluate の CDP エラーは READY probe と**同じ扱い**でリトライする。
-            // 実測で確認済みの経路が二つある: story 側スクリプトの
+            // 実測で確認済みの経路が二つある（PR #19）: story 側スクリプトの
             // navigation / reload が pending evaluate の実行コンテキストを壊す
             // 「Inspected target navigated or closed」（-32000。context 破棄系）
             // と、rAF コールバックを捨てるページで pending promise が GC に
@@ -2086,7 +2086,7 @@ const FREEZE_PHASES: EvaluatePhases = EvaluatePhases {
 /// （約 30 行ずつ）。同型のまま二箇所にあるということは、片方だけ直せば
 /// 非対称が生まれるということでもある——freeze evaluate の CDP エラーを
 /// 即 [`RenderError::Cdp`]（環境分類＝ビルド即中断）へ倒していた非対称を
-/// で塞いだのが、まさにその型の事故だった。
+/// PR #19 で塞いだのが、まさにその型の事故だった。
 ///
 /// 手続きは次の三段:
 ///
@@ -2097,7 +2097,7 @@ const FREEZE_PHASES: EvaluatePhases = EvaluatePhases {
 ///    [`RenderError::Timeout`]
 /// 3. CDP エラーは撮影対象ページの内容に起因しうる（navigation / reload に
 ///    よる実行コンテキスト破棄、pending promise の GC 回収——どちらも
-///    の実測）ので [`POLL_INTERVAL`] ごとにリトライし、次の一回が
+///    PR #19 の実測）ので [`POLL_INTERVAL`] ごとにリトライし、次の一回が
 ///    deadline を跨ぐなら [`EvaluatePhases::retry_exhausted`] の
 ///    [`RenderError::Timeout`]（story 分類）で倒す
 ///
@@ -2298,7 +2298,7 @@ const FONT_WARNING_MAX_FAMILIES: usize = 5;
 ///   撮影は止めずに警告文字列 `Ok(Some(..))` を返す（意図した fail-open——
 ///   失敗経路①。理由はモジュール doc）。一覧は family 名で sort してから
 ///   [`FONT_WARNING_MAX_FAMILIES`] 件で打ち切り（JS Set の列挙順＝挿入順に
-///   警告文を依存させない。）、件数は一意化後の集合の
+///   警告文を依存させない。PR #32 で固定）、件数は一意化後の集合の
 ///   大きさで数える
 /// - `ok: false` — **フォントが揃ったと確かめられなかった**。`errors` に
 ///   原因（`document.fonts` の欠落・形違い、`ready` の reject、列挙の
@@ -3216,7 +3216,7 @@ mod tests {
         (addr, task)
     }
 
-    /// 【・実測再現 / positive control】フォントを条件待ちしないと、
+    /// 【PR #27・実測再現 / positive control】フォントを条件待ちしないと、
     /// 同じバンドル・同じブラウザで同じ story を繰り返し撮ってもバイト列が
     /// 一致しないこと。
     ///
@@ -3224,7 +3224,7 @@ mod tests {
     /// 「初回だけ遅いフォント配信」で縮約する: 1 回目の撮影ではフォントが
     /// SETTLE_DELAY（250ms）に間に合わず、2 回目以降はキャッシュ相当で即着する。
     /// 差分は**序盤に偏り**、外れた絵はすべて marker 赤（フォント未着）——
-    /// それがフォント読み込み競争の指紋である（の初回実測: 8 回中
+    /// それがフォント読み込み競争の指紋である（PR #27 の初回実測: 8 回中
     /// 1 回・run 0 のみ不一致・marker と完全連動）。
     ///
     /// `wait_for_fonts = false` はテスト専用の裏口。この試験は
@@ -3342,7 +3342,7 @@ mod tests {
         }
     }
 
-    /// 【・修正の実測】`document.fonts.ready` を条件待ちすると、
+    /// 【PR #27・修正の実測】`document.fonts.ready` を条件待ちすると、
     /// 陽性対照（`settle_delay_alone_lets_the_font_race_the_capture`）と
     /// **同じ**遅延フォント配信でも、繰り返し撮った絵がバイト単位で一致する。
     ///
@@ -3404,7 +3404,7 @@ mod tests {
         );
     }
 
-    /// 【・fail-closed の実測】フォントが期限内に届かないページは
+    /// 【PR #27・fail-closed の実測】フォントが期限内に届かないページは
     /// **撮らずに** [`RenderError::Timeout`]（[`FONTS_PHASES`] の phase）で
     /// 落ちる。同じページを修正前の撮影過程（`wait_for_fonts = false` の
     /// 裏口）に通すと**撮れてしまう**——これが塞いだ穴の実測である。
@@ -3468,12 +3468,12 @@ mod tests {
         }
     }
 
-    /// 【・失敗経路②】`ready` 解決後に新たなフォント要求（二波）が
+    /// 【PR #27・失敗経路②】`ready` 解決後に新たなフォント要求（二波）が
     /// 始まるページは、失敗ではなく**待ち直し**で収束し、繰り返し撮っても
     /// バイト単位で一致すること。
     ///
     /// 待ち直し前の実装（`ready` 解決後の `status` 単発読みで `'loading'` なら
-    /// 即失敗）では、この fixture は **8/8 で毎回失敗**した（実測。
+    /// 即失敗）では、この fixture は **8/8 で毎回失敗**した（PR #27 実測。
     /// エラーは常に「fonts.ready resolved but new font loads have already
     /// started」）——二波の開始はハンドラ登録順で FONTS_WAIT_SCRIPT の
     /// `status` 読みより必ず先に観測されるため、窓に依る flaky ではなく
@@ -3545,7 +3545,7 @@ mod tests {
         );
     }
 
-    /// 【・失敗経路④の堅持】待ち直しを入れても fail-closed は壊れて
+    /// 【PR #27・失敗経路④の堅持】待ち直しを入れても fail-closed は壊れて
     /// いないこと——二波目が**永遠に来ない**ページは、撮らずに共有 deadline の
     /// [`RenderError::Timeout`]（[`FONTS_PHASES`] の phase）へ倒れる。
     ///
@@ -3592,18 +3592,18 @@ mod tests {
         }
     }
 
-    /// 【→・失敗経路①の固定】フォントの**読み込み失敗**（404 等）
+    /// 【PR #27・失敗経路①の固定】フォントの**読み込み失敗**（404 等）
     /// は story を落とさない——代替字形のまま**撮れて**、警告が残り、絵が
     /// **決定的**（繰り返し撮ってバイト一致）であること。marker が赤のまま
     /// （フォントは本当に失敗している）であることも確かめ、「実は読めていた」
     /// への劣化を弾く。
     ///
-    /// 当初は (a) fail-closed（1 つでも error なら story 失敗）を選んだが、
-    /// yupix 殿のレビューで得た新しい実証により (b) 撮って警告へ転換した——
+    /// PR #27 では当初 (a) fail-closed（1 つでも error なら story 失敗）を選んだが、
+    /// PR #27 の yupix 殿レビューで得た新しい実証により (b) 撮って警告へ転換した——
     /// 原因の `@font-face` は preview-head 等で **project 全体に共有**され、
     /// egress の無いワーカーの外部フォント参照や `local()` 前提の宣言ひとつで、
     /// そのフォントを一切表示しない story まで全 story が落ちる（修正前は
-    /// fallback で決定的に緑だった）。(b) は当初の設計が明示的に許した道であり
+    /// fallback で決定的に緑だった）。(b) は PR #27 の当初の設計が明示的に許した道であり
     /// 後戻りではない。害の比較はモジュール doc 失敗経路①を参照。
     /// **黙って fail-closed へ戻す変更はこの試験を落とす**——戻すなら
     /// あの害の比較ごと書き直すこと。
@@ -3611,10 +3611,10 @@ mod tests {
     /// 警告の文言・一意化後の件数・上限は `fonts_verdict_turns_failed_fonts_
     /// into_a_bounded_warning`（単体）が固定する。ここでは実ブラウザ貫通で
     /// 「撮れる・決定的・フォントは本当に失敗・**警告が成功値に載る**」を
-    /// 固定する（C/F）。
+    /// 固定する（PR #27 C/F）。
     ///
     /// 警告の assert は同時に **`failed` キーの契約の script 側**を固定する
-    /// （F）: 警告は [`FONTS_WAIT_SCRIPT`] が実ブラウザで `failed` に
+    /// （PR #27 F）: 警告は [`FONTS_WAIT_SCRIPT`] が実ブラウザで `failed` に
     /// family を載せて返した場合にだけ生まれる（[`fonts_verdict`] は `failed`
     /// 欠落を「旧形の応答＝警告なしの成功」として受けるため、script 側が
     /// `failed` を落とす変更を入れると警告だけが静かに消える——この試験が
@@ -3646,7 +3646,7 @@ mod tests {
                 .render_story(&server.base_url(), "demo-font--text")
                 .await
                 .expect("a failing font load must capture with fallback glyphs, not fail");
-            // 警告が成功値に載っていること（C/F）。この assert が
+            // 警告が成功値に載っていること（PR #27 C/F）。この assert が
             // 通る＝実ブラウザの FONTS_WAIT_SCRIPT が `failed` に family を
             // 載せて返した、ということ——`failed` を落とす変更はここで落ちる。
             let warning = rendered.font_warning.as_deref().unwrap_or_else(|| {
@@ -3787,13 +3787,13 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・検証と撮影の窓】`storyRendered` の後に自分を reload する
+    /// 【PR #27・検証と撮影の窓】`storyRendered` の後に自分を reload する
     /// story で、フォント未検証の document を撮らないこと。
     ///
     /// 修正前（d6aa8a3。フォント検証が FREEZE の前にあるだけの形）は、fonts
     /// 待ちが reload **前**の document で ok を返し、FREEZE が navigated or
     /// closed のリトライを経て reload **後**の document で成功し、フォント
-    /// 未検証の document がそのまま撮れた（実測: 本番既定で
+    /// 未検証の document がそのまま撮れた（PR #27 実測: 本番既定で
     /// `render_story` は Ok を返し、marker は赤＝二巡目のフォントは loading
     /// のままだった）。窓は evaluate 二往復ではなく **deadline までの
     /// リトライ全長**——数十秒になりうる。
@@ -3878,7 +3878,7 @@ mod tests {
         }
     }
 
-    /// 【・やり直しの収束】reload する story でも、reload 後の
+    /// 【PR #27・やり直しの収束】reload する story でも、reload 後の
     /// フォントが届くなら、再確認→検証列のやり直しを経て**検証済みの**
     /// document が撮れること（marker 緑＝webfont 適用済み）。
     ///
@@ -3947,7 +3947,7 @@ mod tests {
     ///    webfont（`/font2.ttf`・配信は初回 600ms 遅延）のテキストを差し込み、
     ///    生き残った channel（window 上に維持される）へ `storyRendered` を
     ///    出し直す——READY のやり直しが「新 document の描画完了」を世代印で
-    ///    本当に待つようになったため、再シグナルの無い差し替えは
+    ///    本当に待つようになったため（PR #27）、再シグナルの無い差し替えは
     ///    正しく Timeout へ倒れる。この fixture は「再シグナルする真っ当な
     ///    story」の側を固定する。
     ///    marker は `document.fonts.check()` 成立で緑になる——差し替え直後の
@@ -4110,7 +4110,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【 A・陽性対照つき実測】`document.open()` で document を
+    /// 【PR #27 A・陽性対照つき実測】`document.open()` で document を
     /// 差し替える story で、未検証の document を撮らないこと。
     ///
     /// 修正前（08bcaf4。印が `window.__vrtFontsVerified` にあった形）の実測:
@@ -4174,7 +4174,7 @@ mod tests {
         );
     }
 
-    /// 【 B・実測】reload 後の再描画が遅い story で、未描画の絵を
+    /// 【PR #27 B・実測】reload 後の再描画が遅い story で、未描画の絵を
     /// 撮らないこと——やり直しが READY 待ちと `SETTLE_DELAY` から回る証拠。
     ///
     /// 修正前（08bcaf4。やり直しが fonts 待ちからしか回らない形）の実測:
@@ -4230,7 +4230,7 @@ mod tests {
         );
     }
 
-    /// 【 B・実測】reload 後に `storyThrewException` を出す story の
+    /// 【PR #27 B・実測】reload 後に `storyThrewException` を出す story の
     /// エラーが、やり直しの READY 待ちで**二巡目でも観測される**こと。
     ///
     /// 修正前（08bcaf4）の実測: やり直しが fonts 待ちからしか回らないため
@@ -4277,7 +4277,7 @@ mod tests {
 
     /// `document.open()` で差し替えた新 document の**再描画が遅い**バンドル。
     /// READY のやり直しが世代印で新 document を本当に待つかの検証用
-    /// （失敗経路⑤の document.open() 形）。
+    /// （PR #27・失敗経路⑤の document.open() 形）。
     ///
     /// [`write_slow_rerender_reload_bundle`] の骨格を reload から
     /// `document.open()` へ移したもの。reload と違いグローバルオブジェクトが
@@ -4354,7 +4354,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・陽性対照つき実測】`document.open()` で差し替えた新
+    /// 【PR #27 ①・陽性対照つき実測】`document.open()` で差し替えた新
     /// document の再描画が遅い story で、未描画の絵を撮らないこと——READY の
     /// 印（`window.__VRT_READY__.rendered`）が window 上で差し替えを生き延びて
     /// も、やり直しの READY 待ちが**新 document の描画完了**を待つ証拠。
@@ -4407,7 +4407,7 @@ mod tests {
         );
     }
 
-    /// 【・実測】`document.open()` で差し替えた後に
+    /// 【PR #27 ①・実測】`document.open()` で差し替えた後に
     /// `storyThrewException` を出す story のエラーが、やり直しの READY 待ちで
     /// **二巡目でも観測される**こと（reload 形の
     /// [`a_story_error_after_reload_is_observed_by_the_redo`] の
@@ -4456,7 +4456,7 @@ mod tests {
     }
 
     /// 差し替えの**前後で二度** error を出すバンドル。error の印の世代
-    /// の検証用。
+    /// （PR #27 ②）の検証用。
     ///
     /// - 旧 document: 描画して `storyRendered`（READY は普通に通る）。
     ///   検証済みの印（`vrtFontsVerified`）が付いた瞬間に
@@ -4519,7 +4519,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・修正前実測つき】差し替え後の document で出た**二度目**の
+    /// 【PR #27 ②・修正前実測つき】差し替え後の document で出た**二度目**の
     /// error が、前 document の error に塞がれず記録されること。
     ///
     /// rendered の印は書く側（hook）と読む側（probe）の両方が世代を見るが、
@@ -4574,7 +4574,7 @@ mod tests {
     }
 
     /// **同一 document の中で**二度 error を出すバンドル。`recordError` の
-    /// 「同一世代内は先着固定」の検証用。
+    /// 「同一世代内は先着固定」の検証用（PR #27 ⑨）。
     ///
     /// document の差し替えは行わない——二つの `storyThrewException` は同じ
     /// documentElement の世代で撃たれる。
@@ -4588,11 +4588,11 @@ mod tests {
         );
     }
 
-    /// 【】同一 document 内で二度出た error は**先着が固定**され、
+    /// 【PR #27 ⑨】同一 document 内で二度出た error は**先着が固定**され、
     /// 失敗メッセージは一度目のものになること。
     ///
     /// `recordError` の先着固定は「最初の失敗が根本原因で、続く失敗は
-    /// 巻き添えのことが多い」という診断上の判断（で世代の中へ
+    /// 巻き添えのことが多い」という診断上の判断（PR #27 ② で世代の中へ
     /// 閉じた半分の、**残り半分**の性質）だが、これまでどの試験も固定して
     /// いなかった——先着固定を消して常時上書きにしても全試験が緑のまま
     /// だった。本試験は upgrade 側（常時上書き＝二度目のメッセージが出る）を
@@ -4639,7 +4639,7 @@ mod tests {
 
     /// `window.__STORYBOOK_PREVIEW__.storyRenders` の保険経路**だけ**で ready を
     /// 判定させるバンドル（channel は一切置かない）。差し替え後、前 document の
-    /// `phase: 'completed'` が window 上で生き残ることの検証用（で
+    /// `phase: 'completed'` が window 上で生き残ることの検証用（PR #27 ①で
     /// READY の印と同型と特定した第二の生存状態）。
     ///
     /// 新 document は `#storybook-root` を持たず、シグナルも出さない——
@@ -4686,7 +4686,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・実測】前 document の `storyRenders` 完了 phase（window 上で
+    /// 【PR #27 ①・実測】前 document の `storyRenders` 完了 phase（window 上で
     /// 差し替えを生き延びる）が、差し替え後の document を ready と誤判定しない
     /// こと。
     ///
@@ -4741,7 +4741,7 @@ mod tests {
 
     /// Storybook ランタイムを一切持たないバンドルが、検証成立の直後に
     /// `document.open()` で自分を差し替える形。DOM ヒューリスティックの
-    /// [`SIGNAL_GRACE`] が**巡ごと**に測られるかの検証用。
+    /// [`SIGNAL_GRACE`] が**巡ごと**に測られるかの検証用（PR #27 ③）。
     ///
     /// - 旧 document: 緑のベタ塗り。ランタイム無しなので READY は Absent の
     ///   DOM ヒューリスティック（猶予 [`SIGNAL_GRACE`]）で成立する
@@ -4795,7 +4795,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・実測】やり直しの巡でも DOM ヒューリスティックの
+    /// 【PR #27 ③・実測】やり直しの巡でも DOM ヒューリスティックの
     /// [`SIGNAL_GRACE`] が**その巡の開始から**測り直されること。
     ///
     /// 修正前（efbcf7d。猶予が story 全体の `started` から測られていた形）の
@@ -4890,7 +4890,7 @@ mod tests {
     }
 
     /// 同一オリジン iframe の**中だけ**が webfont を使うバンドル。
-    /// フォント待ち・再確認の iframe 再帰（D）の検証用。
+    /// フォント待ち・再確認の iframe 再帰（PR #27 D）の検証用。
     ///
     /// top document はフォントを使わない。iframe（`frame.html`）が
     /// `@font-face` の webfont を要求し、右上 40x40 の marker が
@@ -4914,7 +4914,7 @@ mod tests {
         );
     }
 
-    /// 【 D・陽性対照つき実測】同一オリジン iframe の中のフォントも
+    /// 【PR #27 D・陽性対照つき実測】同一オリジン iframe の中のフォントも
     /// フォント待ちの対象であること。
     ///
     /// positive control（`wait_for_fonts = false` の裏口）: フォント層が
@@ -4998,7 +4998,7 @@ mod tests {
 
     /// open shadow root の**中**の同一オリジン iframe だけが webfont を使う
     /// バンドル。フォント待ち・再確認の走査範囲を FREEZE の `freezeRoot` と
-    /// 揃える検証用。
+    /// 揃える検証用（PR #27 ②）。
     ///
     /// [`write_iframe_webfont_bundle`] の iframe を open shadow root の中へ
     /// 移したもの。`querySelectorAll` は shadow 境界を越えない（FREEZE 内の
@@ -5029,7 +5029,7 @@ mod tests {
         );
     }
 
-    /// 【・陽性対照つき実測】open shadow root の中の同一オリジン
+    /// 【PR #27 ②・陽性対照つき実測】open shadow root の中の同一オリジン
     /// iframe のフォントも、フォント待ち・再確認の対象であること——走査範囲が
     /// FREEZE の `freezeRoot` と同じ（`shadowRoot` へ潜り `localName` で
     /// `iframe` と `frame` を見る）ことの固定。
@@ -5117,7 +5117,7 @@ mod tests {
     /// 同一オリジン iframe の中が **frameset**（`<frame>`）で、その frame の
     /// 中だけが webfont を使うバンドル。走査の `localName === 'frame'` 分岐
     /// （[`COLLECT_DOCUMENTS_JS`]・FREEZE の同型）に実 fixture を与える
-    /// 検証用（——README の「`<iframe>` と `<frame>` の両方を見る」
+    /// 検証用（PR #27 ⑤——README の「`<iframe>` と `<frame>` の両方を見る」
     /// 宣言と試験の釣り合い）。
     ///
     /// `<frame>` は frameset document の中でしか描画されず、frameset
@@ -5147,7 +5147,7 @@ mod tests {
         );
     }
 
-    /// 【・陽性対照つき】`<frame>`（frameset）の中のフォントも
+    /// 【PR #27 ⑤・陽性対照つき】`<frame>`（frameset）の中のフォントも
     /// フォント待ちの対象であること——走査が `localName` で `iframe` と
     /// `frame` の両方を見る、という README・doc の宣言に対する実 fixture。
     ///
@@ -5230,7 +5230,7 @@ mod tests {
 
     /// 同一オリジン iframe に**素の XML document**（feed.xml）を読むバンドル。
     /// 「印を刻む口（`dataset`）を持たない document」の扱いの検証用
-    /// （追送・yupix レビュー）。
+    /// （PR #27 追送・yupix レビュー）。
     ///
     /// 素の XML document の documentElement は HTMLOrSVGElement mixin を
     /// 実装せず `dataset` が undefined——印の代入は TypeError で throw する。
@@ -5255,7 +5255,7 @@ mod tests {
         );
     }
 
-    /// 【 追送・実測】素の XML document を持つ同一オリジン iframe が
+    /// 【PR #27 追送・実測】素の XML document を持つ同一オリジン iframe が
     /// フォント待ちを壊さないこと。
     ///
     /// 修正前（efbcf7d）は、検証済みの印を書くループだけが try/catch の外に
@@ -5316,7 +5316,7 @@ mod tests {
 
     /// 同一オリジン iframe のフォントが**届かないまま**、フォント待ちの最中に
     /// iframe が DOM から外されるバンドル。切り離された document の待ちの
-    /// 検証用（yupix レビュー）。
+    /// 検証用（PR #27 ②・yupix レビュー）。
     ///
     /// storyRendered（iframe load 駆動）の後 900ms で iframe を remove する。
     /// フォント待ちは [`SETTLE_DELAY`]（250ms）後に始まり、iframe の
@@ -5345,7 +5345,7 @@ mod tests {
         );
     }
 
-    /// 【・実測】フォント待ちの最中に切り離された同一オリジン iframe
+    /// 【PR #27 ②・実測】フォント待ちの最中に切り離された同一オリジン iframe
     /// が story を Timeout させないこと——撮れて、絵（iframe の外れた後の
     /// top document）が決定的であること。
     ///
@@ -5426,7 +5426,7 @@ mod tests {
 
     /// `document.fonts` を **stateful getter** の偽物へ差し替えるバンドル。
     /// 「形チェック（`gather`）は通るが、settle の**二度目以降の読み**で
-    /// throw する」getter の検証用（yupix レビュー）。
+    /// throw する」getter の検証用（PR #27 ③・yupix レビュー）。
     ///
     /// 読みの回数は現行実装の読み順に合わせてある（変わると陽性対照の
     /// 意味が変わるので注記）:
@@ -5486,7 +5486,7 @@ mod tests {
         );
     }
 
-    /// 【・実測】`fonts.ready` / `fonts.status` の**二度目の読み**で
+    /// 【PR #27 ③・実測】`fonts.ready` / `fonts.status` の**二度目の読み**で
     /// throw する stateful getter が、原因つきの即時 [`RenderError::Story`] に
     /// 倒れること——deadline まで待った原因不明の Timeout にならないこと。
     ///
@@ -5900,7 +5900,7 @@ mod tests {
         }
     }
 
-    /// で実測した CDP エラー（-32000。navigation / reload が pending
+    /// PR #19 で実測した CDP エラー（-32000。navigation / reload が pending
     /// evaluate の実行コンテキストを壊したときの文言）を模す。
     fn cdp_context_destroyed() -> chromiumoxide::error::CdpError {
         chromiumoxide::error::CdpError::ChromeMessage(
@@ -6038,7 +6038,7 @@ mod tests {
         }
     }
 
-    /// 【・失敗経路①(b)】読み込みに失敗したフォントは撮影を止めず、
+    /// 【PR #27・失敗経路①(b)】読み込みに失敗したフォントは撮影を止めず、
     /// **有界の**警告になる。
     ///
     /// 証明する: `failed` の family が警告に載り、件数は一意化後の集合の
@@ -6105,7 +6105,7 @@ mod tests {
         );
     }
 
-    /// 【】警告文字列は family の**到着順に依らない**。
+    /// 【PR #32】警告文字列は family の**到着順に依らない**。
     ///
     /// 証明する: 集合として同値な `failed` を逆順で渡しても警告文字列が
     /// 同一であること（Rust 側 sort の固定）。打ち切り境界
@@ -6527,7 +6527,7 @@ mod tests {
         );
     }
 
-    /// 【・修正前の陽性対照から反転】Storybook の順序どおり
+    /// 【PR #36・修正前の陽性対照から反転】Storybook の順序どおり
     /// `storyRendered` の後に play が走って遅れて投げる story は撮らない。
     /// 修正前は緑の PNG を `Ok` で返したことを先に実測済み。
     #[tokio::test(flavor = "multi_thread")]
@@ -6624,7 +6624,7 @@ mod tests {
         assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
     }
 
-    /// 【・回帰】本物の phase 順（`storyRendered` は `completed` phase の
+    /// 【PR #36・回帰】本物の phase 順（`storyRendered` は `completed` phase の
     /// 中で出て、直後に `afterEach` → `finished` へ抜ける）で撮れること。
     ///
     /// ready の条件を `completed` phase だけに絞った形では、100ms 間隔の probe が
@@ -7688,7 +7688,7 @@ mod tests {
 
     /// **わざと凍らせられない**アニメーション（animationend の無限連鎖）を
     /// open shadow root の**中**に置くバンドル。running の収集
-    /// （`collectRunning`）の走査が shadow へ潜ることの片側検証用（
+    /// （`collectRunning`）の走査が shadow へ潜ることの片側検証用（PR #27 ①
     /// ——対③「走査を複数箇所へ写したなら各々に片側だけ壊すと赤くなる試験が
     /// あるか」）。
     fn write_shadow_unfreezable_bundle(root: &Path) {
@@ -7718,7 +7718,7 @@ mod tests {
         );
     }
 
-    /// 【・対③】open shadow root の**中**の凍結不能アニメーションも
+    /// 【PR #27 ①・対③】open shadow root の**中**の凍結不能アニメーションも
     /// 「running が残った」として検知され、失敗を返すこと。
     ///
     /// freezeRoot（凍らせる側）と collectRunning（数える側）は walk を各自に
@@ -7795,7 +7795,7 @@ mod tests {
 
     /// **わざと凍らせられない**アニメーションを同一オリジン iframe の**中**に
     /// 置くバンドル。走査（[`FREEZE_SCRIPT`] の `walkRoots`）の iframe 分岐の
-    /// 検知側検証用（——shadow 版
+    /// 検知側検証用（PR #27 ⑦——shadow 版
     /// [`write_shadow_unfreezable_bundle`] と同型の空欄埋め）。
     fn write_iframe_unfreezable_bundle(root: &Path) {
         write_unfreezable_frame_html(root);
@@ -7813,7 +7813,7 @@ mod tests {
         );
     }
 
-    /// 【】同一オリジン iframe の**中**の凍結不能アニメーションも
+    /// 【PR #27 ⑦】同一オリジン iframe の**中**の凍結不能アニメーションも
     /// 「running が残った」として検知され、失敗を返すこと。
     ///
     /// shadow 版（`an_unfreezable_animation_inside_a_shadow_root_is_still_
@@ -7857,7 +7857,7 @@ mod tests {
     }
 
     /// **わざと凍らせられない**アニメーションを frameset の `<frame>` の中に
-    /// 置くバンドル。走査の `frame` 分岐の検知側検証用。
+    /// 置くバンドル。走査の `frame` 分岐の検知側検証用（PR #27 ⑦）。
     /// frameset document は story の top にはなれない（body を持てず
     /// `#storybook-root` を置けない）ため、iframe → frameset → frame の形は
     /// [`write_frameset_webfont_bundle`] と同じ。
@@ -7883,7 +7883,7 @@ mod tests {
         );
     }
 
-    /// 【】frameset の `<frame>` の中の凍結不能アニメーションも
+    /// 【PR #27 ⑦】frameset の `<frame>` の中の凍結不能アニメーションも
     /// 検知され、失敗を返すこと。
     ///
     /// 修正前の走査（freezeRoot / collectRunning が各自に持つ写し）では、
@@ -7927,7 +7927,7 @@ mod tests {
     }
 
     /// 無限スピナーを frameset の `<frame>` の中に置くバンドル。凍らせる側が
-    /// `frame` へ届くことの検証用（——検知側の
+    /// `frame` へ届くことの検証用（PR #27 ⑦——検知側の
     /// [`write_frameset_unfreezable_bundle`] と対）。
     fn write_frameset_animated_bundle(root: &Path) {
         std::fs::write(
@@ -7965,7 +7965,7 @@ mod tests {
         );
     }
 
-    /// 【・凍らせる側】frameset の `<frame>` の中の無限アニメーション
+    /// 【PR #27 ⑦・凍らせる側】frameset の `<frame>` の中の無限アニメーション
     /// が座標 0 で静止され、二回撮って同じ絵になること。
     ///
     /// 凍らせる側だけが `frame` へ届かない退行では、running が残って
@@ -8662,7 +8662,7 @@ mod tests {
         .expect("write iframe.html");
     }
 
-    /// 【・失敗経路③の実ブラウザ貫通】`document.fonts` が FontFaceSet に
+    /// 【PR #27・失敗経路③の実ブラウザ貫通】`document.fonts` が FontFaceSet に
     /// 見えない形へ差し替えられたページは、**待たずに・撮らずに**
     /// [`RenderError::Story`] で落ち、[`FONTS_WAIT_SCRIPT`] の形チェックが積んだ
     /// `errors` の文言が Rust 側の失敗メッセージまで届くこと。
@@ -9066,7 +9066,7 @@ mod tests {
     }
 
     /// **freeze 中の navigation / reload は story 単位の失敗である**こと
-    /// （経路 1。実測のエラーは
+    /// （PR #19 ①経路 1。実測のエラーは
     /// 「Inspected target navigated or closed」）。
     ///
     /// 修正前は freeze evaluate の CDP エラーを即 [`RenderError::Cdp`] に
@@ -9129,7 +9129,7 @@ mod tests {
     /// rAF コールバックを**捨てる**（保持しない）バンドル。freeze の pending
     /// promise は resolve 関数がどこからも参照されなくなり、V8 の GC が
     /// promise ごと回収して evaluate が「Error -32000: Promise was collected」
-    /// で返る（の実測）。素の状態では回収まで約 30 秒かかるので、
+    /// で返る（PR #19 の実測）。素の状態では回収まで約 30 秒かかるので、
     /// 大きな割り当てを捨て続けるループで GC を意図的に急がせる。
     fn write_collected_freeze_bundle(root: &Path) {
         std::fs::write(
@@ -9172,7 +9172,7 @@ mod tests {
     }
 
     /// **pending promise の GC 回収も story 単位の失敗である**こと
-    /// （経路 2: 「Promise was collected」—— で
+    /// （PR #19 ①経路 2: 「Promise was collected」——PR #19 で
     /// `write_raf_suppressed_bundle` に実測として書き残した挙動が、
     /// そのまま「freeze evaluate の CDP エラー＝ビルド即中断」の穴を指した）。
     ///
@@ -9186,7 +9186,7 @@ mod tests {
     /// 回収が起きない可能性は残る——その場合は共有 deadline の時間切れで同じ
     /// Timeout に落ち、テストは通る（CDP エラー経路の決定的な固定は
     /// `reloading_page_during_freeze_fails_story_scoped` が担う。こちらは
-    /// 実測のエラー文言まで含めた第二経路の記録である）。
+    /// PR #19 実測のエラー文言まで含めた第二経路の記録である）。
     #[tokio::test(flavor = "multi_thread")]
     async fn collected_freeze_promise_fails_story_scoped() {
         let Some(chromium) = discover_chromium() else {
