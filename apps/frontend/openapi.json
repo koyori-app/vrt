@@ -7367,7 +7367,7 @@
       },
       "QueueHealthResponse": {
         "type": "object",
-        "description": "キュー 1 本の状態（`/health/queues`）。",
+        "description": "キュー 1 本の状態（`/v1/health/queues`）。",
         "required": [
           "queue",
           "live_workers",
@@ -7410,7 +7410,7 @@
       },
       "QueuesHealthResponse": {
         "type": "object",
-        "description": "`/health/queues` の応答。",
+        "description": "`/v1/health/queues` の応答。",
         "required": [
           "queues"
         ],
