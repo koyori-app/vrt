@@ -296,7 +296,7 @@ API に同居させるとこの再起動が HTTP まで巻き添えにする。
 ワーカーが読む設定は API より狭く、`DATABASE_URL`・`REDIS_URL`・`APP_URL`・ストレージ設定・
 GitHub App の資格情報だけで、PAT の署名鍵や OAuth の資格情報は渡さない。
 停止検知の設計は [worker-supervision.md](worker-supervision.md) に、キューごとの状態は
-`GET /health/queues`（認証不要・集計値のみ）で読める。
+`GET /v1/health/queues`（認証不要・集計値のみ）で読める。
 
 切り替えは worker サービスを起動して登録を確認してから API を `false` にする。
 順序を逆にすると、その間だけ誰もキューを消費しない。

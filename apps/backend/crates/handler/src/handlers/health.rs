@@ -24,7 +24,7 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
-/// キュー 1 本の状態（`/health/queues`）。
+/// キュー 1 本の状態（`/v1/health/queues`）。
 #[derive(Serialize, ToSchema)]
 pub struct QueueHealthResponse {
     /// キュー名（= `apalis.workers.worker_type`）。
@@ -41,7 +41,7 @@ pub struct QueueHealthResponse {
     pub oldest_wait_seconds: Option<u64>,
 }
 
-/// `/health/queues` の応答。
+/// `/v1/health/queues` の応答。
 #[derive(Serialize, ToSchema)]
 pub struct QueuesHealthResponse {
     pub queues: Vec<QueueHealthResponse>,

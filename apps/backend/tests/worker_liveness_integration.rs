@@ -72,12 +72,12 @@ async fn an_unregistered_worker_is_observed_as_missing() {
     );
 }
 
-/// `/health/queues` は認証なしで読めて、集計値だけを返す。
+/// `/v1/health/queues` は認証なしで読めて、集計値だけを返す。
 #[tokio::test(flavor = "multi_thread")]
 async fn queues_endpoint_is_public_and_hides_worker_ids() {
     let app = TestApp::new().await;
 
-    let response = app.get("/health/queues").await;
+    let response = app.get("/v1/health/queues").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body: serde_json::Value = response.json().await.expect("queues json");
 
