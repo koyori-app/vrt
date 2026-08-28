@@ -398,19 +398,16 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 監視は別タスクに置き、停止要求より先に終わったものだけを失敗として通知する。
-    let has_tasks = !tasks.is_empty();
     let (failure_tx, failure_rx) = tokio::sync::oneshot::channel::<String>();
     let (drained_tx, drained_rx) = tokio::sync::oneshot::channel::<()>();
     let watch_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut watcher = TaskWatcher::new(tasks);
-        if has_tasks {
-            tokio::select! {
-                reason = watcher.first_exit() => {
-                    let _ = failure_tx.send(reason);
-                }
-                _ = wait_for_shutdown(watch_shutdown) => {}
+        tokio::select! {
+            reason = watcher.first_exit() => {
+                let _ = failure_tx.send(reason);
             }
+            _ = wait_for_shutdown(watch_shutdown) => {}
         }
         watcher.drain().await;
         let _ = drained_tx.send(());

@@ -47,13 +47,11 @@ impl SupervisedTask {
 /// 監視対象をまとめて見張る。
 pub struct TaskWatcher {
     rx: mpsc::UnboundedReceiver<(String, Result<(), String>)>,
-    remaining: usize,
 }
 
 impl TaskWatcher {
     pub fn new(tasks: Vec<SupervisedTask>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let remaining = tasks.len();
         for task in tasks {
             let tx = tx.clone();
             let label = task.label;
@@ -66,31 +64,22 @@ impl TaskWatcher {
                 let _ = tx.send((label, result));
             });
         }
-        Self { rx, remaining }
-    }
-
-    /// 監視対象が 1 つも無ければ true（このプロセスはワーカーを持たない）。
-    pub fn is_empty(&self) -> bool {
-        self.remaining == 0
+        Self { rx }
     }
 
     /// 最初に終わったタスクを待ち、その理由を返す。
     ///
     /// 停止要求の前に呼ばれる想定なので、正常終了も異常として説明する。
-    /// 監視対象が空のときは永久に待つ（呼び出し側の select で使うため）。
+    ///
+    /// 監視対象が無い（または全部の報告を受け取り終えた）場合は解決しない。
+    /// ここで即座に値を返すと、`select!` が停止要求と同時にready になったときに
+    /// 「タスクが落ちた」側を引く可能性があり、ワーカーを持たないプロセスの
+    /// 正常停止がランダムに異常終了へ化ける。
     pub async fn first_exit(&mut self) -> String {
         match self.rx.recv().await {
-            Some((label, Ok(()))) => {
-                self.remaining = self.remaining.saturating_sub(1);
-                format!("{label} stopped unexpectedly")
-            }
-            Some((label, Err(error))) => {
-                self.remaining = self.remaining.saturating_sub(1);
-                format!("{label} stopped: {error}")
-            }
-            // 送信側がすべて落ちた場合。ここへ来ることはないが、
-            // select の分岐として永久に待たせるより説明を返す。
-            None => "all supervised tasks ended".to_string(),
+            Some((label, Ok(()))) => format!("{label} stopped unexpectedly"),
+            Some((label, Err(error))) => format!("{label} stopped: {error}"),
+            None => std::future::pending().await,
         }
     }
 
@@ -224,11 +213,19 @@ mod tests {
 
     /// ワーカーを持たないプロセス（API で JOB_WORKERS_ENABLED=false）は、
     /// 監視対象が空でも停止要求で普通に終わる。
+    ///
+    /// 停止要求が即座に ready な場合、`select!` は ready な分岐から無作為に選ぶ。
+    /// 監視側が「対象なし」を値で返していると、その半分で正常停止が異常終了に
+    /// 化ける（実際に CI で再現した）。取り違えを一度の実行で捕まえるため繰り返す。
     #[tokio::test]
     async fn no_tasks_still_shuts_down_cleanly() {
-        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        run_until_shutdown(Vec::new(), shutdown_tx, std::future::ready(()))
-            .await
-            .expect("an empty supervisor must exit zero");
+        for attempt in 0..32 {
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            run_until_shutdown(Vec::new(), shutdown_tx, std::future::ready(()))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("an empty supervisor must exit zero (attempt {attempt}): {error}")
+                });
+        }
     }
 }
