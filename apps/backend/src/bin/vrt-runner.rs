@@ -3,9 +3,10 @@
 //! HTTP API、Redis、OAuth/GitHub の資格情報は不要。API と同じ DATABASE_URL と
 //! STORAGE_BACKEND 設定、レンダリング用 CHROMIUM_PATH だけを受け取る。
 
-use std::{env, future::Future};
+use std::env;
 
 use backend::server::spawn_render_build_worker_with_state;
+use backend::supervision::{SupervisedTask, run_until_shutdown};
 use job::RenderJobState;
 use tokio::sync::watch;
 use tracing::info;
@@ -59,56 +60,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let handle = spawn_render_build_worker_with_state(render_build_storage, state, shutdown_rx);
+    let worker =
+        spawn_render_build_worker_with_state(render_build_storage, state, shutdown_rx.clone());
+
+    // ハートビートが止まるだけの経路にも備える（ワーカー ID は自分の分だけ見る）。
+    let watched = vec![job::liveness::WatchedWorker {
+        queue: worker.queue.clone(),
+        worker_id: worker.worker_id.clone(),
+    }];
+    let monitor_shutdown = shutdown_rx.clone();
+    let tasks = vec![
+        SupervisedTask::new("render build worker", worker.handle),
+        SupervisedTask::new(
+            "worker heartbeat monitor",
+            tokio::spawn(async move {
+                job::liveness::watch_heartbeats(
+                    pg_pool,
+                    watched,
+                    job::liveness::LivenessConfig::from_env(),
+                    monitor_shutdown,
+                )
+                .await
+            }),
+        ),
+    ];
 
     info!(%chromium_path, "vrt-runner ready; polling render_build queue");
-    supervise_worker(handle, shutdown_tx, shutdown_signal()).await?;
+    run_until_shutdown(tasks, shutdown_tx, shutdown_signal()).await?;
     Ok(())
-}
-
-/// OS の停止通知と worker 自身の終了を同時に監視する。
-///
-/// worker が先に止まった場合に PID だけ残すと、Compose / Dokploy の restart policy が
-/// 発火せずキューが永久に止まる。正常終了に見えても runner にとっては異常なので、
-/// エラーを返してプロセスを非ゼロ終了させる。
-async fn supervise_worker<E, F>(
-    mut handle: tokio::task::JoinHandle<Result<(), E>>,
-    shutdown_tx: watch::Sender<bool>,
-    shutdown: F,
-) -> Result<(), std::io::Error>
-where
-    E: std::fmt::Display,
-    F: Future<Output = ()>,
-{
-    tokio::pin!(shutdown);
-
-    tokio::select! {
-        result = &mut handle => match result {
-            Ok(Ok(())) => Err(std::io::Error::other("render worker stopped unexpectedly")),
-            Ok(Err(error)) => Err(std::io::Error::other(format!(
-                "render worker stopped with an error: {error}"
-            ))),
-            Err(error) => Err(std::io::Error::other(format!(
-                "render worker task failed: {error}"
-            ))),
-        },
-        () = &mut shutdown => {
-            let _ = shutdown_tx.send(true);
-            info!("vrt-runner shutting down; waiting for in-flight build");
-            match handle.await {
-                Ok(Ok(())) => {
-                    info!("render worker stopped");
-                    Ok(())
-                }
-                Ok(Err(error)) => Err(std::io::Error::other(format!(
-                    "render worker stopped with an error during shutdown: {error}"
-                ))),
-                Err(error) => Err(std::io::Error::other(format!(
-                    "render worker task failed during shutdown: {error}"
-                ))),
-            }
-        }
-    }
 }
 
 async fn shutdown_signal() {
@@ -139,28 +118,40 @@ async fn shutdown_signal() {
 mod tests {
     use super::*;
 
+    /// ワーカーが停止要求より先に終わったら、runner はプロセスごと落ちる。
+    /// PID だけ残すと restart policy が発火せず、キューが永久に止まる。
     #[tokio::test]
     async fn worker_exit_before_shutdown_is_an_error() {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        let handle = tokio::spawn(async { Ok::<(), std::io::Error>(()) });
+        let tasks = vec![SupervisedTask::new(
+            "render build worker",
+            tokio::spawn(async { Ok::<(), std::io::Error>(()) }),
+        )];
 
-        let error = supervise_worker(handle, shutdown_tx, std::future::pending())
+        let error = run_until_shutdown(tasks, shutdown_tx, std::future::pending())
             .await
             .expect_err("a runner must not outlive its worker");
 
-        assert!(error.to_string().contains("stopped unexpectedly"));
+        assert!(
+            error.to_string().contains("stopped unexpectedly"),
+            "{error}"
+        );
     }
 
+    /// 停止要求が先なら、在庫を捌き終えてから 0 で終わる。
     #[tokio::test]
     async fn shutdown_signal_stops_the_worker_gracefully() {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let handle = tokio::spawn(async move {
-            shutdown_rx.changed().await.expect("shutdown sender");
-            assert!(*shutdown_rx.borrow());
-            Ok::<(), std::io::Error>(())
-        });
+        let tasks = vec![SupervisedTask::new(
+            "render build worker",
+            tokio::spawn(async move {
+                shutdown_rx.changed().await.expect("shutdown sender");
+                assert!(*shutdown_rx.borrow());
+                Ok::<(), std::io::Error>(())
+            }),
+        )];
 
-        supervise_worker(handle, shutdown_tx, std::future::ready(()))
+        run_until_shutdown(tasks, shutdown_tx, std::future::ready(()))
             .await
             .expect("signal-driven shutdown is successful");
     }

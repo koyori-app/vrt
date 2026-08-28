@@ -99,6 +99,16 @@ pub struct Settings {
     /// API イメージに Chromium を入れない場合は `STORYBOOK_RENDER_ENABLED=true` を指定する。
     #[serde(default, rename = "storybook_render_enabled")]
     pub storybook_render_enabled_override: Option<bool>,
+    /// API プロセス内で compare_build / github_status / github_webhook の
+    /// ワーカーを起動するか。
+    ///
+    /// 既定は true で、開発用の単一コンテナ構成をそのまま動かせる。独立した
+    /// `vrt-worker` を使う環境では API に `JOB_WORKERS_ENABLED=false` を設定し、
+    /// 同じキューを二重に消費しないようにする（二重消費自体は apalis の
+    /// ロックで壊れないが、容量が重複するだけで得がない）。
+    #[serde(default = "default_job_workers_enabled")]
+    pub job_workers_enabled: bool,
+
     /// e2e テスト専用のログイン口 `POST /v1/auth/test-login` を開くフラグ。
     ///
     /// **本番では絶対に有効にしないこと。** 有効にすると、認証情報なしで任意の
@@ -111,6 +121,36 @@ pub struct Settings {
 
 /// GitHub API の既定ベース URL。
 pub const DEFAULT_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+
+/// ジョブワーカーが実際に読む設定だけを抜き出したもの。
+///
+/// API から切り離したワーカープロセスへ [`Settings`] を丸ごと渡すと、
+/// ワーカーが使わない `PERSONAL_TOKEN_SECRET` や OAuth の資格情報まで
+/// 必須になる（[`Settings`] がそれらを検証するため）。渡す秘密情報を
+/// 必要な分に絞るために、この形へ移し替えてから渡す。
+#[derive(Clone, Debug)]
+pub struct JobSettings {
+    /// レビュー UI へのリンクの組み立てに使う（`github_status`）。
+    pub app_url: String,
+    /// 末尾スラッシュを落とした GitHub API のベース URL。
+    pub github_api_base_url: String,
+    pub github_app_id: Option<u64>,
+    pub github_app_private_key_pem: Option<String>,
+    /// ビルド自動プルーニングの最低保持日数（`compare_build`）。
+    pub storage_min_retention_days: u32,
+}
+
+impl From<&Settings> for JobSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            app_url: settings.app_url.clone(),
+            github_api_base_url: settings.github_api_base_url(),
+            github_app_id: settings.github_app_id,
+            github_app_private_key_pem: settings.github_app_private_key_pem.clone(),
+            storage_min_retention_days: settings.storage_min_retention_days,
+        }
+    }
+}
 
 impl Settings {
     /// GitHub App が設定されているか（App ID + 秘密鍵の両方が必要）。
@@ -163,6 +203,10 @@ fn default_storybook_cache_dir() -> String {
 }
 
 fn default_render_worker_enabled() -> bool {
+    true
+}
+
+fn default_job_workers_enabled() -> bool {
     true
 }
 
@@ -277,6 +321,7 @@ mod tests {
             storage_min_retention_days: 0,
             chromium_path: None,
             render_worker_enabled: default_render_worker_enabled(),
+            job_workers_enabled: default_job_workers_enabled(),
             storybook_render_enabled_override: None,
             test_login_enabled: false,
         }
