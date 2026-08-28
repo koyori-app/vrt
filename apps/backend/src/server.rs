@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa_scalar::{Scalar, Servable};
 
-use crate::supervision::{SupervisedTask, TaskWatcher};
+use crate::supervision::{DRAIN_DEADLINE, SupervisedTask, TaskWatcher};
 use handler::AppState;
 use handler::middlewares::logging::logging_middleware;
 use job::{JobState, RenderBuildStorage, RenderJobState};
@@ -403,13 +403,22 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let watch_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut watcher = TaskWatcher::new(tasks);
-        tokio::select! {
+        let failed = tokio::select! {
             reason = watcher.first_exit() => {
                 let _ = failure_tx.send(reason);
+                true
             }
-            _ = wait_for_shutdown(watch_shutdown) => {}
+            _ = wait_for_shutdown(watch_shutdown) => false,
+        };
+        if failed {
+            // 異常経路だけ期限を切る。戻ってこないジョブを待ち続けると
+            // `drained_rx` が解決せず、非ゼロ終了に到達できない
+            // （理由は `supervision::DRAIN_DEADLINE`）。
+            watcher.drain_within(DRAIN_DEADLINE).await;
+        } else {
+            // 正常な停止は在庫を捌き切るまで待つ。猶予は stop_grace_period。
+            watcher.drain().await;
         }
-        watcher.drain().await;
         let _ = drained_tx.send(());
     });
 
