@@ -20,6 +20,7 @@ pub fn create_routes() -> OpenApiRouter<AppState> {
         "/v1",
         OpenApiRouter::<AppState>::new()
             .routes(routes!(crate::handlers::health::health))
+            .routes(routes!(crate::handlers::health::queues_health))
             .nest("/auth", auth::routes())
             .nest("/baseline-entries", baseline_entries::routes())
             .nest("/builds", builds::routes())

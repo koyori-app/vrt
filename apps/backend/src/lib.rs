@@ -4,6 +4,7 @@
 //! export_openapi 等からのパス互換のため再エクスポートを維持する。
 
 pub mod server;
+pub mod supervision;
 
 pub use common::{error, settings};
 pub use handler::{AppState, handlers, middlewares, openapi, routes};
