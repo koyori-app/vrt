@@ -20,7 +20,9 @@
 use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DbBackend, Statement, prelude::Uuid,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -238,8 +240,33 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), anyhow::Error> {
-    let db = &state.db;
+    // 比較は comparisons の全削除・再作成を含むため、ビルド単位で直列化する。
+    // apalis の idempotency key は投入側の重複しか抑止せず、queued の回収経路や
+    // 旧形式のジョブとの併走までは防げない。transaction-scoped lock なら、別 worker
+    // / 別プロセスのジョブも同じビルドについて一つずつ比較本体へ進められる。
+    let state = state.clone();
+    let db = state.db.clone();
+    common::db::with_transaction(&db, move |txn| {
+        Box::pin(async move {
+            txn.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [build_id.to_string().into()],
+            ))
+            .await?;
 
+            run_locked(txn, build_id, recompare, &state).await
+        })
+    })
+    .await
+}
+
+async fn run_locked<C: ConnectionTrait>(
+    db: &C,
+    build_id: Uuid,
+    recompare: bool,
+    state: &JobState,
+) -> Result<(), anyhow::Error> {
     let build = service::builds::get_build(db, build_id).await?;
     let build = match (build.mode, build.status) {
         // screenshots モードのパイプライン先頭。worker が実際に取得してから
@@ -301,6 +328,7 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
         Some(plan) => {
             materialize_carry_forward(
                 state,
+                db,
                 &project,
                 &build,
                 &baseline_entries,
@@ -586,6 +614,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn materialize_carry_forward(
     state: &JobState,
+    db: &impl ConnectionTrait,
     project: &projects::Model,
     build: &builds::Model,
     baseline_entries: &[baseline_entries::Model],
@@ -595,8 +624,6 @@ async fn materialize_carry_forward(
 ) -> Result<Vec<screenshots::Model>, anyhow::Error> {
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-
-    let db = &state.db;
 
     let selected = plan.selected_set();
     let manifest = plan.manifest_set();
