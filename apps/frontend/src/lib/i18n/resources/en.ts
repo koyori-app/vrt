@@ -251,6 +251,11 @@ export const en = {
     retry: "Retry build",
     retryStarted: "Build retry started",
     retryFailed: "Could not retry build",
+    recompare: "Compare with current baseline",
+    recompareStarted: "Recomparison started",
+    recompareFailed: "Could not start recomparison",
+    confirmRecompare:
+      "Compare this build with the current baseline? The comparisons are rebuilt, so the reviews recorded on this build will be lost.",
     approve: "Approve build",
     approved: "Build approved — screenshots promoted to the new baseline",
     approveFailed: "Could not approve build",

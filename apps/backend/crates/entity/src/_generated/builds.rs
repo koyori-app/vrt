@@ -53,6 +53,10 @@ pub struct Model {
     pub approved_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub completed_at: Option<DateTimeWithTimeZone>,
+    /// 再比較（`POST /v1/builds/{id}/recompare`）が queued へ戻した時刻。
+    /// queued のまま止まったビルドの再投入を、新規 finalize 直後の queued と
+    /// 区別するための由来印。パイプライン完走時に NULL へ戻る。
+    pub recompare_requested_at: Option<DateTimeWithTimeZone>,
     #[sea_orm(
         belongs_to,
         from = "project_id",
