@@ -11,19 +11,30 @@ use common::TestApp;
 use job::liveness::{DEFAULT_STALE_AFTER, WatchedWorker, observe, queue_health, stale_workers};
 use reqwest::StatusCode;
 
+async fn wait_for_compare_queue(app: &TestApp) -> job::liveness::QueueHealth {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let queues = queue_health(&app.state.pg_pool, DEFAULT_STALE_AFTER)
+                .await
+                .expect("read queue health");
+            if let Some(compare) = queues
+                .into_iter()
+                .find(|queue| queue.queue.starts_with("compare_build") && queue.live_workers >= 1)
+            {
+                return compare;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("compare_build worker heartbeat was not registered in time")
+}
+
 /// TestApp はワーカーを起動するので、そのキューは「消費者がいる」状態で見える。
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_health_shows_the_running_workers() {
     let app = TestApp::new().await;
-
-    let queues = queue_health(&app.state.pg_pool, DEFAULT_STALE_AFTER)
-        .await
-        .expect("read queue health");
-
-    let compare = queues
-        .iter()
-        .find(|q| q.queue.starts_with("compare_build"))
-        .expect("compare_build queue is registered");
+    let compare = wait_for_compare_queue(&app).await;
 
     assert!(
         compare.live_workers >= 1,
@@ -76,6 +87,7 @@ async fn an_unregistered_worker_is_observed_as_missing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queues_endpoint_is_public_and_hides_worker_ids() {
     let app = TestApp::new().await;
+    wait_for_compare_queue(&app).await;
 
     let response = app.get("/v1/health/queues").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -102,14 +114,7 @@ async fn queues_endpoint_is_public_and_hides_worker_ids() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_queue_reports_no_wait() {
     let app = TestApp::new().await;
-
-    let queues = queue_health(&app.state.pg_pool, Duration::from_secs(180))
-        .await
-        .expect("read queue health");
-    let compare = queues
-        .iter()
-        .find(|q| q.queue.starts_with("compare_build"))
-        .expect("compare_build queue is registered");
+    let compare = wait_for_compare_queue(&app).await;
 
     assert_eq!(compare.waiting_jobs, 0);
     assert_eq!(compare.oldest_wait, None);

@@ -262,7 +262,7 @@ async fn run(
         BuildStatus::Processing => {
             crate::compare_build::enqueue_idempotent(
                 &state.compare_build_storage,
-                crate::CompareBuildJob { build_id },
+                crate::CompareBuildJob::new(build_id),
                 compare_handoff_key,
             )
             .await?;
@@ -386,7 +386,7 @@ async fn run(
     // `github_status` を compare_build が投入するのと同じチェーンパターン。
     crate::compare_build::enqueue_idempotent(
         &state.compare_build_storage,
-        crate::CompareBuildJob { build_id },
+        crate::CompareBuildJob::new(build_id),
         compare_handoff_key,
     )
     .await?;

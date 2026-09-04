@@ -1132,6 +1132,7 @@ mod tests {
             approved_at: None,
             created_at: Utc::now().fixed_offset(),
             completed_at: None,
+            recompare_requested_at: None,
         }
     }
 

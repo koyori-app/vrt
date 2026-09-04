@@ -1014,6 +1014,130 @@
         ]
       }
     },
+    "/v1/builds/{build_id}/recompare": {
+      "post": {
+        "tags": [
+          "Builds"
+        ],
+        "summary": "ビルドを現行 baseline と比較し直す",
+        "description": "admin 以上が必要。比較が済んだビルド（`changes_detected` / `passed`）を、撮影し直さずに現行 baseline と突き合わせ直す。レビュー待ちの間に別のビルドが承認されて baseline が動き、承認できなくなったビルドの救済用。比較結果は作り直されるため、このビルドに記録済みのレビュー（承認・却下）は失われる。baseline が動いていない場合、部分撮影のビルドの場合、比較がまだ終わっていない場合は 409。",
+        "operationId": "recompare_build",
+        "parameters": [
+          {
+            "name": "build_id",
+            "in": "path",
+            "description": "ビルドID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "再比較を開始したビルド",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ログインまたはセッションが必要です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "この操作は許可されていません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "リソースが見つかりません",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "再比較できない状態です",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "サーバー側で問題が発生しました。時間をおいて再度お試しください",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "API 共通のエラー応答ボディ。",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "internal-error"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/builds/{build_id}/reject": {
       "post": {
         "tags": [
@@ -6636,7 +6760,7 @@
       },
       "BuildStatus": {
         "type": "string",
-        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ queued ──worker──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ queued ──worker──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                                             └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n\n再実行（failed のみ）:\nfailed ──retry──▶ queued ──worker──▶ rendering（storybook） | processing（screenshots）\n```",
+        "description": "ビルドのライフサイクル。遷移は `service::builds::transition` に集約する。\n\n```text\nscreenshots モード:\npending ──finalize──▶ queued ──worker──▶ processing ──▶ passed | changes_detected | failed\n\nstorybook モード:\npending ──finalize──▶ queued ──worker──▶ rendering ──▶ processing ──▶ passed | changes_detected | failed\n                                             └──────────────────────▶ failed\n\nどちらも: changes_detected ──▶ approved | rejected / passed ──▶ approved\n\n再実行（failed のみ）:\nfailed ──retry──▶ queued ──worker──▶ rendering（storybook） | processing（screenshots）\n\n再比較（比較が済んだビルドを現行 baseline と突き合わせ直す）:\nchanges_detected | passed ──recompare──▶ queued ──worker──▶ processing\n```\n\n再比較は撮影をやり直さない（screenshots は残っているので比較だけ差し替える）。\n入口は [`service::builds::recompare`] だけで、部分撮影ビルドは弾かれる——\n旧 baseline から複製した流用スクリーンショットが混ざったまま新しい baseline と\n比較すると、撮っていない story に偽の差分が出る。",
         "enum": [
           "pending",
           "queued",
