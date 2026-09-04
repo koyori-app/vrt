@@ -44,6 +44,34 @@ pub const WORKER_CONCURRENCY: usize = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareBuildJob {
     pub build_id: Uuid,
+    /// 再比較（[`service::builds::recompare`]）が投入したジョブか。
+    ///
+    /// storybook モードのパイプラインでは `queued` は「レンダリング待ち」を意味し、
+    /// 比較ジョブは `(_, processing)` でしか動かない。再比較は撮影をやり直さず
+    /// `queued` から比較だけを走らせるので、その 1 経路だけを開けるための印。
+    ///
+    /// `serde(default)` は後方互換のため。このフィールドが無い状態で投入された
+    /// 既存ジョブ（ローリングデプロイ中の in-flight）は従来動作になる。
+    #[serde(default)]
+    pub recompare: bool,
+}
+
+impl CompareBuildJob {
+    /// パイプラインの通常経路（finalize / render からの引き渡し / retry）。
+    pub fn new(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: false,
+        }
+    }
+
+    /// 比較が済んだビルドを現行 baseline と突き合わせ直す経路。
+    pub fn recompare(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: true,
+        }
+    }
 }
 
 /// `CompareBuildJob` のストレージ。
@@ -153,7 +181,7 @@ pub async fn enqueue_idempotent(
 /// その場合のみ apalis のリトライに委ねる。
 pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
-    let outcome = match run(build_id, &state).await {
+    let outcome = match run(build_id, job.recompare, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "compare build job failed");
@@ -209,7 +237,7 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
+async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), anyhow::Error> {
     let db = &state.db;
 
     let build = service::builds::get_build(db, build_id).await?;
@@ -219,11 +247,18 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
             service::builds::transition(db, build, BuildStatus::Processing).await?
         }
+        // 再比較は撮影をやり直さないので、storybook でも render を挟まず
+        // queued から比較へ入る。この経路を `recompare` でしか開けないのは、
+        // まだレンダリングしていない storybook ビルド（screenshots 0 枚）を
+        // 比較すると「全 removed」を確定させてしまうため。
+        (builds::BuildMode::Storybook, BuildStatus::Queued) if recompare => {
+            service::builds::transition(db, build, BuildStatus::Processing).await?
+        }
         // storybook の render 完了後に積まれた compare job と、旧バージョンが
         // finalize 時点で Processing にしたジョブはそのまま続行する。
         (_, BuildStatus::Processing) => build,
         (mode, status) => {
-            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            tracing::info!(%build_id, ?mode, ?status, recompare, "skipping compare job outside its processing phase");
             return Ok(());
         }
     };
@@ -478,15 +513,6 @@ impl Outcome {
     }
 }
 
-/// スクリーンショットが baseline 流用の複製（`metadata.reused == true`）か。
-fn is_reused(shot: &screenshots::Model) -> bool {
-    shot.metadata
-        .as_ref()
-        .and_then(|m| m.get("reused"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 /// 一時的でありうる失敗（ストレージ IO 等）を短いバックオフ付きでやり直す。
 ///
 /// carry-forward は 1 エントリごとに download → upload → insert の 3 段で、
@@ -577,7 +603,7 @@ async fn materialize_carry_forward(
 
     let uploaded: HashSet<&str> = shots
         .iter()
-        .filter(|s| !is_reused(s))
+        .filter(|s| !service::screenshots::is_reused(s))
         .map(|s| s.name.as_str())
         .collect();
     if uploaded != selected {

@@ -492,7 +492,7 @@ pub async fn finalize_build(
                 build_service::finalize_screenshots(&state.db, build, captured_names).await?;
             job::compare_build::enqueue(
                 &state.compare_build_storage,
-                job::CompareBuildJob { build_id: build.id },
+                job::CompareBuildJob::new(build.id),
             )
             .await
             .map_err(AppError::Internal)?;
