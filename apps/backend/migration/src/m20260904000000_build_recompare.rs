@@ -21,9 +21,7 @@ impl MigrationTrait for Migration {
         // パイプラインが完走した時点（`service::builds::transition`）で NULL に戻す。
         manager
             .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE builds ADD COLUMN recompare_requested_at TIMESTAMPTZ",
-            )
+            .execute_unprepared("ALTER TABLE builds ADD COLUMN recompare_requested_at TIMESTAMPTZ")
             .await?;
         Ok(())
     }
@@ -31,9 +29,7 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
             .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE builds DROP COLUMN IF EXISTS recompare_requested_at",
-            )
+            .execute_unprepared("ALTER TABLE builds DROP COLUMN IF EXISTS recompare_requested_at")
             .await?;
         Ok(())
     }
