@@ -12,7 +12,7 @@ use futures::{StreamExt, TryStreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
     DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-    prelude::Uuid,
+    prelude::Uuid, sea_query::Query,
 };
 
 use common::db::with_transaction;
@@ -208,6 +208,7 @@ pub async fn create_build<C: ConnectionTrait>(
         approved_at: Set(None),
         created_at: Set(Utc::now().fixed_offset()),
         completed_at: Set(None),
+        recompare_requested_at: Set(None),
     }
     .insert(db)
     .await?)
@@ -354,6 +355,9 @@ pub async fn transition<C: ConnectionTrait>(
     active.status = Set(to);
     if to.completes_pipeline() {
         active.completed_at = Set(Some(Utc::now().fixed_offset()));
+        // 再比較の由来印はパイプラインが完走した時点で用済み。残しておくと
+        // 次に queued へ入ったビルドが「再比較の取りこぼし」に見えてしまう。
+        active.recompare_requested_at = Set(None);
     }
     Ok(active.update(db).await?)
 }
@@ -613,6 +617,14 @@ pub async fn finalize_screenshots(
         Box::pin(async move {
             // ロック順 1（build のみ）。計画・状態はこの取り直した行を正とする。
             let build = crate::review_lock::build(txn, build_id).await?;
+            // pending 再確認（storybook 側の finalize と同じ位置づけ）。
+            // 遷移表だけを頼りにすると、`changes_detected` / `passed` からも
+            // queued へ戻れるようになった時点で **finalize の再送が
+            // 事実上の再比較になってしまう**——CI トークン（Member）で、
+            // 部分撮影の除外も baseline_id のリセットも通さずに。
+            if build.status != BuildStatus::Pending {
+                return Err(AppError::Conflict);
+            }
             let plan = capture_plan(&build)?;
             match &plan {
                 None => {
@@ -834,6 +846,12 @@ pub async fn attach_storybook_bundle<C: ConnectionTrait>(
 }
 
 /// 比較結果のカウントを集計して build に書き戻す。
+///
+/// 失敗情報（`error_message` / `failure_origin` / `failure_code`）もここで消す。
+/// 比較を最後まで走らせたビルドに前回の失敗が残っていると、結果が
+/// `changes_detected` なのに失敗として表示される。これは机上の話ではない:
+/// 同じビルドに比較ジョブが二重に入ると、後着が `(build_id, name)` の UNIQUE で
+/// 落ちて失敗情報を書き、その後に先着が完走してこの関数へ来る。
 pub async fn apply_counts<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
@@ -841,6 +859,9 @@ pub async fn apply_counts<C: ConnectionTrait>(
     baseline_id: Option<Uuid>,
 ) -> Result<builds::Model, AppError> {
     let mut active: builds::ActiveModel = build.into();
+    active.error_message = Set(None);
+    active.failure_origin = Set(None);
+    active.failure_code = Set(None);
     active.total_count = Set(counts.total);
     active.changed_count = Set(counts.changed);
     active.added_count = Set(counts.added);
@@ -852,6 +873,16 @@ pub async fn apply_counts<C: ConnectionTrait>(
 }
 
 /// ジョブが回復不能なエラーで落ちたときの終着点。
+///
+/// 既にパイプラインが完走した状態（終端 + `changes_detected`）なら何もしない。
+/// 終端の除外はリトライ時の二重書き込み防止で、`changes_detected` の除外は
+/// **完走した結果を後から来たジョブの失敗で潰さない**ため——同じビルドに比較
+/// ジョブが二重に入ると、後着が `(build_id, name)` の UNIQUE で落ちる。ここを
+/// 素通しすると、先着が確定させたレビュー待ちの結果が `failed` に化ける。
+///
+/// 逆に `queued` / `rendering` / `processing` には従来どおり書く。ここまで
+/// no-op にすると、状態遷移の書き込み自体が失敗したジョブがビルドを進行中の
+/// まま残し、`failed` を入口とする [`retry_failed`] でも回収できなくなる。
 pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
@@ -859,8 +890,13 @@ pub async fn mark_failed<C: ConnectionTrait>(
     failure_origin: builds::BuildFailureOrigin,
     failure_code: impl Into<String>,
 ) -> Result<builds::Model, AppError> {
-    // 既に終端状態なら何もしない（リトライ時の二重書き込み防止）。
-    if build.status.is_terminal() {
+    if build.status.is_terminal() || build.status.completes_pipeline() {
+        tracing::warn!(
+            build_id = %build.id,
+            status = ?build.status,
+            %message,
+            "skipped marking a build failed: its pipeline already finished"
+        );
         return Ok(build);
     }
     let mut active: builds::ActiveModel = build.into();
@@ -965,6 +1001,154 @@ pub async fn retry_failed(
     .await
 }
 
+/// 再比較で `queued` へ戻したビルドが、ジョブの再投入を受け付けない期間（秒）。
+///
+/// 再投入の受け付け（[`recompare`] の `queued` 経路）は、ジョブ投入の失敗や
+/// ワーカーの入れ替えで `queued` のまま止まったビルドを救うためのもので、
+/// 連打の受け皿ではない。この期間を置くことで、普通に処理待ちしている
+/// ビルドへ比較ジョブが二重に積まれるのを防ぐ。
+const RECOMPARE_REQUEUE_COOLDOWN_SECS: i64 = 60;
+
+/// 比較が済んだビルドを、現行 baseline と突き合わせ直す。ジョブ投入は
+/// 呼び出し側（ハンドラ）が行う（finalize / retry と同じ分担）。
+///
+/// ## なぜ要るか
+///
+/// ビルドがレビューを待っている間に別のビルドが承認されると baseline が動く。
+/// 動いた後の承認は「baseline moved」で 409 になる（[`approve_build`]）ので
+/// 事故は起きないが、そのビルドを救う手立てが **CI からの作り直し** しか無かった。
+/// 撮影済みのスクリーンショットは残っているので、比較だけやり直せば足りる。
+///
+/// ## 対象
+///
+/// - `changes_detected` / `passed`: 比較が完走したビルド。ここから `queued` へ戻す
+/// - `queued` かつ再比較の由来印付き: 再投入だけ行う（下記の回収経路）
+/// - それ以外は 409。`approved` / `rejected` を含めないのは、確定したレビュー結果を
+///   破壊しないため（再比較は比較行を作り直すので、承認・却下の記録が消える）
+///
+/// ## 部分撮影ビルドを弾く理由
+///
+/// 部分撮影（storybook の `only_story_ids` / screenshots の capture plan）は、
+/// 撮らなかった story を**旧 baseline の PNG の複製**で埋める。この複製を新しい
+/// baseline と比較すると、撮ってもいない story に差分が出る。さらにそれを承認すると
+/// 全スクリーンショットが baseline へ昇格するため、**旧 baseline の絵が新しい
+/// baseline へ焼き付く**（誰もレビューしていない巻き戻し）。複製を捨てて撮り直す
+/// こともできない——選択集合は旧 baseline との差分から決めた計画の産物で、
+/// baseline が動いた時点でその前提が崩れているためである（計画の添付が
+/// [`attach_capture_plan`] で 409 になるのと同じ理屈）。
+///
+/// ## baseline が動いていないときは 409
+///
+/// 再比較は比較行を作り直す＝**進行中のレビューを捨てる**操作なので、結果が
+/// 変わらないと分かっている場合は実行しない。
+///
+/// ## 回収経路（`queued` の受け付け）
+///
+/// ジョブ投入の失敗や、再比較を知らない旧ワーカーがジョブを取りこぼした場合、
+/// ビルドは `queued` のまま止まる。`failed` ではないので [`retry_failed`] では
+/// 拾えない。そこで、**再比較が付けた由来印
+/// （`recompare_requested_at`）がある `queued`** に限って再投入を受け付ける。
+/// 由来印なしの `queued`（finalize 直後・retry 直後）を受け付けてはならない——
+/// storybook のレンダリング待ちに比較ジョブを撃ち込むと、
+/// 「screenshots 0 枚 vs baseline = 全 removed」を確定させてしまう。
+pub async fn recompare(db: &DatabaseConnection, build_id: Uuid) -> Result<builds::Model, AppError> {
+    with_transaction(db, move |txn| {
+        Box::pin(async move {
+            // ロック順 1（build のみ）。状態はこの取り直した行を正とする。
+            // 承認・却下・別の再比較との併走は、この行ロックで直列化される。
+            let build = crate::review_lock::build(txn, build_id).await?;
+
+            // 回収経路: 既に再比較で queued にしてあるビルドは、遷移もリセットも
+            // せずジョブだけ積み直す。
+            if build.status == BuildStatus::Queued {
+                let Some(requested_at) = build.recompare_requested_at else {
+                    return Err(AppError::ConflictDetail(format!(
+                        "cannot recompare: build #{} is queued and has not been compared yet;                          wait for the current run to finish.",
+                        build.number
+                    )));
+                };
+                let waited = Utc::now().fixed_offset() - requested_at;
+                if waited < chrono::Duration::seconds(RECOMPARE_REQUEUE_COOLDOWN_SECS) {
+                    return Err(AppError::ConflictDetail(format!(
+                        "cannot recompare: build #{} was already queued for recomparison                          {}s ago; wait at least {}s before requeueing it.",
+                        build.number,
+                        waited.num_seconds().max(0),
+                        RECOMPARE_REQUEUE_COOLDOWN_SECS
+                    )));
+                }
+                tracing::warn!(
+                    build_id = %build.id,
+                    number = build.number,
+                    waited_secs = waited.num_seconds(),
+                    "requeueing a recompare job for a build stuck in queued"
+                );
+                // 由来印を打ち直して、次の再投入までまた待たせる。据え置くと
+                // 一度期限が切れたビルドは叩くたびにジョブが積まれてしまう。
+                let mut active: builds::ActiveModel = build.into();
+                active.recompare_requested_at = Set(Some(Utc::now().fixed_offset()));
+                return Ok(active.update(txn).await?);
+            }
+
+            if !matches!(
+                build.status,
+                BuildStatus::ChangesDetected | BuildStatus::Passed
+            ) {
+                return Err(AppError::ConflictDetail(format!(
+                    "cannot recompare: build #{} has status {:?}; only builds whose comparison                      already finished (changes_detected / passed) can be compared again.",
+                    build.number, build.status
+                )));
+            }
+
+            // 部分撮影ビルドの除外。判定は「旧 baseline から複製した
+            // スクリーンショットが混ざっているか」そのもの。
+            let shots = crate::screenshots::list_for_build(txn, build.id).await?;
+            if shots.iter().any(crate::screenshots::is_reused) {
+                return Err(AppError::ConflictDetail(format!(
+                    "cannot recompare: build #{} carries screenshots copied from the baseline                      it was planned against (partial capture). comparing those copies with a                      different baseline would report changes for stories this build never                      captured; create a new build planned against the current baseline instead.",
+                    build.number
+                )));
+            }
+
+            // baseline が動いていないなら、やり直しても同じ結果になる。
+            let project = crate::projects::get_project(txn, build.project_id).await?;
+            let current = crate::baselines::latest_for(txn, &project, &build.branch).await?;
+            let current_id = current.as_ref().map(|baseline| baseline.id);
+            if build.baseline_id == current_id {
+                return Err(AppError::ConflictDetail(format!(
+                    "cannot recompare: build #{} was already compared against the current                      baseline, so nothing would change. recomparing would only discard the                      reviews recorded on this build.",
+                    build.number
+                )));
+            }
+
+            // 遷移表（`can_transition_to`）にもこの向きが載っていることを、
+            // 一本化の規約どおり release でも検査する。
+            if !build.status.can_transition_to(BuildStatus::Queued) {
+                return Err(AppError::Conflict);
+            }
+
+            let mut active: builds::ActiveModel = build.into();
+            active.status = Set(BuildStatus::Queued);
+            // 由来印。回収経路（上）がこれを見て、finalize 直後の queued と区別する。
+            active.recompare_requested_at = Set(Some(Utc::now().fixed_offset()));
+            // 比較ジョブは `baseline_id` が埋まっているとそれを使う。前回の比較で
+            // 書き戻された値を消さないと、同じ baseline と比べ直すだけになる。
+            active.baseline_id = Set(None);
+            active.error_message = Set(None);
+            active.failure_origin = Set(None);
+            active.failure_code = Set(None);
+            active.completed_at = Set(None);
+            active.total_count = Set(0);
+            active.changed_count = Set(0);
+            active.added_count = Set(0);
+            active.removed_count = Set(0);
+            active.unchanged_count = Set(0);
+            active.content_hash_skipped_count = Set(0);
+            Ok(active.update(txn).await?)
+        })
+    })
+    .await
+}
+
 /// レビュー待ち（`review_status = pending` かつ人手判断が要る）の比較件数。
 pub async fn pending_review_count<C: ConnectionTrait>(
     db: &C,
@@ -1059,6 +1243,18 @@ pub async fn approve_build(
                     "cannot approve: build #{} now has status {:?}, which cannot transition to \
                      approved; refresh the build before retrying.",
                     build.number, build.status
+                )));
+            }
+            // 状態の等値だけでは、preflight の最中に再比較が一巡したケースを
+            // 捕まえられない（`changes_detected` → 再比較 → `changes_detected`）。
+            // 比較行はすべて作り直され、レビューは pending に戻っているので、
+            // ここを素通しすると `force` 承認が**画面に出ていなかった比較**を
+            // まとめて承認してしまう。完走のたびに必ず動く `completed_at` で塞ぐ。
+            if build.completed_at != preflight_build.completed_at {
+                return Err(AppError::ConflictDetail(format!(
+                    "cannot approve: build #{} was compared again while its screenshots were \
+                     being verified; review the new comparisons before approving.",
+                    build.number
                 )));
             }
             let project = crate::review_lock::project(txn, build.project_id).await?;
@@ -1530,7 +1726,9 @@ pub async fn prune_project_builds_best_effort(
 /// - 現行 baseline の参照元ビルド（`baselines.source_build_id`）。baseline エントリは
 ///   ビルドのスクリーンショットと**同じストレージキーを共有**するため、参照元を消すと
 ///   baseline の実体まで失われる
-/// - 進行中（非 terminal）のビルド。数えも消しもしない
+/// - 進行中（非 terminal）のビルド。数えも消しもしない。再比較
+///   （[`recompare`]）で `queued` に戻ったビルドと、その結果 `changes_detected` に
+///   なったビルドもここに入る——保持数の枠を空けたければレビューを進めること
 /// - 作成から `min_retention_days` 日経っていないビルド。Wasabi 等は削除後も最低保存
 ///   期間分を課金するため、期間内の削除はコスト削減にならない（0 で無効）
 ///
@@ -1607,7 +1805,34 @@ pub async fn prune_old_builds(
         let storybook_key = build.storybook_key.clone();
 
         // 先に DB 行を消す（screenshots / comparisons / build_logs は FK cascade）。
-        builds::Entity::delete_by_id(build.id).exec(db).await?;
+        //
+        // 削除条件は行ロック無しでも安全なように DELETE 自身へ持たせる。上で読んだ
+        // 一覧と保護集合はスナップショットであり、ストレージ I/O を挟むこのループの
+        // 間に「一覧に載った passed ビルドが再比較され、承認されて新しい baseline の
+        // 参照元になる」ところまで進みうる。その行を消すと baseline エントリは
+        // スクリーンショットと同じストレージキーを共有しているので、**現行 baseline の
+        // 実体ごと消える**。
+        let deleted_row = builds::Entity::delete_many()
+            .filter(builds::Column::Id.eq(build.id))
+            .filter(builds::Column::Status.is_in(terminal))
+            .filter(
+                builds::Column::Id.not_in_subquery(
+                    Query::select()
+                        .column(baselines::Column::SourceBuildId)
+                        .from(baselines::Entity)
+                        .and_where(baselines::Column::SourceBuildId.is_not_null())
+                        .to_owned(),
+                ),
+            )
+            .exec(db)
+            .await?;
+        if deleted_row.rows_affected == 0 {
+            tracing::info!(
+                build_id = %build.id,
+                "skipped pruning a build that stopped being prunable while pruning ran"
+            );
+            continue;
+        }
 
         // ストレージ削除はベストエフォート。失敗は警告ログのみで無視する。
         for shot in &shots {

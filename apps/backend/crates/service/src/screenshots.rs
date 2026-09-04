@@ -116,6 +116,24 @@ pub fn carry_forward_screenshot_id(build_id: Uuid, name: &str) -> Uuid {
     Uuid::new_v5(&namespace, format!("{build_id}/{name}").as_bytes())
 }
 
+/// スクリーンショットが baseline からの流用複製（`metadata.reused == true`）か。
+///
+/// 流用複製を作る経路は 2 つある（storybook の `only_story_ids`、screenshots の
+/// capture plan）。どちらも「撮っていない story を旧 baseline の PNG で埋めた」
+/// 印としてこのフラグを立てるので、判定は
+/// **「このビルドに旧 baseline 由来の画像が混ざっているか」**そのものになる。
+/// 再比較（[`crate::builds::recompare`]）はこれを見て部分撮影ビルドを弾く。
+///
+/// SQL 側で `metadata->>'reused' = 'true'` と書くと JSON の真偽値と文字列 `"true"`
+/// の扱いが割れるため、判定はこの関数に一本化する。
+pub fn is_reused(shot: &screenshots::Model) -> bool {
+    shot.metadata
+        .as_ref()
+        .and_then(|m| m.get("reused"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 /// PNG のマジックバイトと寸法を検証する。デコードできない画像はここで弾く。
 pub fn validate_png(bytes: &[u8]) -> Result<(u32, u32), AppError> {
     if bytes.len() > MAX_UPLOAD_BYTES {

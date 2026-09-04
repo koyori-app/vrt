@@ -684,6 +684,16 @@ impl TestApp {
         }
     }
 
+    /// このアプリの apalis ワーカーを止める。
+    ///
+    /// キューはテストごとに分かれているので、止めても他のテストには影響しない。
+    /// 「queued のまま止まったビルド」など、ワーカーが動いていると再現できない
+    /// 状態を作るために使う。停止は次のポーリングで効くので、呼び出し側は
+    /// 実行中のジョブが片付くまで少し待つこと。
+    pub fn stop_workers(&self) {
+        let _ = self.worker_shutdown.send(true);
+    }
+
     /// GitHub App 有効で立てたときの wiremock。
     pub fn github(&self) -> &MockGithub {
         self.github
