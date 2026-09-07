@@ -1063,14 +1063,16 @@ pub async fn recompare(db: &DatabaseConnection, build_id: Uuid) -> Result<builds
             if build.status == BuildStatus::Queued {
                 let Some(requested_at) = build.recompare_requested_at else {
                     return Err(AppError::ConflictDetail(format!(
-                        "cannot recompare: build #{} is queued and has not been compared yet;                          wait for the current run to finish.",
+                        "cannot recompare: build #{} is queued and has not been compared yet; \
+                         wait for the current run to finish.",
                         build.number
                     )));
                 };
                 let waited = Utc::now().fixed_offset() - requested_at;
                 if waited < chrono::Duration::seconds(RECOMPARE_REQUEUE_COOLDOWN_SECS) {
                     return Err(AppError::ConflictDetail(format!(
-                        "cannot recompare: build #{} was already queued for recomparison                          {}s ago; wait at least {}s before requeueing it.",
+                        "cannot recompare: build #{} was already queued for recomparison \
+                         {}s ago; wait at least {}s before requeueing it.",
                         build.number,
                         waited.num_seconds().max(0),
                         RECOMPARE_REQUEUE_COOLDOWN_SECS
@@ -1094,7 +1096,8 @@ pub async fn recompare(db: &DatabaseConnection, build_id: Uuid) -> Result<builds
                 BuildStatus::ChangesDetected | BuildStatus::Passed
             ) {
                 return Err(AppError::ConflictDetail(format!(
-                    "cannot recompare: build #{} has status {:?}; only builds whose comparison                      already finished (changes_detected / passed) can be compared again.",
+                    "cannot recompare: build #{} has status {:?}; only builds whose comparison \
+                     already finished (changes_detected / passed) can be compared again.",
                     build.number, build.status
                 )));
             }
@@ -1104,7 +1107,10 @@ pub async fn recompare(db: &DatabaseConnection, build_id: Uuid) -> Result<builds
             let shots = crate::screenshots::list_for_build(txn, build.id).await?;
             if shots.iter().any(crate::screenshots::is_reused) {
                 return Err(AppError::ConflictDetail(format!(
-                    "cannot recompare: build #{} carries screenshots copied from the baseline                      it was planned against (partial capture). comparing those copies with a                      different baseline would report changes for stories this build never                      captured; create a new build planned against the current baseline instead.",
+                    "cannot recompare: build #{} carries screenshots copied from the baseline \
+                     it was planned against (partial capture). comparing those copies with a \
+                     different baseline would report changes for stories this build never \
+                     captured; create a new build planned against the current baseline instead.",
                     build.number
                 )));
             }
@@ -1115,7 +1121,9 @@ pub async fn recompare(db: &DatabaseConnection, build_id: Uuid) -> Result<builds
             let current_id = current.as_ref().map(|baseline| baseline.id);
             if build.baseline_id == current_id {
                 return Err(AppError::ConflictDetail(format!(
-                    "cannot recompare: build #{} was already compared against the current                      baseline, so nothing would change. recomparing would only discard the                      reviews recorded on this build.",
+                    "cannot recompare: build #{} was already compared against the current \
+                     baseline, so nothing would change. recomparing would only discard the \
+                     reviews recorded on this build.",
                     build.number
                 )));
             }
