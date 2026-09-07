@@ -52,15 +52,21 @@ fn job_settings() -> Result<JobSettings, std::io::Error> {
         })?),
         None => None,
     };
+    let storage_min_retention_days = match optional_env("STORAGE_MIN_RETENTION_DAYS") {
+        Some(raw) => raw.parse::<u32>().map_err(|_| {
+            std::io::Error::other(format!(
+                "STORAGE_MIN_RETENTION_DAYS must be a number, got `{raw}`"
+            ))
+        })?,
+        None => 0,
+    };
 
     Ok(JobSettings {
         app_url: required_env("APP_URL")?,
         github_api_base_url,
         github_app_id,
         github_app_private_key_pem,
-        storage_min_retention_days: optional_env("STORAGE_MIN_RETENTION_DAYS")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
+        storage_min_retention_days,
     })
 }
 
