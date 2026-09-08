@@ -84,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = required_env("DATABASE_URL")?;
     let redis_url = required_env("REDIS_URL")?;
     let settings = job_settings()?;
+    let liveness_config = job::liveness::LivenessConfig::try_from_env()?;
 
     let db = common::db::connect_database(&database_url).await?;
     let redis_client = common::cache::redis::RedisConnection::new(&redis_url);
@@ -160,13 +161,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tasks.push(SupervisedTask::new(
         "worker heartbeat monitor",
         tokio::spawn(async move {
-            job::liveness::watch_heartbeats(
-                pg_pool,
-                watched,
-                job::liveness::LivenessConfig::from_env(),
-                monitor_shutdown,
-            )
-            .await
+            job::liveness::watch_heartbeats(pg_pool, watched, liveness_config, monitor_shutdown)
+                .await
         }),
     ));
 

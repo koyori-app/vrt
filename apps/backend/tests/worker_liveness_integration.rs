@@ -8,22 +8,39 @@ mod common;
 use std::time::Duration;
 
 use common::TestApp;
-use job::liveness::{DEFAULT_STALE_AFTER, WatchedWorker, observe, queue_health, stale_workers};
+use job::liveness::{
+    DEFAULT_STALE_AFTER, QueueHealth, WatchedWorker, observe, queue_health, stale_workers,
+};
 use reqwest::StatusCode;
+
+async fn wait_for_live_queue(app: &TestApp, queue: &str) -> QueueHealth {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let queues = queue_health(&app.state.pg_pool, DEFAULT_STALE_AFTER)
+                .await
+                .expect("read queue health");
+            if let Some(health) = queues.into_iter().find(|health| {
+                health.queue == queue
+                    && health.live_workers >= 1
+                    && health
+                        .newest_heartbeat_age
+                        .is_some_and(|age| age < DEFAULT_STALE_AFTER)
+            }) {
+                return health;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{queue} did not register a fresh heartbeat within 5 seconds"))
+}
 
 /// TestApp はワーカーを起動するので、そのキューは「消費者がいる」状態で見える。
 #[tokio::test(flavor = "multi_thread")]
 async fn queue_health_shows_the_running_workers() {
     let app = TestApp::new().await;
-
-    let queues = queue_health(&app.state.pg_pool, DEFAULT_STALE_AFTER)
-        .await
-        .expect("read queue health");
-
-    let compare = queues
-        .iter()
-        .find(|q| q.queue.starts_with("compare_build"))
-        .expect("compare_build queue is registered");
+    let queue = app.state.compare_build_storage.config().queue().to_string();
+    let compare = wait_for_live_queue(&app, &queue).await;
 
     assert!(
         compare.live_workers >= 1,
@@ -76,6 +93,8 @@ async fn an_unregistered_worker_is_observed_as_missing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queues_endpoint_is_public_and_hides_worker_ids() {
     let app = TestApp::new().await;
+    let queue = app.state.compare_build_storage.config().queue().to_string();
+    wait_for_live_queue(&app, &queue).await;
 
     let response = app.get("/v1/health/queues").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -102,14 +121,8 @@ async fn queues_endpoint_is_public_and_hides_worker_ids() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_queue_reports_no_wait() {
     let app = TestApp::new().await;
-
-    let queues = queue_health(&app.state.pg_pool, Duration::from_secs(180))
-        .await
-        .expect("read queue health");
-    let compare = queues
-        .iter()
-        .find(|q| q.queue.starts_with("compare_build"))
-        .expect("compare_build queue is registered");
+    let queue = app.state.compare_build_storage.config().queue().to_string();
+    let compare = wait_for_live_queue(&app, &queue).await;
 
     assert_eq!(compare.waiting_jobs, 0);
     assert_eq!(compare.oldest_wait, None);

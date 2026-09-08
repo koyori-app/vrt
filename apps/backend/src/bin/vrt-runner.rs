@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = required_env("DATABASE_URL")?;
     let chromium_path = required_env("CHROMIUM_PATH")?;
+    let liveness_config = job::liveness::LivenessConfig::try_from_env()?;
 
     let db = common::db::connect_database(&database_url).await?;
     let pg_pool = backend::jobs::setup_pool(&database_url).await?;
@@ -74,13 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SupervisedTask::new(
             "worker heartbeat monitor",
             tokio::spawn(async move {
-                job::liveness::watch_heartbeats(
-                    pg_pool,
-                    watched,
-                    job::liveness::LivenessConfig::from_env(),
-                    monitor_shutdown,
-                )
-                .await
+                job::liveness::watch_heartbeats(pg_pool, watched, liveness_config, monitor_shutdown)
+                    .await
             }),
         ),
     ];

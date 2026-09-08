@@ -55,18 +55,38 @@ impl Default for LivenessConfig {
 }
 
 impl LivenessConfig {
-    /// 環境変数 `WORKER_HEARTBEAT_STALE_SECS` で閾値を上書きする（不正値は既定）。
-    pub fn from_env() -> Self {
-        let stale_after = std::env::var("WORKER_HEARTBEAT_STALE_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_STALE_AFTER);
-        Self {
+    /// 環境変数 `WORKER_HEARTBEAT_STALE_SECS` を検証して閾値を組み立てる。
+    pub fn try_from_env() -> Result<Self, std::io::Error> {
+        let stale_after = match std::env::var("WORKER_HEARTBEAT_STALE_SECS") {
+            Ok(raw) => {
+                let seconds = raw
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|seconds| *seconds > 0)
+                    .ok_or_else(|| {
+                        std::io::Error::other(format!(
+                            "WORKER_HEARTBEAT_STALE_SECS must be a positive number, got `{raw}`"
+                        ))
+                    })?;
+                Duration::from_secs(seconds)
+            }
+            Err(std::env::VarError::NotPresent) => DEFAULT_STALE_AFTER,
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                return Err(std::io::Error::other(format!(
+                    "WORKER_HEARTBEAT_STALE_SECS must be a positive number, got {raw:?}"
+                )));
+            }
+        };
+        Ok(Self {
             stale_after,
             ..Self::default()
-        }
+        })
+    }
+
+    /// 環境変数 `WORKER_HEARTBEAT_STALE_SECS` で閾値を上書きする（不正値は既定）。
+    pub fn from_env() -> Self {
+        Self::try_from_env().unwrap_or_default()
     }
 }
 
@@ -374,7 +394,7 @@ mod tests {
         assert!(!all_fresh(&[], stale_after));
     }
 
-    /// 閾値は環境変数で上書きできる。不正値は既定へ落とす。
+    /// 閾値は環境変数で上書きできる。検証付きの入口では不正値を拒否する。
     #[test]
     fn stale_threshold_comes_from_the_environment() {
         assert_eq!(LivenessConfig::default().stale_after, DEFAULT_STALE_AFTER);
@@ -387,11 +407,20 @@ mod tests {
             LivenessConfig::from_env().stale_after,
             Duration::from_secs(45)
         );
+        assert_eq!(
+            LivenessConfig::try_from_env().unwrap().stale_after,
+            Duration::from_secs(45)
+        );
 
-        for invalid in ["0", "-1", "abc", ""] {
+        for invalid in ["0", "-1", "180s", "3m", "", "18446744073709551616"] {
             unsafe {
                 std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", invalid);
             }
+            let error = LivenessConfig::try_from_env().unwrap_err();
+            assert!(
+                error.to_string().contains(invalid),
+                "`{invalid}` must be reported: {error}"
+            );
             assert_eq!(
                 LivenessConfig::from_env().stale_after,
                 DEFAULT_STALE_AFTER,
@@ -401,5 +430,9 @@ mod tests {
         unsafe {
             std::env::remove_var("WORKER_HEARTBEAT_STALE_SECS");
         }
+        assert_eq!(
+            LivenessConfig::try_from_env().unwrap().stale_after,
+            DEFAULT_STALE_AFTER
+        );
     }
 }
