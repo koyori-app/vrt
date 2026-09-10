@@ -484,7 +484,6 @@ async fn requeueing_is_limited_to_builds_marked_by_a_recompare() {
     );
 }
 
-
 /// storybook モードの再比較は、レンダリングを挟まず比較だけやり直す。
 ///
 /// この経路（`(Storybook, Queued) if recompare`）は screenshots モードのテストでは
@@ -514,7 +513,11 @@ async fn recompare_reruns_a_storybook_build_without_rendering_it_again() {
     assert_eq!(res.status(), StatusCode::OK, "approve the second build");
 
     let res = fx.recompare(third_id).await;
-    assert_eq!(res.status(), StatusCode::OK, "recompare the storybook build");
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "recompare the storybook build"
+    );
 
     let build = fx.wait_for_terminal(third_id).await;
     assert_eq!(

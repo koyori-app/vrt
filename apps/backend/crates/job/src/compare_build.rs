@@ -255,7 +255,7 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
     common::db::with_transaction(&db, move |txn| {
         Box::pin(async move {
             let acquired = txn
-                .query_one(Statement::from_sql_and_values(
+                .query_one_raw(Statement::from_sql_and_values(
                     DbBackend::Postgres,
                     "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
                     [build_id.to_string().into()],
