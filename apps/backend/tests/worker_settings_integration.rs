@@ -67,7 +67,11 @@ fn valid_or_unset_retention_days_reach_the_next_configuration_check() {
 fn invalid_app_url_stops_worker_startup() {
     // API の Settings と同じ検証を通す。scheme 無しの値を通すと commit status の
     // target_url が不正なまま GitHub へ送られる。
-    for value in ["vrt.example.test", "http:/vrt.example.test", "ftp://vrt.example.test"] {
+    for value in [
+        "vrt.example.test",
+        "http:/vrt.example.test",
+        "ftp://vrt.example.test",
+    ] {
         let output = start_worker(None, Some(value));
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
