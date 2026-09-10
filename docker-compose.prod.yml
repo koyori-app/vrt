@@ -166,6 +166,10 @@ services:
       # 削除済みオブジェクトにも最低保存期間分を課金するストレージでは 90 を設定する。
       # runner 側にも同じ値を渡すこと。
       - STORAGE_MIN_RETENTION_DAYS
+      # ハートビートが途切れたと見なすまでの秒数（既定 180、下限 60）。
+      # /v1/health/queues の live_workers 判定に使うので、worker / runner と同じ値にすること。
+      # 値がずれると、外形監視が健全なキューを死んだと報告したり、逆に再起動中の窓を隠したりする。
+      - WORKER_HEARTBEAT_STALE_SECS
       # --- GitHub App（任意。PR ステータス連携）---
       # GITHUB_APP_ID と GITHUB_APP_PRIVATE_KEY_PEM の両方が揃って初めて有効。
       # 片方だけだと警告ログのみで無言で無効になる。PEM は改行を \n にエスケープして 1 行で渡す
@@ -223,7 +227,7 @@ services:
       - GITHUB_APP_ID
       - GITHUB_APP_PRIVATE_KEY_PEM
       - GITHUB_API_BASE_URL
-      # ハートビートが途切れたと見なすまでの秒数（既定 180）。
+      # ハートビートが途切れたと見なすまでの秒数（既定 180、下限 60）。backend と同じ値にすること。
       - WORKER_HEARTBEAT_STALE_SECS
     volumes:
       - uploads:/home/app/uploads
