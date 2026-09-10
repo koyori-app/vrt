@@ -10,6 +10,9 @@
 //! 2. baseline が動いていないビルドの再比較は 409（レビューだけ失われるため）
 //! 3. finalize の再送を再比較の代わりに使えない（CI トークンでの裏口）
 //! 4. `queued` の再投入は、再比較が付けた由来印がある行に限る
+//! 5. storybook モードでも、再比較は撮り直さず比較だけやり直す
+//! 6. 由来印は「再比較の queued」を出るすべての経路（完走・失敗・retry）で消える
+//! 7. 重複した比較ジョブの後着が、完走したビルドの結果を上書きしない
 
 mod common;
 
@@ -185,6 +188,37 @@ impl Fixture {
             .update(&self.app.state.db)
             .await
             .expect("force build into queued");
+    }
+
+    /// ワーカーが動いていると作れない状態（失敗で止まったビルド）を直接作る。
+    async fn force_failed(&self, build_id: Uuid, marker: Option<chrono::Duration>) {
+        let build = self.reload(build_id).await;
+        let mut active: builds::ActiveModel = build.into();
+        active.status = Set(builds::BuildStatus::Failed);
+        active.error_message = Set(Some("compare job died".into()));
+        active.recompare_requested_at =
+            Set(marker.map(|age| chrono::Utc::now().fixed_offset() - age));
+        active
+            .update(&self.app.state.db)
+            .await
+            .expect("force build into failed");
+    }
+
+    /// 撮影済みのスクリーンショットはそのままにモードだけ差し替える。
+    async fn set_mode(&self, build_id: Uuid, mode: builds::BuildMode) {
+        let build = self.reload(build_id).await;
+        let mut active: builds::ActiveModel = build.into();
+        active.mode = Set(mode);
+        active
+            .update(&self.app.state.db)
+            .await
+            .expect("switch build mode");
+    }
+
+    async fn retry(&self, build_id: Uuid) -> reqwest::Response {
+        self.app
+            .post_json(&format!("/v1/builds/{build_id}/retry"), json!({}))
+            .await
     }
 
     async fn comparisons(&self, build_id: Uuid) -> Vec<Value> {
@@ -448,4 +482,180 @@ async fn requeueing_is_limited_to_builds_marked_by_a_recompare() {
         StatusCode::CONFLICT,
         "再投入の直後はまた待たせる"
     );
+}
+
+
+/// storybook モードの再比較は、レンダリングを挟まず比較だけやり直す。
+///
+/// この経路（`(Storybook, Queued) if recompare`）は screenshots モードのテストでは
+/// 一度も通らない——CI の作成 API はモード未指定だと screenshots になるため。
+#[tokio::test(flavor = "multi_thread")]
+async fn recompare_reruns_a_storybook_build_without_rendering_it_again() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    let second = fx.run_build("sha2", &[("home", BLUE)]).await;
+    let third = fx.run_build("sha3", &[("home", BLUE)]).await;
+    let second_id = build_id_of(&second);
+    let third_id = build_id_of(&third);
+    assert_eq!(third["status"], "changes_detected");
+
+    // 撮影済みのスクリーンショットは残したまま、モードだけ storybook にする。
+    // 再比較が撮り直さないことを、撮影経路を動かさずに確かめるため。
+    fx.set_mode(third_id, builds::BuildMode::Storybook).await;
+
+    // baseline を動かして 3 本目を取り残す。
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve the second build");
+
+    let res = fx.recompare(third_id).await;
+    assert_eq!(res.status(), StatusCode::OK, "recompare the storybook build");
+
+    let build = fx.wait_for_terminal(third_id).await;
+    assert_eq!(
+        build["status"], "passed",
+        "storybook でも render を挟まず比較だけやり直す"
+    );
+    let statuses: Vec<String> = fx
+        .comparisons(third_id)
+        .await
+        .into_iter()
+        .map(|c| c["status"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(statuses, vec!["unchanged"], "比較結果は作り直される");
+}
+
+/// 再比較の由来印は、比較が失敗して retry を通ったビルドから消える。
+///
+/// 残ると、レンダリング待ちの `queued` が「再比較の取りこぼし」に見え、
+/// screenshots 0 枚のビルドへ比較ジョブが撃ち込まれてしまう。
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_clears_the_recompare_marker() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let first_id = build_id_of(&first);
+
+    // ワーカーを止めて、再比較の由来印を持ったまま失敗した状態を作る。
+    fx.app.stop_workers();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fx.force_failed(first_id, Some(chrono::Duration::seconds(600)))
+        .await;
+
+    let res = fx.retry(first_id).await;
+    assert_eq!(res.status(), StatusCode::OK, "retry the failed build");
+
+    let build = fx.reload(first_id).await;
+    assert_eq!(build.status, builds::BuildStatus::Queued);
+    assert!(
+        build.recompare_requested_at.is_none(),
+        "retry 直後の queued に由来印を残さない"
+    );
+
+    // 由来印が無いので、回収経路の入口で止まる。
+    let res = fx.recompare(first_id).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "retry 直後のビルドを再比較の入口にしない"
+    );
+    let message = error_message(res).await;
+    assert!(
+        message.contains("has not been compared yet"),
+        "処理待ちであることを伝えること: {message}"
+    );
+}
+
+/// 後から着いた重複ジョブの失敗が、完走したビルドを `failed` に化けさせない。
+/// 進行中のビルドには従来どおり書き、そのとき再比較の由来印も落とす。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_failed_leaves_a_finished_pipeline_alone() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let first_id = build_id_of(&first);
+    assert_eq!(first["status"], "changes_detected");
+
+    let build = fx.reload(first_id).await;
+    let result = service::builds::mark_failed(
+        &fx.app.state.db,
+        build,
+        "late duplicate compare job".into(),
+        entity::builds::BuildFailureOrigin::Vrt,
+        "compare_internal",
+    )
+    .await
+    .expect("mark_failed on a finished build");
+    assert_eq!(
+        result.status,
+        builds::BuildStatus::ChangesDetected,
+        "レビュー待ちの結果を後着の失敗で潰さない"
+    );
+    assert!(
+        result.error_message.is_none(),
+        "失敗情報も書かない: {:?}",
+        result.error_message
+    );
+
+    // 進行中のビルドには書く。ここで由来印も消える（失敗経路は transition を通らない）。
+    fx.app.stop_workers();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fx.force_queued(first_id, Some(chrono::Duration::seconds(600)))
+        .await;
+    let build = fx.reload(first_id).await;
+    let result = service::builds::mark_failed(
+        &fx.app.state.db,
+        build,
+        "compare job died".into(),
+        entity::builds::BuildFailureOrigin::Vrt,
+        "compare_internal",
+    )
+    .await
+    .expect("mark_failed on a running build");
+    assert_eq!(result.status, builds::BuildStatus::Failed);
+    assert!(
+        result.recompare_requested_at.is_none(),
+        "失敗経路でも由来印を消す"
+    );
+}
+
+/// 完走した比較は、後着ジョブが書いた失敗情報を消してから集計を書く。
+#[tokio::test(flavor = "multi_thread")]
+async fn apply_counts_clears_a_previous_failure() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let first_id = build_id_of(&first);
+
+    fx.app.stop_workers();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // 後着ジョブが失敗を書いた processing のビルド。
+    let build = fx.reload(first_id).await;
+    let mut active: builds::ActiveModel = build.into();
+    active.status = Set(builds::BuildStatus::Processing);
+    active.error_message = Set(Some("duplicate compare job".into()));
+    active.failure_origin = Set(Some(entity::builds::BuildFailureOrigin::Vrt));
+    active.failure_code = Set(Some("compare_internal".into()));
+    let build = active
+        .update(&fx.app.state.db)
+        .await
+        .expect("force build into processing");
+
+    let build = service::builds::apply_counts(
+        &fx.app.state.db,
+        build,
+        service::builds::BuildCounts::default(),
+        None,
+    )
+    .await
+    .expect("apply counts");
+    assert!(build.error_message.is_none(), "失敗メッセージを残さない");
+    assert!(build.failure_origin.is_none(), "失敗の所有者を残さない");
+    assert!(build.failure_code.is_none(), "失敗コードを残さない");
 }
