@@ -250,7 +250,9 @@ pub fn load_settings() -> Result<Settings, anyhow::Error> {
 }
 
 /// 絶対 URL の http(s) ベースのみ許可（`http:/host` のような scheme 直後1スラッシュは拒否）。
-fn validate_app_url(raw: &str) -> Result<(), validator::ValidationError> {
+///
+/// API の `Settings` だけでなく、同じ `APP_URL` を読む worker の起動時検証からも使う。
+pub fn validate_app_url(raw: &str) -> Result<(), validator::ValidationError> {
     let url = raw.trim();
     if url.is_empty() {
         return Err(validator::ValidationError::new("required"));

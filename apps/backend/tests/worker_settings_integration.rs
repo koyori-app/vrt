@@ -64,8 +64,23 @@ fn valid_or_unset_retention_days_reach_the_next_configuration_check() {
 }
 
 #[test]
+fn invalid_app_url_stops_worker_startup() {
+    // API の Settings と同じ検証を通す。scheme 無しの値を通すと commit status の
+    // target_url が不正なまま GitHub へ送られる。
+    for value in ["vrt.example.test", "http:/vrt.example.test", "ftp://vrt.example.test"] {
+        let output = start_worker(None, Some(value));
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("APP_URL") && stderr.contains(value),
+            "invalid APP_URL {value} must stop the worker before connections: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn invalid_heartbeat_staleness_stops_worker_and_runner_startup() {
-    for value in ["0", "180s", "3m"] {
+    for value in ["0", "59", "180s", "3m"] {
         let worker = start_binary(
             env!("CARGO_BIN_EXE_vrt-worker"),
             &[

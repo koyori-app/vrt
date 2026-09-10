@@ -28,6 +28,14 @@ pub const DEFAULT_GRACE: Duration = Duration::from_secs(120);
 /// ハートビートを読む間隔。
 pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// `WORKER_HEARTBEAT_STALE_SECS` に許す下限。
+///
+/// apalis のハートビート間隔は 30 秒なので、健全なワーカーの `last_seen` の齢も
+/// 0〜30 秒台を行き来する。これを下回る閾値は健全なワーカーを「古い」と判定し、
+/// 監視が Err を返してプロセスが落ち、再起動を繰り返すだけになる。
+/// しかも `POLL_INTERVAL` と `DEFAULT_GRACE` は設定できないので、下げても検知は速くならない。
+pub const MIN_STALE_AFTER_SECS: u64 = 60;
+
 /// 監視対象の 1 本。
 #[derive(Clone, Debug)]
 pub struct WatchedWorker {
@@ -63,10 +71,10 @@ impl LivenessConfig {
                     .trim()
                     .parse::<u64>()
                     .ok()
-                    .filter(|seconds| *seconds > 0)
+                    .filter(|seconds| *seconds >= MIN_STALE_AFTER_SECS)
                     .ok_or_else(|| {
                         std::io::Error::other(format!(
-                            "WORKER_HEARTBEAT_STALE_SECS must be a positive number, got `{raw}`"
+                            "WORKER_HEARTBEAT_STALE_SECS must be at least {MIN_STALE_AFTER_SECS} seconds (apalis heartbeats every 30s), got `{raw}`"
                         ))
                     })?;
                 Duration::from_secs(seconds)
@@ -74,7 +82,7 @@ impl LivenessConfig {
             Err(std::env::VarError::NotPresent) => DEFAULT_STALE_AFTER,
             Err(std::env::VarError::NotUnicode(raw)) => {
                 return Err(std::io::Error::other(format!(
-                    "WORKER_HEARTBEAT_STALE_SECS must be a positive number, got {raw:?}"
+                    "WORKER_HEARTBEAT_STALE_SECS must be at least {MIN_STALE_AFTER_SECS} seconds (apalis heartbeats every 30s), got {raw:?}"
                 )));
             }
         };
@@ -401,18 +409,28 @@ mod tests {
 
         // SAFETY: テスト内でのみ環境変数を触る。
         unsafe {
-            std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", "45");
+            std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", "600");
         }
         assert_eq!(
             LivenessConfig::from_env().stale_after,
-            Duration::from_secs(45)
+            Duration::from_secs(600)
         );
         assert_eq!(
             LivenessConfig::try_from_env().unwrap().stale_after,
-            Duration::from_secs(45)
+            Duration::from_secs(600)
         );
 
-        for invalid in ["0", "-1", "180s", "3m", "", "18446744073709551616"] {
+        // 下限は apalis のハートビート間隔（30 秒）の 2 倍。1〜59 は健全なワーカーを
+        // 古いと誤判定してクラッシュループになるので拒否する。
+        unsafe {
+            std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", "60");
+        }
+        assert_eq!(
+            LivenessConfig::try_from_env().unwrap().stale_after,
+            Duration::from_secs(MIN_STALE_AFTER_SECS)
+        );
+
+        for invalid in ["0", "-1", "1", "29", "59", "180s", "3m", "", "18446744073709551616"] {
             unsafe {
                 std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", invalid);
             }

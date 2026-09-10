@@ -61,8 +61,17 @@ fn job_settings() -> Result<JobSettings, std::io::Error> {
         None => 0,
     };
 
+    // API 側の Settings と同じ検証を掛ける。scheme の無い値を通すと
+    // commit status の target_url が不正な URL のまま GitHub へ送られる。
+    let app_url = required_env("APP_URL")?;
+    common::settings::validate_app_url(&app_url).map_err(|_| {
+        std::io::Error::other(format!(
+            "APP_URL must be an absolute http(s) URL, got `{app_url}`"
+        ))
+    })?;
+
     Ok(JobSettings {
-        app_url: required_env("APP_URL")?,
+        app_url,
         github_api_base_url,
         github_app_id,
         github_app_private_key_pem,
