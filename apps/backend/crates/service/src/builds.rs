@@ -872,6 +872,16 @@ pub async fn apply_counts<C: ConnectionTrait>(
     Ok(active.update(db).await?)
 }
 
+/// `mark_failed` が上書きしてよい進行中の状態。
+///
+/// ここに載っていない状態（終端 + `changes_detected`）は書き換えない。
+const FAILABLE_STATUSES: [BuildStatus; 4] = [
+    BuildStatus::Pending,
+    BuildStatus::Queued,
+    BuildStatus::Rendering,
+    BuildStatus::Processing,
+];
+
 /// ジョブが回復不能なエラーで落ちたときの終着点。
 ///
 /// 既にパイプラインが完走した状態（終端 + `changes_detected`）なら何もしない。
@@ -883,6 +893,15 @@ pub async fn apply_counts<C: ConnectionTrait>(
 /// 逆に `queued` / `rendering` / `processing` には従来どおり書く。ここまで
 /// no-op にすると、状態遷移の書き込み自体が失敗したジョブがビルドを進行中の
 /// まま残し、`failed` を入口とする [`retry_failed`] でも回収できなくなる。
+///
+/// この判定は呼び出し側のスナップショットではなく `UPDATE` の `WHERE` に埋める。
+/// 重複した比較ジョブは先着のトランザクションが COMMIT する前に読んだ行——つまり
+/// まだ `queued` の行——を持って落ちてくるので、読みで判定すると先着が確定させた
+/// 結果を後着の `failed` が上書きしてしまう。
+///
+/// 再比較の由来印もここで消す。失敗経路は [`transition`] を通らないため、
+/// 残したままだと [`retry_failed`] を経た `queued` が「再比較の取りこぼし」に
+/// 見え、描画待ちのビルドへ比較ジョブが撃ち込まれる。
 pub async fn mark_failed<C: ConnectionTrait>(
     db: &C,
     build: builds::Model,
@@ -890,22 +909,46 @@ pub async fn mark_failed<C: ConnectionTrait>(
     failure_origin: builds::BuildFailureOrigin,
     failure_code: impl Into<String>,
 ) -> Result<builds::Model, AppError> {
-    if build.status.is_terminal() || build.status.completes_pipeline() {
+    let build_id = build.id;
+    let result = builds::Entity::update_many()
+        .col_expr(
+            builds::Column::Status,
+            sea_orm::sea_query::Expr::value(BuildStatus::Failed),
+        )
+        .col_expr(
+            builds::Column::ErrorMessage,
+            sea_orm::sea_query::Expr::value(message.clone()),
+        )
+        .col_expr(
+            builds::Column::FailureOrigin,
+            sea_orm::sea_query::Expr::value(failure_origin),
+        )
+        .col_expr(
+            builds::Column::FailureCode,
+            sea_orm::sea_query::Expr::value(failure_code.into()),
+        )
+        .col_expr(
+            builds::Column::CompletedAt,
+            sea_orm::sea_query::Expr::value(Utc::now().fixed_offset()),
+        )
+        .col_expr(
+            builds::Column::RecompareRequestedAt,
+            sea_orm::sea_query::Expr::value(None::<chrono::DateTime<chrono::FixedOffset>>),
+        )
+        .filter(builds::Column::Id.eq(build_id))
+        .filter(builds::Column::Status.is_in(FAILABLE_STATUSES))
+        .exec(db)
+        .await?;
+
+    if result.rows_affected == 0 {
         tracing::warn!(
-            build_id = %build.id,
+            build_id = %build_id,
             status = ?build.status,
             %message,
             "skipped marking a build failed: its pipeline already finished"
         );
-        return Ok(build);
     }
-    let mut active: builds::ActiveModel = build.into();
-    active.status = Set(BuildStatus::Failed);
-    active.error_message = Set(Some(message));
-    active.failure_origin = Set(Some(failure_origin));
-    active.failure_code = Set(Some(failure_code.into()));
-    active.completed_at = Set(Some(Utc::now().fixed_offset()));
-    Ok(active.update(db).await?)
+    get_build(db, build_id).await
 }
 
 /// 失敗ビルドの再実行でパイプラインのどこからやり直すか。
@@ -989,6 +1032,11 @@ pub async fn retry_failed(
             active.failure_origin = Set(None);
             active.failure_code = Set(None);
             active.completed_at = Set(None);
+            // 再比較の由来印は queued を出るときに消えるのが原則だが、失敗経路は
+            // `transition` を通らないので retry のここでも消す。残すと、比較が
+            // 失敗した再比較ビルドが由来印付きの queued に戻り、描画待ちのまま
+            // 回収経路の比較ジョブを受け入れてしまう。
+            active.recompare_requested_at = Set(None);
             active.total_count = Set(0);
             active.changed_count = Set(0);
             active.added_count = Set(0);

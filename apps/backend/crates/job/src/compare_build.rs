@@ -244,16 +244,33 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
     // apalis の idempotency key は投入側の重複しか抑止せず、queued の回収経路や
     // 旧形式のジョブとの併走までは防げない。transaction-scoped lock なら、別 worker
     // / 別プロセスのジョブも同じビルドについて一つずつ比較本体へ進められる。
+    //
+    // ロックはブロッキング版ではなく `try` 版を使う。ロックは比較の全工程
+    // （ストレージ I/O と PNG デコードを含む）にわたって保持されるので、
+    // ブロッキング版だと重複ジョブが先着の全実行時間ぶん待ち続け、
+    // 2 スロットしかない比較ワーカーとプール接続を占有してデプロイ全体の
+    // 比較を止めてしまう。重複ジョブが足せる仕事は無いので、取れなければ即座に終わる。
     let state = state.clone();
     let db = state.db.clone();
     common::db::with_transaction(&db, move |txn| {
         Box::pin(async move {
-            txn.execute_raw(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                [build_id.to_string().into()],
-            ))
-            .await?;
+            let acquired = txn
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
+                    [build_id.to_string().into()],
+                ))
+                .await?
+                .map(|row| row.try_get::<bool>("", "acquired"))
+                .transpose()?
+                .unwrap_or(false);
+            if !acquired {
+                tracing::info!(
+                    %build_id,
+                    "skipping compare job: another job is already comparing this build"
+                );
+                return Ok(());
+            }
 
             run_locked(txn, build_id, recompare, &state).await
         })
@@ -261,6 +278,16 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
     .await
 }
 
+/// 比較本体。`db` は直列化ロックを持つトランザクション。
+///
+/// 進行中に観測されるための書き込み——`processing` への遷移と `build_logs`——だけは
+/// トランザクションではなくプール (`state.db`) へ出す。トランザクションの中に置くと
+/// COMMIT まで他セッションから 1 行も見えず、数分かかる比較のあいだ
+/// `GET /v1/builds/{id}` は `queued` を返し続け、ログ画面は空のまま、
+/// 最後に全部が一度に現れる（失敗時はロールバックで進捗行が消える）。
+///
+/// プール側の書き込みはトランザクションが builds 行を更新する前に済ませるので、
+/// 行ロックで自分自身を待つことはない。
 async fn run_locked<C: ConnectionTrait>(
     db: &C,
     build_id: Uuid,
@@ -272,14 +299,14 @@ async fn run_locked<C: ConnectionTrait>(
         // screenshots モードのパイプライン先頭。worker が実際に取得してから
         // processing にするため、UI はキュー待ちと処理中を区別できる。
         (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
-            service::builds::transition(db, build, BuildStatus::Processing).await?
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
         }
         // 再比較は撮影をやり直さないので、storybook でも render を挟まず
         // queued から比較へ入る。この経路を `recompare` でしか開けないのは、
         // まだレンダリングしていない storybook ビルド（screenshots 0 枚）を
         // 比較すると「全 removed」を確定させてしまうため。
         (builds::BuildMode::Storybook, BuildStatus::Queued) if recompare => {
-            service::builds::transition(db, build, BuildStatus::Processing).await?
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
         }
         // storybook の render 完了後に積まれた compare job と、旧バージョンが
         // finalize 時点で Processing にしたジョブはそのまま続行する。
@@ -350,7 +377,7 @@ async fn run_locked<C: ConnectionTrait>(
 
     // 比較対象数が確定した時点で開始行を残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!("compare started: {total} comparisons"),
@@ -415,7 +442,7 @@ async fn run_locked<C: ConnectionTrait>(
         processed += 1;
         if processed.is_multiple_of(10) || processed == total {
             service::build_logs::append(
-                db,
+                &state.db,
                 build_id,
                 LogLevel::Info,
                 format!("compared {processed}/{total}"),
@@ -426,7 +453,7 @@ async fn run_locked<C: ConnectionTrait>(
 
     if ambiguous_missing_count > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build_id,
             LogLevel::Info,
             format!(
@@ -447,7 +474,7 @@ async fn run_locked<C: ConnectionTrait>(
 
     // 完了サマリ。内訳を 1 行で残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!(
@@ -749,7 +776,7 @@ async fn materialize_carry_forward(
 
     if carried > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!("carried forward {carried} baseline screenshots outside the planned set"),
@@ -765,7 +792,7 @@ async fn materialize_carry_forward(
             "reporting as removed"
         };
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!(
