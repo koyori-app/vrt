@@ -430,7 +430,17 @@ mod tests {
             Duration::from_secs(MIN_STALE_AFTER_SECS)
         );
 
-        for invalid in ["0", "-1", "1", "29", "59", "180s", "3m", "", "18446744073709551616"] {
+        for invalid in [
+            "0",
+            "-1",
+            "1",
+            "29",
+            "59",
+            "180s",
+            "3m",
+            "",
+            "18446744073709551616",
+        ] {
             unsafe {
                 std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", invalid);
             }
