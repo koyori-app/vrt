@@ -91,11 +91,6 @@ impl LivenessConfig {
             ..Self::default()
         })
     }
-
-    /// 環境変数 `WORKER_HEARTBEAT_STALE_SECS` で閾値を上書きする（不正値は既定）。
-    pub fn from_env() -> Self {
-        Self::try_from_env().unwrap_or_default()
-    }
 }
 
 /// 1 回分の観測結果。行が無い場合は `None`。
@@ -412,10 +407,6 @@ mod tests {
             std::env::set_var("WORKER_HEARTBEAT_STALE_SECS", "600");
         }
         assert_eq!(
-            LivenessConfig::from_env().stale_after,
-            Duration::from_secs(600)
-        );
-        assert_eq!(
             LivenessConfig::try_from_env().unwrap().stale_after,
             Duration::from_secs(600)
         );
@@ -448,11 +439,6 @@ mod tests {
             assert!(
                 error.to_string().contains(invalid),
                 "`{invalid}` must be reported: {error}"
-            );
-            assert_eq!(
-                LivenessConfig::from_env().stale_after,
-                DEFAULT_STALE_AFTER,
-                "`{invalid}` must fall back to the default"
             );
         }
         unsafe {
