@@ -198,6 +198,68 @@ async fn prune_keeps_baseline_referenced_builds() {
     assert!(!object_exists(storage, &b2.2).await, "b2 の PNG は消える");
 }
 
+/// 承認がビルドを baseline の参照元にする最中にプルーニングが走っても、
+/// その参照元と実体を消さない。
+///
+/// 条件付き DELETE 一発では防げない競合の回帰テスト。承認側が build 行を握ったまま
+/// baseline を作り、プルーニングはその行ロック待ちで止まる。Postgres の
+/// READ COMMITTED では、再開した DELETE は「approved へ変わった build 行」を
+/// 見直す一方で、別テーブルを引く副問い合わせは文の開始時スナップショットのまま——
+/// 同じトランザクションが作った baseline 行が見えないまま削除に進んでしまう。
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_keeps_builds_baselined_while_it_waits_for_the_row_lock() {
+    use sea_orm::{ConnectionTrait, TransactionTrait};
+
+    let app = TestApp::new().await;
+    app.login_as_new_user().await;
+    let tenant_id = create_tenant(&app, "prune-race").await;
+    let project_id = create_project(&app, tenant_id, "web").await;
+    let db = &app.state.db;
+    let storage = &app.state.storage;
+
+    let b1 = make_passed_build(&app, tenant_id, project_id, "sha1").await;
+    let _b2 = make_passed_build(&app, tenant_id, project_id, "sha2").await;
+
+    // 承認相当のトランザクション。build 行を握ってから baseline を作り、COMMIT は保留する。
+    let txn = db.begin().await.expect("begin");
+    txn.execute_unprepared(&format!(
+        "UPDATE builds SET status = 'approved' WHERE id = '{}'",
+        b1.0
+    ))
+    .await
+    .expect("approve b1");
+    txn.execute_unprepared(&format!(
+        "INSERT INTO baselines (id, project_id, branch, source_build_id, created_at) \
+         VALUES ('{}', '{project_id}', 'main', '{}', now())",
+        Uuid::new_v4(),
+        b1.0
+    ))
+    .await
+    .expect("insert baseline");
+
+    // 上限 1 なので b1 が唯一の候補。上のトランザクションが握る行ロックで待たされる。
+    let prune = {
+        let db = db.clone();
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            service::builds::prune_old_builds(&db, &storage, project_id, 1, 0).await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    txn.commit().await.expect("commit");
+
+    let deleted = prune.await.expect("join prune").expect("prune");
+    assert_eq!(deleted, 0, "baseline の参照元になった b1 は消さない");
+    assert!(
+        service::builds::get_build(db, b1.0).await.is_ok(),
+        "b1 の行が残る"
+    );
+    assert!(
+        object_exists(storage, &b1.2).await,
+        "現行 baseline が参照する実体が残る"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prune_is_noop_when_retention_is_unlimited() {
     let app = TestApp::new().await;
