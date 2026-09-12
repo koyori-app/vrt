@@ -11,8 +11,8 @@ use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DbBackend, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-    prelude::Uuid, sea_query::Query,
+    DbBackend, EntityTrait, Iterable, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    Statement, prelude::Uuid,
 };
 
 use common::db::with_transaction;
@@ -874,13 +874,14 @@ pub async fn apply_counts<C: ConnectionTrait>(
 
 /// `mark_failed` が上書きしてよい進行中の状態。
 ///
-/// ここに載っていない状態（終端 + `changes_detected`）は書き換えない。
-const FAILABLE_STATUSES: [BuildStatus; 4] = [
-    BuildStatus::Pending,
-    BuildStatus::Queued,
-    BuildStatus::Rendering,
-    BuildStatus::Processing,
-];
+/// 列挙を手で持たず「終端でもパイプライン完走でもない」から導く。状態を増やしたとき
+/// 既定で書ける側に入れるため——手で足す形だと足し忘れがそのまま `mark_failed` の
+/// 黙った no-op になり、進行中のまま残ったビルドを [`retry_failed`] でも回収できない。
+fn failable_statuses() -> Vec<BuildStatus> {
+    BuildStatus::iter()
+        .filter(|status| !status.is_terminal() && !status.completes_pipeline())
+        .collect()
+}
 
 /// ジョブが回復不能なエラーで落ちたときの終着点。
 ///
@@ -936,7 +937,7 @@ pub async fn mark_failed<C: ConnectionTrait>(
             sea_orm::sea_query::Expr::value(None::<chrono::DateTime<chrono::FixedOffset>>),
         )
         .filter(builds::Column::Id.eq(build_id))
-        .filter(builds::Column::Status.is_in(FAILABLE_STATUSES))
+        .filter(builds::Column::Status.is_in(failable_statuses()))
         .exec(db)
         .await?;
 
@@ -1810,12 +1811,7 @@ pub async fn prune_old_builds(
 
     // terminal 状態のビルドを新しい順に取得する。changes_detected は含めない
     // （レビュー待ちでパイプラインは終わっていないため、is_terminal と揃える）。
-    let terminal = [
-        BuildStatus::Passed,
-        BuildStatus::Failed,
-        BuildStatus::Approved,
-        BuildStatus::Rejected,
-    ];
+    let terminal: Vec<BuildStatus> = BuildStatus::iter().filter(|s| s.is_terminal()).collect();
     let builds = builds::Entity::find()
         .filter(builds::Column::ProjectId.eq(project_id))
         .filter(builds::Column::Status.is_in(terminal))
@@ -1846,80 +1842,85 @@ pub async fn prune_old_builds(
             continue;
         }
 
-        // ストレージキーは DB 削除で cascade 消去される前に集めておく。
-        let shots = screenshots::Entity::find()
-            .filter(screenshots::Column::BuildId.eq(build.id))
-            .all(db)
-            .await?;
-        let diff_keys: Vec<String> = comparisons::Entity::find()
-            .filter(comparisons::Column::BuildId.eq(build.id))
-            .all(db)
-            .await?
-            .into_iter()
-            .filter_map(|comparison| comparison.diff_storage_key)
-            .collect();
-        let storybook_key = build.storybook_key.clone();
-
-        // 先に DB 行を消す（screenshots / comparisons / build_logs は FK cascade）。
+        // DB 行の削除は候補ごとのトランザクションで行い、最初に build 行を
+        // `FOR UPDATE` してから状態と baseline 参照を読み直す（承認経路と同じ
+        // ロック規約——[`crate::review_lock`]）。
         //
-        // 削除条件は行ロック無しでも安全なように DELETE 自身へ持たせる。上で読んだ
-        // 一覧と保護集合はスナップショットであり、ストレージ I/O を挟むこのループの
-        // 間に「一覧に載った passed ビルドが再比較され、承認されて新しい baseline の
-        // 参照元になる」ところまで進みうる。その行を消すと baseline エントリは
-        // スクリーンショットと同じストレージキーを共有しているので、**現行 baseline の
+        // 条件付き DELETE 一発では足りない。Postgres の READ COMMITTED では、
+        // 行ロック待ちで再開した DELETE は**その行の最新版**で WHERE を評価し直す
+        // 一方、別テーブルを引く副問い合わせは文の開始時スナップショットのままになる。
+        // 承認が先にロックを取っていると、再開した DELETE には「approved へ変わった
+        // build 行」は見えるのに「その承認が作った baseline 行」は見えず、現行
+        // baseline の参照元を消せてしまう。baseline エントリはスクリーンショットと
+        // ストレージキーを共有しているので、続くストレージ削除で**現行 baseline の
         // 実体ごと消える**。
-        let deleted_row = builds::Entity::delete_many()
-            .filter(builds::Column::Id.eq(build.id))
-            .filter(builds::Column::Status.is_in(terminal))
-            .filter(
-                builds::Column::Id.not_in_subquery(
-                    Query::select()
-                        .column(baselines::Column::SourceBuildId)
-                        .from(baselines::Entity)
-                        .and_where(baselines::Column::SourceBuildId.is_not_null())
-                        .to_owned(),
-                ),
-            )
-            .exec(db)
-            .await?;
-        if deleted_row.rows_affected == 0 {
+        //
+        // ロックを取ってから別の文で読み直せば、承認が先なら新しい baseline が見えて
+        // 中止でき、プルーニングが先なら承認側が `NotFound` で中止する。
+        let build_id = build.id;
+        let keys = with_transaction(db, move |txn| {
+            Box::pin(async move {
+                let locked = match crate::review_lock::build(txn, build_id).await {
+                    Ok(locked) => locked,
+                    // 並行する削除に先を越された。
+                    Err(AppError::NotFound) => return Ok(None),
+                    Err(e) => return Err(e),
+                };
+                if !locked.status.is_terminal() {
+                    return Ok(None);
+                }
+                if baselines::Entity::find()
+                    .filter(baselines::Column::SourceBuildId.eq(build_id))
+                    .one(txn)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+
+                // ストレージキーは DB 削除で cascade 消去される前に集めておく。
+                let shot_keys: Vec<String> = screenshots::Entity::find()
+                    .filter(screenshots::Column::BuildId.eq(build_id))
+                    .all(txn)
+                    .await?
+                    .into_iter()
+                    .map(|shot| shot.storage_key)
+                    .collect();
+                let diff_keys: Vec<String> = comparisons::Entity::find()
+                    .filter(comparisons::Column::BuildId.eq(build_id))
+                    .all(txn)
+                    .await?
+                    .into_iter()
+                    .filter_map(|comparison| comparison.diff_storage_key)
+                    .collect();
+
+                // screenshots / comparisons / build_logs は FK cascade で消える。
+                builds::Entity::delete_by_id(build_id).exec(txn).await?;
+
+                Ok(Some((shot_keys, diff_keys, locked.storybook_key)))
+            })
+        })
+        .await?;
+
+        // ストレージ削除は COMMIT 済みの候補にだけ行う。
+        let Some((shot_keys, diff_keys, storybook_key)) = keys else {
             tracing::info!(
-                build_id = %build.id,
+                build_id = %build_id,
                 "skipped pruning a build that stopped being prunable while pruning ran"
             );
             continue;
-        }
+        };
 
         // ストレージ削除はベストエフォート。失敗は警告ログのみで無視する。
-        for shot in &shots {
-            if let Err(e) = storage.delete(&shot.storage_key).await {
-                tracing::warn!(
-                    build_id = %build.id,
-                    key = %shot.storage_key,
-                    error = %e,
-                    "failed to delete pruned screenshot object"
-                );
-            }
-        }
-        for key in &diff_keys {
+        for key in shot_keys.iter().chain(&diff_keys).chain(&storybook_key) {
             if let Err(e) = storage.delete(key).await {
                 tracing::warn!(
-                    build_id = %build.id,
+                    build_id = %build_id,
                     key = %key,
                     error = %e,
-                    "failed to delete pruned diff object"
+                    "failed to delete pruned object"
                 );
             }
-        }
-        if let Some(key) = &storybook_key
-            && let Err(e) = storage.delete(key).await
-        {
-            tracing::warn!(
-                build_id = %build.id,
-                key = %key,
-                error = %e,
-                "failed to delete pruned storybook bundle"
-            );
         }
 
         deleted += 1;
@@ -1968,6 +1969,34 @@ mod tests {
             }
             .has_differences()
         );
+    }
+
+    #[test]
+    fn failable_statuses_cover_in_progress_builds_only() {
+        let failable = failable_statuses();
+        for status in [
+            BuildStatus::Pending,
+            BuildStatus::Queued,
+            BuildStatus::Rendering,
+            BuildStatus::Processing,
+        ] {
+            assert!(
+                failable.contains(&status),
+                "{status:?} には失敗を書けるべき"
+            );
+        }
+        for status in [
+            BuildStatus::Passed,
+            BuildStatus::ChangesDetected,
+            BuildStatus::Failed,
+            BuildStatus::Approved,
+            BuildStatus::Rejected,
+        ] {
+            assert!(
+                !failable.contains(&status),
+                "{status:?} を mark_failed で潰してはいけない"
+            );
+        }
     }
 
     #[test]
