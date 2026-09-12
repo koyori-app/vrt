@@ -3,6 +3,9 @@ use backend::{AppState, server::run};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = backend::settings::load_settings()?;
+    // worker / runner と同じ検証をここでも通す。API だけ不正値を既定値へ落とすと、
+    // ワーカーが起動に失敗している間も API は healthy のまま別の閾値で判定してしまう。
+    let liveness = job::liveness::LivenessConfig::try_from_env()?;
 
     let db = common::db::connect_database(&settings.database_url).await?;
     db.get_schema_registry("entity::*").sync(&db).await?;
@@ -42,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         github_webhook_storage,
         render_build_storage,
         http: http_client,
+        liveness,
     };
     run(state).await?;
 

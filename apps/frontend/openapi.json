@@ -3570,6 +3570,38 @@
         }
       }
     },
+    "/v1/health/queues": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "ジョブキューの状態を返す。認証不要。",
+        "description": "外形監視はセッションを持てないので認証を要求しない。その代わり、\nワーカー ID や接続情報は出さず集計値だけを返す。\n\nこの値でプロセスを落とすことはしない。滞留は「ワーカーが詰まっている」\n場合と「単に混んでいる」場合を区別できず、混雑を障害と誤認して再起動すると\n孤児の再投入で `attempts` を消費して事態を悪化させる。判断は人に残す。",
+        "operationId": "queues_health",
+        "responses": {
+          "200": {
+            "description": "キューごとのワーカーと待ちジョブの状態",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueuesHealthResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "キューの状態を読めませんでした",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/personal_tokens": {
       "get": {
         "tags": [
@@ -7330,6 +7362,64 @@
             "type": "integer",
             "format": "int32",
             "description": "storybook モードのレンダリングに使うビューポート幅（px）。"
+          }
+        }
+      },
+      "QueueHealthResponse": {
+        "type": "object",
+        "description": "キュー 1 本の状態（`/v1/health/queues`）。",
+        "required": [
+          "queue",
+          "live_workers",
+          "waiting_jobs"
+        ],
+        "properties": {
+          "live_workers": {
+            "type": "integer",
+            "format": "int64",
+            "description": "直近にハートビートを打ったワーカー数。0 なら誰も消費していない。"
+          },
+          "newest_heartbeat_age_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "最新ハートビートの古さ（秒）。ワーカーの登録が無ければ null。",
+            "minimum": 0
+          },
+          "oldest_wait_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "その最古の待ち時間（秒）。待ちが無ければ null。",
+            "minimum": 0
+          },
+          "queue": {
+            "type": "string",
+            "description": "キュー名（= `apalis.workers.worker_type`）。"
+          },
+          "waiting_jobs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "一度も取得されていない待ちジョブ数。"
+          }
+        }
+      },
+      "QueuesHealthResponse": {
+        "type": "object",
+        "description": "`/v1/health/queues` の応答。",
+        "required": [
+          "queues"
+        ],
+        "properties": {
+          "queues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueueHealthResponse"
+            }
           }
         }
       },
