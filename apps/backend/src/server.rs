@@ -363,6 +363,7 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     // ハートビート監視はワーカーと同じ apalis 用プールを読む。
     // router へ state を渡す前に取り出しておく。
     let liveness_pool = state.pg_pool.clone();
+    let liveness_config = state.liveness.clone();
 
     let api = router
         .merge(Scalar::with_url("/scalar", openapi.clone()))
@@ -387,7 +388,7 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
 
     if !watched.is_empty() {
         let pool = liveness_pool.clone();
-        let config = job::liveness::LivenessConfig::from_env();
+        let config = liveness_config;
         let monitor_shutdown = shutdown_rx.clone();
         tasks.push(SupervisedTask::new(
             "worker heartbeat monitor",

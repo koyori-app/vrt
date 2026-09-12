@@ -67,12 +67,9 @@ pub struct QueuesHealthResponse {
 pub async fn queues_health(
     axum::extract::State(state): axum::extract::State<crate::AppState>,
 ) -> Result<Json<QueuesHealthResponse>, crate::error::AppError> {
-    let queues = job::liveness::queue_health(
-        &state.pg_pool,
-        job::liveness::LivenessConfig::from_env().stale_after,
-    )
-    .await
-    .map_err(|e| crate::error::AppError::Internal(anyhow::anyhow!("read queue health: {e}")))?;
+    let queues = job::liveness::queue_health(&state.pg_pool, state.liveness.stale_after)
+        .await
+        .map_err(|e| crate::error::AppError::Internal(anyhow::anyhow!("read queue health: {e}")))?;
 
     Ok(Json(QueuesHealthResponse {
         queues: queues
