@@ -20,7 +20,9 @@
 use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DbBackend, Statement, prelude::Uuid,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -44,6 +46,34 @@ pub const WORKER_CONCURRENCY: usize = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareBuildJob {
     pub build_id: Uuid,
+    /// 再比較（[`service::builds::recompare`]）が投入したジョブか。
+    ///
+    /// storybook モードのパイプラインでは `queued` は「レンダリング待ち」を意味し、
+    /// 比較ジョブは `(_, processing)` でしか動かない。再比較は撮影をやり直さず
+    /// `queued` から比較だけを走らせるので、その 1 経路だけを開けるための印。
+    ///
+    /// `serde(default)` は後方互換のため。このフィールドが無い状態で投入された
+    /// 既存ジョブ（ローリングデプロイ中の in-flight）は従来動作になる。
+    #[serde(default)]
+    pub recompare: bool,
+}
+
+impl CompareBuildJob {
+    /// パイプラインの通常経路（finalize / render からの引き渡し / retry）。
+    pub fn new(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: false,
+        }
+    }
+
+    /// 比較が済んだビルドを現行 baseline と突き合わせ直す経路。
+    pub fn recompare(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: true,
+        }
+    }
 }
 
 /// `CompareBuildJob` のストレージ。
@@ -153,7 +183,7 @@ pub async fn enqueue_idempotent(
 /// その場合のみ apalis のリトライに委ねる。
 pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
-    let outcome = match run(build_id, &state).await {
+    let outcome = match run(build_id, job.recompare, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "compare build job failed");
@@ -209,21 +239,80 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
-    let db = &state.db;
+async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), anyhow::Error> {
+    // 比較は comparisons の全削除・再作成を含むため、ビルド単位で直列化する。
+    // apalis の idempotency key は投入側の重複しか抑止せず、queued の回収経路や
+    // 旧形式のジョブとの併走までは防げない。transaction-scoped lock なら、別 worker
+    // / 別プロセスのジョブも同じビルドについて一つずつ比較本体へ進められる。
+    //
+    // ロックはブロッキング版ではなく `try` 版を使う。ロックは比較の全工程
+    // （ストレージ I/O と PNG デコードを含む）にわたって保持されるので、
+    // ブロッキング版だと重複ジョブが先着の全実行時間ぶん待ち続け、
+    // 2 スロットしかない比較ワーカーとプール接続を占有してデプロイ全体の
+    // 比較を止めてしまう。重複ジョブが足せる仕事は無いので、取れなければ即座に終わる。
+    let state = state.clone();
+    let db = state.db.clone();
+    common::db::with_transaction(&db, move |txn| {
+        Box::pin(async move {
+            let acquired = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
+                    [build_id.to_string().into()],
+                ))
+                .await?
+                .map(|row| row.try_get::<bool>("", "acquired"))
+                .transpose()?
+                .unwrap_or(false);
+            if !acquired {
+                tracing::info!(
+                    %build_id,
+                    "skipping compare job: another job is already comparing this build"
+                );
+                return Ok(());
+            }
 
+            run_locked(txn, build_id, recompare, &state).await
+        })
+    })
+    .await
+}
+
+/// 比較本体。`db` は直列化ロックを持つトランザクション。
+///
+/// 進行中に観測されるための書き込み——`processing` への遷移と `build_logs`——だけは
+/// トランザクションではなくプール (`state.db`) へ出す。トランザクションの中に置くと
+/// COMMIT まで他セッションから 1 行も見えず、数分かかる比較のあいだ
+/// `GET /v1/builds/{id}` は `queued` を返し続け、ログ画面は空のまま、
+/// 最後に全部が一度に現れる（失敗時はロールバックで進捗行が消える）。
+///
+/// プール側の書き込みはトランザクションが builds 行を更新する前に済ませるので、
+/// 行ロックで自分自身を待つことはない。
+async fn run_locked<C: ConnectionTrait>(
+    db: &C,
+    build_id: Uuid,
+    recompare: bool,
+    state: &JobState,
+) -> Result<(), anyhow::Error> {
     let build = service::builds::get_build(db, build_id).await?;
     let build = match (build.mode, build.status) {
         // screenshots モードのパイプライン先頭。worker が実際に取得してから
         // processing にするため、UI はキュー待ちと処理中を区別できる。
         (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
-            service::builds::transition(db, build, BuildStatus::Processing).await?
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
+        }
+        // 再比較は撮影をやり直さないので、storybook でも render を挟まず
+        // queued から比較へ入る。この経路を `recompare` でしか開けないのは、
+        // まだレンダリングしていない storybook ビルド（screenshots 0 枚）を
+        // 比較すると「全 removed」を確定させてしまうため。
+        (builds::BuildMode::Storybook, BuildStatus::Queued) if recompare => {
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
         }
         // storybook の render 完了後に積まれた compare job と、旧バージョンが
         // finalize 時点で Processing にしたジョブはそのまま続行する。
         (_, BuildStatus::Processing) => build,
         (mode, status) => {
-            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            tracing::info!(%build_id, ?mode, ?status, recompare, "skipping compare job outside its processing phase");
             return Ok(());
         }
     };
@@ -266,6 +355,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         Some(plan) => {
             materialize_carry_forward(
                 state,
+                db,
                 &project,
                 &build,
                 &baseline_entries,
@@ -287,7 +377,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     // 比較対象数が確定した時点で開始行を残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!("compare started: {total} comparisons"),
@@ -352,7 +442,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         processed += 1;
         if processed.is_multiple_of(10) || processed == total {
             service::build_logs::append(
-                db,
+                &state.db,
                 build_id,
                 LogLevel::Info,
                 format!("compared {processed}/{total}"),
@@ -363,7 +453,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     if ambiguous_missing_count > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build_id,
             LogLevel::Info,
             format!(
@@ -384,7 +474,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     // 完了サマリ。内訳を 1 行で残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!(
@@ -478,15 +568,6 @@ impl Outcome {
     }
 }
 
-/// スクリーンショットが baseline 流用の複製（`metadata.reused == true`）か。
-fn is_reused(shot: &screenshots::Model) -> bool {
-    shot.metadata
-        .as_ref()
-        .and_then(|m| m.get("reused"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 /// 一時的でありうる失敗（ストレージ IO 等）を短いバックオフ付きでやり直す。
 ///
 /// carry-forward は 1 エントリごとに download → upload → insert の 3 段で、
@@ -560,6 +641,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn materialize_carry_forward(
     state: &JobState,
+    db: &impl ConnectionTrait,
     project: &projects::Model,
     build: &builds::Model,
     baseline_entries: &[baseline_entries::Model],
@@ -570,14 +652,12 @@ async fn materialize_carry_forward(
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-    let db = &state.db;
-
     let selected = plan.selected_set();
     let manifest = plan.manifest_set();
 
     let uploaded: HashSet<&str> = shots
         .iter()
-        .filter(|s| !is_reused(s))
+        .filter(|s| !service::screenshots::is_reused(s))
         .map(|s| s.name.as_str())
         .collect();
     if uploaded != selected {
@@ -696,7 +776,7 @@ async fn materialize_carry_forward(
 
     if carried > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!("carried forward {carried} baseline screenshots outside the planned set"),
@@ -712,7 +792,7 @@ async fn materialize_carry_forward(
             "reporting as removed"
         };
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!(

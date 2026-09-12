@@ -66,7 +66,15 @@ pub enum BuildFailureOrigin {
 ///
 /// 再実行（failed のみ）:
 /// failed ──retry──▶ queued ──worker──▶ rendering（storybook） | processing（screenshots）
+///
+/// 再比較（比較が済んだビルドを現行 baseline と突き合わせ直す）:
+/// changes_detected | passed ──recompare──▶ queued ──worker──▶ processing
 /// ```
+///
+/// 再比較は撮影をやり直さない（screenshots は残っているので比較だけ差し替える）。
+/// 入口は [`service::builds::recompare`] だけで、部分撮影ビルドは弾かれる——
+/// 旧 baseline から複製した流用スクリーンショットが混ざったまま新しい baseline と
+/// 比較すると、撮っていない story に偽の差分が出る。
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize, ToSchema,
 )]
@@ -161,9 +169,13 @@ impl BuildStatus {
             // 差分ゼロで通ったビルドも、baseline 昇格のために明示承認できる。
             (Passed, Approved) => true,
             // 失敗したビルドの再実行。どちらへ戻るかはモードで決まる
-            // （`service::builds::retry_failed` が振り分ける）。approved /
-            // rejected / passed からは戻れない——やり直しの入口は failed だけ。
+            // （`service::builds::retry_failed` が振り分ける）。
             (Failed, Queued) => true,
+            // 比較が済んだビルドの再比較（`service::builds::recompare`）。
+            // baseline が動いて承認できなくなったビルドを、撮り直さずに
+            // 現行 baseline と突き合わせ直すための入口。approved / rejected
+            // からは戻れない——レビューが確定した結果は書き換えない。
+            (ChangesDetected | Passed, Queued) => true,
             _ => false,
         }
     }
@@ -198,10 +210,25 @@ mod tests {
         assert!(!Failed.can_transition_to(Passed));
         assert!(!Failed.can_transition_to(ChangesDetected));
         assert!(!Failed.can_transition_to(Pending));
-        // failed 以外の終端からは再実行できない。
-        assert!(!Passed.can_transition_to(Queued));
+        // レビューが確定した終端からは戻れない。
         assert!(!Approved.can_transition_to(Queued));
         assert!(!Rejected.can_transition_to(Queued));
+    }
+
+    #[test]
+    fn recompare_transitions() {
+        // 比較が済んだビルドは、撮り直さずに比較だけやり直せる。
+        assert!(ChangesDetected.can_transition_to(Queued));
+        assert!(Passed.can_transition_to(Queued));
+        // 再比較で戻れるのは queued だけ。結果状態を直接書き換える向きは無い。
+        assert!(!ChangesDetected.can_transition_to(Processing));
+        assert!(!ChangesDetected.can_transition_to(Passed));
+        assert!(!Passed.can_transition_to(ChangesDetected));
+        assert!(!Passed.can_transition_to(Processing));
+        // 処理中のビルドは queued へ巻き戻せない（二重投入の入口を作らない）。
+        // pending → queued は finalize の正規経路なのでここでは扱わない。
+        assert!(!Processing.can_transition_to(Queued));
+        assert!(!Rendering.can_transition_to(Queued));
     }
 
     #[test]

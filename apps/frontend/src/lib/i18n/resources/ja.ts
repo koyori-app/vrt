@@ -251,6 +251,11 @@ export const ja: Resources = {
     retry: "ビルドを再実行",
     retryStarted: "ビルドの再実行を開始しました",
     retryFailed: "ビルドを再実行できませんでした",
+    recompare: "現行 baseline と比較し直す",
+    recompareStarted: "再比較を開始しました",
+    recompareFailed: "再比較を開始できませんでした",
+    confirmRecompare:
+      "このビルドを現行 baseline と比較し直しますか？ 比較結果は作り直されるため、このビルドに記録済みのレビューは失われます。",
     approve: "ビルドを承認",
     approved: "ビルドを承認しました — スクリーンショットを新しいベースラインにしました",
     approveFailed: "ビルドを承認できませんでした",

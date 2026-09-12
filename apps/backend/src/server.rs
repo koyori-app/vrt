@@ -273,6 +273,36 @@ async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) -> Result<(), st
     Ok(())
 }
 
+/// worker の終了が停止要求に伴うものかを判定する。
+///
+/// `watcher.first_exit()` と shutdown 通知は同時に ready になり得るため、
+/// `select!` の選択結果だけで異常終了を判定してはいけない。worker は停止要求を
+/// 観測してから正常終了するので、終了通知を受けた直後にフラグを再確認すれば、
+/// graceful shutdown との競合を安全に正常扱いできる。
+fn is_unexpected_worker_exit(shutdown: &watch::Receiver<bool>) -> bool {
+    !*shutdown.borrow()
+}
+
+/// worker の終了と停止要求のどちらが先に来たかを見張り、異常終了なら理由を返す。
+///
+/// `run` の `tokio::spawn` から切り出してあるのは、この分岐そのものを
+/// テストから直接叩けるようにするため（フラグの極性だけを見るテストは、
+/// 判定対象に非決定性が無いので恒真になる）。
+async fn watch_for_failure(
+    watcher: &mut TaskWatcher,
+    shutdown: watch::Receiver<bool>,
+) -> Option<String> {
+    let flag = shutdown.clone();
+    tokio::select! {
+        reason = watcher.first_exit() => {
+            // shutdown 通知と worker の正常終了は同時に ready になり得る。
+            // 終了通知後のフラグ確認で、停止要求に伴う終了を failure と区別する。
+            is_unexpected_worker_exit(&flag).then_some(reason)
+        }
+        _ = wait_for_shutdown(shutdown) => None,
+    }
+}
+
 pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let log_filter = tracing_subscriber::EnvFilter::new(
         std::env::var("RUST_LOG").unwrap_or_else(|_| "info,sqlx=warn".into()),
@@ -404,12 +434,12 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let watch_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut watcher = TaskWatcher::new(tasks);
-        let failed = tokio::select! {
-            reason = watcher.first_exit() => {
+        let failed = match watch_for_failure(&mut watcher, watch_shutdown).await {
+            Some(reason) => {
                 let _ = failure_tx.send(reason);
                 true
             }
-            _ = wait_for_shutdown(watch_shutdown) => false,
+            None => false,
         };
         if failed {
             // 異常経路だけ期限を切る。戻ってこないジョブを待ち続けると
@@ -481,5 +511,55 @@ async fn shutdown_signal_inner() {
     tokio::select! {
         () = ctrl_c => warn!("received Ctrl+C"),
         () = terminate => warn!("received SIGTERM"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// shutdown 通知を受けて正常終了した worker が、監視側の failure に化けない
+    /// ことを、通知と終了が競合する形で繰り返し確認する。
+    #[tokio::test]
+    async fn worker_exit_after_shutdown_is_not_reported_as_failure() {
+        for attempt in 0..32 {
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut watcher = TaskWatcher::new(vec![SupervisedTask::new(
+                "compare build worker",
+                tokio::spawn({
+                    let mut shutdown = shutdown_rx.clone();
+                    async move {
+                        let _ = shutdown.changed().await;
+                        Ok::<(), std::io::Error>(())
+                    }
+                }),
+            )]);
+
+            shutdown_tx.send(true).expect("shutdown receiver exists");
+            assert!(
+                watch_for_failure(&mut watcher, shutdown_rx).await.is_none(),
+                "graceful worker exit was reported as failure (attempt {attempt})"
+            );
+            watcher.drain().await;
+        }
+    }
+
+    /// 停止要求が無いまま worker が終わった場合は、理由つきで failure になる。
+    #[tokio::test]
+    async fn worker_exit_without_shutdown_is_reported_as_failure() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut watcher = TaskWatcher::new(vec![SupervisedTask::new(
+            "compare build worker",
+            tokio::spawn(async { Ok::<(), std::io::Error>(()) }),
+        )]);
+
+        let reason = watch_for_failure(&mut watcher, shutdown_rx)
+            .await
+            .expect("worker exit without shutdown must be a failure");
+        assert!(
+            reason.contains("compare build worker"),
+            "failure reason must name the task: {reason}"
+        );
+        watcher.drain().await;
     }
 }

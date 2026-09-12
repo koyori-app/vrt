@@ -382,6 +382,67 @@ pub async fn reject_build(
 #[axum::debug_handler]
 #[utoipa::path(
     post,
+    path = "/{build_id}/recompare",
+    tag = "Builds",
+    summary = "ビルドを現行 baseline と比較し直す",
+    description = "admin 以上が必要。比較が済んだビルド（`changes_detected` / `passed`）を、\
+                   撮影し直さずに現行 baseline と突き合わせ直す。レビュー待ちの間に別の\
+                   ビルドが承認されて baseline が動き、承認できなくなったビルドの救済用。\
+                   \
+                   比較結果は作り直されるため、このビルドに記録済みのレビュー\
+                   （承認・却下）は失われる。baseline が動いていない場合、部分撮影の\
+                   ビルドの場合、比較がまだ終わっていない場合は 409。",
+    params(("build_id" = Uuid, Path, description = "ビルドID")),
+    responses(
+        (status = 200, description = "再比較を開始したビルド", body = BuildResponse),
+        (status = 409, description = "再比較できない状態です", body = ServerError),
+        CrudErrors,
+    )
+)]
+pub async fn recompare_build(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(build_id): Path<Uuid>,
+) -> Result<Json<BuildResponse>, AppError> {
+    auth.require_session()?;
+    let (build, _) =
+        load_build_with_role(&state, build_id, auth.user_id, TenantRole::Admin).await?;
+
+    // 状態検査・カウントと baseline のリセットは行ロック下で recompare が行う。
+    let build = build_service::recompare(&state.db, build.id).await?;
+
+    // 進捗ログの区切り。ここでの失敗は握り潰す——遷移をコミットしたあとに
+    // エラーを返すと、ジョブが積まれないまま queued のビルドだけが残る
+    // （ログ 1 行のために回収作業を増やさない）。
+    if let Err(e) = log_service::append(
+        &state.db,
+        build.id,
+        log_service::LogLevel::Info,
+        "recompare requested; previous comparisons were discarded",
+    )
+    .await
+    {
+        tracing::warn!(build_id = %build.id, error = %e, "failed to log recompare request");
+    }
+
+    // 再比較であることをジョブに伝える。storybook モードは通常 `queued` を
+    // レンダリング待ちとして扱うため、この印が無いと比較ジョブが素通りする。
+    job::compare_build::enqueue(
+        &state.compare_build_storage,
+        job::CompareBuildJob::recompare(build.id),
+    )
+    .await
+    .map_err(AppError::Internal)?;
+
+    // queued を GitHub の pending ステータスとして見せる（finalize / retry と同じ）。
+    job::github_status::enqueue_best_effort(&state.github_status_storage, build.id).await;
+
+    Ok(Json(build.into()))
+}
+
+#[axum::debug_handler]
+#[utoipa::path(
+    post,
     path = "/{build_id}/retry",
     tag = "Builds",
     summary = "失敗したビルドを再実行",
@@ -445,7 +506,7 @@ pub async fn retry_build(
         build_service::RetryTarget::Compare => {
             job::compare_build::enqueue(
                 &state.compare_build_storage,
-                job::CompareBuildJob { build_id: build.id },
+                job::CompareBuildJob::new(build.id),
             )
             .await
             .map_err(AppError::Internal)?;
