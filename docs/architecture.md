@@ -10,8 +10,12 @@
                  ▼
              backend (axum, :3400) ──▶ Postgres
                  │                └──▶ Valkey（セッション / OAuth state）
-                 ├─ apalis ワーカー（compare_build / github_status / github_webhook）
+                 ├─ apalis ワーカー（既定。JOB_WORKERS_ENABLED=false で vrt-worker へ委ねる）
                  └─ ストレージ（local ディレクトリ or S3 互換）
+
+             vrt-worker ──▶ Postgres の compare_build / github_status / github_webhook キュー
+                 ├─ Valkey（インストールトークンのキャッシュ）
+                 └─ backend と同じストレージ
 
              vrt-runner ──▶ Postgres の render_build キュー
                  ├─ ヘッドレス Chromium（CHROMIUM_PATH）
@@ -280,6 +284,22 @@ HTTP リクエストはそこで完了する。worker が取得した時点で `
 どのストーリーで落ちたかが入る（Chromium が無い / 起動できない場合も同じ経路で
 `failed` になり、ワーカーは死なない）。ブラウザは 1 ジョブ = 1 インスタンス、
 ワーカーの同時実行数は 1、ブラウザ内の story page 同時実行数は 2 に固定してある。
+
+### 独立ワーカー
+
+`vrt-worker` は `compare_build` / `github_status` / `github_webhook` を消費する独立
+バイナリで、API に `JOB_WORKERS_ENABLED=false` を設定すると API 内のワーカーは起動しない。
+分けている理由は復帰のさせ方にある。apalis のワーカーはハートビートに失敗した時点で走行
+ループを抜けるため、止まったらプロセスを非ゼロ終了させて restart policy に戻してもらう。
+API に同居させるとこの再起動が HTTP まで巻き添えにする。
+
+ワーカーが読む設定は API より狭く、`DATABASE_URL`・`REDIS_URL`・`APP_URL`・ストレージ設定・
+GitHub App の資格情報だけで、PAT の署名鍵や OAuth の資格情報は渡さない。
+停止検知の設計は [worker-supervision.md](worker-supervision.md) に、キューごとの状態は
+`GET /v1/health/queues`（認証不要・集計値のみ）で読める。
+
+切り替えは worker サービスを起動して登録を確認してから API を `false` にする。
+順序を逆にすると、その間だけ誰もキューを消費しない。
 
 ### 独立 runner
 

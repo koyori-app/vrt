@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use entity::{builds, projects, tenants};
 use service::github::{
-    CommentWrite, GithubApiError, STATUS_CONTEXT, build_target_url, github_app, installation_token,
-    latest_status_build_number, post_commit_status, pr_comment_body, pr_comment_marker,
-    status_for_build, upsert_pr_comment,
+    CommentWrite, GithubApiError, STATUS_CONTEXT, build_target_url, github_app_from_parts,
+    installation_token, latest_status_build_number, post_commit_status, pr_comment_body,
+    pr_comment_marker, status_for_build, upsert_pr_comment,
 };
 
 use crate::JobState;
@@ -145,7 +145,12 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
         return Ok(());
     };
 
-    let Some(app) = github_app(&state.settings, &state.http) else {
+    let Some(app) = github_app_from_parts(
+        state.settings.github_app_id,
+        state.settings.github_app_private_key_pem.as_deref(),
+        &state.settings.github_api_base_url,
+        &state.http,
+    ) else {
         tracing::warn!(
             %build_id,
             "github status job: github app is not configured (GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY_PEM)"
@@ -178,7 +183,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
     // 比べないよう、slug の一致は latest_status_build_number 側で確認する。
     let existing_status_number = latest_status_build_number(
         &state.http,
-        &state.settings.github_api_base_url(),
+        &state.settings.github_api_base_url,
         &token,
         repo,
         &build.commit_sha,
@@ -202,7 +207,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
     } else {
         post_commit_status(
             &state.http,
-            &state.settings.github_api_base_url(),
+            &state.settings.github_api_base_url,
             &token,
             repo,
             &build.commit_sha,
@@ -236,7 +241,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), GithubApiError> {
         );
         let outcome = upsert_pr_comment(
             &state.http,
-            &state.settings.github_api_base_url(),
+            &state.settings.github_api_base_url,
             &token,
             repo,
             pr_number,

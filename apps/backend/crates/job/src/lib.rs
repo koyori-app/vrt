@@ -3,11 +3,12 @@
 pub mod compare_build;
 pub mod github_status;
 pub mod github_webhook;
+pub mod liveness;
 pub mod render_build;
 
 use std::sync::Arc;
 
-use apalis_postgres::PgPool;
+pub use apalis_postgres::PgPool;
 
 pub use compare_build::{CompareBuildJob, CompareBuildStorage};
 pub use github_status::{GithubStatusJob, GithubStatusStorage};
@@ -15,7 +16,7 @@ pub use github_webhook::{GithubWebhookJob, GithubWebhookStorage};
 pub use render_build::{RenderBuildJob, RenderBuildStorage};
 use sea_orm::DatabaseConnection;
 
-use common::settings::Settings;
+use common::settings::JobSettings;
 use service::storage::StorageBackend;
 
 /// ワーカーが必要とする依存の束。
@@ -23,7 +24,9 @@ use service::storage::StorageBackend;
 /// ワーカーは実際に使う要素だけをここから受け取る。
 #[derive(Clone)]
 pub struct JobState {
-    pub settings: Arc<Settings>,
+    /// ワーカーが読む設定だけを持つ（`Settings` 全体は渡さない。理由は
+    /// [`JobSettings`] の説明を参照）。
+    pub settings: JobSettings,
     pub db: DatabaseConnection,
     pub redis_client: common::cache::redis::RedisConnection,
     pub storage: Arc<dyn StorageBackend>,

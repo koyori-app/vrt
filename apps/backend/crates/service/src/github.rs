@@ -122,14 +122,32 @@ impl std::fmt::Display for CommitState {
 /// （＝ GitHub 連携は無効）。秘密鍵の妥当性はここでは検証しない
 /// （JWT 発行時にエラーになる）。
 pub fn github_app(settings: &Settings, http: &reqwest::Client) -> Option<GithubApp> {
-    let app_id = settings.github_app_id?;
-    let pem = settings.github_app_private_key_pem.as_ref()?;
+    github_app_from_parts(
+        settings.github_app_id,
+        settings.github_app_private_key_pem.as_deref(),
+        &settings.github_api_base_url(),
+        http,
+    )
+}
+
+/// `Settings` を持たない呼び出し元（ジョブワーカー）向けに、資格情報だけから組む。
+///
+/// ワーカープロセスへ `Settings` を丸ごと渡さずに済ませるための入口で、
+/// 判定条件は [`github_app`] と同じ（App ID と秘密鍵の両方が必要）。
+pub fn github_app_from_parts(
+    app_id: Option<u64>,
+    private_key_pem: Option<&str>,
+    api_base_url: &str,
+    http: &reqwest::Client,
+) -> Option<GithubApp> {
+    let app_id = app_id?;
+    let pem = private_key_pem?;
     Some(
         GithubApp::new(
             http.clone(),
-            GithubAppCredentials::new(app_id.to_string(), pem.clone()),
+            GithubAppCredentials::new(app_id.to_string(), pem.to_string()),
         )
-        .with_api_base(settings.github_api_base_url())
+        .with_api_base(api_base_url.to_string())
         .with_user_agent(USER_AGENT),
     )
 }
@@ -1310,6 +1328,7 @@ mod tests {
             storage_min_retention_days: 0,
             chromium_path: None,
             render_worker_enabled: true,
+            job_workers_enabled: true,
             storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
@@ -1356,6 +1375,7 @@ mod tests {
             storage_min_retention_days: 0,
             chromium_path: None,
             render_worker_enabled: true,
+            job_workers_enabled: true,
             storybook_render_enabled_override: None,
             test_login_enabled: false,
         };
