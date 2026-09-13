@@ -638,6 +638,7 @@ impl TestApp {
             github_webhook_storage,
             render_build_storage,
             http: http_client,
+            liveness: job::liveness::LivenessConfig::default(),
         };
 
         let session_store = SessionStore::<SessionRedisPool>::new(

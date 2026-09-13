@@ -38,4 +38,7 @@ pub struct AppState {
     pub render_build_storage: Arc<RenderBuildStorage>,
     /// 外部 API 呼び出し用の共有 HTTP クライアント（GitHub API）。
     pub http: reqwest::Client,
+    /// 起動時に検証済みのハートビート閾値。監視タスクと `/v1/health/queues` が
+    /// 同じ値を読むように、ここ 1 か所で持つ。
+    pub liveness: job::liveness::LivenessConfig,
 }
