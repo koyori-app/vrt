@@ -43,6 +43,33 @@ pub const MAX_RETRIES: usize = 3;
 /// ワーカーの同時実行数。diff は CPU バウンドなので控えめにする。
 pub const WORKER_CONCURRENCY: usize = 2;
 
+/// 比較ワーカーが必要とする DB プールの最小本数。
+///
+/// 比較ジョブ 1 件は、直列化ロックを持つトランザクションの接続を全工程
+/// （ストレージ I/O と PNG デコードを含む）にわたって握ったまま、進捗の書き込み
+/// （`processing` 遷移と `build_logs`）でプールからもう 1 本取る（理由は
+/// [`run_locked`] のドキュメントを参照）。つまり同時実行スロットぶんの
+/// トランザクション接続に加えて、最低 1 本の空きが要る。
+pub const MIN_DB_CONNECTIONS: u32 = WORKER_CONCURRENCY as u32 + 1;
+
+/// 比較ワーカーを起動してよいプール設定かを検査する。
+///
+/// 足りないまま起動すると、進捗の書き込みがプールの `acquire_timeout` まで待たされて
+/// 比較が必ず失敗する。起動時に弾いて、実行時の `PoolTimedOut` ではなく設定エラーとして
+/// 見えるようにする。
+pub fn ensure_db_pool_headroom(max_connections: u32) -> Result<(), String> {
+    if max_connections < MIN_DB_CONNECTIONS {
+        return Err(format!(
+            "DATABASE_MAX_CONNECTIONS={max_connections} is too small to run the compare worker: \
+             it needs at least {MIN_DB_CONNECTIONS} connections \
+             ({WORKER_CONCURRENCY} for the per-build transactions plus 1 for progress writes). \
+             raise DATABASE_MAX_CONNECTIONS to {MIN_DB_CONNECTIONS} or more, \
+             or disable the compare worker on this process."
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareBuildJob {
     pub build_id: Uuid,
@@ -999,6 +1026,16 @@ async fn compare_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_pool_headroom_requires_a_spare_connection_per_compare_slot() {
+        // 同時実行スロットぶんのトランザクション接続だけでは、進捗の書き込みが
+        // 取れずに必ずタイムアウトする。境界の両側を押さえる。
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS - 1).is_err());
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS).is_ok());
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS + 1).is_ok());
+        assert!(ensure_db_pool_headroom(1).is_err());
+    }
 
     fn shot(name: &str) -> screenshots::Model {
         screenshots::Model {
