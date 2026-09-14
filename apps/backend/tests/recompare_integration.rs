@@ -19,7 +19,7 @@ mod common;
 use std::time::Duration;
 
 use common::TestApp;
-use entity::{builds, comparisons, scopes::Scope};
+use entity::{builds, comparisons, scopes::Scope, screenshots};
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
@@ -40,6 +40,7 @@ fn png(color: [u8; 4]) -> Vec<u8> {
 
 const RED: [u8; 4] = [220, 30, 30, 255];
 const BLUE: [u8; 4] = [30, 30, 220, 255];
+const GREEN: [u8; 4] = [30, 200, 30, 255];
 
 struct Fixture {
     app: TestApp,
@@ -234,6 +235,19 @@ impl Fixture {
             .collect()
     }
 
+    /// ビルドの指定ショットのストレージキー。承認で作られる baseline エントリは
+    /// このキーをそのまま共有するので、baseline 実体を消すのにも使える。
+    async fn screenshot_key(&self, build_id: Uuid, name: &str) -> String {
+        screenshots::Entity::find()
+            .filter(screenshots::Column::BuildId.eq(build_id))
+            .filter(screenshots::Column::Name.eq(name))
+            .one(&self.app.state.db)
+            .await
+            .expect("load screenshot")
+            .expect("screenshot exists")
+            .storage_key
+    }
+
     async fn comparisons(&self, build_id: Uuid) -> Vec<Value> {
         let res = self
             .app
@@ -251,6 +265,48 @@ fn build_id_of(build: &Value) -> Uuid {
 
 async fn object_exists(storage: &std::sync::Arc<dyn StorageBackend>, key: &str) -> bool {
     storage.get_stream(key).await.is_ok()
+}
+
+/// 差分 PNG キー（`.../builds/{id}/diffs/{comparison}.png`）が指す実ディレクトリ。
+fn diffs_dir_of(key: &str) -> std::path::PathBuf {
+    let root = std::env::var("LOCAL_UPLOAD_DIR").unwrap_or_else(|_| "./uploads".into());
+    std::path::Path::new(&root).join(
+        std::path::Path::new(key)
+            .parent()
+            .expect("diff key has a directory"),
+    )
+}
+
+/// ディレクトリに実在する差分 PNG のファイル名（ソート済み）。
+fn diff_objects(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read diffs dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// ストレージキーのファイル名部分（ソート済み）。
+fn file_names_of(keys: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = keys
+        .iter()
+        .map(|key| {
+            std::path::Path::new(key)
+                .file_name()
+                .expect("key has a file name")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 async fn error_message(res: reqwest::Response) -> String {
@@ -363,6 +419,74 @@ async fn recompare_deletes_the_diff_images_it_replaces() {
     assert!(
         !object_exists(&fx.app.state.storage, &stale_key).await,
         "置き換えられた差分 PNG はストレージにも残らない"
+    );
+}
+
+/// 途中で失敗した比較は、その実行で上げた差分 PNG を置き去りにしない。
+///
+/// 後始末は成功なら「置き換えた古い PNG」を、失敗なら「今回上げた PNG」を消す。
+/// 成功側だけを固定していると、この 2 本を取り違えても——生きている PNG を消して
+/// 孤児を残す、最悪の入れ替え——テストは通ってしまう。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_compare_deletes_the_diff_images_it_uploaded() {
+    let fx = setup().await;
+
+    let first = fx
+        .run_build("sha1", &[("a-home", RED), ("z-broken", RED)])
+        .await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    // a-home だけ差し替えたビルド。あとで承認して baseline を進める。
+    let second = fx
+        .run_build("sha2", &[("a-home", BLUE), ("z-broken", RED)])
+        .await;
+    let second_id = build_id_of(&second);
+
+    // 取り残される側。a-home が changed なので差分 PNG を 1 枚持つ。
+    let third = fx
+        .run_build("sha3", &[("a-home", GREEN), ("z-broken", RED)])
+        .await;
+    let third_id = build_id_of(&third);
+    assert_eq!(third["status"], "changes_detected");
+
+    let live_keys = fx.diff_keys(third_id).await;
+    assert_eq!(live_keys.len(), 1, "a-home だけが差分 PNG を持つ");
+    let diffs_dir = diffs_dir_of(&live_keys[0]);
+
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve the second build");
+
+    // 新しい baseline の z-broken の実体を消す。baseline エントリはスクリーンショットと
+    // ストレージキーを共有するので、これで再比較は z-broken の整合性検査で必ず落ちる。
+    // 比較は名前順なので、落ちる時点で a-home の差分 PNG は既に上がっている。
+    let broken_key = fx.screenshot_key(second_id, "z-broken").await;
+    fx.app
+        .state
+        .storage
+        .delete(&broken_key)
+        .await
+        .expect("delete the baseline object");
+
+    let res = fx.recompare(third_id).await;
+    assert_eq!(res.status(), StatusCode::OK, "recompare the stranded build");
+    let build = fx.wait_for_terminal(third_id).await;
+    assert_eq!(
+        build["status"], "failed",
+        "baseline の実体が欠けた比較は失敗する"
+    );
+
+    assert_eq!(
+        fx.diff_keys(third_id).await,
+        live_keys,
+        "失敗した比較はロールバックされ、比較行は再比較前のまま"
+    );
+    assert_eq!(
+        diff_objects(&diffs_dir),
+        file_names_of(&live_keys),
+        "ディスクに残る差分 PNG は比較行が指すものだけ（失敗した実行の分は消える）"
     );
 }
 
