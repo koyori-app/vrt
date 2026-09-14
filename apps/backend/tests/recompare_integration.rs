@@ -19,11 +19,12 @@ mod common;
 use std::time::Duration;
 
 use common::TestApp;
-use entity::{builds, scopes::Scope};
+use entity::{builds, comparisons, scopes::Scope};
 use image::{Rgba, RgbaImage};
 use reqwest::StatusCode;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
+use service::storage::StorageBackend;
 use uuid::Uuid;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -221,6 +222,18 @@ impl Fixture {
             .await
     }
 
+    /// 比較行が指す差分 PNG のキー（`unchanged` などキーを持たない行は含まない）。
+    async fn diff_keys(&self, build_id: Uuid) -> Vec<String> {
+        comparisons::Entity::find()
+            .filter(comparisons::Column::BuildId.eq(build_id))
+            .all(&self.app.state.db)
+            .await
+            .expect("load comparisons")
+            .into_iter()
+            .filter_map(|comparison| comparison.diff_storage_key)
+            .collect()
+    }
+
     async fn comparisons(&self, build_id: Uuid) -> Vec<Value> {
         let res = self
             .app
@@ -234,6 +247,10 @@ impl Fixture {
 
 fn build_id_of(build: &Value) -> Uuid {
     build["id"].as_str().expect("build id").parse().unwrap()
+}
+
+async fn object_exists(storage: &std::sync::Arc<dyn StorageBackend>, key: &str) -> bool {
+    storage.get_stream(key).await.is_ok()
 }
 
 async fn error_message(res: reqwest::Response) -> String {
@@ -302,6 +319,51 @@ async fn recompare_lets_a_stranded_build_be_approved_against_the_new_baseline() 
 
     let res = fx.approve(third_id, json!({})).await;
     assert_eq!(res.status(), StatusCode::OK, "再比較したビルドは承認できる");
+}
+
+/// 置き換えた差分 PNG はストレージからも消える。
+///
+/// 比較行を消すだけだとキーを辿る手立てが無くなり、ビルドのプルーニングからも
+/// 届かない孤児が再比較のたびに積み上がる。
+#[tokio::test(flavor = "multi_thread")]
+async fn recompare_deletes_the_diff_images_it_replaces() {
+    let fx = setup().await;
+
+    let first = fx.run_build("sha1", &[("home", RED)]).await;
+    let res = fx
+        .approve(build_id_of(&first), json!({ "force": true }))
+        .await;
+    assert_eq!(res.status(), StatusCode::OK, "approve first build");
+
+    let second = fx.run_build("sha2", &[("home", BLUE)]).await;
+    let third = fx.run_build("sha3", &[("home", BLUE)]).await;
+    let second_id = build_id_of(&second);
+    let third_id = build_id_of(&third);
+    assert_eq!(third["status"], "changes_detected");
+
+    let mut keys = fx.diff_keys(third_id).await;
+    let stale_key = keys.pop().expect("changed な比較は差分 PNG を持つ");
+    assert!(
+        object_exists(&fx.app.state.storage, &stale_key).await,
+        "比較直後の差分 PNG は存在する"
+    );
+
+    let res = fx.approve(second_id, json!({ "force": true })).await;
+    assert_eq!(res.status(), StatusCode::OK, "approve the second build");
+
+    let res = fx.recompare(third_id).await;
+    assert_eq!(res.status(), StatusCode::OK, "recompare the stranded build");
+    let build = fx.wait_for_terminal(third_id).await;
+    assert_eq!(build["status"], "passed");
+
+    assert!(
+        fx.diff_keys(third_id).await.is_empty(),
+        "unchanged に変わった比較は差分 PNG を持たない"
+    );
+    assert!(
+        !object_exists(&fx.app.state.storage, &stale_key).await,
+        "置き換えられた差分 PNG はストレージにも残らない"
+    );
 }
 
 /// baseline が動いていないなら、やり直しても結果は同じ。レビューだけ失われるので止める。

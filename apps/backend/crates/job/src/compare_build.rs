@@ -25,7 +25,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use entity::{
     baseline_entries, builds, builds::BuildStatus, comparisons, comparisons::ComparisonStatus,
@@ -250,9 +250,12 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
     // ブロッキング版だと重複ジョブが先着の全実行時間ぶん待ち続け、
     // 2 スロットしかない比較ワーカーとプール接続を占有してデプロイ全体の
     // 比較を止めてしまう。重複ジョブが足せる仕事は無いので、取れなければ即座に終わる。
+    let storage = state.storage.clone();
     let state = state.clone();
     let db = state.db.clone();
-    common::db::with_transaction(&db, move |txn| {
+    let diff_keys = Arc::new(DiffKeys::default());
+    let ledger = diff_keys.clone();
+    let result = common::db::with_transaction(&db, move |txn| {
         Box::pin(async move {
             let acquired = txn
                 .query_one_raw(Statement::from_sql_and_values(
@@ -272,10 +275,62 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
                 return Ok(());
             }
 
-            run_locked(txn, build_id, recompare, &state).await
+            run_locked(txn, build_id, recompare, &state, &ledger).await
         })
     })
-    .await
+    .await;
+
+    // 差分 PNG は comparisons 行と一緒には消えない。行を消しただけだとキーを
+    // 知る手立てが無くなり、ビルドのプルーニングからも辿れない孤児になる。
+    // COMMIT できたなら置き換えた古い PNG を、ロールバックしたなら今回書いた
+    // PNG を捨てる。削除はベストエフォート（プルーニングと同じ扱い）。
+    let orphans = match &result {
+        Ok(()) => diff_keys.take_replaced(),
+        Err(_) => diff_keys.take_uploaded(),
+    };
+    for key in orphans {
+        if let Err(e) = storage.delete(&key).await {
+            tracing::warn!(
+                %build_id,
+                key = %key,
+                error = %e,
+                "failed to delete an orphaned diff image"
+            );
+        }
+    }
+
+    result
+}
+
+/// トランザクションの外で後始末するための差分 PNG のキー。
+///
+/// 比較は comparisons 行を毎回消して作り直すが、ストレージ上の PNG は行に
+/// 引きずられない。どちらを捨てるかは COMMIT できたかで決まるので、
+/// トランザクションの内側から外側へキーだけを持ち出す。
+#[derive(Default)]
+struct DiffKeys {
+    /// 作り直しで置き換えられた、実行前から存在した PNG。
+    replaced: Mutex<Vec<String>>,
+    /// この実行でアップロードした PNG。
+    uploaded: Mutex<Vec<String>>,
+}
+
+impl DiffKeys {
+    fn push_replaced(&self, keys: impl IntoIterator<Item = String>) {
+        self.replaced.lock().expect("diff key lock").extend(keys);
+    }
+
+    fn push_uploaded(&self, key: String) {
+        self.uploaded.lock().expect("diff key lock").push(key);
+    }
+
+    fn take_replaced(&self) -> Vec<String> {
+        std::mem::take(&mut self.replaced.lock().expect("diff key lock"))
+    }
+
+    fn take_uploaded(&self) -> Vec<String> {
+        std::mem::take(&mut self.uploaded.lock().expect("diff key lock"))
+    }
 }
 
 /// 比較本体。`db` は直列化ロックを持つトランザクション。
@@ -293,6 +348,7 @@ async fn run_locked<C: ConnectionTrait>(
     build_id: Uuid,
     recompare: bool,
     state: &JobState,
+    diff_keys: &DiffKeys,
 ) -> Result<(), anyhow::Error> {
     let build = service::builds::get_build(db, build_id).await?;
     let build = match (build.mode, build.status) {
@@ -320,6 +376,8 @@ async fn run_locked<C: ConnectionTrait>(
     let project = service::projects::get_project(db, build.project_id).await?;
 
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
+    // 行を消すとキーを辿れなくなるので、先に差分 PNG のキーを持ち出しておく。
+    diff_keys.push_replaced(service::comparisons::diff_keys_for_build(db, build_id).await?);
     service::comparisons::delete_for_build(db, build_id).await?;
 
     // baseline の解決は 2 系統ある。
@@ -409,6 +467,10 @@ async fn run_locked<C: ConnectionTrait>(
             // join のキーは必ずどちらかに由来するので到達しない。
             (None, None) => unreachable!("join key without any side"),
         };
+
+        if let Some(key) = &outcome.diff_storage_key {
+            diff_keys.push_uploaded(key.clone());
+        }
 
         match outcome.status {
             ComparisonStatus::Added => counts.added += 1,
