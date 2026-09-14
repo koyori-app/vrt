@@ -124,6 +124,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compare_build_storage: compare_build_storage.clone(),
     };
 
+    job::compare_build::ensure_db_pool_headroom(common::db::db_max_connections())
+        .map_err(std::io::Error::other)?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let workers = vec![
         (

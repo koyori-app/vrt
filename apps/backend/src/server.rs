@@ -353,6 +353,7 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let mut workers: Vec<(&str, SpawnedWorker)> = Vec::new();
 
     if state.settings.job_workers_enabled {
+        compare_build::ensure_db_pool_headroom(common::db::db_max_connections())?;
         workers.push((
             "compare build worker",
             spawn_compare_build_worker(&state, shutdown_rx.clone()),
