@@ -198,6 +198,24 @@ async fn prune_keeps_baseline_referenced_builds() {
     assert!(!object_exists(storage, &b2.2).await, "b2 の PNG は消える");
 }
 
+/// `holder_pid` のバックエンドにブロックされている接続の数。
+async fn blocked_by(db: &DatabaseConnection, holder_pid: i32) -> i64 {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    db.query_one_raw(Statement::from_string(
+        DatabaseBackend::Postgres,
+        format!(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE {holder_pid} = ANY(pg_blocking_pids(pid))"
+        ),
+    ))
+    .await
+    .expect("query pg_blocking_pids")
+    .expect("count row")
+    .try_get_by_index(0)
+    .expect("count value")
+}
+
 /// 承認がビルドを baseline の参照元にする最中にプルーニングが走っても、
 /// その参照元と実体を消さない。
 ///
@@ -208,7 +226,7 @@ async fn prune_keeps_baseline_referenced_builds() {
 /// 同じトランザクションが作った baseline 行が見えないまま削除に進んでしまう。
 #[tokio::test(flavor = "multi_thread")]
 async fn prune_keeps_builds_baselined_while_it_waits_for_the_row_lock() {
-    use sea_orm::{ConnectionTrait, TransactionTrait};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TransactionTrait};
 
     let app = TestApp::new().await;
     app.login_as_new_user().await;
@@ -237,6 +255,19 @@ async fn prune_keeps_builds_baselined_while_it_waits_for_the_row_lock() {
     .await
     .expect("insert baseline");
 
+    // ロックを握っている側のバックエンド PID。プルーニングがこの PID に
+    // ブロックされたことを確かめるのに使う。
+    let holder_pid: i32 = txn
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid()",
+        ))
+        .await
+        .expect("query backend pid")
+        .expect("backend pid row")
+        .try_get_by_index(0)
+        .expect("backend pid value");
+
     // 上限 1 なので b1 が唯一の候補。上のトランザクションが握る行ロックで待たされる。
     let prune = {
         let db = db.clone();
@@ -245,7 +276,20 @@ async fn prune_keeps_builds_baselined_while_it_waits_for_the_row_lock() {
             service::builds::prune_old_builds(&db, &storage, project_id, 1, 0).await
         })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 実際にブロックされたことを確認してから COMMIT する。一定時間 sleep するだけだと、
+    // プルーニングが行ロック待ちへ入る前に COMMIT した回は競合していない経路
+    // （コミット済みの baseline をそのまま読むだけ）を通り、それでも deleted == 0 で
+    // 通ってしまう。CI が混んだ回だけ検証内容が静かに空になるのを防ぐ。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while blocked_by(db, holder_pid).await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "プルーニングが b1 の行ロック待ちに入らなかった"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
     txn.commit().await.expect("commit");
 
     let deleted = prune.await.expect("join prune").expect("prune");
