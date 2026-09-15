@@ -311,9 +311,38 @@ async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), an
     // 知る手立てが無くなり、ビルドのプルーニングからも辿れない孤児になる。
     // COMMIT できたなら置き換えた古い PNG を、ロールバックしたなら今回書いた
     // PNG を捨てる。削除はベストエフォート（プルーニングと同じ扱い）。
+    //
+    // `Err` はロールバックを意味しない。サーバが COMMIT を終えた直後に接続が切れると、
+    // 応答を受け取れずに `Err` になる一方で、比較行と今回の差分キーは確定している。
+    // そのため失敗時は別接続で比較行を読み直し、参照されていないキーだけを捨てる。
+    // 読み直せなければ削除を見送る——孤児を残すほうが、確定した結果の画像を消すより安全。
     let orphans = match &result {
         Ok(()) => diff_keys.take_replaced(),
-        Err(_) => diff_keys.take_uploaded(),
+        Err(_) => {
+            let uploaded = diff_keys.take_uploaded();
+            if uploaded.is_empty() {
+                uploaded
+            } else {
+                match service::comparisons::diff_keys_for_build(&db, build_id).await {
+                    Ok(referenced) => {
+                        let referenced: HashSet<String> = referenced.into_iter().collect();
+                        uploaded
+                            .into_iter()
+                            .filter(|key| !referenced.contains(key))
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %build_id,
+                            error = %e,
+                            count = uploaded.len(),
+                            "keeping diff images of a failed compare: could not tell whether it committed"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        }
     };
     for key in orphans {
         if let Err(e) = storage.delete(&key).await {
