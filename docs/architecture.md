@@ -172,6 +172,7 @@ GET /v1/auth/{provider}/callback
                                   └── reject  ──▶ rejected (終端)
 
    failed ── retry ──▶ queued
+   passed | changes_detected ── recompare ──▶ queued
 ```
 
 - `pending` … ビルド行を作った直後。スクリーンショット（`screenshots` モード）
@@ -193,6 +194,26 @@ GET /v1/auth/{provider}/callback
 - `approved` … 承認済み。**このビルドの全スクリーンショットが
   `(project, branch)` の新しい baseline になる。**
 - `rejected` … 却下。baseline は更新されず、未レビューの比較は `rejected` になる。
+
+比較が済んだビルド（`passed` / `changes_detected`）は、撮影し直さずに現行
+baseline と比べ直せる（`POST /v1/builds/{build_id}/recompare`、admin 以上）。
+レビューを待っている間に別のビルドが承認されて baseline が動くと、そのビルドの
+承認は「baseline moved」で止まる。スクリーンショットは残っているので、比較だけ
+やり直せば救える——という経路である。
+
+- 比較結果は作り直されるため、**そのビルドに記録済みのレビューは失われる**
+  （baseline が動いた時点でその判断は無効になっている）
+- baseline が動いていないビルドは 409。やり直しても結果は同じで、レビューだけが
+  消えるため
+- 部分撮影のビルドは 409。撮らなかった story が旧 baseline の PNG の複製で
+  埋まっており、別の baseline と比べると撮ってもいない story に差分が出る。
+  そのまま承認すれば旧 baseline の絵が新しい baseline へ焼き付く
+- `approved` / `rejected` は 409。確定したレビュー結果は書き換えない
+
+再比較の間、GitHub の commit status は `pending` に戻り、比較結果が出た時点で
+書き直される（同じコミットに後続のビルドがある場合は、そちらが優先されて更新
+されない）。必須チェックにしている場合、古いビルドの再比較で成功していた
+チェックが失敗に転じうる。
 
 遷移は `service::builds::transition` に一本化されていて、表に無い遷移は
 すべて 409。実装は `entity::builds::BuildStatus::can_transition_to`。
@@ -300,6 +321,12 @@ GitHub App の資格情報だけで、PAT の署名鍵や OAuth の資格情報�
 
 切り替えは worker サービスを起動して登録を確認してから API を `false` にする。
 順序を逆にすると、その間だけ誰もキューを消費しない。
+
+ローリング更新では **worker を API より先に入れ替える**。再比較のジョブは
+「storybook ビルドを `queued` から比較へ進めてよい」という印を持つが、この印を
+知らない旧 worker はそのジョブを対象外として消費してしまい、ビルドが `queued` の
+まま止まる。止まった場合は同じ再比較エンドポイントで回収できる
+（`queued` に入れてから 1 分後以降、ジョブだけを積み直す）。
 
 ### 独立 runner
 

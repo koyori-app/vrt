@@ -1154,3 +1154,57 @@ async fn plan_with_empty_manifest_reports_full_deletion_as_removed() {
     );
     assert_eq!(build["unchanged_count"].as_i64(), Some(0));
 }
+
+/// 部分撮影ビルドは再比較できない。
+///
+/// 撮らなかった story は旧 baseline の PNG の複製で埋まっている。これを別の
+/// baseline と比べると、撮ってもいない story に差分が出る。そのまま承認すれば
+/// 全スクリーンショットが baseline へ昇格するので、**旧 baseline の絵が新しい
+/// baseline へ焼き付く**（誰もレビューしていない巻き戻し）。
+#[tokio::test(flavor = "multi_thread")]
+async fn recompare_is_rejected_for_a_partially_captured_build() {
+    let fx = setup().await;
+    fx.establish_baseline("base0011", png(40, 30, [255, 255, 255, 255]))
+        .await;
+
+    // home だけ撮り直す部分撮影ビルド。about / pricing は baseline から複製される。
+    let build = fx.create_build("subset10").await;
+    let build_id = build_id_of(&build);
+    fx.attach_plan_ok(build_id, &["home"], &FULL_MANIFEST, "base0011")
+        .await;
+    fx.upload(build_id, "home", png(40, 30, [255, 0, 0, 255]))
+        .await;
+    assert_eq!(fx.finalize(build_id, None).await.status(), StatusCode::OK);
+    let subset = fx.wait_for_terminal(build_id).await;
+    assert_eq!(subset["status"].as_str(), Some("changes_detected"));
+
+    // 別のビルドを承認して baseline を動かす（再比較を試したくなる状況）。
+    fx.establish_baseline("base0012", png(40, 30, [0, 0, 255, 255]))
+        .await;
+
+    let res = fx
+        .app
+        .post_json(&format!("/v1/builds/{build_id}/recompare"), json!({}))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "流用複製を抱えたビルドを別の baseline と比べ直させない"
+    );
+    let body: Value = res.json().await.expect("error json");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("partial capture"),
+        "部分撮影が理由だと伝えること: {message}"
+    );
+
+    // 比較結果もビルドの状態も触られていない。
+    use sea_orm::EntityTrait;
+    let build = entity::builds::Entity::find_by_id(build_id)
+        .one(&fx.app.state.db)
+        .await
+        .expect("load build")
+        .expect("build exists");
+    assert_eq!(build.status, entity::builds::BuildStatus::ChangesDetected);
+    assert_eq!(fx.comparisons(build_id).await.len(), 3);
+}

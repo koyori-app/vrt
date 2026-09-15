@@ -89,6 +89,23 @@ pub async fn review(
     .await
 }
 
+/// ビルドに紐づく比較が持つ差分 PNG のキーを集める。
+///
+/// 比較行を消す前に呼ぶ。行を消してからではキーを辿れず、ストレージ上の
+/// PNG がビルドのプルーニングからも届かない孤児になる。
+pub async fn diff_keys_for_build<C: ConnectionTrait>(
+    db: &C,
+    build_id: Uuid,
+) -> Result<Vec<String>, AppError> {
+    Ok(comparisons::Entity::find()
+        .filter(comparisons::Column::BuildId.eq(build_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|comparison| comparison.diff_storage_key)
+        .collect())
+}
+
 /// ビルドに紐づく比較を全削除する（ジョブのリトライ時に呼ぶ）。
 pub async fn delete_for_build<C: ConnectionTrait>(db: &C, build_id: Uuid) -> Result<(), AppError> {
     comparisons::Entity::delete_many()
