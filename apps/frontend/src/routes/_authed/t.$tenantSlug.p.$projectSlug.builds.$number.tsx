@@ -184,6 +184,14 @@ function BuildReview({
     onError: (error) => toast.error(errorMessage(error, t("build.retryFailed"))),
   });
 
+  const recompareBuild = $api.useMutation("post", "/v1/builds/{build_id}/recompare", {
+    onSuccess: async () => {
+      await invalidateBuild();
+      toast.success(t("build.recompareStarted"));
+    },
+    onError: (error) => toast.error(errorMessage(error, t("build.recompareFailed"))),
+  });
+
   const review = useCallback(
     (comparison: Comparison | undefined, action: "approve" | "reject") => {
       if (!comparison) return;
@@ -347,6 +355,20 @@ function BuildReview({
             onClick={() => retryBuild.mutate({ params: { path: { build_id: buildId } } })}
           >
             {t("build.retry")}
+          </Button>
+        ) : null}
+        {/* Comparisons are rebuilt against the current baseline, so the reviews
+            recorded on this build are discarded — hence the confirmation. */}
+        {build.status === "changes_detected" || build.status === "passed" ? (
+          <Button
+            variant="outline"
+            disabled={recompareBuild.isPending}
+            onClick={() => {
+              if (!confirm(t("build.confirmRecompare"))) return;
+              recompareBuild.mutate({ params: { path: { build_id: buildId } } });
+            }}
+          >
+            {t("build.recompare")}
           </Button>
         ) : null}
         <Button variant="success" disabled={approveBuild.isPending} onClick={onApproveBuild}>

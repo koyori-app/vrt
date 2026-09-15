@@ -20,10 +20,12 @@
 use apalis::prelude::{BoxDynError, Data, TaskBuilder, TaskSink, TaskSinkError};
 use apalis_postgres::{Config, PgPool, PostgresStorage};
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, prelude::Uuid};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ConnectionTrait, DbBackend, Statement, prelude::Uuid,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use entity::{
     baseline_entries, builds, builds::BuildStatus, comparisons, comparisons::ComparisonStatus,
@@ -41,9 +43,64 @@ pub const MAX_RETRIES: usize = 3;
 /// ワーカーの同時実行数。diff は CPU バウンドなので控えめにする。
 pub const WORKER_CONCURRENCY: usize = 2;
 
+/// 比較ワーカーが必要とする DB プールの最小本数。
+///
+/// 比較ジョブ 1 件は、直列化ロックを持つトランザクションの接続を全工程
+/// （ストレージ I/O と PNG デコードを含む）にわたって握ったまま、進捗の書き込み
+/// （`processing` 遷移と `build_logs`）でプールからもう 1 本取る（理由は
+/// [`run_locked`] のドキュメントを参照）。つまり同時実行スロットぶんの
+/// トランザクション接続に加えて、最低 1 本の空きが要る。
+pub const MIN_DB_CONNECTIONS: u32 = WORKER_CONCURRENCY as u32 + 1;
+
+/// 比較ワーカーを起動してよいプール設定かを検査する。
+///
+/// 足りないまま起動すると、進捗の書き込みがプールの `acquire_timeout` まで待たされて
+/// 比較が必ず失敗する。起動時に弾いて、実行時の `PoolTimedOut` ではなく設定エラーとして
+/// 見えるようにする。
+pub fn ensure_db_pool_headroom(max_connections: u32) -> Result<(), String> {
+    if max_connections < MIN_DB_CONNECTIONS {
+        return Err(format!(
+            "DATABASE_MAX_CONNECTIONS={max_connections} is too small to run the compare worker: \
+             it needs at least {MIN_DB_CONNECTIONS} connections \
+             ({WORKER_CONCURRENCY} for the per-build transactions plus 1 for progress writes). \
+             raise DATABASE_MAX_CONNECTIONS to {MIN_DB_CONNECTIONS} or more, \
+             or disable the compare worker on this process."
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareBuildJob {
     pub build_id: Uuid,
+    /// 再比較（[`service::builds::recompare`]）が投入したジョブか。
+    ///
+    /// storybook モードのパイプラインでは `queued` は「レンダリング待ち」を意味し、
+    /// 比較ジョブは `(_, processing)` でしか動かない。再比較は撮影をやり直さず
+    /// `queued` から比較だけを走らせるので、その 1 経路だけを開けるための印。
+    ///
+    /// `serde(default)` は後方互換のため。このフィールドが無い状態で投入された
+    /// 既存ジョブ（ローリングデプロイ中の in-flight）は従来動作になる。
+    #[serde(default)]
+    pub recompare: bool,
+}
+
+impl CompareBuildJob {
+    /// パイプラインの通常経路（finalize / render からの引き渡し / retry）。
+    pub fn new(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: false,
+        }
+    }
+
+    /// 比較が済んだビルドを現行 baseline と突き合わせ直す経路。
+    pub fn recompare(build_id: Uuid) -> Self {
+        Self {
+            build_id,
+            recompare: true,
+        }
+    }
 }
 
 /// `CompareBuildJob` のストレージ。
@@ -153,7 +210,7 @@ pub async fn enqueue_idempotent(
 /// その場合のみ apalis のリトライに委ねる。
 pub async fn process(job: CompareBuildJob, state: Data<JobState>) -> Result<(), BoxDynError> {
     let build_id = job.build_id;
-    let outcome = match run(build_id, &state).await {
+    let outcome = match run(build_id, job.recompare, &state).await {
         Ok(()) => Ok(()),
         Err(err) => {
             tracing::error!(%build_id, error = %err, "compare build job failed");
@@ -209,21 +266,165 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
-    let db = &state.db;
+async fn run(build_id: Uuid, recompare: bool, state: &JobState) -> Result<(), anyhow::Error> {
+    // 比較は comparisons の全削除・再作成を含むため、ビルド単位で直列化する。
+    // apalis の idempotency key は投入側の重複しか抑止せず、queued の回収経路や
+    // 旧形式のジョブとの併走までは防げない。transaction-scoped lock なら、別 worker
+    // / 別プロセスのジョブも同じビルドについて一つずつ比較本体へ進められる。
+    //
+    // ロックはブロッキング版ではなく `try` 版を使う。ロックは比較の全工程
+    // （ストレージ I/O と PNG デコードを含む）にわたって保持されるので、
+    // ブロッキング版だと重複ジョブが先着の全実行時間ぶん待ち続け、
+    // 2 スロットしかない比較ワーカーとプール接続を占有してデプロイ全体の
+    // 比較を止めてしまう。重複ジョブが足せる仕事は無いので、取れなければ即座に終わる。
+    let storage = state.storage.clone();
+    let state = state.clone();
+    let db = state.db.clone();
+    let diff_keys = Arc::new(DiffKeys::default());
+    let ledger = diff_keys.clone();
+    let result = common::db::with_transaction(&db, move |txn| {
+        Box::pin(async move {
+            let acquired = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0)) AS acquired",
+                    [build_id.to_string().into()],
+                ))
+                .await?
+                .map(|row| row.try_get::<bool>("", "acquired"))
+                .transpose()?
+                .unwrap_or(false);
+            if !acquired {
+                tracing::info!(
+                    %build_id,
+                    "skipping compare job: another job is already comparing this build"
+                );
+                return Ok(());
+            }
 
+            run_locked(txn, build_id, recompare, &state, &ledger).await
+        })
+    })
+    .await;
+
+    // 差分 PNG は comparisons 行と一緒には消えない。行を消しただけだとキーを
+    // 知る手立てが無くなり、ビルドのプルーニングからも辿れない孤児になる。
+    // COMMIT できたなら置き換えた古い PNG を、ロールバックしたなら今回書いた
+    // PNG を捨てる。削除はベストエフォート（プルーニングと同じ扱い）。
+    //
+    // `Err` はロールバックを意味しない。サーバが COMMIT を終えた直後に接続が切れると、
+    // 応答を受け取れずに `Err` になる一方で、比較行と今回の差分キーは確定している。
+    // そのため失敗時は別接続で比較行を読み直し、参照されていないキーだけを捨てる。
+    // 読み直せなければ削除を見送る——孤児を残すほうが、確定した結果の画像を消すより安全。
+    let orphans = match &result {
+        Ok(()) => diff_keys.take_replaced(),
+        Err(_) => {
+            let uploaded = diff_keys.take_uploaded();
+            if uploaded.is_empty() {
+                uploaded
+            } else {
+                match service::comparisons::diff_keys_for_build(&db, build_id).await {
+                    Ok(referenced) => {
+                        let referenced: HashSet<String> = referenced.into_iter().collect();
+                        uploaded
+                            .into_iter()
+                            .filter(|key| !referenced.contains(key))
+                            .collect()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %build_id,
+                            error = %e,
+                            count = uploaded.len(),
+                            "keeping diff images of a failed compare: could not tell whether it committed"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    };
+    for key in orphans {
+        if let Err(e) = storage.delete(&key).await {
+            tracing::warn!(
+                %build_id,
+                key = %key,
+                error = %e,
+                "failed to delete an orphaned diff image"
+            );
+        }
+    }
+
+    result
+}
+
+/// トランザクションの外で後始末するための差分 PNG のキー。
+///
+/// 比較は comparisons 行を毎回消して作り直すが、ストレージ上の PNG は行に
+/// 引きずられない。どちらを捨てるかは COMMIT できたかで決まるので、
+/// トランザクションの内側から外側へキーだけを持ち出す。
+#[derive(Default)]
+struct DiffKeys {
+    /// 作り直しで置き換えられた、実行前から存在した PNG。
+    replaced: Mutex<Vec<String>>,
+    /// この実行でアップロードした PNG。
+    uploaded: Mutex<Vec<String>>,
+}
+
+impl DiffKeys {
+    fn push_replaced(&self, keys: impl IntoIterator<Item = String>) {
+        self.replaced.lock().expect("diff key lock").extend(keys);
+    }
+
+    fn push_uploaded(&self, key: String) {
+        self.uploaded.lock().expect("diff key lock").push(key);
+    }
+
+    fn take_replaced(&self) -> Vec<String> {
+        std::mem::take(&mut self.replaced.lock().expect("diff key lock"))
+    }
+
+    fn take_uploaded(&self) -> Vec<String> {
+        std::mem::take(&mut self.uploaded.lock().expect("diff key lock"))
+    }
+}
+
+/// 比較本体。`db` は直列化ロックを持つトランザクション。
+///
+/// 進行中に観測されるための書き込み——`processing` への遷移と `build_logs`——だけは
+/// トランザクションではなくプール (`state.db`) へ出す。トランザクションの中に置くと
+/// COMMIT まで他セッションから 1 行も見えず、数分かかる比較のあいだ
+/// `GET /v1/builds/{id}` は `queued` を返し続け、ログ画面は空のまま、
+/// 最後に全部が一度に現れる（失敗時はロールバックで進捗行が消える）。
+///
+/// プール側の書き込みはトランザクションが builds 行を更新する前に済ませるので、
+/// 行ロックで自分自身を待つことはない。
+async fn run_locked<C: ConnectionTrait>(
+    db: &C,
+    build_id: Uuid,
+    recompare: bool,
+    state: &JobState,
+    diff_keys: &DiffKeys,
+) -> Result<(), anyhow::Error> {
     let build = service::builds::get_build(db, build_id).await?;
     let build = match (build.mode, build.status) {
         // screenshots モードのパイプライン先頭。worker が実際に取得してから
         // processing にするため、UI はキュー待ちと処理中を区別できる。
         (builds::BuildMode::Screenshots, BuildStatus::Queued) => {
-            service::builds::transition(db, build, BuildStatus::Processing).await?
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
+        }
+        // 再比較は撮影をやり直さないので、storybook でも render を挟まず
+        // queued から比較へ入る。この経路を `recompare` でしか開けないのは、
+        // まだレンダリングしていない storybook ビルド（screenshots 0 枚）を
+        // 比較すると「全 removed」を確定させてしまうため。
+        (builds::BuildMode::Storybook, BuildStatus::Queued) if recompare => {
+            service::builds::transition(&state.db, build, BuildStatus::Processing).await?
         }
         // storybook の render 完了後に積まれた compare job と、旧バージョンが
         // finalize 時点で Processing にしたジョブはそのまま続行する。
         (_, BuildStatus::Processing) => build,
         (mode, status) => {
-            tracing::info!(%build_id, ?mode, ?status, "skipping compare job outside its processing phase");
+            tracing::info!(%build_id, ?mode, ?status, recompare, "skipping compare job outside its processing phase");
             return Ok(());
         }
     };
@@ -231,6 +432,8 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
     let project = service::projects::get_project(db, build.project_id).await?;
 
     // リトライ安全性: 前回の途中結果を捨ててからやり直す。
+    // 行を消すとキーを辿れなくなるので、先に差分 PNG のキーを持ち出しておく。
+    diff_keys.push_replaced(service::comparisons::diff_keys_for_build(db, build_id).await?);
     service::comparisons::delete_for_build(db, build_id).await?;
 
     // baseline の解決は 2 系統ある。
@@ -266,6 +469,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         Some(plan) => {
             materialize_carry_forward(
                 state,
+                db,
                 &project,
                 &build,
                 &baseline_entries,
@@ -287,7 +491,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     // 比較対象数が確定した時点で開始行を残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!("compare started: {total} comparisons"),
@@ -319,6 +523,10 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
             // join のキーは必ずどちらかに由来するので到達しない。
             (None, None) => unreachable!("join key without any side"),
         };
+
+        if let Some(key) = &outcome.diff_storage_key {
+            diff_keys.push_uploaded(key.clone());
+        }
 
         match outcome.status {
             ComparisonStatus::Added => counts.added += 1,
@@ -352,7 +560,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
         processed += 1;
         if processed.is_multiple_of(10) || processed == total {
             service::build_logs::append(
-                db,
+                &state.db,
                 build_id,
                 LogLevel::Info,
                 format!("compared {processed}/{total}"),
@@ -363,7 +571,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     if ambiguous_missing_count > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build_id,
             LogLevel::Info,
             format!(
@@ -384,7 +592,7 @@ async fn run(build_id: Uuid, state: &JobState) -> Result<(), anyhow::Error> {
 
     // 完了サマリ。内訳を 1 行で残す。
     service::build_logs::append(
-        db,
+        &state.db,
         build_id,
         LogLevel::Info,
         format!(
@@ -478,15 +686,6 @@ impl Outcome {
     }
 }
 
-/// スクリーンショットが baseline 流用の複製（`metadata.reused == true`）か。
-fn is_reused(shot: &screenshots::Model) -> bool {
-    shot.metadata
-        .as_ref()
-        .and_then(|m| m.get("reused"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
 /// 一時的でありうる失敗（ストレージ IO 等）を短いバックオフ付きでやり直す。
 ///
 /// carry-forward は 1 エントリごとに download → upload → insert の 3 段で、
@@ -560,6 +759,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn materialize_carry_forward(
     state: &JobState,
+    db: &impl ConnectionTrait,
     project: &projects::Model,
     build: &builds::Model,
     baseline_entries: &[baseline_entries::Model],
@@ -570,14 +770,12 @@ async fn materialize_carry_forward(
     use sea_orm::sea_query::OnConflict;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-    let db = &state.db;
-
     let selected = plan.selected_set();
     let manifest = plan.manifest_set();
 
     let uploaded: HashSet<&str> = shots
         .iter()
-        .filter(|s| !is_reused(s))
+        .filter(|s| !service::screenshots::is_reused(s))
         .map(|s| s.name.as_str())
         .collect();
     if uploaded != selected {
@@ -696,7 +894,7 @@ async fn materialize_carry_forward(
 
     if carried > 0 {
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!("carried forward {carried} baseline screenshots outside the planned set"),
@@ -712,7 +910,7 @@ async fn materialize_carry_forward(
             "reporting as removed"
         };
         service::build_logs::append(
-            db,
+            &state.db,
             build.id,
             LogLevel::Info,
             format!(
@@ -857,6 +1055,16 @@ async fn compare_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_pool_headroom_requires_a_spare_connection_per_compare_slot() {
+        // 同時実行スロットぶんのトランザクション接続だけでは、進捗の書き込みが
+        // 取れずに必ずタイムアウトする。境界の両側を押さえる。
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS - 1).is_err());
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS).is_ok());
+        assert!(ensure_db_pool_headroom(MIN_DB_CONNECTIONS + 1).is_ok());
+        assert!(ensure_db_pool_headroom(1).is_err());
+    }
 
     fn shot(name: &str) -> screenshots::Model {
         screenshots::Model {
