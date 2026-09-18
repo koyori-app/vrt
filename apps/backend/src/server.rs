@@ -317,7 +317,15 @@ pub async fn run(state: AppState) -> Result<(), Box<dyn std::error::Error>> {
     let settings = &state.settings;
     let addr = settings.listen_addr.clone();
 
+    // memory_lifetime を 0 にして axum_session の in-memory キャッシュを使わない。
+    // 既定（60 分）だと axum_session 0.20 の掃除タスクが DashMap のシャード読み取り
+    // ロック（parking_lot）を握ったまま Valkey への保存を await し、同じシャードへ
+    // 書き込むリクエストが tokio ワーカースレッドを OS レベルでブロックする。
+    // ワーカー 4 本が全部そこで止まると掃除タスク自身も進めず、プロセスが無言で
+    // 固まる（2026-09-16 の本番障害）。0 ならその掃除経路は走らず、セッションは
+    // 毎リクエスト Valkey から読む（GET 1 回分のコスト）。
     let session_config = SessionConfig::default()
+        .with_memory_lifetime(chrono::Duration::zero())
         .with_secure(is_prod)
         .with_cookie_same_site(if is_prod {
             SameSite::None
