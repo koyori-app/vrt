@@ -234,6 +234,8 @@ async fn ensure_schema(db: &DatabaseConnection) {
 
 fn test_session_config() -> SessionConfig {
     SessionConfig::default()
+        // 本番（server.rs）と同じく in-memory キャッシュを使わない。
+        .with_memory_lifetime(chrono::Duration::zero())
         .with_secure(false)
         .with_cookie_same_site(SameSite::Lax)
         .with_ip_and_user_agent(false)
