@@ -10,7 +10,10 @@ exclude = ["migration", "vendor/apalis-postgres", "vendor/axum_session"]
 # 握ったまま 1 件ずつ DB 保存を await する（`inner.iter()` を跨ぐ store_session）。
 # 同じシャードへ書き込むリクエストは parking_lot で OS スレッドごとブロックされるため、
 # 掃除対象が多いと Tokio のワーカーが全部詰まり、プロセスが無言で固まる。
-# 公開 API は変えず、await の前に対象を collect してロックを解放するだけを当てている。
+# 公開 API は変えず、await の前に対象を collect してロックを解放する。
+# あわせて、セッション ID ごとの tokio Mutex で DB への保存と削除を直列化している。
+# ガードを手放すと掃除の保存が logout の削除を追い越せるようになり、消したはずの
+# セッションを書き戻してしまうため（回帰テストは vendor 側の cargo test --lib）。
 [patch.crates-io]
 apalis-postgres = { path = "vendor/apalis-postgres" }
 axum_session = { path = "vendor/axum_session" }

@@ -1,4 +1,4 @@
-use crate::{DatabasePool, SessionData, SessionError, SessionStore};
+use crate::{DatabasePool, SessionError, SessionStore};
 use chrono::Utc;
 #[cfg(feature = "key-store")]
 use fastbloom_rs::Deletable;
@@ -52,31 +52,37 @@ where
             // we ensure they get synced before unloading them from memory but only if the database/cookie has not expired.
             if session_store.is_persistent() {
                 // LOCAL PATCH: `DashMap::iter()` holds a shard read guard for as long as the
-                // iterator lives, and `store_session` below awaits a database round trip per
-                // entry. Holding that guard across the await blocks every request that writes
-                // to the same shard (`insert` / `get_mut`) at the OS level via parking_lot, so
-                // a large sweep can wedge every Tokio worker and freeze the whole runtime.
-                // Snapshot the expired entries first, then release the guards before awaiting.
-                let expired: Vec<SessionData> = session_store
+                // iterator lives, and saving below awaits a database round trip per entry.
+                // Holding that guard across the await blocks every request that writes to the
+                // same shard (`insert` / `get_mut`) at the OS level via parking_lot, so a large
+                // sweep can wedge every Tokio worker and freeze the whole runtime.
+                //
+                // Snapshot the ids first and release the guards before awaiting. The value is
+                // re-read under the session lock inside `store_expired_session`: a snapshot
+                // taken here could otherwise be written back after a concurrent logout deleted
+                // the record, resurrecting the old credentials.
+                let expired: Vec<String> = session_store
                     .inner
                     .iter()
                     .filter(|r| r.autoremove < current_time)
-                    .map(|r| r.value().clone())
+                    .map(|r| r.key().clone())
                     .collect();
 
-                for session in expired {
-                    if !session.expired() {
-                        if let Err(err) = session_store.store_session(&session).await {
+                for id in expired {
+                    match session_store.store_expired_session(&id, current_time).await {
+                        Ok(true) => {
+                            tracing::debug!("Session id {}: was saved to the database.", id)
+                        }
+                        Ok(false) => tracing::debug!(
+                            "Session id {}: was dropped or refreshed before the sweep saved it.",
+                            id
+                        ),
+                        Err(err) => {
                             tracing::debug!(
                                 "Session Failed to save to Database with error: {}",
                                 err
                             );
                             break;
-                        } else {
-                            tracing::debug!(
-                                "Session id {}: was saved to the database.",
-                                session.id
-                            );
                         }
                     }
                 }
