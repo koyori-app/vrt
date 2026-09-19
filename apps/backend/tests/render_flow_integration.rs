@@ -1380,7 +1380,7 @@ async fn omitting_mode_keeps_the_screenshots_behaviour() {
 
 /// 読み込みに失敗する（404 になる）webfont を参照する 2 story の index。
 ///
-/// 2 story にしてあるのは警告の**畳み**（cmd_663 ④）を結線で固定するため——
+/// 2 story にしてあるのは警告の**畳み**を結線で固定するため——
 /// 原因の `@font-face` は preview-head 相当で全 story に共有され、両 story が
 /// 同文の警告を出す。
 const FONT_404_INDEX_JSON: &str = r#"{
@@ -1440,7 +1440,7 @@ fn font_404_bundle_zip() -> Vec<u8> {
     )
 }
 
-/// 【cmd_660 C】読み込みに失敗したフォントの警告が**永続 build log**
+/// 【 C】読み込みに失敗したフォントの警告が**永続 build log**
 /// （`warn` 行）に現れること——利用者が `passed` と一緒に読む場所への
 /// 一気通貫の固定。
 ///
@@ -1478,7 +1478,7 @@ async fn a_failing_font_load_leaves_a_warning_in_the_build_logs() {
         .iter()
         .filter(|l| l.level == "warn" && l.message.starts_with("story warning"))
         .collect();
-    // 畳み（cmd_663 ④）: 2 story が同文の警告を出すが、永続化されるのは
+    // 畳み: 2 story が同文の警告を出すが、永続化されるのは
     // 「初出の 1 行＋件数と初出 story を運ぶ集計の 1 行」の計 2 行——story
     // ごとに 1 行ずつ（=2 行の同文）へ戻す退行はこの assert が落とす。
     assert_eq!(
@@ -1500,11 +1500,19 @@ async fn a_failing_font_load_leaves_a_warning_in_the_build_logs() {
         "the warn line must carry the font warning with the failing family, got: {}",
         first.message
     );
+    // 畳みの契約: 集計行が運ぶ story は**初出のみ**で、
+    // 2 件目以降の story ID は build log から失われる（意図した割り切り——
+    // 全行同文ゆえ個別 ID に行ごとの新情報が無い。README のフォント節に
+    // 明記）。集計行単独でも「どのフォントの話か」が分かるよう family 名は
+    // 載る。
     let summary = &warns[1];
     assert!(
-        summary.message.contains("2 stories") && summary.message.contains("demo-font--"),
-        "the summary line must carry the story count and the representative \
-         story so no identity is lost by the collapse, got: {}",
+        summary.message.contains("2 stories")
+            && summary.message.contains("demo-font--")
+            && summary.message.contains("VrtTestFont"),
+        "the summary line must carry the story count, the first-reported story \
+         (the only story identity that survives the collapse), and the failing \
+         family, got: {}",
         summary.message
     );
 }
