@@ -701,6 +701,7 @@ mod tests {
     use super::*;
     use crate::{DatabaseError, DatabasePool};
     use async_trait::async_trait;
+    use dashmap::DashMap;
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::mpsc;
@@ -845,6 +846,127 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 保存の最中に、同じセッションのマップへ書き込むモック。
+    ///
+    /// リクエストが応答時にやること（`get_mut` = シャードの write ロック）を、
+    /// 掃除と同じタスクの中で起こす。掃除がシャードのガードを握ったまま保存を
+    /// await していると、parking_lot は再入を許さずスレッドごと止まる。
+    #[derive(Debug, Clone)]
+    struct ReentrantPool {
+        /// `SessionStore` を作ってからでないと渡せないので、後から差し込む。
+        inner: Arc<StdMutex<Option<Arc<DashMap<String, SessionData>>>>>,
+    }
+
+    #[async_trait]
+    impl DatabasePool for ReentrantPool {
+        async fn initiate(&self, _table_name: &str) -> Result<(), DatabaseError> {
+            Ok(())
+        }
+
+        async fn count(&self, _table_name: &str) -> Result<i64, DatabaseError> {
+            Ok(0)
+        }
+
+        async fn store(
+            &self,
+            id: &str,
+            _session: &str,
+            _expires: i64,
+            _table_name: &str,
+        ) -> Result<(), DatabaseError> {
+            let inner = self.inner.lock().expect("inner").clone();
+            if let Some(inner) = inner {
+                if let Some(mut session) = inner.get_mut(id) {
+                    session.update = true;
+                }
+            }
+            Ok(())
+        }
+
+        async fn load(
+            &self,
+            _id: &str,
+            _table_name: &str,
+        ) -> Result<Option<String>, DatabaseError> {
+            Ok(None)
+        }
+
+        async fn delete_one_by_id(&self, _id: &str, _t: &str) -> Result<(), DatabaseError> {
+            Ok(())
+        }
+
+        async fn exists(&self, _id: &str, _table_name: &str) -> Result<bool, DatabaseError> {
+            Ok(false)
+        }
+
+        /// DB 掃除を失敗させて `runner` を 1 周で終わらせる。
+        async fn delete_by_expiry(&self, _table_name: &str) -> Result<Vec<String>, DatabaseError> {
+            Err(DatabaseError::GenericDeleteError("stop the runner".into()))
+        }
+
+        async fn delete_all(&self, _table_name: &str) -> Result<(), DatabaseError> {
+            Ok(())
+        }
+
+        async fn get_ids(&self, _table_name: &str) -> Result<Vec<String>, DatabaseError> {
+            Ok(Vec::new())
+        }
+
+        fn auto_handles_expiry(&self) -> bool {
+            false
+        }
+    }
+
+    /// 掃除はシャードのガードを await 越しに握らない。
+    ///
+    /// 本番で 20 時間後に起きた無言のハングの再現。`DashMap::iter()` のガードを
+    /// 保存の await を跨いで持つと、同じシャードへ書くリクエストが parking_lot で
+    /// OS スレッドごと止まり、掃除自身をポーリングする者がいなくなる。
+    ///
+    /// 掃除は別スレッドの runtime で走らせる。止まったときに固まるのはその
+    /// スレッドだけで、テスト側は待ち時間で失敗を検出できる。
+    #[test]
+    fn the_sweep_does_not_hold_a_shard_guard_across_the_save() {
+        let (done, finished) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let result = runtime.block_on(async {
+                let pool = ReentrantPool {
+                    inner: Arc::new(StdMutex::new(None)),
+                };
+                let store = SessionStore::new(Some(pool.clone()), SessionConfig::default())
+                    .await
+                    .expect("session store");
+                *pool.inner.lock().expect("inner") = Some(store.inner.clone());
+
+                let id = "swept-while-a-request-writes";
+                let mut session = SessionData::new(id.to_string(), true, &store.config);
+                session.autoremove = Utc::now() - Duration::try_minutes(5).unwrap_or_default();
+                store.inner.insert(id.to_string(), session);
+
+                // 初回の掃除は起動の 1 時間後なので、期限を過去にして 1 周目で走らせる。
+                {
+                    let mut timers = store.timers.write().await;
+                    let past = Utc::now() - Duration::try_seconds(1).unwrap_or_default();
+                    timers.last_expiry_sweep = past;
+                    timers.last_database_expiry_sweep = past;
+                }
+
+                crate::runner(store, false).await
+            });
+            let _ = done.send(result.is_ok());
+        });
+
+        let stopped = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("掃除がシャードのガードを握ったまま止まっている");
+        assert!(stopped, "runner は DB 掃除の失敗で抜ける");
     }
 
     /// 掃除がロックを取る前に logout が済んでいれば、書き戻しは起きない。
