@@ -685,8 +685,6 @@ dependencies = [
 [[package]]
 name = "axum_session"
 version = "0.20.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0deb5c3602db0d699dff8cca8ae2d3ff01320cccdebf5a4aeda4ad25008737c2"
 dependencies = [
  "aes-gcm 0.10.3",
  "async-trait",

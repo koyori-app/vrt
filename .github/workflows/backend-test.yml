@@ -69,3 +69,10 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
         working-directory: apps/backend
+
+      # ベンダーしたクレートは workspace から除外しているので `--workspace` に
+      # 含まれない。ローカルパッチ（セッション掃除とリクエストの直列化）の回帰
+      # テストだけを走らせる。DB もコンテナも要らないので数秒で終わる。
+      - name: Run vendored axum_session unit tests
+        run: cargo test --lib
+        working-directory: apps/backend/vendor/axum_session
