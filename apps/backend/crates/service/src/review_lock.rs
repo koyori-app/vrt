@@ -42,6 +42,12 @@
 //!
 //!   を保証する。
 //!
+//! ## merge 元 PR の baseline の引き継ぎ
+//!
+//! `baselines::inherit_from_branch`（default branch のビルド作成時に PR の枝の
+//! baseline を写す）は、承認と同じく project 行だけを排他ロックして baseline を
+//! 作る。build 行は取らないので、下の一方向の順序には入らない。
+//!
 //! project 行まで取る経路（承認・plan 添付・部分 storybook finalize）はいずれも
 //! build を先に取るので、全経路の排他ロック取得順は
 //! `build -> project -> comparison` の一方向のまま——循環は構造的に生じない。

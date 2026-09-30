@@ -27,6 +27,7 @@ use crate::openapi::{CrudErrors, SessionAuthErrors};
 use entity::{builds::BuildMode, builds::BuildStatus, scopes::Scope, tenant_members::TenantRole};
 use payload::builds::*;
 use service::builds as build_service;
+use service::github as github_service;
 use service::projects as project_service;
 use service::render as render_service;
 use service::screenshots::{self as screenshot_service, MAX_UPLOAD_BYTES};
@@ -128,6 +129,22 @@ pub async fn create_build(
         mode,
     )
     .await?;
+
+    // merge 後の default branch のビルドは、merge 元 PR の枝で承認した baseline を
+    // 引き継ぐ。下の baseline_commit_sha と、以後の比較・承認・plan 添付の解決が
+    // 引き継いだものを指すよう、ここで先に済ませる。GitHub App が使えないときや
+    // 引けないときは何もせず、いまの二段解決のまま（ビルドの作成は失敗させない）。
+    github_service::inherit_merged_pr_baseline(
+        &state.db,
+        &state.redis_client,
+        &state.http,
+        github_service::github_app(&state.settings, &state.http).as_ref(),
+        &state.settings.github_api_base_url(),
+        &project,
+        &build.branch,
+        &build.commit_sha,
+    )
+    .await;
 
     // CLI が「今回の baseline はどのコミットか」を知って撮り直しを絞れるよう、
     // 作成レスポンスにだけ現時点の baseline のコミット SHA を載せる。ここでは
