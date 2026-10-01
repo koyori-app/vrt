@@ -3,12 +3,12 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, prelude::Uuid,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, prelude::Uuid,
 };
 
 use common::db::with_transaction;
 use common::error::AppError;
-use entity::{baseline_entries, baselines, projects};
+use entity::{baseline_entries, baselines, builds, projects};
 
 /// 比較に使う baseline を解決する。
 ///
@@ -90,9 +90,26 @@ pub async fn get_baseline<C: ConnectionTrait>(
 /// PR の承認が見えなくなる。写した行は default branch の baseline になるので、以後の
 /// 解決（比較・承認・plan 添付）はすべて `latest_for` のまま引き継いだものを掴む。
 ///
-/// 写すのは、PR の枝の baseline が default branch の最新より新しいときだけ。
-/// default branch がその後に承認されていれば、そちらを巻き戻さない。同じ承認を
-/// 二度写さないよう、default branch の最新が既に同じ承認の写しなら何もしない。
+/// 写す元は、`source_branch` の baseline のうち、承認したビルドが PR `pr_number` の
+/// ものの最新に限る。枝の名前は merge の後に別の PR が使い回せるので、名前だけで
+/// 選ぶと、古い merge commit のビルド（再実行など）が、同じ名前の別の PR で承認した
+/// baseline を写してしまう。ビルドの PR 番号はビルド作成の要求が申告した値である
+/// （vrt-actions は `github.event.pull_request.number` を送る）。PR 番号を持たない
+/// ビルド（push で作ったビルドなど）で承認した baseline は写さない。
+///
+/// 写すのは、PR の枝の baseline が default branch の最新より新しいときだけ。比べるのは
+/// baseline の行の `created_at` で、写した行にはその時刻（`Utc::now()`）が入る。ゆえに
+/// default branch の baseline が（写しも含めて）更新された後に merge された PR は
+/// 引き継がない。例: PR A と PR B をこの順に承認し、A を merge（写る）してから B を
+/// merge すると、B の baseline は A の写しより古いので写らない。default branch が
+/// その後に承認されていれば巻き戻さない、という守りと同じ比べ方である。
+///
+/// 写した行に `source.created_at` を保持するだけでは直らない。写しは名前の集合を
+/// 丸ごと一組で置き換えるので、B を A の写しの上へ写せば、A で承認した名前の変更が
+/// 消える（B は A の承認を含まない）。名前ごとに合成する本筋は VRT-26 で扱う。
+///
+/// 同じ承認を二度写さないよう、default branch の最新が既に同じ承認の写しなら何もしない。
+/// ただしこの守りは、上の `created_at` の比べでも同じく止まる（写しは元より新しい）。
 ///
 /// `source_build_id` は元の承認ビルドを指したまま写す。baseline エントリは
 /// そのビルドのスクリーンショットとストレージキーを共有しているので、
@@ -106,6 +123,7 @@ pub async fn inherit_from_branch(
     db: &DatabaseConnection,
     project_id: Uuid,
     source_branch: &str,
+    pr_number: i64,
 ) -> Result<Option<baselines::Model>, AppError> {
     let source_branch = source_branch.to_string();
     with_transaction(db, move |txn| {
@@ -114,7 +132,10 @@ pub async fn inherit_from_branch(
             if source_branch == project.default_branch {
                 return Ok(None);
             }
-            let Some(source) = latest_on_branch(txn, project.id, &source_branch).await? else {
+            let Some(source) =
+                latest_on_branch_for_pull_request(txn, project.id, &source_branch, pr_number)
+                    .await?
+            else {
                 return Ok(None);
             };
             if let Some(current) =
@@ -156,4 +177,36 @@ pub async fn inherit_from_branch(
         })
     })
     .await
+}
+
+/// 指定ブランチの baseline のうち、承認したビルドが PR `pr_number` のものの最新。
+async fn latest_on_branch_for_pull_request<C: ConnectionTrait>(
+    db: &C,
+    project_id: Uuid,
+    branch: &str,
+    pr_number: i64,
+) -> Result<Option<baselines::Model>, AppError> {
+    // ビルドの PR 番号は i32 で持つ。収まらない番号の PR のビルドは在りえない。
+    let Ok(pr_number) = i32::try_from(pr_number) else {
+        return Ok(None);
+    };
+    let build_ids: Vec<Uuid> = builds::Entity::find()
+        .select_only()
+        .column(builds::Column::Id)
+        .filter(builds::Column::ProjectId.eq(project_id))
+        .filter(builds::Column::PullRequestNumber.eq(pr_number))
+        .into_tuple()
+        .all(db)
+        .await?;
+    if build_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(baselines::Entity::find()
+        .filter(baselines::Column::ProjectId.eq(project_id))
+        .filter(baselines::Column::Branch.eq(branch))
+        .filter(baselines::Column::SourceBuildId.is_in(build_ids))
+        .order_by_desc(baselines::Column::CreatedAt)
+        .order_by_desc(baselines::Column::Id)
+        .one(db)
+        .await?)
 }

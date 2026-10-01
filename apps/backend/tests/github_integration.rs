@@ -2360,3 +2360,208 @@ async fn newer_default_branch_baseline_is_not_overwritten() {
         "the newer default-branch baseline stays in place"
     );
 }
+
+/// プロジェクトの default branch（main）に在る baseline の行の数。
+async fn main_baseline_rows(app: &TestApp, project: &Project) -> u64 {
+    use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
+
+    let project_id: Uuid = project.project_id.parse().expect("project id");
+    entity::baselines::Entity::find()
+        .filter(entity::baselines::Column::ProjectId.eq(project_id))
+        .filter(entity::baselines::Column::Branch.eq("main"))
+        .count(&app.state.db)
+        .await
+        .expect("count baselines")
+}
+
+/// PR の枝のビルドを流して承認する（同じプロジェクトに二本目以降の PR を足す）。
+#[allow(clippy::too_many_arguments)]
+async fn approve_pr_build(
+    app: &TestApp,
+    project: &Project,
+    token: &str,
+    repo: &str,
+    head_ref: &str,
+    sha: &str,
+    pr_number: i32,
+    color: [u8; 4],
+) {
+    app.github().expect_commit_statuses(repo, sha).await;
+    app.github()
+        .expect_pr_comments(repo, i64::from(pr_number), json!([]))
+        .await;
+    let (_, build) = run_ci_build(app, project, token, head_ref, sha, Some(pr_number), color).await;
+    approve(app, &build).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reused_branch_name_does_not_inherit_another_pull_requests_baseline() {
+    // merge 済みの PR #31 の枝名を、あとで未 merge の PR #32 が使い回し、その baseline が
+    // 承認された。#31 の merge commit のビルドを（再実行で）作っても、写るのは #31 の
+    // baseline であって、枝名が同じだけの #32 の baseline ではない。
+    let app = TestApp::new_with_github().await;
+    let repo = "acme-inc/inherit-reused";
+    let pr31_sha = Uuid::new_v4().simple().to_string();
+    let pr32_sha = Uuid::new_v4().simple().to_string();
+    let main_sha = Uuid::new_v4().simple().to_string();
+    let (project, token) =
+        linked_project_with_pr_baseline(&app, repo, "feature/reused", &pr31_sha, 31).await;
+
+    // 同じ枝名で別の PR #32 を開き、違う絵を承認する（#31 より新しい baseline になる）。
+    approve_pr_build(
+        &app,
+        &project,
+        &token,
+        repo,
+        "feature/reused",
+        &pr32_sha,
+        32,
+        [0, 0, 255, 255],
+    )
+    .await;
+
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_sha,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            31,
+            "feature/reused",
+            "main",
+            &main_sha,
+            true
+        )])),
+    )
+    .await;
+
+    // #31 と同じ絵（赤）を撮る。写ったのが #31 なら差分は出ない。
+    assert_main_build_inherits(&app, &project, &token, repo, &main_sha, &pr31_sha).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_build_of_the_same_merge_commit_does_not_inherit_again() {
+    // 同じ merge commit で main のビルドを二度作る（CI の再実行など）。二度目は写さない。
+    // baseline_commit_sha が同じであることでは足りない（created_at の守りでも同じになる）
+    // ので、default branch の baseline の行が増えないことを直に数える。
+    let app = TestApp::new_with_github().await;
+    let repo = "acme-inc/inherit-twice";
+    let pr_sha = Uuid::new_v4().simple().to_string();
+    let main_sha = Uuid::new_v4().simple().to_string();
+    let (project, token) =
+        linked_project_with_pr_baseline(&app, repo, "feature/twice", &pr_sha, 33).await;
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_sha,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            33,
+            "feature/twice",
+            "main",
+            &main_sha,
+            true
+        )])),
+    )
+    .await;
+
+    assert_eq!(main_baseline_rows(&app, &project).await, 0);
+    assert_main_build_inherits(&app, &project, &token, repo, &main_sha, &pr_sha).await;
+    assert_eq!(
+        main_baseline_rows(&app, &project).await,
+        1,
+        "the first build of the merge commit inherits once"
+    );
+
+    let (created, _) = run_ci_build(
+        &app,
+        &project,
+        &token,
+        "main",
+        &main_sha,
+        None,
+        [255, 0, 0, 255],
+    )
+    .await;
+    assert_eq!(
+        created["baseline_commit_sha"].as_str(),
+        Some(pr_sha.as_str())
+    );
+    assert_eq!(
+        main_baseline_rows(&app, &project).await,
+        1,
+        "the second build of the same merge commit does not copy the baseline again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_request_merged_after_an_inheritance_is_not_inherited() {
+    // 境界を意図として固定する。PR A と PR B をこの順に承認し、A を merge（写る）、
+    // そのあと B を merge する。B の baseline は、A を写した行（写した時刻が入る）より
+    // 古いので引き継がない。名前ごとに合成する本筋は VRT-26 で扱う。
+    let app = TestApp::new_with_github().await;
+    let repo = "acme-inc/inherit-boundary";
+    let a_sha = Uuid::new_v4().simple().to_string();
+    let b_sha = Uuid::new_v4().simple().to_string();
+    let (project, token) =
+        linked_project_with_pr_baseline(&app, repo, "feature/a", &a_sha, 34).await;
+    approve_pr_build(
+        &app,
+        &project,
+        &token,
+        repo,
+        "feature/b",
+        &b_sha,
+        35,
+        [0, 0, 255, 255],
+    )
+    .await;
+
+    // A を merge する。A の baseline が写る。
+    let main_a = Uuid::new_v4().simple().to_string();
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_a,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            34,
+            "feature/a",
+            "main",
+            &main_a,
+            true
+        )])),
+    )
+    .await;
+    assert_main_build_inherits(&app, &project, &token, repo, &main_a, &a_sha).await;
+
+    // B を merge する。B の baseline は写した行より古いので、main は A のまま。
+    let main_b = Uuid::new_v4().simple().to_string();
+    app.github().expect_commit_statuses(repo, &main_b).await;
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_b,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            35,
+            "feature/b",
+            "main",
+            &main_b,
+            true
+        )])),
+    )
+    .await;
+    let (created, _) = run_ci_build(
+        &app,
+        &project,
+        &token,
+        "main",
+        &main_b,
+        None,
+        [0, 0, 255, 255],
+    )
+    .await;
+    assert_eq!(
+        created["baseline_commit_sha"].as_str(),
+        Some(a_sha.as_str()),
+        "a pull request merged after an inheritance is not inherited (VRT-26)"
+    );
+    assert_eq!(main_baseline_rows(&app, &project).await, 1);
+}

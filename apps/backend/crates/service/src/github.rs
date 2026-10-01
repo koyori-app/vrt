@@ -1076,13 +1076,31 @@ pub async fn merged_pull_requests_for_commit(
 /// その PR の枝の最新 baseline を default branch の baseline として写す
 /// （[`crate::baselines::inherit_from_branch`]）。
 ///
+/// 写す元は、その PR の番号で承認した baseline に限る（枝の名前は使い回せるため。
+/// [`crate::baselines::inherit_from_branch`]）。
+///
+/// ## 何を信頼しているか
+///
+/// `branch` と `commit_sha` はビルド作成の要求が申告した値で、その sha がいま
+/// default branch 上に在ることは確かめない。PR の `merge_commit_sha` が `commit_sha`
+/// と一致することも要求しない（rebase merge では前の方の写しの commit でも同じ PR が
+/// 返るので、一致を要求すると引けなくなる）。GitHub に問うのは「この commit を
+/// default branch へ入れた merge 済みの PR はどれか」だけである。
+///
+/// 申告を検めないのは、写せる物が限られているからである。写すのは、同じプロジェクトで
+/// 承認され、その PR として merge された baseline だけで、しかも default branch の最新
+/// より新しいときだけ。未承認の絵は入らない。申告を偽れるのは、そのプロジェクトに
+/// ビルドを作れるトークンの持ち主で、その者は default branch のビルドを直に作って
+/// 承認を求めることもできる。祖先を `GET /repos/{repo}/compare/{default}...{sha}` で
+/// 確かめる道もあるが、API が 1 本増えるわりに、閉じられる穴が無い。
+///
 /// ベストエフォート。次のどれでも何もせず、いまの二段解決（同じ枝 → default
 /// branch）のまま進む。ビルドの作成は失敗させない:
 ///
 /// - GitHub App が未設定（[`github_app`] が `None`）
 /// - プロジェクトが installation + リポジトリに紐付いていない
 /// - トークン取得・PR の取得に失敗した（警告ログのみ）
-/// - merge 済みの PR が無い、または PR の枝に baseline が無い
+/// - merge 済みの PR が無い、または PR の枝にその PR で承認した baseline が無い
 #[allow(clippy::too_many_arguments)]
 pub async fn inherit_merged_pr_baseline(
     db: &sea_orm::DatabaseConnection,
@@ -1136,7 +1154,9 @@ pub async fn inherit_merged_pr_baseline(
     };
 
     for pull in pulls {
-        match crate::baselines::inherit_from_branch(db, project.id, &pull.head_ref).await {
+        match crate::baselines::inherit_from_branch(db, project.id, &pull.head_ref, pull.number)
+            .await
+        {
             Ok(Some(baseline)) => {
                 tracing::info!(
                     project_id = %project.id,
