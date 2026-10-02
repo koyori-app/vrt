@@ -108,8 +108,13 @@ pub async fn get_baseline<C: ConnectionTrait>(
 /// 丸ごと一組で置き換えるので、B を A の写しの上へ写せば、A で承認した名前の変更が
 /// 消える（B は A の承認を含まない）。名前ごとに合成する本筋は VRT-26 で扱う。
 ///
-/// 同じ承認を二度写さないよう、default branch の最新が既に同じ承認の写しなら何もしない。
-/// ただしこの守りは、上の `created_at` の比べでも同じく止まる（写しは元より新しい）。
+/// 同じ承認を二度写さないよう、default branch の最新が既に同じ承認の写しなら何もしない
+/// （同じ merge commit のビルドを再実行したときなど）。ふつうは上の `created_at` の比べでも
+/// 止まる。写しは写した時刻を持ち、元より新しいからである。だが二つの時刻は別の時計で
+/// 入る。元の行の時刻は承認したプロセスの、写しの時刻は写したプロセスの `Utc::now()`
+/// である。API を複数のプロセスで動かし、写した側の時計が遅れていれば、写しの方が元より
+/// 古くなりうる。そのとき `created_at` の比べは写しを「元より古い」と見て写し直そうと
+/// するので、止めるのはこの守りだけになる。
 ///
 /// `source_build_id` は元の承認ビルドを指したまま写す。baseline エントリは
 /// そのビルドのスクリーンショットとストレージキーを共有しているので、
@@ -118,33 +123,36 @@ pub async fn get_baseline<C: ConnectionTrait>(
 /// 承認と同じく project 行を排他ロックしてから読み直す（[`crate::review_lock`]）。
 /// build 行は取らないので `build -> project` の順序は崩れない。
 ///
-/// 写したときは写した baseline を、写さなかったときは `None` を返す。
+/// 写したか、写さなかったならその訳を返す（[`Inheritance`]）。
 pub async fn inherit_from_branch(
     db: &DatabaseConnection,
     project_id: Uuid,
     source_branch: &str,
     pr_number: i64,
-) -> Result<Option<baselines::Model>, AppError> {
+) -> Result<Inheritance, AppError> {
     let source_branch = source_branch.to_string();
     with_transaction(db, move |txn| {
         Box::pin(async move {
             let project = crate::review_lock::project(txn, project_id).await?;
             if source_branch == project.default_branch {
-                return Ok(None);
+                return Ok(Inheritance::SourceIsDefaultBranch);
             }
             let Some(source) =
                 latest_on_branch_for_pull_request(txn, project.id, &source_branch, pr_number)
                     .await?
             else {
-                return Ok(None);
+                return Ok(Inheritance::NoBaselineForPullRequest);
             };
             if let Some(current) =
                 latest_on_branch(txn, project.id, &project.default_branch).await?
             {
-                let already_inherited = current.source_build_id.is_some()
-                    && current.source_build_id == source.source_build_id;
-                if already_inherited || current.created_at >= source.created_at {
-                    return Ok(None);
+                if current.source_build_id.is_some()
+                    && current.source_build_id == source.source_build_id
+                {
+                    return Ok(Inheritance::AlreadyInherited);
+                }
+                if current.created_at >= source.created_at {
+                    return Ok(Inheritance::DefaultBranchIsNewer);
                 }
             }
 
@@ -173,10 +181,39 @@ pub async fn inherit_from_branch(
                 .await?;
             }
 
-            Ok(Some(inherited))
+            Ok(Inheritance::Inherited(inherited))
         })
     })
     .await
+}
+
+/// [`inherit_from_branch`] の結果。写さなかったときは、その訳を持つ。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Inheritance {
+    /// default branch の baseline として写した。
+    Inherited(baselines::Model),
+    /// PR の枝が default branch そのもの。
+    SourceIsDefaultBranch,
+    /// PR の枝に、その PR の番号で承認した baseline が無い。PR 番号を申告しない
+    /// ビルド（push で作ったビルドなど）だけで承認した場合もここに入る。
+    NoBaselineForPullRequest,
+    /// default branch の最新が、既に同じ承認の写し。
+    AlreadyInherited,
+    /// default branch の最新が、PR の枝の baseline より新しい（巻き戻さない）。
+    DefaultBranchIsNewer,
+}
+
+impl Inheritance {
+    /// ログに出す短い訳。
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Inheritance::Inherited(_) => "inherited",
+            Inheritance::SourceIsDefaultBranch => "source_is_default_branch",
+            Inheritance::NoBaselineForPullRequest => "no_baseline_for_pull_request",
+            Inheritance::AlreadyInherited => "already_inherited",
+            Inheritance::DefaultBranchIsNewer => "default_branch_is_newer",
+        }
+    }
 }
 
 /// 指定ブランチの baseline のうち、承認したビルドが PR `pr_number` のものの最新。

@@ -2565,3 +2565,114 @@ async fn pull_request_merged_after_an_inheritance_is_not_inherited() {
     );
     assert_eq!(main_baseline_rows(&app, &project).await, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_request_approved_only_on_push_builds_is_not_inherited() {
+    // PR の枝を push で撮り、PR 番号を申告しないビルドで承認した。merge 後の main の
+    // ビルドは引き継がず、写さなかった訳が戻り値（とログ）に残る。
+    let app = TestApp::new_with_github().await;
+    let repo = "acme-inc/inherit-push";
+    let token = ci_token(&app).await;
+    let project = create_tenant_and_project(&app).await;
+    link_project_to_repo(&app, &project, unique_installation_id(), repo).await;
+    let push_sha = Uuid::new_v4().simple().to_string();
+    let main_sha = Uuid::new_v4().simple().to_string();
+    app.github().expect_commit_statuses(repo, &push_sha).await;
+    app.github().expect_commit_statuses(repo, &main_sha).await;
+
+    let (_, push_build) = run_ci_build(
+        &app,
+        &project,
+        &token,
+        "feature/push",
+        &push_sha,
+        None,
+        [255, 0, 0, 255],
+    )
+    .await;
+    approve(&app, &push_build).await;
+
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_sha,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            36,
+            "feature/push",
+            "main",
+            &main_sha,
+            true
+        )])),
+    )
+    .await;
+    assert_main_build_does_not_inherit(&app, &project, &token, &main_sha).await;
+
+    let project_id: Uuid = project.project_id.parse().expect("project id");
+    let outcome =
+        service::baselines::inherit_from_branch(&app.state.db, project_id, "feature/push", 36)
+            .await
+            .expect("inherit_from_branch");
+    assert_eq!(
+        outcome,
+        service::baselines::Inheritance::NoBaselineForPullRequest
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn already_inherited_stops_a_second_copy_when_the_copy_looks_older() {
+    // 時計のずれで写しの時刻が元より古くなった形を、写しの行の created_at を書き換えて
+    // 作る。created_at の比べは写しを「元より古い」と見るので、二度写しを止めるのは
+    // already_inherited だけになる。
+    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder};
+
+    let app = TestApp::new_with_github().await;
+    let repo = "acme-inc/inherit-skew";
+    let pr_sha = Uuid::new_v4().simple().to_string();
+    let main_sha = Uuid::new_v4().simple().to_string();
+    let (project, token) =
+        linked_project_with_pr_baseline(&app, repo, "feature/skew", &pr_sha, 37).await;
+    mount_commit_pulls(
+        &app,
+        repo,
+        &main_sha,
+        ResponseTemplate::new(200).set_body_json(json!([associated_pull(
+            37,
+            "feature/skew",
+            "main",
+            &main_sha,
+            true
+        )])),
+    )
+    .await;
+    assert_main_build_inherits(&app, &project, &token, repo, &main_sha, &pr_sha).await;
+    assert_eq!(main_baseline_rows(&app, &project).await, 1);
+
+    // 写しの行を、元の baseline より 1 時間古くする（写した側の時計が遅れていた形）。
+    let project_id: Uuid = project.project_id.parse().expect("project id");
+    let latest = |branch: &'static str| {
+        entity::baselines::Entity::find()
+            .filter(entity::baselines::Column::ProjectId.eq(project_id))
+            .filter(entity::baselines::Column::Branch.eq(branch))
+            .order_by_desc(entity::baselines::Column::CreatedAt)
+            .one(&app.state.db)
+    };
+    let source = latest("feature/skew")
+        .await
+        .unwrap()
+        .expect("source baseline");
+    let copy = latest("main").await.unwrap().expect("copied baseline");
+    let mut skewed: entity::baselines::ActiveModel = copy.into();
+    skewed.created_at = Set(source.created_at - chrono::Duration::hours(1));
+    skewed.update(&app.state.db).await.expect("skew the copy");
+
+    let outcome =
+        service::baselines::inherit_from_branch(&app.state.db, project_id, "feature/skew", 37)
+            .await
+            .expect("inherit_from_branch");
+    assert_eq!(outcome, service::baselines::Inheritance::AlreadyInherited);
+    assert_eq!(
+        main_baseline_rows(&app, &project).await,
+        1,
+        "already_inherited alone stops the second copy"
+    );
+}

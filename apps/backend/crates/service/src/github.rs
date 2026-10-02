@@ -1157,7 +1157,7 @@ pub async fn inherit_merged_pr_baseline(
         match crate::baselines::inherit_from_branch(db, project.id, &pull.head_ref, pull.number)
             .await
         {
-            Ok(Some(baseline)) => {
+            Ok(crate::baselines::Inheritance::Inherited(baseline)) => {
                 tracing::info!(
                     project_id = %project.id,
                     repo,
@@ -1169,7 +1169,19 @@ pub async fn inherit_merged_pr_baseline(
                 );
                 return;
             }
-            Ok(None) => {}
+            // 写さなかった訳を残す。PR 番号を申告しないビルドだけで承認した枝では
+            // 引き継ぎが発火しないので、ここが無いと発火しなかった訳が残らない。
+            Ok(skipped) => {
+                tracing::info!(
+                    project_id = %project.id,
+                    repo,
+                    sha = commit_sha,
+                    pr_number = pull.number,
+                    head_ref = %pull.head_ref,
+                    reason = skipped.reason(),
+                    "did not inherit the merged pull request's baseline"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     project_id = %project.id,
