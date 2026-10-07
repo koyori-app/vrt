@@ -7,6 +7,8 @@
 //! - コミットステータスの POST は [`post_commit_status`]。
 //! - PR へのビルドリンクコメントは [`upsert_pr_comment`]（マーカー付きコメントを
 //!   1 PR × 1 プロジェクトにつき 1 件だけ維持する）。
+//! - merge 後の default branch のビルドへ PR の枝の baseline を引き継ぐのは
+//!   [`inherit_merged_pr_baseline`]（merge 元 PR は [`merged_pull_requests_for_commit`]）。
 //!
 //! ## forge-github との分担
 //!
@@ -16,7 +18,8 @@
 //!
 //! 一方 **コミットステータスの API は forge-github に無い**ため、
 //! `POST /repos/{owner}/{repo}/statuses/{sha}` はこのモジュールで直接叩く
-//! （auth-core 側は変更しない方針）。ベース URL は同じ設定値を使うので、
+//! （auth-core 側は変更しない方針）。merge 元 PR を引く
+//! `GET /repos/{owner}/{repo}/commits/{sha}/pulls` も同じく直接叩く。ベース URL は同じ設定値を使うので、
 //! Enterprise / テストでも一貫して差し替わる。
 
 use std::collections::HashMap;
@@ -981,6 +984,215 @@ pub async fn upsert_pr_comment(
         return Ok(CommentWrite::Wrote);
     }
     Err(error_from_response("upsert pr comment", response).await)
+}
+
+// ── merge 元 PR の解決（baseline の引き継ぎ）─────────────────────────────
+//
+// PR の枝で承認した baseline を、merge 後の default branch のビルドへ引き継ぐため、
+// default branch の commit を入れた merge 済み PR を引く。
+
+/// commit を base の枝へ入れた、merge 済みの PR。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPullRequest {
+    pub number: i64,
+    /// PR の枝（`head.ref`）。この枝の baseline を引き継ぐ。
+    pub head_ref: String,
+    /// merge で base に入った commit。merge commit・squash の commit・rebase の最後の写し。
+    pub merge_commit_sha: Option<String>,
+}
+
+/// `GET /repos/{repo}/commits/{sha}/pulls` で、`sha` を `base_branch` へ入れた
+/// merge 済みの PR を引く。
+///
+/// merge commit・squash・rebase のどれでも、GitHub は base の枝上の commit に対して
+/// merge 済みの PR を同じ形で返す（rebase は前の方の写しでも同じ PR が返る）。
+/// open の PR（base の commit を含む PR の枝など）と、別の枝へ入った PR は除く。
+///
+/// 並びは `sha` を merge commit とする PR を先に置く。複数返るのは稀で、ふつうは 0 か 1 件。
+pub async fn merged_pull_requests_for_commit(
+    http: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    repo: &str,
+    sha: &str,
+    base_branch: &str,
+) -> Result<Vec<MergedPullRequest>, GithubApiError> {
+    #[derive(serde::Deserialize)]
+    struct Branch {
+        #[serde(rename = "ref")]
+        ref_name: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PullRequest {
+        number: i64,
+        #[serde(default)]
+        merged_at: Option<String>,
+        #[serde(default)]
+        merge_commit_sha: Option<String>,
+        head: Branch,
+        base: Branch,
+    }
+
+    let url = format!(
+        "{}/repos/{repo}/commits/{sha}/pulls?per_page=100",
+        base_url.trim_end_matches('/')
+    );
+    let response = http
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("list commit pulls: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(error_from_response("list commit pulls", response).await);
+    }
+
+    let pulls: Vec<PullRequest> = response
+        .json()
+        .await
+        .map_err(|e| GithubApiError::Transient(anyhow::anyhow!("decode commit pulls: {e}")))?;
+
+    let mut merged: Vec<MergedPullRequest> = pulls
+        .into_iter()
+        .filter(|pull| pull.merged_at.is_some() && pull.base.ref_name == base_branch)
+        .map(|pull| MergedPullRequest {
+            number: pull.number,
+            head_ref: pull.head.ref_name,
+            merge_commit_sha: pull.merge_commit_sha,
+        })
+        .collect();
+    merged.sort_by_key(|pull| pull.merge_commit_sha.as_deref() != Some(sha));
+    Ok(merged)
+}
+
+/// merge 後の default branch のビルドへ、merge 元 PR の枝の baseline を引き継ぐ。
+///
+/// ビルドの作成時に呼ぶ。`branch` が default branch で、プロジェクトが GitHub の
+/// リポジトリに紐付いていれば、`commit_sha` を入れた merge 済み PR を引き、
+/// その PR の枝の最新 baseline を default branch の baseline として写す
+/// （[`crate::baselines::inherit_from_branch`]）。
+///
+/// 写す元は、その PR の番号で承認した baseline に限る（枝の名前は使い回せるため。
+/// [`crate::baselines::inherit_from_branch`]）。
+///
+/// ## 何を信頼しているか
+///
+/// `branch` と `commit_sha` はビルド作成の要求が申告した値で、その sha がいま
+/// default branch 上に在ることは確かめない。PR の `merge_commit_sha` が `commit_sha`
+/// と一致することも要求しない（rebase merge では前の方の写しの commit でも同じ PR が
+/// 返るので、一致を要求すると引けなくなる）。GitHub に問うのは「この commit を
+/// default branch へ入れた merge 済みの PR はどれか」だけである。
+///
+/// 申告を検めないのは、写せる物が限られているからである。写すのは、同じプロジェクトで
+/// 承認され、その PR として merge された baseline だけで、しかも default branch の最新
+/// より新しいときだけ。未承認の絵は入らない。申告を偽れるのは、そのプロジェクトに
+/// ビルドを作れるトークンの持ち主で、その者は default branch のビルドを直に作って
+/// 承認を求めることもできる。祖先を `GET /repos/{repo}/compare/{default}...{sha}` で
+/// 確かめる道もあるが、API が 1 本増えるわりに、閉じられる穴が無い。
+///
+/// ベストエフォート。次のどれでも何もせず、いまの二段解決（同じ枝 → default
+/// branch）のまま進む。ビルドの作成は失敗させない:
+///
+/// - GitHub App が未設定（[`github_app`] が `None`）
+/// - プロジェクトが installation + リポジトリに紐付いていない
+/// - トークン取得・PR の取得に失敗した（警告ログのみ）
+/// - merge 済みの PR が無い、または PR の枝にその PR で承認した baseline が無い
+#[allow(clippy::too_many_arguments)]
+pub async fn inherit_merged_pr_baseline(
+    db: &sea_orm::DatabaseConnection,
+    redis: &RedisConnection,
+    http: &reqwest::Client,
+    app: Option<&GithubApp>,
+    api_base_url: &str,
+    project: &projects::Model,
+    branch: &str,
+    commit_sha: &str,
+) {
+    if branch != project.default_branch {
+        return;
+    }
+    let (Some(installation_id), Some(repo)) = (
+        project.github_installation_id,
+        project.github_repo.as_deref(),
+    ) else {
+        return;
+    };
+    let Some(app) = app else {
+        return;
+    };
+
+    let pulls = match installation_token(redis, app, installation_id).await {
+        Ok(token) => {
+            merged_pull_requests_for_commit(
+                http,
+                api_base_url,
+                &token,
+                repo,
+                commit_sha,
+                &project.default_branch,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    let pulls = match pulls {
+        Ok(pulls) => pulls,
+        Err(e) => {
+            tracing::warn!(
+                project_id = %project.id,
+                repo,
+                sha = commit_sha,
+                error = %e,
+                "baseline inheritance skipped: could not look up the merged pull request"
+            );
+            return;
+        }
+    };
+
+    for pull in pulls {
+        match crate::baselines::inherit_from_branch(db, project.id, &pull.head_ref, pull.number)
+            .await
+        {
+            Ok(crate::baselines::Inheritance::Inherited(baseline)) => {
+                tracing::info!(
+                    project_id = %project.id,
+                    repo,
+                    sha = commit_sha,
+                    pr_number = pull.number,
+                    head_ref = %pull.head_ref,
+                    baseline_id = %baseline.id,
+                    "inherited the merged pull request's baseline"
+                );
+                return;
+            }
+            // 写さなかった訳を残す。PR 番号を申告しないビルドだけで承認した枝では
+            // 引き継ぎが発火しないので、ここが無いと発火しなかった訳が残らない。
+            Ok(skipped) => {
+                tracing::info!(
+                    project_id = %project.id,
+                    repo,
+                    sha = commit_sha,
+                    pr_number = pull.number,
+                    head_ref = %pull.head_ref,
+                    reason = skipped.reason(),
+                    "did not inherit the merged pull request's baseline"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project.id,
+                    pr_number = pull.number,
+                    error = %e,
+                    "baseline inheritance failed"
+                );
+                return;
+            }
+        }
+    }
 }
 
 // ── installations（claim とプロジェクト紐付け）──────────────────────────────
