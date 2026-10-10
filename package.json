@@ -3,10 +3,12 @@
   "private": true,
   "packageManager": "pnpm@11.15.1",
   "scripts": {
-    "prepare": "husky"
+    "prepare": "husky",
+    "test:play-trace": "node --test scripts/play-trace-storybook.test.mjs"
   },
   "devDependencies": {
     "husky": "9.1.7",
-    "lint-staged": "17.1.0"
+    "lint-staged": "17.1.0",
+    "storybook": "9.0.15"
   }
 }
