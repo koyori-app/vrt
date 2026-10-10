@@ -385,19 +385,32 @@ const READY_HOOK_SCRIPT: &str = r#"
       breakTrace('malformed instrumenter call metadata', false);
       return;
     }
-    if (!payload.path.every((part) => typeof part === 'string')) {
-      breakTrace('malformed instrumenter call path', false);
-      return;
+    const sanitizedPath = [];
+    try {
+      for (const part of payload.path.slice(0, TRACE_PATH_LIMIT)) {
+        if (typeof part === 'string') {
+          sanitizedPath.push(clipText(part));
+        } else if (part && typeof part === 'object' && typeof part.__callId__ === 'string') {
+          sanitizedPath.push({ __callId__: clipText(part.__callId__) });
+        } else {
+          breakTrace('malformed instrumenter call path', false);
+        }
+      }
+    } catch (error) {
+      breakTrace('instrumenter call path could not be summarized', false);
     }
     const tooLarge = payload.path.length > TRACE_PATH_LIMIT ||
       payload.args.length > TRACE_ARG_LIMIT || payload.id.length > TRACE_TEXT_LIMIT ||
       payload.method.length > TRACE_TEXT_LIMIT ||
-      payload.path.some((part) => part.length > TRACE_TEXT_LIMIT);
+      payload.path.some((part) =>
+        (typeof part === 'string' && part.length > TRACE_TEXT_LIMIT) ||
+        (part && typeof part.__callId__ === 'string' && part.__callId__.length > TRACE_TEXT_LIMIT)
+      );
     if (tooLarge) breakTrace('instrumenter call metadata exceeded capture limits', true);
     try {
       state.traceMetadata.set(clipText(payload.id), {
         id: clipText(payload.id),
-        path: payload.path.slice(0, TRACE_PATH_LIMIT).map(clipText),
+        path: sanitizedPath,
         method: clipText(payload.method),
         args: payload.args.slice(0, TRACE_ARG_LIMIT).map(summarizeArg),
       });
@@ -1482,10 +1495,21 @@ pub struct PlayTrace {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct PlayTraceCall {
     pub id: String,
-    pub path: Vec<String>,
+    pub path: Vec<PlayTracePathSegment>,
     pub method: String,
     pub args: Vec<PlayTraceArg>,
     pub status: PlayTraceStatus,
+}
+
+/// instrumenter の object path。連鎖呼びでは直前 call への参照が混ざる。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum PlayTracePathSegment {
+    Property(String),
+    CallRef {
+        #[serde(rename = "__callId__")]
+        call_id: String,
+    },
 }
 
 /// call 引数の安全な要約。入力文字列そのものは保持しない。
@@ -1584,13 +1608,6 @@ impl Readiness {
             }
         };
         match parsed.get("state").and_then(|v| v.as_str()) {
-            Some("ready") if play_trace.issue.is_some() => Readiness::Error {
-                message: format!(
-                    "instrumenter trace invalid: {}",
-                    play_trace.issue.as_deref().unwrap_or("unknown reason")
-                ),
-                play_trace,
-            },
             Some("ready") => Readiness::Ready(play_trace),
             Some("error") => Readiness::Error {
                 message: parsed
@@ -3070,7 +3087,12 @@ mod tests {
       }
       emitCall('call-1', ['userEvent'], 'click', ['private button label']);
       emitCall('call-2', ['expect'], 'toBeVisible', [{ secret: 'not retained' }]);
-      emitCall('call-3', ['expect'], 'toHaveTextContent', ['private expected text']);
+      emitCall(
+        'call-3',
+        [{ __callId__: 'call-2' }],
+        'toHaveTextContent',
+        ['private expected text']
+      );
 
       if (id === 'demo-play--immediate-throws') {
         emitSync('error');
@@ -5974,7 +5996,7 @@ mod tests {
         );
         assert!(matches!(
             probe(r#"{"state":"ready"}"#),
-            Readiness::Error { play_trace, .. }
+            Readiness::Ready(play_trace)
                 if play_trace.issue.as_deref() == Some("missing instrumenter trace")
         ));
         assert_eq!(
@@ -6721,8 +6743,17 @@ mod tests {
                 PlayTraceStatus::Error,
             ]
         );
-        assert_eq!(trace.calls[0].path, ["userEvent"]);
+        assert_eq!(
+            trace.calls[0].path,
+            [PlayTracePathSegment::Property("userEvent".to_string())]
+        );
         assert_eq!(trace.calls[0].method, "click");
+        assert_eq!(
+            trace.calls[2].path,
+            [PlayTracePathSegment::CallRef {
+                call_id: "call-2".to_string(),
+            }]
+        );
         assert_eq!(
             trace.calls[0].args[0].summary.as_deref(),
             Some("redacted:length=20")
@@ -6815,9 +6846,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn malformed_instrumenter_payload_cannot_succeed() {
+    async fn malformed_instrumenter_payload_is_diagnosed_without_failing_a_passing_play() {
         let Some(chromium) = discover_chromium() else {
-            eprintln!("SKIP malformed_instrumenter_payload_cannot_succeed: no chromium");
+            eprintln!(
+                "SKIP malformed_instrumenter_payload_is_diagnosed_without_failing_a_passing_play: no chromium"
+            );
             return;
         };
         let _guard = BROWSER_LOCK.lock().await;
@@ -6828,35 +6861,26 @@ mod tests {
         options.story_timeout = Duration::from_secs(5);
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
-        let err = renderer
+        let rendered = renderer
             .render_story(&server.base_url(), "demo-play--malformed-trace")
             .await
-            .expect_err("a malformed instrumenter payload must fail closed");
+            .expect("trace corruption must not change a passing play into a story failure");
         renderer.close().await;
 
-        match err {
-            RenderError::Story {
-                message,
-                play_trace: Some(trace),
-                ..
-            } => {
-                assert!(message.contains("instrumenter trace invalid"));
-                assert!(
-                    trace
-                        .issue
-                        .as_deref()
-                        .is_some_and(|issue| issue.contains("malformed"))
-                );
-            }
-            other => panic!("malformed trace must be a story error, got {other:?}"),
-        }
+        assert!(
+            rendered
+                .play_trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("malformed"))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn incomplete_or_reordered_instrumenter_payload_cannot_succeed() {
+    async fn incomplete_or_reordered_trace_is_diagnosed_without_failing_passing_plays() {
         let Some(chromium) = discover_chromium() else {
             eprintln!(
-                "SKIP incomplete_or_reordered_instrumenter_payload_cannot_succeed: no chromium"
+                "SKIP incomplete_or_reordered_trace_is_diagnosed_without_failing_passing_plays: no chromium"
             );
             return;
         };
@@ -6873,24 +6897,19 @@ mod tests {
             ("demo-play--missing-sync-trace", "without a sync payload"),
             ("demo-play--out-of-order-trace", "order changed"),
         ] {
-            let err = renderer
+            let rendered = renderer
                 .render_story(&server.base_url(), story_id)
                 .await
-                .expect_err("an incomplete or reordered trace must fail closed");
-            match err {
-                RenderError::Story {
-                    play_trace: Some(trace),
-                    ..
-                } => assert!(
-                    trace
-                        .issue
-                        .as_deref()
-                        .is_some_and(|issue| issue.contains(expected_issue)),
-                    "unexpected trace issue for {story_id}: {:?}",
-                    trace.issue
-                ),
-                other => panic!("broken trace must be a story error, got {other:?}"),
-            }
+                .expect("trace integrity issues must not override a passing play");
+            assert!(
+                rendered
+                    .play_trace
+                    .issue
+                    .as_deref()
+                    .is_some_and(|issue| issue.contains(expected_issue)),
+                "unexpected trace issue for {story_id}: {:?}",
+                rendered.play_trace.issue
+            );
         }
         renderer.close().await;
     }
@@ -6911,33 +6930,26 @@ mod tests {
         options.story_timeout = Duration::from_secs(5);
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
-        let err = renderer
+        let rendered = renderer
             .render_story(&server.base_url(), "demo-play--oversized-trace")
             .await
-            .expect_err("an oversized instrumenter payload must fail closed");
+            .expect("a bounded trace issue must not override a passing play");
         renderer.close().await;
 
-        match err {
-            RenderError::Story {
-                play_trace: Some(trace),
-                ..
-            } => {
-                assert_eq!(trace.calls.len(), 128);
-                assert!(trace.truncated);
-                assert!(
-                    trace
-                        .issue
-                        .as_deref()
-                        .is_some_and(|issue| issue.contains("128-call"))
-                );
-                assert_eq!(
-                    trace.calls[0].args[0].summary.as_deref(),
-                    Some("redacted:length=10000")
-                );
-                assert!(format!("{trace:?}").len() < 80_000);
-            }
-            other => panic!("oversized trace must be a story error, got {other:?}"),
-        }
+        let trace = rendered.play_trace;
+        assert_eq!(trace.calls.len(), 128);
+        assert!(trace.truncated);
+        assert!(
+            trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("128-call"))
+        );
+        assert_eq!(
+            trace.calls[0].args[0].summary.as_deref(),
+            Some("redacted:length=10000")
+        );
+        assert!(format!("{trace:?}").len() < 80_000);
     }
 
     /// 【cmd_693・回帰】本物の phase 順（`storyRendered` は `completed` phase の
