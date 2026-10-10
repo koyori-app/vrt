@@ -312,8 +312,173 @@ const READY_HOOK_SCRIPT: &str = r#"
   // フォントの印を document 側へ移したのと同じ前提から導かれる）。イベントは
   // 発火のたびにその時点の documentElement を刻むので、差し替え後に生き残った
   // channel へ再シグナルが来れば新しい世代で立ち直る。
-  const state = { rendered: false, renderedRoot: null, error: null, errorRoot: null };
+  const state = {
+    rendered: false,
+    renderedRoot: null,
+    error: null,
+    errorRoot: null,
+    traceRoot: null,
+    traceMetadata: new Map(),
+    traceOrder: [],
+    traceCalls: [],
+    traceIssue: null,
+    traceTruncated: false,
+    traceSawCall: false,
+    traceSawSync: false,
+  };
   window.__VRT_READY__ = state;
+
+  // The sync event is the ordering/status authority. The call event only
+  // supplies metadata. Keep this collector deliberately bounded: play args
+  // can contain application secrets and arbitrarily large DOM/object graphs.
+  const TRACE_CALL_LIMIT = 128;
+  const TRACE_PATH_LIMIT = 16;
+  const TRACE_ARG_LIMIT = 8;
+  const TRACE_TEXT_LIMIT = 160;
+  const clipText = (value) => String(value).slice(0, TRACE_TEXT_LIMIT);
+  const breakTrace = (reason, truncated) => {
+    if (!state.traceIssue) state.traceIssue = clipText(reason);
+    if (truncated) state.traceTruncated = true;
+  };
+  const resetTraceForDocument = () => {
+    const current = document.documentElement;
+    if (state.traceRoot === current) return;
+    state.traceRoot = current;
+    state.traceMetadata = new Map();
+    state.traceOrder = [];
+    state.traceCalls = [];
+    state.traceIssue = null;
+    state.traceTruncated = false;
+    state.traceSawCall = false;
+    state.traceSawSync = false;
+  };
+  const summarizeArg = (arg) => {
+    if (arg === null) return { kind: 'null', summary: null };
+    const kind = typeof arg;
+    if (kind === 'string') {
+      return { kind: 'string', summary: 'redacted:length=' + String(arg.length) };
+    }
+    if (kind === 'number') {
+      return { kind: 'number', summary: Number.isFinite(arg) ? clipText(arg) : 'non-finite' };
+    }
+    if (kind === 'boolean') return { kind: 'boolean', summary: String(arg) };
+    if (kind === 'undefined') return { kind: 'undefined', summary: null };
+    if (kind === 'bigint' || kind === 'symbol' || kind === 'function') {
+      return { kind, summary: null };
+    }
+    if (Array.isArray(arg)) return { kind: 'array', summary: 'length=' + String(arg.length) };
+    if (arg && arg.__callId__) return { kind: 'call-ref', summary: null };
+    if (arg && arg.nodeType === 1) {
+      return { kind: 'element', summary: clipText(arg.tagName || 'element') };
+    }
+    return { kind: 'object', summary: null };
+  };
+  const collectCall = (payload) => {
+    resetTraceForDocument();
+    state.traceSawCall = true;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      breakTrace('malformed instrumenter call payload', false);
+      return;
+    }
+    if (typeof payload.id !== 'string' || typeof payload.method !== 'string' ||
+        !Array.isArray(payload.path) || !Array.isArray(payload.args)) {
+      breakTrace('malformed instrumenter call metadata', false);
+      return;
+    }
+    const sanitizedPath = [];
+    try {
+      for (const part of payload.path.slice(0, TRACE_PATH_LIMIT)) {
+        if (typeof part === 'string') {
+          sanitizedPath.push(clipText(part));
+        } else if (part && typeof part === 'object' && typeof part.__callId__ === 'string') {
+          sanitizedPath.push({ __callId__: clipText(part.__callId__) });
+        } else {
+          breakTrace('malformed instrumenter call path', false);
+        }
+      }
+    } catch (error) {
+      breakTrace('instrumenter call path could not be summarized', false);
+    }
+    const tooLarge = payload.path.length > TRACE_PATH_LIMIT ||
+      payload.args.length > TRACE_ARG_LIMIT || payload.id.length > TRACE_TEXT_LIMIT ||
+      payload.method.length > TRACE_TEXT_LIMIT ||
+      payload.path.some((part) =>
+        (typeof part === 'string' && part.length > TRACE_TEXT_LIMIT) ||
+        (part && typeof part.__callId__ === 'string' && part.__callId__.length > TRACE_TEXT_LIMIT)
+      );
+    if (tooLarge) breakTrace('instrumenter call metadata exceeded capture limits', true);
+    try {
+      state.traceMetadata.set(clipText(payload.id), {
+        id: clipText(payload.id),
+        path: sanitizedPath,
+        method: clipText(payload.method),
+        args: payload.args.slice(0, TRACE_ARG_LIMIT).map(summarizeArg),
+      });
+    } catch (error) {
+      breakTrace('instrumenter call arguments could not be summarized', false);
+    }
+  };
+  const collectSync = (payload) => {
+    resetTraceForDocument();
+    state.traceSawSync = true;
+    if (!payload || typeof payload !== 'object' || !Array.isArray(payload.logItems)) {
+      breakTrace('malformed instrumenter sync payload', false);
+      return;
+    }
+    if (payload.logItems.length > TRACE_CALL_LIMIT) {
+      breakTrace('instrumenter sync exceeded 128-call capture limit', true);
+    }
+    const items = payload.logItems.slice(0, TRACE_CALL_LIMIT);
+    const nextOrder = [];
+    const calls = [];
+    const seen = new Set();
+    for (const item of items) {
+      if (!item || typeof item.callId !== 'string' || typeof item.status !== 'string') {
+        breakTrace('malformed instrumenter sync item', false);
+        continue;
+      }
+      const id = clipText(item.callId);
+      if (item.callId.length > TRACE_TEXT_LIMIT) {
+        breakTrace('instrumenter call id exceeded capture limit', true);
+      }
+      if (seen.has(id)) {
+        breakTrace('duplicate instrumenter call id in sync order', false);
+        continue;
+      }
+      seen.add(id);
+      nextOrder.push(id);
+      const metadata = state.traceMetadata.get(id);
+      if (!metadata) {
+        breakTrace('sync referenced call without metadata: ' + id, false);
+        continue;
+      }
+      if (!['done', 'error', 'active', 'waiting'].includes(item.status)) {
+        breakTrace('unknown instrumenter call status: ' + clipText(item.status), false);
+        continue;
+      }
+      calls.push({ ...metadata, status: item.status });
+    }
+    const shared = Math.min(state.traceOrder.length, nextOrder.length);
+    for (let index = 0; index < shared; index += 1) {
+      if (state.traceOrder[index] !== nextOrder[index]) {
+        breakTrace('instrumenter sync order changed', false);
+        break;
+      }
+    }
+    state.traceOrder = nextOrder;
+    state.traceCalls = calls;
+  };
+  state.playTrace = () => {
+    resetTraceForDocument();
+    const issue = state.traceIssue || (state.traceSawCall && !state.traceSawSync
+      ? 'instrumenter calls were observed without a sync payload'
+      : null);
+    return {
+      calls: state.traceCalls,
+      issue,
+      truncated: state.traceTruncated,
+    };
+  };
 
   const describe = (payload) => {
     if (payload == null) return 'unknown error';
@@ -345,6 +510,14 @@ const READY_HOOK_SCRIPT: &str = r#"
     channel.on('storyRendered', () => {
       state.rendered = true;
       state.renderedRoot = document.documentElement;
+    });
+    channel.on('storybook/instrumenter/call', (payload) => {
+      try { collectCall(payload); }
+      catch (error) { breakTrace('instrumenter call collector failed', false); }
+    });
+    channel.on('storybook/instrumenter/sync', (payload) => {
+      try { collectSync(payload); }
+      catch (error) { breakTrace('instrumenter sync collector failed', false); }
     });
     // play 関数の例外は「描画は終わったが検証に失敗した」状態。撮影より診断を優先する。
     for (const event of [
@@ -395,8 +568,11 @@ JSON.stringify((() => {
   // 前 document の残骸——読まずに待ち続ける（cmd_661 ①）。
   const hook = window.__VRT_READY__;
   const current = document.documentElement;
+  const playTrace = hook && hook.traceRoot === current && typeof hook.playTrace === 'function'
+    ? hook.playTrace()
+    : { calls: [], issue: null, truncated: false };
   if (hook && hook.error && hook.errorRoot === current) {
-    return { state: 'error', message: String(hook.error) };
+    return { state: 'error', message: String(hook.error), play_trace: playTrace };
   }
   // Storybook の StoryRender は preparing → loading → beforeEach → rendering →
   // playing → played → completing → completed → afterEach → finished と phase を
@@ -447,7 +623,11 @@ JSON.stringify((() => {
         // root が空なのも普通——domReady を要求すると、本物のエラー通知を
         // 黙らせて 30 秒の Timeout に劣化させる。世代を刻む口が無いのは
         // completed と同じ（モジュール doc の常駐状態の表を参照）。
-        return { state: 'error', message: 'render phase: ' + String(phase) };
+        return {
+          state: 'error',
+          message: 'render phase: ' + String(phase),
+          play_trace: playTrace,
+        };
       }
       // 絵がまだ確定していない phase。世代の合う rendered 印があっても
       // READY にしない——これが play の完了を待つ門である。`played` /
@@ -465,7 +645,7 @@ JSON.stringify((() => {
         // 世代は hook 側で固定できている。空 story も正当なので
         // domReady を要求しない。
         if (hook && hook.rendered && hook.renderedRoot === current) {
-          return { state: 'ready' };
+          return { state: 'ready', play_trace: playTrace };
         }
         // storyRenders は Storybook 自身が window に置く状態で、hook と違い
         // 世代を刻んでいない（内部実装への書き込みは採らない判断——モジュール
@@ -484,7 +664,7 @@ JSON.stringify((() => {
         // root の中身に依存しない突き合わせ（完了 phase 観測時の世代を Rust
         // 側で覚える等）は検証世代の一般化そのもので、#27 の範囲外として
         // 併記に留める（モジュール doc「本 PR で扱わないもの」）。
-        if (domReady) return { state: 'ready' };
+        if (domReady) return { state: 'ready', play_trace: playTrace };
         return { state: 'pending', dom_ready: domReady };
       }
       // 知らない phase 名（将来の SB が足したもの）は phase では判定せず、
@@ -498,7 +678,9 @@ JSON.stringify((() => {
   // preview phase を公開しない古い構成と cargo 最小 fixture、レンダーが
   // storyRenders に登録される前後の窓、そして知らない phase 名は、
   // 従来どおり世代つきの channel の rendered 印を信じる。
-  if (hook && hook.rendered && hook.renderedRoot === current) return { state: 'ready' };
+  if (hook && hook.rendered && hook.renderedRoot === current) {
+    return { state: 'ready', play_trace: playTrace };
+  }
 
   const runtime = !!(window.__STORYBOOK_ADDONS_CHANNEL__ || window.__STORYBOOK_PREVIEW__);
   if (runtime) return { state: 'pending', dom_ready: domReady };
@@ -1293,6 +1475,60 @@ static FONTS_RECHECK_PROBE: LazyLock<String> = LazyLock::new(|| {
     .concat()
 });
 
+/// Storybook instrumenter から得た、順序つきの play call 診断。
+///
+/// 順序と status は `storybook/instrumenter/sync` の `logItems` を正とし、
+/// `storybook/instrumenter/call` は path / method / args の metadata を補う。
+/// 保持上限は 128 calls、call ごとに path 16 要素・args 8 要素、文字列 160 文字。
+/// Story の値には秘密が含まれうるため、生の文字列引数は保持せず長さだけを残す。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PlayTrace {
+    pub calls: Vec<PlayTraceCall>,
+    /// 欠落・型違い・順序の破損など、trace を信用できない理由。
+    #[serde(default)]
+    pub issue: Option<String>,
+    /// 入力が上限を越え、保持内容を打ち切ったことを示す。
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PlayTraceCall {
+    pub id: String,
+    pub path: Vec<PlayTracePathSegment>,
+    pub method: String,
+    pub args: Vec<PlayTraceArg>,
+    pub status: PlayTraceStatus,
+}
+
+/// instrumenter の object path。連鎖呼びでは直前 call への参照が混ざる。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum PlayTracePathSegment {
+    Property(String),
+    CallRef {
+        #[serde(rename = "__callId__")]
+        call_id: String,
+    },
+}
+
+/// call 引数の安全な要約。入力文字列そのものは保持しない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct PlayTraceArg {
+    pub kind: String,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayTraceStatus {
+    Done,
+    Error,
+    Active,
+    Waiting,
+}
+
 #[derive(Debug, Error)]
 pub enum RenderError {
     #[error("failed to launch chromium at {path}: {source}")]
@@ -1316,7 +1552,11 @@ pub enum RenderError {
     /// Storybook 自身が「このストーリーは失敗した」と言ってきた場合。
     /// タイムアウトより遥かに早く、理由つきで返せる。
     #[error("story `{story_id}` reported a render error: {message}")]
-    Story { story_id: String, message: String },
+    Story {
+        story_id: String,
+        message: String,
+        play_trace: Option<PlayTrace>,
+    },
     #[error("story `{story_id}` failed to render: {source}")]
     Cdp {
         story_id: String,
@@ -1329,9 +1569,12 @@ pub enum RenderError {
 #[derive(Debug, PartialEq, Eq)]
 enum Readiness {
     /// Storybook が描画完了を通知した（または DOM フォールバックが成立した）。
-    Ready,
+    Ready(PlayTrace),
     /// Storybook がこのストーリーの失敗を通知した。
-    Error(String),
+    Error {
+        message: String,
+        play_trace: PlayTrace,
+    },
     /// ランタイムはいる。まだ描画中。
     Pending,
     /// Storybook ランタイムが見当たらない。`dom_ready` は旧ヒューリスティックの結果。
@@ -1350,15 +1593,30 @@ impl Readiness {
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
             return Readiness::Pending;
         };
+        let play_trace = match parsed.get("play_trace") {
+            None => PlayTrace {
+                calls: Vec::new(),
+                issue: Some("missing instrumenter trace".to_string()),
+                truncated: false,
+            },
+            Some(value) => {
+                serde_json::from_value::<PlayTrace>(value.clone()).unwrap_or_else(|e| PlayTrace {
+                    calls: Vec::new(),
+                    issue: Some(format!("malformed instrumenter trace: {e}")),
+                    truncated: false,
+                })
+            }
+        };
         match parsed.get("state").and_then(|v| v.as_str()) {
-            Some("ready") => Readiness::Ready,
-            Some("error") => Readiness::Error(
-                parsed
+            Some("ready") => Readiness::Ready(play_trace),
+            Some("error") => Readiness::Error {
+                message: parsed
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error")
                     .to_string(),
-            ),
+                play_trace,
+            },
             Some("absent") => Readiness::Absent {
                 dom_ready: parsed
                     .get("dom_ready")
@@ -1385,6 +1643,8 @@ pub struct RenderedStory {
     /// 失敗経路①の意図した fail-open——代替字形のまま撮った印）。
     /// 検証列をやり直した場合は**撮影された巡**の警告である。
     pub font_warning: Option<String>,
+    /// この story の play で観測した interaction。play が無ければ空。
+    pub play_trace: PlayTrace,
 }
 
 /// [`RenderError::Cdp`] だけを 1 回やり直すリトライ骨格。
@@ -1749,8 +2009,8 @@ impl StoryRenderer {
         // も静止の対象で、順序を崩すとその性質が壊れる。常に二度待つ形も
         // 採らない——再待ちが走るのは窓が実際に開いたと検知された時だけで
         // ある。停止性は READY 待ちと共有の deadline が担う。
-        let font_warning = loop {
-            self.wait_for_story_ready(page, story_id, deadline).await?;
+        let (font_warning, play_trace) = loop {
+            let round_play_trace = self.wait_for_story_ready(page, story_id, deadline).await?;
 
             tokio::time::sleep(SETTLE_DELAY).await;
 
@@ -1787,7 +2047,7 @@ impl StoryRenderer {
             // wait_for_fonts が無効なら印を残す層がそもそも無いので確かめない
             // （テスト専用の裏口。本番経路は常に有効）。
             if !self.options.wait_for_fonts {
-                break round_warning;
+                break (round_warning, round_play_trace);
             }
             let recheck_result = evaluate_with_deadline_retry(
                 || page.evaluate(FONTS_RECHECK_PROBE.as_str()),
@@ -1798,7 +2058,7 @@ impl StoryRenderer {
             )
             .await?;
             if fonts_recheck_verdict(recheck_result.value(), story_id)? {
-                break round_warning;
+                break (round_warning, round_play_trace);
             }
             // 未検証を検知した。やり直す前に deadline を確かめる——evaluate が
             // すべて即応するのに再確認だけ不成立が続くページ（入れ替わり・
@@ -1825,7 +2085,11 @@ impl StoryRenderer {
                 story_id: story_id.to_string(),
                 source,
             })?;
-        Ok(RenderedStory { png, font_warning })
+        Ok(RenderedStory {
+            png,
+            font_warning,
+            play_trace,
+        })
     }
 
     /// READY 待ち（Storybook の描画完了シグナルのポーリング）。
@@ -1841,7 +2105,7 @@ impl StoryRenderer {
         page: &chromiumoxide::page::Page,
         story_id: &str,
         deadline: std::time::Instant,
-    ) -> Result<(), RenderError> {
+    ) -> Result<PlayTrace, RenderError> {
         // Absent（ランタイム無し）の DOM ヒューリスティックに与える
         // [`SIGNAL_GRACE`] は**この巡の開始**から測る。story 全体の開始時刻から
         // 測ると、やり直しの巡では猶予が最初から尽きており、root に子が一つ
@@ -1854,11 +2118,15 @@ impl StoryRenderer {
         loop {
             match page.evaluate(probe.as_str()).await {
                 Ok(result) => match Readiness::parse(result.value()) {
-                    Readiness::Ready => return Ok(()),
-                    Readiness::Error(message) => {
+                    Readiness::Ready(play_trace) => return Ok(play_trace),
+                    Readiness::Error {
+                        message,
+                        play_trace,
+                    } => {
                         return Err(RenderError::Story {
                             story_id: story_id.to_string(),
                             message,
+                            play_trace: Some(play_trace),
                         });
                     }
                     // Storybook ランタイムが無いバンドルだけ、猶予を置いて DOM で判定する。
@@ -1868,7 +2136,7 @@ impl StoryRenderer {
                                 %story_id,
                                 "no storybook render signal; falling back to the DOM heuristic"
                             );
-                            return Ok(());
+                            return Ok(PlayTrace::default());
                         }
                     }
                     Readiness::Pending => {}
@@ -2126,6 +2394,7 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
     let unparseable = |detail: String| RenderError::Story {
         story_id: story_id.to_string(),
         message: format!("freeze result was unparseable: {detail}"),
+        play_trace: None,
     };
     let Some(raw) = value.and_then(|v| v.as_str()) else {
         return Err(unparseable(format!(
@@ -2159,6 +2428,7 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
                 return Err(RenderError::Story {
                     story_id: story_id.to_string(),
                     message: format!("freeze failed: {reason}{errors_note}"),
+                    play_trace: None,
                 });
             }
             let running = parsed.get("running").and_then(|v| v.as_array());
@@ -2178,6 +2448,7 @@ fn freeze_verdict(value: Option<&serde_json::Value>, story_id: &str) -> Result<(
                     count = running.map(|a| a.len()).unwrap_or(0),
                     sweeps = parsed.get("sweeps").and_then(|v| v.as_u64()).unwrap_or(0),
                 ),
+                play_trace: None,
             })
         }
         None => Err(unparseable(format!(
@@ -2205,6 +2476,7 @@ fn reduced_motion_verdict(
     let unparseable = |detail: String| RenderError::Story {
         story_id: story_id.to_string(),
         message: format!("reduced-motion verification result was unparseable: {detail}"),
+        play_trace: None,
     };
     let Some(raw) = value.and_then(|v| v.as_str()) else {
         return Err(unparseable(format!(
@@ -2236,6 +2508,7 @@ fn reduced_motion_verdict(
                     "reduced-motion emulation was requested but could not be \
                      verified as applied{errors_note}"
                 ),
+                play_trace: None,
             })
         }
         None => Err(unparseable(format!(
@@ -2282,6 +2555,7 @@ fn fonts_verdict(
     let unparseable = |detail: String| RenderError::Story {
         story_id: story_id.to_string(),
         message: format!("fonts-ready wait result was unparseable: {detail}"),
+        play_trace: None,
     };
     let Some(raw) = value.and_then(|v| v.as_str()) else {
         return Err(unparseable(format!(
@@ -2342,6 +2616,7 @@ fn fonts_verdict(
                 message: format!(
                     "fonts were not verified as loaded before the capture{errors_note}"
                 ),
+                play_trace: None,
             })
         }
         None => Err(unparseable(format!(
@@ -2367,6 +2642,7 @@ fn fonts_recheck_verdict(
     let unparseable = |detail: String| RenderError::Story {
         story_id: story_id.to_string(),
         message: format!("fonts recheck result was unparseable: {detail}"),
+        play_trace: None,
     };
     let Some(raw) = value.and_then(|v| v.as_str()) else {
         return Err(unparseable(format!(
@@ -2552,6 +2828,7 @@ mod tests {
         let ok = RenderedStory {
             png: vec![1, 2, 3],
             font_warning: None,
+            play_trace: PlayTrace::default(),
         };
         let (result, calls) = run_retry(vec![Err(cdp_error("s--d")), Ok(ok)]).await;
         assert_eq!(result.unwrap().png, vec![1, 2, 3]);
@@ -2574,6 +2851,7 @@ mod tests {
         let story = RenderError::Story {
             story_id: "s--d".into(),
             message: "boom".into(),
+            play_trace: None,
         };
         let (result, calls) = run_retry(vec![Err(story)]).await;
         assert!(matches!(result, Err(RenderError::Story { .. })));
@@ -2595,6 +2873,7 @@ mod tests {
         let ok = RenderedStory {
             png: vec![9],
             font_warning: None,
+            play_trace: PlayTrace::default(),
         };
         let (result, calls) = run_retry(vec![Ok(ok)]).await;
         assert_eq!(result.unwrap().png, vec![9]);
@@ -2746,7 +3025,77 @@ mod tests {
       window.__VRT_PLAY_ORDER__.push('play-started');
       document.getElementById('play-target').style.background = '#00ff00';
 
+      const instrumenterCall = 'storybook/instrumenter/call';
+      const instrumenterSync = 'storybook/instrumenter/sync';
+      const emitCall = function (callId, path, method, args) {
+        channel.emit(instrumenterCall, { id: callId, path: path, method: method, args: args });
+      };
+      const emitSync = function (thirdStatus) {
+        channel.emit(instrumenterSync, {
+          logItems: [
+            { callId: 'call-1', status: 'done' },
+            { callId: 'call-2', status: 'done' },
+            { callId: 'call-3', status: thirdStatus }
+          ]
+        });
+      };
+      if (id === 'demo-play--malformed-trace') {
+        channel.emit(instrumenterCall, { id: 42, args: 'not-an-array' });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--missing-call-trace') {
+        channel.emit(instrumenterSync, {
+          logItems: [{ callId: 'missing-call', status: 'done' }]
+        });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--missing-sync-trace') {
+        emitCall('call-without-sync', ['expect'], 'toBeVisible', []);
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--out-of-order-trace') {
+        emitCall('call-1', ['userEvent'], 'click', []);
+        emitCall('call-2', ['expect'], 'toBeVisible', []);
+        channel.emit(instrumenterSync, {
+          logItems: [
+            { callId: 'call-1', status: 'done' },
+            { callId: 'call-2', status: 'done' }
+          ]
+        });
+        channel.emit(instrumenterSync, {
+          logItems: [
+            { callId: 'call-2', status: 'done' },
+            { callId: 'call-1', status: 'done' }
+          ]
+        });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--oversized-trace') {
+        const logItems = [];
+        for (let index = 0; index < 129; index += 1) {
+          const callId = 'large-' + String(index);
+          emitCall(callId, ['expect'], 'toEqual', ['x'.repeat(10000)]);
+          logItems.push({ callId: callId, status: 'done' });
+        }
+        channel.emit(instrumenterSync, { logItems: logItems });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      emitCall('call-1', ['userEvent'], 'click', ['private button label']);
+      emitCall('call-2', ['expect'], 'toBeVisible', [{ secret: 'not retained' }]);
+      emitCall(
+        'call-3',
+        [{ __callId__: 'call-2' }],
+        'toHaveTextContent',
+        ['private expected text']
+      );
+
       if (id === 'demo-play--immediate-throws') {
+        emitSync('error');
         window.__VRT_PLAY_ORDER__.push('play-threw');
         channel.emit('playFunctionThrewException', {
           message: 'immediate play assertion failed (storyRendered -> play-started -> play-threw)'
@@ -2757,10 +3106,12 @@ mod tests {
       (async function play() {
         await new Promise(function (resolve) { setTimeout(resolve, 900); });
         if (id === 'demo-play--throws') {
+          emitSync('error');
           throw new Error(
             'delayed play assertion failed (storyRendered -> play-started -> play-threw)'
           );
         }
+        emitSync('done');
         window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
         window.__VRT_PLAY_ORDER__.push('play-completed');
       })().catch(function (error) {
@@ -5632,11 +5983,22 @@ mod tests {
     fn readiness_parses_probe_results() {
         let probe = |raw: &str| Readiness::parse(Some(&serde_json::Value::String(raw.to_string())));
 
-        assert_eq!(probe(r#"{"state":"ready"}"#), Readiness::Ready);
         assert_eq!(
-            probe(r#"{"state":"error","message":"storyErrored: boom"}"#),
-            Readiness::Error("storyErrored: boom".to_string())
+            probe(r#"{"state":"ready","play_trace":{"calls":[]}}"#),
+            Readiness::Ready(PlayTrace::default())
         );
+        assert_eq!(
+            probe(r#"{"state":"error","message":"storyErrored: boom","play_trace":{"calls":[]}}"#),
+            Readiness::Error {
+                message: "storyErrored: boom".to_string(),
+                play_trace: PlayTrace::default(),
+            }
+        );
+        assert!(matches!(
+            probe(r#"{"state":"ready"}"#),
+            Readiness::Ready(play_trace)
+                if play_trace.issue.as_deref() == Some("missing instrumenter trace")
+        ));
         assert_eq!(
             probe(r#"{"state":"absent","dom_ready":true}"#),
             Readiness::Absent { dom_ready: true }
@@ -6353,6 +6715,50 @@ mod tests {
             .render_story(&server.base_url(), "demo-play--throws")
             .await
             .expect_err("a delayed play failure must stop the capture");
+        let trace = match &err {
+            RenderError::Story {
+                play_trace: Some(trace),
+                ..
+            } => trace,
+            other => panic!("play failure must carry a trace, got {other:?}"),
+        };
+        assert_eq!(trace.calls.len(), 3);
+        assert_eq!(
+            trace
+                .calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["call-1", "call-2", "call-3"]
+        );
+        assert_eq!(
+            trace
+                .calls
+                .iter()
+                .map(|call| call.status)
+                .collect::<Vec<_>>(),
+            [
+                PlayTraceStatus::Done,
+                PlayTraceStatus::Done,
+                PlayTraceStatus::Error,
+            ]
+        );
+        assert_eq!(
+            trace.calls[0].path,
+            [PlayTracePathSegment::Property("userEvent".to_string())]
+        );
+        assert_eq!(trace.calls[0].method, "click");
+        assert_eq!(
+            trace.calls[2].path,
+            [PlayTracePathSegment::CallRef {
+                call_id: "call-2".to_string(),
+            }]
+        );
+        assert_eq!(
+            trace.calls[0].args[0].summary.as_deref(),
+            Some("redacted:length=20")
+        );
+        assert!(!format!("{trace:?}").contains("private button label"));
         renderer.close().await;
 
         let message = err.to_string();
@@ -6411,21 +6817,139 @@ mod tests {
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
         let started = std::time::Instant::now();
-        let png = renderer
+        let rendered = renderer
             .render_story(&server.base_url(), "demo-play--passes")
             .await
-            .expect("a passing play must still capture")
-            .png;
+            .expect("a passing play must still capture");
         let elapsed = started.elapsed();
         renderer.close().await;
 
+        assert_eq!(rendered.play_trace.calls.len(), 3);
+        assert_eq!(
+            rendered
+                .play_trace
+                .calls
+                .iter()
+                .map(|call| call.status)
+                .collect::<Vec<_>>(),
+            [PlayTraceStatus::Done; 3]
+        );
+        assert_eq!(rendered.play_trace.issue, None);
+        assert!(!rendered.play_trace.truncated);
         assert!(
             elapsed >= Duration::from_millis(900),
             "capture must wait for the play completion, took {elapsed:?}"
         );
-        let image = decode_png(&png);
+        let image = decode_png(&rendered.png);
         let center = image.get_pixel(160, 120);
         assert_eq!((center[0], center[1], center[2]), (0, 255, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_instrumenter_payload_is_diagnosed_without_failing_a_passing_play() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP malformed_instrumenter_payload_is_diagnosed_without_failing_a_passing_play: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let rendered = renderer
+            .render_story(&server.base_url(), "demo-play--malformed-trace")
+            .await
+            .expect("trace corruption must not change a passing play into a story failure");
+        renderer.close().await;
+
+        assert!(
+            rendered
+                .play_trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("malformed"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incomplete_or_reordered_trace_is_diagnosed_without_failing_passing_plays() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP incomplete_or_reordered_trace_is_diagnosed_without_failing_passing_plays: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        for (story_id, expected_issue) in [
+            ("demo-play--missing-call-trace", "without metadata"),
+            ("demo-play--missing-sync-trace", "without a sync payload"),
+            ("demo-play--out-of-order-trace", "order changed"),
+        ] {
+            let rendered = renderer
+                .render_story(&server.base_url(), story_id)
+                .await
+                .expect("trace integrity issues must not override a passing play");
+            assert!(
+                rendered
+                    .play_trace
+                    .issue
+                    .as_deref()
+                    .is_some_and(|issue| issue.contains(expected_issue)),
+                "unexpected trace issue for {story_id}: {:?}",
+                rendered.play_trace.issue
+            );
+        }
+        renderer.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instrumenter_trace_is_bounded_and_redacts_long_string_arguments() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP instrumenter_trace_is_bounded_and_redacts_long_string_arguments: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let rendered = renderer
+            .render_story(&server.base_url(), "demo-play--oversized-trace")
+            .await
+            .expect("a bounded trace issue must not override a passing play");
+        renderer.close().await;
+
+        let trace = rendered.play_trace;
+        assert_eq!(trace.calls.len(), 128);
+        assert!(trace.truncated);
+        assert!(
+            trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("128-call"))
+        );
+        assert_eq!(
+            trace.calls[0].args[0].summary.as_deref(),
+            Some("redacted:length=10000")
+        );
+        assert!(format!("{trace:?}").len() < 80_000);
     }
 
     /// 【cmd_693・回帰】本物の phase 順（`storyRendered` は `completed` phase の
