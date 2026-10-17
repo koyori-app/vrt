@@ -385,13 +385,14 @@ const READY_HOOK_SCRIPT: &str = r#"
       breakTrace('malformed instrumenter call metadata', false);
       return;
     }
-    // 同じ ID は先着を残す（sync の側の重複・error の先着固定と同じ向き）。後の call で
-    // 黙って上書きすれば、先に並んだ sync の順と中身が食い違っても誰も気づけぬ。
+    // 既に在る ID は、黙って先着を残して戻る。Promise を返す call（userEvent・find*・
+    // waitFor*）は、本物の instrumenter では active で一度、done でもう一度、同じ ID の
+    // CALL を出す——同じ call の状態の更新であって、壊れた trace ではない。順序と状態の
+    // 正は sync であり、ID の重なりの診断は sync の側の「duplicate instrumenter call id
+    // in sync order」が担う。上限の検めより先に見るゆえ、上限に達した後に既に在る
+    // call の状態の更新が届いても、上限の issue は立たぬ。
     const id = clipText(payload.id);
-    if (state.traceMetadata.has(id)) {
-      breakTrace('duplicate instrumenter call id: ' + id, false);
-      return;
-    }
+    if (state.traceMetadata.has(id)) return;
     // 保持は sync の側と同じ 128 件で止める。call だけが大量に届いても、metadata を
     // 際限なく抱えぬ（play の args は秘密や大きな object を含みうる）。
     if (state.traceMetadata.size >= TRACE_CALL_LIMIT) {
@@ -3102,10 +3103,23 @@ mod tests {
         window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
         return;
       }
-      if (id === 'demo-play--duplicate-call-trace') {
-        emitCall('dup-1', ['userEvent'], 'click', []);
-        emitCall('dup-1', ['expect'], 'toBeVisible', []);
-        channel.emit(instrumenterSync, { logItems: [{ callId: 'dup-1', status: 'done' }] });
+      if (id === 'demo-play--async-call-state-update-trace') {
+        // Promise を返す call（userEvent・find*・waitFor*）は、本物の instrumenter では
+        // 呼んだ時に active で、解けた時に done で、同じ id の CALL を二度出す。
+        // 後の CALL の args を変えて、先着の metadata が上書きされぬかを見分ける。
+        // 先に 127 件を据え、async-1 で保持をちょうど上限（128 件）にする。上限に達した後の
+        // 再到着が、上限の issue・truncated を誤って立てぬかも見る。
+        for (let index = 0; index < 127; index += 1) {
+          emitCall('fill-' + String(index), ['expect'], 'toBeVisible', []);
+        }
+        channel.emit(instrumenterCall, {
+          id: 'async-1', path: ['userEvent'], method: 'click', args: [], status: 'active'
+        });
+        channel.emit(instrumenterSync, { logItems: [{ callId: 'async-1', status: 'active' }] });
+        channel.emit(instrumenterCall, {
+          id: 'async-1', path: ['userEvent'], method: 'click', args: ['late'], status: 'done'
+        });
+        channel.emit(instrumenterSync, { logItems: [{ callId: 'async-1', status: 'done' }] });
         window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
         return;
       }
@@ -7025,10 +7039,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn duplicate_instrumenter_call_id_keeps_the_first_metadata_and_is_diagnosed() {
+    async fn async_call_state_update_keeps_the_first_metadata_without_a_trace_issue() {
         let Some(chromium) = discover_chromium() else {
             eprintln!(
-                "SKIP duplicate_instrumenter_call_id_keeps_the_first_metadata_and_is_diagnosed: no chromium"
+                "SKIP async_call_state_update_keeps_the_first_metadata_without_a_trace_issue: no chromium"
             );
             return;
         };
@@ -7041,24 +7055,29 @@ mod tests {
         let renderer = StoryRenderer::launch(options).await.expect("launch");
 
         let rendered = renderer
-            .render_story(&server.base_url(), "demo-play--duplicate-call-trace")
+            .render_story(
+                &server.base_url(),
+                "demo-play--async-call-state-update-trace",
+            )
             .await
-            .expect("a duplicate call id must not override a passing play");
+            .expect("an async call state update must not fail a passing play");
         renderer.close().await;
 
         let trace = rendered.play_trace;
-        assert!(
-            trace
-                .issue
-                .as_deref()
-                .is_some_and(|issue| issue.contains("duplicate instrumenter call id")),
-            "unexpected trace issue: {:?}",
-            trace.issue
-        );
+        // 同じ id の CALL の再到着は状態の更新であって、壊れた trace ではない
+        assert_eq!(trace.issue, None);
         assert!(!trace.truncated);
         assert_eq!(trace.calls.len(), 1);
-        // 先に届いた metadata を残し、後の call で黙って上書きせぬ
-        assert_eq!(trace.calls[0].method, "click");
+        let call = &trace.calls[0];
+        assert_eq!(call.id, "async-1");
+        // 先に届いた metadata を残す（後の CALL の args で上書きせぬ）。状態は sync が決める
+        assert_eq!(call.method, "click");
+        assert!(
+            call.args.is_empty(),
+            "metadata was overwritten: {:?}",
+            call.args
+        );
+        assert_eq!(call.status, PlayTraceStatus::Done);
     }
 
     /// 【cmd_693・回帰】本物の phase 順（`storyRendered` は `completed` phase の

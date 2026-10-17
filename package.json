@@ -4,7 +4,7 @@
   "packageManager": "pnpm@11.15.1",
   "scripts": {
     "prepare": "husky",
-    "test:play-trace": "node --test scripts/play-trace-storybook.test.mjs"
+    "test:play-trace": "node --test scripts/play-trace-storybook.test.mjs scripts/play-trace-storybook-async.test.mjs"
   },
   "devDependencies": {
     "husky": "9.1.7",
