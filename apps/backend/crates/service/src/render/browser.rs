@@ -385,6 +385,19 @@ const READY_HOOK_SCRIPT: &str = r#"
       breakTrace('malformed instrumenter call metadata', false);
       return;
     }
+    // 同じ ID は先着を残す（sync の側の重複・error の先着固定と同じ向き）。後の call で
+    // 黙って上書きすれば、先に並んだ sync の順と中身が食い違っても誰も気づけぬ。
+    const id = clipText(payload.id);
+    if (state.traceMetadata.has(id)) {
+      breakTrace('duplicate instrumenter call id: ' + id, false);
+      return;
+    }
+    // 保持は sync の側と同じ 128 件で止める。call だけが大量に届いても、metadata を
+    // 際限なく抱えぬ（play の args は秘密や大きな object を含みうる）。
+    if (state.traceMetadata.size >= TRACE_CALL_LIMIT) {
+      breakTrace('instrumenter calls exceeded 128-call capture limit', true);
+      return;
+    }
     const sanitizedPath = [];
     try {
       for (const part of payload.path.slice(0, TRACE_PATH_LIMIT)) {
@@ -408,8 +421,8 @@ const READY_HOOK_SCRIPT: &str = r#"
       );
     if (tooLarge) breakTrace('instrumenter call metadata exceeded capture limits', true);
     try {
-      state.traceMetadata.set(clipText(payload.id), {
-        id: clipText(payload.id),
+      state.traceMetadata.set(id, {
+        id,
         path: sanitizedPath,
         method: clipText(payload.method),
         args: payload.args.slice(0, TRACE_ARG_LIMIT).map(summarizeArg),
@@ -3071,6 +3084,28 @@ mod tests {
             { callId: 'call-1', status: 'done' }
           ]
         });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--flooded-call-trace') {
+        // call だけが 1,000 件届き、sync は上限の境（128 件目と 129 件目）を引く 1 件だけ。
+        // sync の側は上限に掛からぬゆえ、保持が止まるかは call の側の上限だけで決まる。
+        for (let index = 0; index < 1000; index += 1) {
+          emitCall('flood-' + String(index), ['expect'], 'toBeVisible', []);
+        }
+        channel.emit(instrumenterSync, {
+          logItems: [
+            { callId: 'flood-127', status: 'done' },
+            { callId: 'flood-128', status: 'done' }
+          ]
+        });
+        window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
+        return;
+      }
+      if (id === 'demo-play--duplicate-call-trace') {
+        emitCall('dup-1', ['userEvent'], 'click', []);
+        emitCall('dup-1', ['expect'], 'toBeVisible', []);
+        channel.emit(instrumenterSync, { logItems: [{ callId: 'dup-1', status: 'done' }] });
         window.__STORYBOOK_PREVIEW__.storyRenders[0].phase = 'completed';
         return;
       }
@@ -6950,6 +6985,80 @@ mod tests {
             Some("redacted:length=10000")
         );
         assert!(format!("{trace:?}").len() < 80_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instrumenter_call_metadata_is_bounded_without_a_large_sync() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP instrumenter_call_metadata_is_bounded_without_a_large_sync: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let rendered = renderer
+            .render_story(&server.base_url(), "demo-play--flooded-call-trace")
+            .await
+            .expect("a bounded call trace must not override a passing play");
+        renderer.close().await;
+
+        let trace = rendered.play_trace;
+        // 128 件目（flood-127）までは保持し、129 件目（flood-128）からは保持せぬ
+        let ids: Vec<&str> = trace.calls.iter().map(|call| call.id.as_str()).collect();
+        assert_eq!(ids, ["flood-127"]);
+        assert!(trace.truncated);
+        assert!(
+            trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("128-call")),
+            "unexpected trace issue: {:?}",
+            trace.issue
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_instrumenter_call_id_keeps_the_first_metadata_and_is_diagnosed() {
+        let Some(chromium) = discover_chromium() else {
+            eprintln!(
+                "SKIP duplicate_instrumenter_call_id_keeps_the_first_metadata_and_is_diagnosed: no chromium"
+            );
+            return;
+        };
+        let _guard = BROWSER_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_play_runtime_bundle(dir.path());
+        let server = StaticServer::start(dir.path()).await.expect("start server");
+        let mut options = RenderOptions::new(chromium, 320, 240);
+        options.story_timeout = Duration::from_secs(5);
+        let renderer = StoryRenderer::launch(options).await.expect("launch");
+
+        let rendered = renderer
+            .render_story(&server.base_url(), "demo-play--duplicate-call-trace")
+            .await
+            .expect("a duplicate call id must not override a passing play");
+        renderer.close().await;
+
+        let trace = rendered.play_trace;
+        assert!(
+            trace
+                .issue
+                .as_deref()
+                .is_some_and(|issue| issue.contains("duplicate instrumenter call id")),
+            "unexpected trace issue: {:?}",
+            trace.issue
+        );
+        assert!(!trace.truncated);
+        assert_eq!(trace.calls.len(), 1);
+        // 先に届いた metadata を残し、後の call で黙って上書きせぬ
+        assert_eq!(trace.calls[0].method, "click");
     }
 
     /// 【cmd_693・回帰】本物の phase 順（`storyRendered` は `completed` phase の
