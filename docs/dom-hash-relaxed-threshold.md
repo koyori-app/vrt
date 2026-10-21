@@ -25,21 +25,23 @@
 
 ### 引く原文について
 
-設計の主張は、先行調査で取得した原文の行で裏づける。
-原文は `file:行` の形で引く。
-該当する原文が無い主張は、「調べた範囲では裏が無い」と書く。
+設計の主張は、先行調査で読んだ公開の資料の引用で裏づける。
+引用できる資料が無い主張は、「調べた範囲では裏が無い」と書く。
 
-引く原文のファイルは次のとおりである（先行調査の `sources/` に置いたもので、この repo には含まれない）。
+引用は、公開の URL と取得の日で示す。
+元の頁は書き換わりうるので、引用の字は取得の日の時点のまま残す。
+引用は、論を支えるのに要る短い一節にとどめ、元の文書は写さない。
+引く資料は次のとおりである。
+取得の日は、いずれも 2026-10-21 である。
 
-| 略称 | 原文 | 元の資料 |
+| 略称 | 題名（出した者） | URL |
 | --- | --- | --- |
-| W3C 7171 | `w3c-csswg-7171-cssstylesheet-tostring.md` | W3C の CSS WG の issue「Add `toString` method on `CSSStyleSheet`」(w3c/csswg-drafts#7171) |
-| Argos | `argos-fix-flaky-visual-tests.md` | Argos のブログ記事「fix flaky visual tests」 |
-| Playwright | `playwright-snapshot-assertions.md` | Playwright の SnapshotAssertions の文書 |
-| jest-image-snapshot | `jest-image-snapshot-readme.md` | jest-image-snapshot の README |
-| Sauce | `sauce-visual-hybrid-diff.md` | Sauce Visual の Smart Hybrid Diff の文書 |
-| Autify | `autify-vrt-failure-causes.md` | Autify の VRT の失敗原因の記事 |
-| 調査記録 | `log.md` | 先行調査の記録 |
+| W3C 7171 | 「[cssom] Add `toString` method on `CSSStyleSheet`」（W3C の CSS Working Group の issue） | https://github.com/w3c/csswg-drafts/issues/7171 |
+| Argos | 「How to fix flaky visual tests: every root cause, solved」（Argos のブログ） | https://argos-ci.com/blog/fix-flaky-visual-tests |
+| Playwright | 「SnapshotAssertions」（Playwright の公式文書） | https://playwright.dev/docs/api/class-snapshotassertions |
+| jest-image-snapshot | 「Jest matcher for image comparisons」の README（jest-image-snapshot の保守者） | https://github.com/kolodny/jest-image-snapshot |
+| Sauce | 「Finding Root Cause Analysis in Your Visual Regressions with Hybrid Diff」（Sauce Labs のブログ） | https://saucelabs.com/blog/how-to-find-root-cause-analysis-hybrid-diff |
+| Autify | 「Causes and solutions for failures in the Element should look the same step」（Autify のヘルプ） | https://help.autify.com/docs/causes-and-solutions-for-vrt-failures |
 
 ### Chromatic の画面の注記について
 
@@ -74,21 +76,21 @@ Chromatic は、比較の画面に DOM の差分を出し、その横の説明�
 
 ## 先行が無いことについて
 
-英語と日本語の検索役が独立に探し、DOM の一致を根拠に画素の閾値を変える道具は、どちらも見つけられなかった（調査記録 `log.md:10`）。
+英語と日本語の検索役が独立に探し、DOM の一致を根拠に画素の閾値を変える道具は、どちらも見つけられなかった（先行調査の結果であり、公開の資料ではないので引用は付けない）。
 この調査は、話題ごとに一度ずつ探したもので、網羅ではない。
 
 最も近い道具は Sauce Visual の Smart Hybrid Diff である。
-画面と DOM の写しを同時に撮るが、その目的は DOM の構造のどこが変わったかを見せることで、閾値の調整には使わない（Sauce `sauce-visual-hybrid-diff.md:31`、「you will also be able to fully understand what specifically in the DOM structure has changed」）。
+画面と DOM の写しを同時に撮るが、その目的は DOM の構造のどこが変わったかを見せることで、閾値の調整には使わない（Sauce、「you will also be able to fully understand what specifically in the DOM structure has changed」）。
 
 閾値を二段に分ける形そのものには先行がある。
-Playwright は、画素ごとの許容の `threshold` と、数や割合の許容の `maxDiffPixels` と `maxDiffPixelRatio` を別に持つ（Playwright `playwright-snapshot-assertions.md:64`、`:68`、`:70`、`:72`）。
-`threshold` は「どの画素を違うと数えるか」を決め、後者は「違う画素がどれだけあれば落とすか」を決める（同 `:64`）。
-jest-image-snapshot も、画素ごとの `customDiffConfig.threshold` と、画像全体の `failureThreshold` を分けている（jest-image-snapshot `jest-image-snapshot-readme.md:278`、`:290`）。
+Playwright は、画素ごとの許容の `threshold` と、数や割合の許容の `maxDiffPixels` と `maxDiffPixelRatio` を別に持つ（Playwright、`maxDiffPixelRatio` は「An acceptable ratio of pixels that are different to the total amount of pixels, between 0 and 1」、`threshold` は「An acceptable perceived color difference in the YIQ color space between the same pixel in compared images」と説明されている）。
+`threshold` は「どの画素を違うと数えるか」を決め、後者は「違う画素がどれだけあれば落とすか」を決める（Playwright、「threshold defines which pixels are considered different」）。
+jest-image-snapshot も、画素ごとの `customDiffConfig.threshold` と、画像全体の `failureThreshold` を分けている（jest-image-snapshot、「the threshold set in the customDiffConfig is the per pixel sensitivity threshold」と「this is the failure threshold for the entire comparison」）。
 ただし、どちらの閾値も DOM とは関係なく、利用者が固定の値で与える。
 
 hash を使う考え自体は、W3C の CSS WG に提案があった。
-投稿者は、DOM と CSSOM をそれぞれ直列化して hash を取り、screenshot の隣に保存すれば、hash が一致しない場合にだけ CI が screenshot を更新できる、と書いている（W3C 7171 `w3c-csswg-7171-cssstylesheet-tostring.md:232`、「serialize the entire DOM and CSSOM and get hashes of each」）。
-狙いは、OS や browser の違いによる描画の差で画像が合わなくなる問題である（同 `:230`）。
+投稿者は、DOM と CSSOM をそれぞれ直列化して hash を取り、screenshot の隣に保存すれば、hash が一致しない場合にだけ CI が screenshot を更新できる、と書いている（W3C 7171、「serialize the entire DOM and CSSOM and get hashes of each」）。
+狙いは、OS や browser の違いによる描画の差で画像が合わなくなる問題である（同じ投稿の「subtle differences in rendering, especially fonts」）。
 この提案は `CSSStyleSheet.toString()` を足す issue の中の一つの使い道として挙がったもので、調べた範囲では実装した道具は見つかっていない。
 
 先行が無いことには、二通りの読み方がある。
@@ -105,7 +107,7 @@ Chromatic の注記が言うとおり、DOM の差分には上流の CSS の変�
 DOM の hash だけを根拠に緩めると、この種の変更が見逃しの入口になる。
 
 したがって、CSSOM を hash に入れる。
-W3C の提案も、DOM と CSSOM の両方を対象にしている（W3C 7171 `:232`）。
+W3C の提案も、DOM と CSSOM の両方を対象にしている（W3C 7171 の同じ投稿）。
 
 hash は一つにまとめず、二つの値（`dom_hash` と `cssom_hash`）にする。
 別々に持てば、不一致のとき「DOM が違う」「CSSOM が違う」を利用者に言えるからである。
@@ -128,8 +130,8 @@ runner が配信する bundle は同一オリジンなので、通常は読め�
 ### 直列化の不確かさ
 
 CSSOM の直列化には既知の不具合がある。
-Chromium の `cssText` は、custom property を含む場合に不正な CSS を出すことがある（W3C 7171 `:248`、https://issues.chromium.org/issues/40804066）。
-同じ投稿は、`toString()` を足しても仕様上の直列化が同じなので解決しないと書いている（同 `:250`）。
+Chromium の `cssText` は、custom property を含む場合に不正な CSS を出すことがある（W3C 7171 の別の投稿、「it can produce invalid CSS when using custom properties」、Chromium の不具合の頁は https://issues.chromium.org/issues/40804066）。
+同じ投稿は、`toString()` を足しても仕様上の直列化が同じなので解決しないと書いている（同じ投稿の追記、「.toString() would have the same issue since that's how it's specced to be serialized」）。
 
 どの型の欠落かは原文に書かれておらず、「別の宣言が同じ文字列になる」（false match を生む）かどうかは、調べた範囲では裏が無い。
 本設計の方針は、規則を `cssText` の一括で取らず、宣言ごとに `getPropertyValue` と `getPropertyPriority` で組み立てることである。
@@ -142,12 +144,12 @@ custom property は、名前を列挙して値を個別に取る。
 
 | 変化 | hash に出ない理由 | 原文 |
 | --- | --- | --- |
-| font ファイルの差し替え（URL が同じ場合） | CSSOM には URL しか入らず、ファイルの中身は入らない | Argos `argos-fix-flaky-visual-tests.md:23`（font が遅れて届くと代替の字形になり、全 text の位置が動く） |
-| 外部の画像の差し替え（URL が同じ場合） | DOM には URL しか入らない | Argos `:54`（画像は描画の後に届いたり、decode が間に合わなかったりする） |
-| canvas の中身 | 画素は DOM の外にある | Argos `:48`（JS 駆動の描画と canvas は CSS で止められない） |
+| font ファイルの差し替え（URL が同じ場合） | CSSOM には URL しか入らず、ファイルの中身は入らない | Argos、「the browser renders the fallback font, and every text node on the page shifts by a few pixels」 |
+| 外部の画像の差し替え（URL が同じ場合） | DOM には URL しか入らない | Argos、「they load after the screenshot (blank rectangle in one run, photo in the next)」 |
+| canvas の中身 | 画素は DOM の外にある | Argos、「JavaScript-driven animations (GSAP, requestAnimationFrame loops, canvas) are not affected by CSS overrides」 |
 | 擬似状態（hover、focus）、scroll の位置 | 属性にも規則にも出ない | 調べた範囲では裏が無い |
-| 外部の API が返す内容の変化 | 反映された結果が DOM に出ていればよいが、画像や iframe の中身は出ない | Argos `:68` |
-| GPU や OS、Chromium の版による描画の差 | これこそ緩めたい差である | Argos `:11`、Autify `autify-vrt-failure-causes.md:25` |
+| 外部の API が返す内容の変化 | 反映された結果が DOM に出ていればよいが、画像や iframe の中身は出ない | Argos、「your screenshots inherit every instability of that API」 |
+| GPU や OS、Chromium の版による描画の差 | これこそ緩めたい差である | Argos、「a GPU rendering text slightly differently」。Autify、「Minor adjustments to system fonts or changes in the rendering algorithm」 |
 
 最後の行が、この仕組みの目的である。
 他の行は、同じ「hash 一致」の中に混ざって、緩めた閾値の下で見逃される。
@@ -210,7 +212,7 @@ Chromium や font の版は、`dom_hash_profile` に含めない。
 
 時刻と乱数は、text を正規表現で消す方式を採らない。
 消せば、本当の text の変化を同じ hash に畳み込む。
-時刻や乱数が絵に入る story は、時計と乱数を固定して、描画を決まったものにするのが本筋である（Argos `argos-fix-flaky-visual-tests.md:86`、`:88`、`:94`）。
+時刻や乱数が絵に入る story は、時計と乱数を固定して、描画を決まったものにするのが本筋である（Argos、「anything nondeterministic in your data ends up nondeterministic in your pixels」）。
 固定しない story は、不一致になるだけで、従来どおりの比較が続く。
 
 ### 撮影の瞬間の安定
@@ -237,7 +239,7 @@ hash を作らなければ、その story は従来どおりの比較になる�
 - `dom_match_diff_threshold` は、`diff_threshold` 以上かつ 0.5 以下とする。
 - `dom_match_diff_ratio_fail` は、`diff_ratio_fail` 以上かつ 0.05 以下とする。
 - 0.5 と 0.05 は仮の上限で、実測のあとで決め直す。
-  上限の根拠は、Argos が画素ごとの閾値の既定を 0.5 にしており、それが anti-aliasing の雑音を吸うためだとしていること（Argos `:132`）にある。
+  上限の根拠は、Argos が画素ごとの閾値の既定を 0.5 にしており、それが anti-aliasing の雑音を吸うためだとしていること（Argos、「with a 0.5 default tuned to absorb anti-aliasing noise」）にある。
   ratio の 0.05 は、根拠となる原文が調べた範囲に無い。
 - 上限を超える値と、1.0 は受け付けない。
   1.0 は「素通し」と同じだからである。
@@ -289,8 +291,8 @@ hash が合っても、画素が大きく動いたなら、CSS か font か外�
 - 設定値には上限があり、素通しになる値は設定できない。
 
 Argos も、同じ危険を指摘している。
-全体に効く大きな許容は、font の入れ替わりを呑むのと同時に、CSS の一行の本当の退行も呑む（Argos `:156`、「A global tolerance high enough to absorb a font swap or a mid-animation frame will also absorb real one-line CSS regressions」）。
-Argos が勧めるのは、安定させることを先にして、許容は画像ごとに絞って使うことである（同 `:146`）。
+全体に効く大きな許容は、font の入れ替わりを呑むのと同時に、CSS の一行の本当の退行も呑む（Argos、「A global tolerance high enough to absorb a font swap or a mid-animation frame will also absorb real one-line CSS regressions」）。
+Argos が勧めるのは、安定させることを先にして、許容は画像ごとに絞って使うことである（同じ記事の「Stabilize the page first, capture in one canonical environment, then apply tolerance surgically per screenshot rather than globally」）。
 本設計の緩めは、hash が一致した組だけに、かつ上限つきで使うので、この勧めに沿う。
 
 ### 緩めた時の絵の扱い
@@ -417,7 +419,7 @@ CSSOM の差分も同じ形で出せるが、全規則を直列化した文字�
 ## 捨てられる筋と防ぎ方
 
 先行が無い理由が「誰かが試して捨てた」だとすれば、捨てる筋は見逃しが出て信を失うことである。
-Argos は、誤検出が積もると利用者が見ずに承認するようになり、本当の退行がすり抜けると書いている（Argos `:17`、「Each false positive trains reviewers to click "approve" without looking」）。
+Argos は、誤検出が積もると利用者が見ずに承認するようになり、本当の退行がすり抜けると書いている（Argos、「Each false positive trains reviewers to click "approve" without looking」）。
 緩めた仕組みでも、同じことが逆向きに起きる。
 見逃しが一度出れば、利用者は緩めた判定全体を信じなくなる。
 
