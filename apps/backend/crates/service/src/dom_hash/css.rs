@@ -5,6 +5,8 @@
 //! 規則の対象は、属性セレクターに現れる scoped style の印と、文字列や `url()` の中の origin だけである。
 //! 規則を足しても、selector や宣言の意味は変えない。
 
+use std::collections::HashSet;
+
 use super::rules::{bound_var_name_len, mask_ephemeral_origins, scope_hex, scope_suffix_number};
 use super::{NormalizeError, NormalizeRules, ScopeIds};
 
@@ -15,6 +17,59 @@ fn err(reason: &'static str, offset: usize) -> NormalizeError {
 /// CSS の識別子に使える字か。
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii()
+}
+
+/// CSS の字に現れる名前の集まりを返す。
+///
+/// 識別子の連なりと、引用符の中の字（の全体と、その中の識別子の連なり）を集める。
+/// `\` に続く字は、識別子の字として扱う（`#a\:b` から `a:b` を得る）。
+/// 16 進の escape は解かない。
+/// DOM の id が、CSS が選ぶ名前かどうかを見るために使う。
+/// 多めに集めるのは安全側である（id を残すほうに倒れる）。
+pub(crate) fn referenced_names(css: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let mut run = String::new();
+    let mut chars = css.chars().peekable();
+    let flush = |run: &mut String, names: &mut HashSet<String>| {
+        if !run.is_empty() {
+            names.insert(std::mem::take(run));
+        }
+    };
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                run.push(next);
+            }
+        } else if is_ident_char(c) {
+            run.push(c);
+        } else if c == '"' || c == '\'' {
+            flush(&mut run, &mut names);
+            let mut inner = String::new();
+            while let Some(d) = chars.next() {
+                if d == '\\' {
+                    if let Some(next) = chars.next() {
+                        inner.push(next);
+                    }
+                } else if d == c {
+                    break;
+                } else {
+                    inner.push(d);
+                }
+            }
+            for word in inner.split(|ch: char| !is_ident_char(ch)) {
+                if !word.is_empty() {
+                    names.insert(word.to_string());
+                }
+            }
+            if !inner.is_empty() {
+                names.insert(inner);
+            }
+        } else {
+            flush(&mut run, &mut names);
+        }
+    }
+    flush(&mut run, &mut names);
+    names
 }
 
 pub(crate) fn normalize(

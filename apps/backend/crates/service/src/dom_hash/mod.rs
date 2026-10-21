@@ -35,6 +35,20 @@
 //! 落とせば不一致が減るが、本当の変化も同じ hash に畳み込み、見逃しの入口になる。
 //! 落とさなければ、不一致が増えるだけで、従来どおりの厳しい比較になる。
 //!
+//! 参照で結ばれた id は、出現順の番号にする。
+//! 参照の属性（`for`、`aria-labelledby`、`aria-controls` など）と `href` の `#` 以降が指す id と、同じ値の `id` が対象である。
+//! build ごとに乱数が変わる id を、部品の名前に頼らずに畳むための、一般の形である。
+//! 既知の生成規則の id（React や Vue の `useId`）を番号にする規則は、参照されていない id にも効く補助として残している。
+//! CSSOM の字に現れる id は、名前が絵に効くので、どちらの規則でも残す。
+//!
+//! 参照で結ぶ規則が見逃すのは、次の変化である。
+//! - 参照された id の名前だけが変わり、CSS にも描画にも出ない変化。
+//! - 外の頁から `#id` で指される anchor の名前の変更（絵には出ない）。
+//! - CSS が id を 16 進の escape で書いている場合の、名前の変更（字の一致で見るので守れない）。
+//!
+//! `url(#id)` の形の参照は扱わない。
+//! その id は、参照されていないものとして、字のまま残る。
+//!
 //! 時刻と乱数の text は消さない。
 //! 消せば、本当の text の変化を同じ hash に畳み込む。
 //! 時刻や乱数が絵に入る story は、story の側で固定するのが本筋である。
@@ -142,14 +156,36 @@ impl ScopeIds {
 /// DOM の字を正規化する。
 ///
 /// `scope_ids` は、続けて CSSOM の字を正規化するときに同じものを渡す。
+///
+/// CSSOM の字を知らないので、参照で結ばれた id は、すべて番号にする。
+/// CSSOM の字に現れる id を残すには、[`normalize_dom_with_css`] を使う。
 pub fn normalize_dom(
     dom: &str,
     rules: &NormalizeRules,
     scope_ids: &mut ScopeIds,
 ) -> Result<String, NormalizeError> {
+    normalize_dom_with_css(dom, "", rules, scope_ids)
+}
+
+/// DOM の字を、CSSOM の字を見ながら正規化する。
+///
+/// CSSOM の字に現れる id は、名前が絵に効くので、番号にせず残す。
+/// `cssom` には、正規化する前の字を渡す（字に現れるかを見るだけである）。
+pub fn normalize_dom_with_css(
+    dom: &str,
+    cssom: &str,
+    rules: &NormalizeRules,
+    scope_ids: &mut ScopeIds,
+) -> Result<String, NormalizeError> {
     check_size(dom)?;
+    check_size(cssom)?;
     let tokens = html::tokenize(dom)?;
-    let tokens = rules::apply_to_dom(tokens, rules, scope_ids);
+    let css_names = if rules.referenced_ids || rules.generated_ids {
+        css::referenced_names(cssom)
+    } else {
+        Default::default()
+    };
+    let tokens = rules::apply_to_dom(tokens, rules, scope_ids, &css_names);
     Ok(html::render(&tokens))
 }
 
@@ -180,7 +216,7 @@ pub fn hash_dom_and_cssom_with(
     rules: &NormalizeRules,
 ) -> Result<DomCssomHashes, NormalizeError> {
     let mut scope_ids = ScopeIds::new();
-    let dom_text = normalize_dom(dom, rules, &mut scope_ids)?;
+    let dom_text = normalize_dom_with_css(dom, cssom, rules, &mut scope_ids)?;
     let cssom_text = normalize_cssom(cssom, rules, &mut scope_ids)?;
     Ok(DomCssomHashes {
         dom_hash: hash_text("dom", &dom_text),

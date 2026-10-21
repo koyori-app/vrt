@@ -630,12 +630,288 @@ fn pointing_at_a_different_element_is_still_a_difference() {
 }
 
 #[test]
-fn hand_written_ids_and_their_references_are_kept() {
+fn hand_written_ids_that_the_css_selects_are_kept() {
+    // 名前が CSS に現れる id は、名前が絵に効く。
+    // 参照で結ばれていても、番号にして同じにしてはならない。
     let rules = all();
-    assert_ne!(
-        dom("<i id=\"a\"></i><b aria-labelledby=\"a\"></b>", &rules),
-        dom("<i id=\"b\"></i><b aria-labelledby=\"b\"></b>", &rules)
+    let a = hash_dom_and_cssom_with(
+        "<i id=\"a\"></i><b aria-labelledby=\"a\"></b>",
+        "#a{color:red}",
+        &rules,
+    )
+    .unwrap();
+    let b = hash_dom_and_cssom_with(
+        "<i id=\"b\"></i><b aria-labelledby=\"b\"></b>",
+        "#b{color:red}",
+        &rules,
+    )
+    .unwrap();
+    assert_ne!(a.dom_hash, b.dom_hash);
+}
+
+// 規則: 参照で結ばれた id
+
+fn dom_css(html: &str, css_text: &str, rules: &NormalizeRules) -> String {
+    normalize_dom_with_css(html, css_text, rules, &mut ScopeIds::new()).expect("正規化できる入力")
+}
+
+fn only_referenced() -> NormalizeRules {
+    only(|r| r.referenced_ids = true)
+}
+
+#[test]
+fn referenced_ids_and_their_references_get_the_same_numbers() {
+    let rules = only_referenced();
+    let html = concat!(
+        "<label for=\"email\">a</label><input id=\"email\" aria-describedby=\"hint\">",
+        "<p id=\"hint\">h</p><div aria-controls=\"panel\" aria-activedescendant=\"opt\"></div>",
+        "<ul id=\"panel\"><li id=\"opt\"></li></ul><a href=\"#hint\">j</a>"
     );
+    assert_eq!(
+        dom_css(html, "", &rules),
+        concat!(
+            "<label for=\"#ref1\">a</label><input id=\"#ref1\" aria-describedby=\"#ref2\">",
+            "<p id=\"#ref2\">h</p><div aria-controls=\"#ref3\" aria-activedescendant=\"#ref4\"></div>",
+            "<ul id=\"#ref3\"><li id=\"#ref4\"></li></ul><a href=\"##ref2\">j</a>"
+        )
+    );
+}
+
+#[test]
+fn every_reference_attribute_is_followed() {
+    let rules = only_referenced();
+    for attr in [
+        "for",
+        "aria-labelledby",
+        "aria-describedby",
+        "aria-controls",
+        "aria-owns",
+        "aria-activedescendant",
+        "aria-details",
+        "aria-errormessage",
+        "aria-flowto",
+        "headers",
+        "list",
+        "form",
+        "popovertarget",
+        "commandfor",
+    ] {
+        let html = format!("<i id=\"x1\"></i><b {attr}=\"x1\"></b>");
+        assert_eq!(
+            dom_css(&html, "", &rules),
+            format!("<i id=\"#ref1\"></i><b {attr}=\"#ref1\"></b>"),
+            "{attr}"
+        );
+    }
+}
+
+#[test]
+fn two_renders_with_different_random_ids_normalize_to_the_same_text() {
+    // 部品の名前に頼らない。
+    // 参照で結ばれていれば、どの形の id でも畳める。
+    let rules = all();
+    let render_a = concat!(
+        "<div aria-activedescendant=\"cm-ac-tqao-0\" aria-controls=\"cm-ac-tqao\"></div>",
+        "<ul id=\"cm-ac-tqao\"><li id=\"cm-ac-tqao-0\">x</li></ul>"
+    );
+    let render_b = concat!(
+        "<div aria-activedescendant=\"cm-ac-11z4e-0\" aria-controls=\"cm-ac-11z4e\"></div>",
+        "<ul id=\"cm-ac-11z4e\"><li id=\"cm-ac-11z4e-0\">x</li></ul>"
+    );
+    assert_eq!(dom_css(render_a, "", &rules), dom_css(render_b, "", &rules));
+    // 参照されていない id は、この規則では畳まない。
+    assert_ne!(
+        dom_css("<ul id=\"cm-ac-tqao\"></ul>", "", &rules),
+        dom_css("<ul id=\"cm-ac-11z4e\"></ul>", "", &rules)
+    );
+}
+
+#[test]
+fn ids_that_the_css_text_names_are_kept() {
+    let rules = only_referenced();
+    let html = "<i id=\"main\"></i><b aria-labelledby=\"main\"></b>";
+    for css_text in [
+        "#main{color:red}",
+        "[id=\"main\"]{color:red}",
+        "[id='main']{color:red}",
+        "a #main > b{color:red}",
+        "/* 説明 */ #main{}",
+    ] {
+        assert_eq!(dom_css(html, css_text, &rules), html, "{css_text}");
+    }
+    // escape を含む id も、CSS の書き方に合わせて守る。
+    let colon = "<i id=\"a:b\"></i><b aria-labelledby=\"a:b\"></b>";
+    assert_eq!(dom_css(colon, "#a\\:b{color:red}", &rules), colon);
+    // CSS に現れない id は番号になる。
+    assert_eq!(
+        dom_css(html, ".main-x{color:red}#other{}", &rules),
+        "<i id=\"#ref1\"></i><b aria-labelledby=\"#ref1\"></b>"
+    );
+}
+
+#[test]
+fn an_id_that_only_shares_a_prefix_with_a_css_name_is_still_numbered() {
+    let rules = only_referenced();
+    assert_eq!(
+        dom_css(
+            "<i id=\"main\"></i><b aria-labelledby=\"main\"></b>",
+            "#main2{color:red}.xmain{}",
+            &rules
+        ),
+        "<i id=\"#ref1\"></i><b aria-labelledby=\"#ref1\"></b>"
+    );
+}
+
+#[test]
+fn ids_that_nothing_refers_to_are_kept() {
+    // 参照されていない id は、名前が何に使われるか分からないので、残す。
+    // 参照で結ばれた id が文書に在っても、結ばれていない id は番号にしない。
+    let rules = only_referenced();
+    let html = concat!(
+        "<i id=\"lonely\"></i><b id=\"other\" aria-hidden=\"true\"></b>",
+        "<i id=\"x1\"></i><label for=\"x1\"></label>"
+    );
+    assert_eq!(
+        dom_css(html, "", &rules),
+        concat!(
+            "<i id=\"lonely\"></i><b id=\"other\" aria-hidden=\"true\"></b>",
+            "<i id=\"#ref1\"></i><label for=\"#ref1\"></label>"
+        )
+    );
+}
+
+#[test]
+fn an_id_that_only_a_fragment_link_points_at_is_numbered() {
+    let rules = only_referenced();
+    assert_eq!(
+        dom_css(
+            "<h2 id=\"sec-9f\"></h2><a href=\"#sec-9f\">x</a>",
+            "",
+            &rules
+        ),
+        "<h2 id=\"#ref1\"></h2><a href=\"##ref1\">x</a>"
+    );
+    assert_eq!(
+        dom_css(
+            "<h2 id=\"sec-9f\"></h2><svg><use xlink:href=\"#sec-9f\"></use></svg>",
+            "",
+            &rules
+        ),
+        "<h2 id=\"#ref1\"></h2><svg><use xlink:href=\"##ref1\"></use></svg>"
+    );
+}
+
+#[test]
+fn a_reference_without_a_target_is_numbered_too() {
+    // 参照先が無くても、名前が絵に効く道は無い。
+    let rules = only_referenced();
+    assert_eq!(
+        dom_css("<b aria-controls=\"gone\"></b>", "", &rules),
+        "<b aria-controls=\"#ref1\"></b>"
+    );
+}
+
+#[test]
+fn an_attribute_with_several_ids_numbers_each_and_keeps_the_order() {
+    let rules = only_referenced();
+    let html = concat!(
+        "<i id=\"a1\"></i><i id=\"b1\"></i><i id=\"c1\"></i>",
+        "<p aria-describedby=\"c1   a1 b1\"></p>"
+    );
+    assert_eq!(
+        dom_css(html, "", &rules),
+        concat!(
+            "<i id=\"#ref1\"></i><i id=\"#ref2\"></i><i id=\"#ref3\"></i>",
+            "<p aria-describedby=\"#ref3 #ref1 #ref2\"></p>"
+        )
+    );
+    // 一部の id だけを CSS が選んでいるときは、その id だけが残る。
+    assert_eq!(
+        dom_css(html, "#b1{color:red}", &rules),
+        concat!(
+            "<i id=\"#ref1\"></i><i id=\"b1\"></i><i id=\"#ref2\"></i>",
+            "<p aria-describedby=\"#ref2 #ref1 b1\"></p>"
+        )
+    );
+}
+
+#[test]
+fn ids_that_appear_twice_share_one_number() {
+    let rules = only_referenced();
+    assert_eq!(
+        dom_css(
+            "<i id=\"d\"></i><i id=\"d\"></i><b for=\"d\"></b><i id=\"e\"></i><b for=\"e\"></b>",
+            "",
+            &rules
+        ),
+        "<i id=\"#ref1\"></i><i id=\"#ref1\"></i><b for=\"#ref1\"></b><i id=\"#ref2\"></i><b for=\"#ref2\"></b>"
+    );
+}
+
+#[test]
+fn pointing_at_another_referenced_id_is_still_a_difference_among_numbered_ids() {
+    // 番号にしても、どの要素がどの要素を指すかは残る。
+    let rules = all();
+    let first = "<i id=\"p\"></i><i id=\"q\"></i><b aria-labelledby=\"p\"></b><u aria-labelledby=\"q\"></u>";
+    let swapped = "<i id=\"p\"></i><i id=\"q\"></i><b aria-labelledby=\"q\"></b><u aria-labelledby=\"p\"></u>";
+    assert_ne!(dom_css(first, "", &rules), dom_css(swapped, "", &rules));
+}
+
+#[test]
+fn an_empty_or_missing_fragment_is_not_a_reference() {
+    let rules = only_referenced();
+    let html = "<a href=\"#\">a</a><a href=\"/x#y\">b</a><a href=\"\">c</a>";
+    assert_eq!(dom_css(html, "", &rules), html);
+}
+
+#[test]
+fn a_reference_through_an_unrelated_attribute_is_not_followed() {
+    // 属性の値がたまたま id と同じでも、参照の属性でなければ字のまま残す。
+    let rules = only_referenced();
+    let html = "<i id=\"email\"></i><input name=\"email\" autocomplete=\"email\" data-testid=\"email\" for-x=\"email\">";
+    assert_eq!(dom_css(html, "", &rules), html);
+}
+
+#[test]
+fn without_the_rule_random_ids_make_builds_differ() {
+    let none = NormalizeRules::none();
+    assert_ne!(
+        dom_css("<i id=\"r9\"></i><b for=\"r9\"></b>", "", &none),
+        dom_css("<i id=\"r7\"></i><b for=\"r7\"></b>", "", &none)
+    );
+}
+
+#[test]
+fn the_referenced_rule_comes_before_the_shape_rule_and_both_respect_the_css() {
+    let rules = all();
+    // 参照で結ばれた id は、形が生成物らしくても、参照の規則の番号になる。
+    assert_eq!(
+        dom_css("<i id=\":r1:\"></i><b for=\":r1:\"></b>", "", &rules),
+        "<i id=\"#ref1\"></i><b for=\"#ref1\"></b>"
+    );
+    // 参照されていない生成物らしい id は、形の規則の番号になる。
+    assert_eq!(
+        dom_css("<i id=\":r2:\"></i>", "", &rules),
+        "<i id=\"#gen1\"></i>"
+    );
+    // CSS が名前を持つ id は、形が生成物らしくても、どちらの規則でも残す。
+    assert_eq!(
+        dom_css("<i id=\"v-0\"></i><b for=\"v-0\"></b>", "#v-0{x:y}", &rules),
+        "<i id=\"v-0\"></i><b for=\"v-0\"></b>"
+    );
+    assert_eq!(
+        dom_css("<i id=\"v-1\"></i>", ".a{content:\"v-1\"}", &rules),
+        "<i id=\"v-1\"></i>"
+    );
+}
+
+#[test]
+fn css_names_collects_identifiers_strings_and_escapes() {
+    let names = css::referenced_names("#a-b .c_d[x=\"e f\"]{g:'h-i'} #j\\:k{} /* l */");
+    for expected in ["a-b", "c_d", "x", "e f", "e", "f", "g", "h-i", "j:k", "l"] {
+        assert!(names.contains(expected), "{expected} を集める: {names:?}");
+    }
+    assert!(!names.contains("a"));
 }
 
 // 規則: 毎回変わる origin

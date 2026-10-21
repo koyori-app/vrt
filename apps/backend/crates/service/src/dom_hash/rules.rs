@@ -2,7 +2,7 @@
 //! 規則は一つずつ独立していて、[`NormalizeRules`] の欄で入れ切りできる。
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ScopeIds;
 use super::html::{Attr, Token, is_void};
@@ -25,6 +25,9 @@ pub struct NormalizeRules {
     pub bound_css_vars: bool,
     /// 自動で生える id と、それを指す属性を、出現順の番号に置き換える。
     pub generated_ids: bool,
+    /// 参照で結ばれた id を、出現順の番号に置き換える。
+    /// CSSOM の字に現れる id は残す。
+    pub referenced_ids: bool,
     /// loopback の origin と `blob:` の識別子を、決まった記号に置き換える。
     pub ephemeral_origins: bool,
     /// 属性を名前の順に並べ、class の語を並べ替える。
@@ -42,6 +45,7 @@ impl NormalizeRules {
             scope_ids: true,
             bound_css_vars: true,
             generated_ids: true,
+            referenced_ids: true,
             ephemeral_origins: true,
             sort_attributes: true,
             collapse_css_whitespace: true,
@@ -56,6 +60,7 @@ impl NormalizeRules {
             scope_ids: false,
             bound_css_vars: false,
             generated_ids: false,
+            referenced_ids: false,
             ephemeral_origins: false,
             sort_attributes: false,
             collapse_css_whitespace: false,
@@ -73,6 +78,7 @@ pub(crate) fn apply_to_dom(
     tokens: Vec<Token>,
     rules: &NormalizeRules,
     scope_ids: &mut ScopeIds,
+    css_names: &HashSet<String>,
 ) -> Vec<Token> {
     let mut tokens = tokens;
     if rules.drop_comments {
@@ -87,8 +93,11 @@ pub(crate) fn apply_to_dom(
     if rules.bound_css_vars {
         number_bound_css_vars(&mut tokens, scope_ids);
     }
+    if rules.referenced_ids {
+        number_referenced_ids(&mut tokens, css_names);
+    }
     if rules.generated_ids {
-        number_generated_ids(&mut tokens);
+        number_generated_ids(&mut tokens, css_names);
     }
     if rules.ephemeral_origins {
         mask_origins_in_attrs(&mut tokens);
@@ -385,11 +394,19 @@ fn vue_use_id_tail(s: &str) -> bool {
 
 /// 自動で生える id と、それを指す属性を、出現順の番号へ置き換える。
 ///
+/// 参照で結ばれた id は、[`number_referenced_ids`] が先に番号にする。
+/// この規則は、形が生成物らしい id のうち、参照されていない物にも効く補助である。
+/// CSSOM の字に現れる id は、名前が絵に効くので残す。
+///
 /// 同じ id には同じ番号を振る。
 /// 参照が定義より先に現れることもあるので、定義と参照を区別せず、現れた順に振る。
-pub(crate) fn number_generated_ids(tokens: &mut [Token]) {
+pub(crate) fn number_generated_ids(tokens: &mut [Token], css_names: &HashSet<String>) {
     let mut numbers: HashMap<String, usize> = HashMap::new();
     let mut mask = |id: &str| -> String {
+        // CSSOM の字に現れる id は、名前が絵に効くので残す。
+        if css_names.contains(id) {
+            return id.to_string();
+        }
         let Some((start, end)) = generated_span(id) else {
             return id.to_string();
         };
@@ -414,6 +431,83 @@ pub(crate) fn number_generated_ids(tokens: &mut [Token]) {
                     .join(" ");
             } else if (name == "href" || name == "xlink:href")
                 && let Some(target) = attr.value.strip_prefix('#')
+            {
+                attr.value = format!("#{}", mask(target));
+            }
+        }
+    }
+}
+
+/// 参照で結ばれた id を、出現順の番号へ置き換える。
+///
+/// 参照の属性（`for`、`aria-labelledby`、`aria-describedby`、`aria-controls`、`aria-activedescendant` など）の値と、
+/// `href` の `#` 以降が指す id を「参照された id」とする。
+/// 参照された id と、同じ値の `id` 属性を、同じ番号にする。
+/// 番号は、定義と参照を区別せず、現れた順に振る。
+///
+/// build ごとに乱数が変わる id を、部品の名前に頼らず畳むための、一般の形である。
+/// id の名前が絵に効く道は、CSS が id で選ぶ場合だけである。
+/// JS が名前で読んだ結果は、描画後の DOM に出る。
+/// そこで、CSSOM の字に現れる id は、名前に意味があるので残す。
+///
+/// 参照されていない id は、この規則では置き換えない。
+/// 既知の生成規則の id は、[`number_generated_ids`] が別に番号にする。
+///
+/// 見逃すのは、次の変化である。
+/// - 参照された id の名前だけが変わり、CSS にも描画にも出ない変化。
+/// - 外の頁から `#id` で指される anchor の名前の変更（絵には出ない）。
+/// - CSS が id を 16 進の escape で書いている場合の、名前の変更（字の一致で見ているため、守れない）。
+///
+/// `url(#id)` の形の参照は、まだ扱わない。
+/// その id は参照されていないものとして、残る。
+pub(crate) fn number_referenced_ids(tokens: &mut [Token], css_names: &HashSet<String>) {
+    let mut referenced: HashSet<String> = HashSet::new();
+    for token in tokens.iter() {
+        let Token::Start { attrs, .. } = token else {
+            continue;
+        };
+        for attr in attrs {
+            let name = attr.name.to_ascii_lowercase();
+            if ID_LIST_ATTRS.contains(&name.as_str()) {
+                referenced.extend(attr.value.split_ascii_whitespace().map(str::to_string));
+            } else if (name == "href" || name == "xlink:href")
+                && let Some(target) = attr.value.strip_prefix('#')
+                && !target.is_empty()
+            {
+                referenced.insert(target.to_string());
+            }
+        }
+    }
+    if referenced.is_empty() {
+        return;
+    }
+    let mut numbers: HashMap<String, usize> = HashMap::new();
+    let mut mask = |id: &str| -> String {
+        if !referenced.contains(id) || css_names.contains(id) {
+            return id.to_string();
+        }
+        let next = numbers.len() + 1;
+        let n = *numbers.entry(id.to_string()).or_insert(next);
+        format!("#ref{n}")
+    };
+    for token in tokens {
+        let Token::Start { attrs, .. } = token else {
+            continue;
+        };
+        for attr in attrs {
+            let name = attr.name.to_ascii_lowercase();
+            if name == "id" {
+                attr.value = mask(&attr.value);
+            } else if ID_LIST_ATTRS.contains(&name.as_str()) {
+                attr.value = attr
+                    .value
+                    .split_ascii_whitespace()
+                    .map(&mut mask)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            } else if (name == "href" || name == "xlink:href")
+                && let Some(target) = attr.value.strip_prefix('#')
+                && !target.is_empty()
             {
                 attr.value = format!("#{}", mask(target));
             }
