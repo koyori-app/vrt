@@ -61,9 +61,15 @@ fn an_unknown_entity_is_kept_as_text_and_stays_distinct() {
 }
 
 #[test]
-fn line_endings_are_unified() {
-    let rules = NormalizeRules::none();
-    assert_eq!(dom("<p>a\r\nb\rc</p>", &rules), "<p>a\nb\nc</p>");
+fn line_endings_are_kept_as_written() {
+    // CSS は CR を空白として、LF を改行として扱う。
+    // white-space: pre の下では描画が違うので、揃えない。
+    let rules = all();
+    assert_eq!(dom("<p>a\r\nb\rc</p>", &rules), "<p>a\r\nb\rc</p>");
+    assert_ne!(
+        dom("<pre>a\rb</pre>", &rules),
+        dom("<pre>a\nb</pre>", &rules)
+    );
 }
 
 #[test]
@@ -181,7 +187,7 @@ fn a_comment_in_css_still_separates_tokens() {
 // 規則: 描画しない要素を落とす
 
 #[test]
-fn script_link_style_and_head_are_dropped_with_their_contents() {
+fn script_link_style_and_head_lose_their_attributes_and_contents_but_stay_as_marks() {
     let rules = only(|r| r.drop_non_rendering = true);
     let html = concat!(
         "<head><meta charset=\"utf-8\"><title>t</title></head>",
@@ -191,7 +197,14 @@ fn script_link_style_and_head_are_dropped_with_their_contents() {
         "<noscript><b>x</b></noscript>",
         "<p>keep</p></body>"
     );
-    assert_eq!(dom(html, &rules), "<body><p>keep</p></body>");
+    // 要素は、兄弟の数と順を残すための空の印として残る。
+    assert_eq!(
+        dom(html, &rules),
+        concat!(
+            "<head></head><body><script></script><link><style></style>",
+            "<noscript></noscript><p>keep</p></body>"
+        )
+    );
 }
 
 #[test]
@@ -199,7 +212,7 @@ fn a_script_body_with_markup_inside_does_not_leak() {
     let rules = only(|r| r.drop_non_rendering = true);
     assert_eq!(
         dom("<script>var a = '<p>x</p>';</script><p>y</p>", &rules),
-        "<p>y</p>"
+        "<script></script><p>y</p>"
     );
 }
 
@@ -234,7 +247,7 @@ fn dropping_a_head_does_not_swallow_the_body_that_follows() {
             "<html lang=\"ja\"><head><style>a{}</style></head><body>x</body></html>",
             &rules
         ),
-        "<html lang=\"ja\"><body>x</body></html>"
+        "<html lang=\"ja\"><head></head><body>x</body></html>"
     );
 }
 
@@ -818,11 +831,12 @@ fn an_attribute_with_several_ids_numbers_each_and_keeps_the_order() {
         "<i id=\"a1\"></i><i id=\"b1\"></i><i id=\"c1\"></i>",
         "<p aria-describedby=\"c1   a1 b1\"></p>"
     );
+    // 区切りの空白は畳まない（属性セレクターは値の全体を字として見る）。
     assert_eq!(
         dom_css(html, "", &rules),
         concat!(
             "<i id=\"#ref1\"></i><i id=\"#ref2\"></i><i id=\"#ref3\"></i>",
-            "<p aria-describedby=\"#ref3 #ref1 #ref2\"></p>"
+            "<p aria-describedby=\"#ref3   #ref1 #ref2\"></p>"
         )
     );
     // 一部の id だけを CSS が選んでいるときは、その id だけが残る。
@@ -830,7 +844,7 @@ fn an_attribute_with_several_ids_numbers_each_and_keeps_the_order() {
         dom_css(html, "#b1{color:red}", &rules),
         concat!(
             "<i id=\"#ref1\"></i><i id=\"b1\"></i><i id=\"#ref2\"></i>",
-            "<p aria-describedby=\"#ref2 #ref1 b1\"></p>"
+            "<p aria-describedby=\"#ref2   #ref1 b1\"></p>"
         )
     );
 }
@@ -994,11 +1008,26 @@ fn css_text_outside_urls_and_strings_is_not_masked() {
 // 規則: 属性と class の並び
 
 #[test]
-fn attribute_and_class_order_do_not_matter() {
+fn attribute_order_does_not_matter() {
     let rules = all();
     assert_eq!(
         dom("<p id=\"x\" class=\"b a  c\" title=\"t\">x</p>", &rules),
-        dom("<p title=\"t\" class=\"c b a\" id=\"x\">x</p>", &rules)
+        dom("<p title=\"t\" class=\"b a  c\" id=\"x\">x</p>", &rules)
+    );
+}
+
+#[test]
+fn a_class_value_is_kept_as_written() {
+    // 属性セレクターは class の値を一つの字として見る。
+    // 語の順も、空白の数も、字のまま残す。
+    let rules = all();
+    assert_eq!(
+        dom("<p class=\" b a  c \">x</p>", &rules),
+        "<p class=\" b a  c \">x</p>"
+    );
+    assert_ne!(
+        dom("<p class=\"a b\">x</p>", &rules),
+        dom("<p class=\"b a\">x</p>", &rules)
     );
 }
 
@@ -1239,4 +1268,168 @@ fn a_real_change_survives_all_the_rules() {
     assert_ne!(base.dom_hash, text.dom_hash);
     assert_ne!(base.cssom_hash, color.cssom_hash);
     assert_ne!(base.dom_hash, structure.dom_hash);
+}
+
+// 検めの指摘の再現
+//
+// 検め手が Chrome で見た目の変化まで確かめた入力を、そのまま使う。
+// hash が一致してはならない。
+// この四つは、「正規化が捨ててよいのは、CSS から観測できぬ差だけである」に背いた規則から出た。
+// 同じ類の網羅は `observation_tests` にある。
+
+#[test]
+fn review_class_word_order_is_visible_to_attribute_selectors() {
+    // [class="a b"] と [class="b a"] は別の規則で、class を入れ替えると赤と青が入れ替わる。
+    let css_text = "[class=\"a b\"] { color: red; } [class=\"b a\"] { color: blue; }";
+    let before = hashes(
+        "<div class=\"a b\">x</div><div class=\"b a\">y</div>",
+        css_text,
+    );
+    let after = hashes(
+        "<div class=\"b a\">x</div><div class=\"a b\">y</div>",
+        css_text,
+    );
+    assert_ne!(before.dom_hash, after.dom_hash);
+    assert_eq!(before.cssom_hash, after.cssom_hash);
+}
+
+#[test]
+fn review_quoted_text_in_a_style_attribute_is_not_a_variable_name() {
+    // content: var(--label) に出る文字列が --aaaaaaaa から --bbbbbbbb に変わる。
+    let css_text = "div::before { content: var(--label); }";
+    let a = hashes("<div style=\"--label: '--aaaaaaaa'\">x</div>", css_text);
+    let b = hashes("<div style=\"--label: '--bbbbbbbb'\">x</div>", css_text);
+    assert_ne!(a.dom_hash, b.dom_hash);
+}
+
+#[test]
+fn review_a_scope_suffix_inside_a_quoted_string_in_a_style_attribute_is_text() {
+    // 検め手が、変数名と同じ区別が要ると名指しした走査。
+    let css_text = "div::before { content: var(--label); }";
+    let a = hashes(
+        "<div data-v-58152a41=\"\" style=\"--label: 'shimmer-58152a41'\">x</div>",
+        css_text,
+    );
+    let b = hashes(
+        "<div data-v-58152a41=\"\" style=\"--label: 'shimmer-#1'\">x</div>",
+        css_text,
+    );
+    assert_ne!(a.dom_hash, b.dom_hash);
+}
+
+#[test]
+fn review_nbsp_is_not_css_whitespace() {
+    // .a<NBSP>b は一つの class 名、.a b は二つの class の子孫。Chrome では文字色が変わる。
+    let html = "<div class=\"a&nbsp;b\">x</div>";
+    let nbsp = hashes(html, ".a\u{a0}b { color: red; }");
+    let space = hashes(html, ".a b { color: red; }");
+    assert_eq!(nbsp.dom_hash, space.dom_hash);
+    assert_ne!(nbsp.cssom_hash, space.cssom_hash);
+}
+
+// 洗い出しで見つかった、同じ類の抜け
+
+#[test]
+fn a_css_hex_escape_is_decoded_when_looking_for_the_ids_a_rule_selects() {
+    // #\31 23 は id="123" を選ぶので、その id は番号にしない。
+    let rules = only_referenced();
+    let html = "<div id=\"123\" aria-labelledby=\"123\">x</div>";
+    assert_eq!(dom_css(html, "#\\31 23{color:red}", &rules), html);
+    // 選ばれていなければ番号になる。
+    assert_eq!(
+        dom_css(html, "#\\31 24{color:red}", &rules),
+        "<div id=\"#ref1\" aria-labelledby=\"#ref1\">x</div>"
+    );
+}
+
+#[test]
+fn css_whitespace_is_exactly_space_tab_lf_cr_and_ff() {
+    let rules = only(|r| r.collapse_css_whitespace = true);
+    assert_eq!(css(" a \t\r\n\x0c b ", &rules), "a b");
+    // それ以外は、見た目が空白でも識別子の一部で、畳まず、trim もしない。
+    for kept in ["\u{a0}", "\u{3000}", "\u{2003}", "\u{85}", "\x0b"] {
+        let text = format!("{kept}a{kept}{kept}b{kept}");
+        assert_eq!(css(&text, &rules), text, "{kept:?}");
+    }
+}
+
+#[test]
+fn the_space_that_ends_a_hex_escape_is_not_folded_into_the_next_space() {
+    let rules = only(|r| r.collapse_css_whitespace = true);
+    assert_eq!(css("#\\31  p{}", &rules), "#\\31  p{}");
+    assert_eq!(css("#\\31 p{}", &rules), "#\\31 p{}");
+}
+
+#[test]
+fn a_comment_after_a_hex_escape_still_separates_the_identifiers() {
+    let rules = all();
+    assert_ne!(css("#\\31 /**/p{}", &rules), css("#\\31 p{}", &rules));
+}
+
+#[test]
+fn a_dropped_element_keeps_its_place_among_its_siblings() {
+    let rules = all();
+    assert_ne!(
+        dom("<div><script></script><p>x</p></div>", &rules),
+        dom("<div><p>x</p></div>", &rules)
+    );
+    // 属性と中身は、build ごとに変わるので捨てる。
+    assert_eq!(
+        dom(
+            "<div><script src=\"/a-1.js\">1</script><p>x</p></div>",
+            &rules
+        ),
+        dom(
+            "<div><script src=\"/a-2.js\">2</script><p>x</p></div>",
+            &rules
+        )
+    );
+}
+
+#[test]
+fn a_dropped_element_the_css_names_is_kept_whole() {
+    let named = "script{display:block}";
+    assert_eq!(
+        dom_css("<script src=\"/a.js\">1</script>", named, &all()),
+        "<script src=\"/a.js\">1</script>"
+    );
+    // 名前を書いていない要素の種類は、そのまま落ちる。
+    assert_eq!(
+        dom_css("<link href=\"/a.css\"><style>a{}</style>", named, &all()),
+        "<link><style></style>"
+    );
+}
+
+#[test]
+fn bare_words_skip_classes_ids_pseudo_classes_strings_and_comments() {
+    let words = css::bare_words(
+        ".link #head a:link ::before @media link-card /* script */ \"style\" b:not(c) scr\\69 pt",
+    );
+    for expected in ["a", "b", "c", "script", "link-card"] {
+        assert!(words.contains(expected), "{expected}: {words:?}");
+    }
+    for skipped in ["link", "head", "style", "media", "not", "before"] {
+        assert!(!words.contains(skipped), "{skipped}: {words:?}");
+    }
+}
+
+#[test]
+fn attr_reads_collect_the_attribute_names_and_give_up_on_unreadable_ones() {
+    let reads = css::attr_reads("a::after{content:attr(href)} b::before{content: ATTR( data-X )}");
+    assert!(reads.reads("href"));
+    assert!(reads.reads("DATA-x"));
+    assert!(!reads.reads("src"));
+    let unreadable = css::attr_reads("a::after{content:attr(h\\72 ef)}");
+    assert!(unreadable.reads("anything"));
+}
+
+#[test]
+fn an_attribute_the_css_reads_with_attr_is_not_rewritten() {
+    let rules = all();
+    let html = "<a href=\"http://127.0.0.1:4101/x\">x</a>";
+    assert_eq!(dom_css(html, "a::after{content:attr(href)}", &rules), html);
+    assert_eq!(
+        dom_css(html, "a::after{content:attr(title)}", &rules),
+        "<a href=\"<origin>/x\">x</a>"
+    );
 }

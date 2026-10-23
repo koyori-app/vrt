@@ -299,7 +299,8 @@ fn escape_attr(s: &str, out: &mut String) {
 ///
 /// 属性は常に二重引用符で括り、値の無い属性も `name=""` と書く。
 /// 空要素は終了タグを書かない。
-/// 改行は LF に揃える。
+/// 改行の字（CR と LF）は、揃えずに字のまま書く。
+/// CSS は CR を空白として、LF を改行として扱うので、`white-space: pre` の下では描画が違う。
 pub(crate) fn render(tokens: &[Token]) -> String {
     let mut out = String::new();
     for token in tokens {
@@ -336,9 +337,6 @@ pub(crate) fn render(tokens: &[Token]) -> String {
                 out.push_str("-->");
             }
         }
-    }
-    if out.contains('\r') {
-        out = out.replace("\r\n", "\n").replace('\r', "\n");
     }
     out
 }

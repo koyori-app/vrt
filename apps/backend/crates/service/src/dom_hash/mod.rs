@@ -35,6 +35,21 @@
 //! 落とせば不一致が減るが、本当の変化も同じ hash に畳み込み、見逃しの入口になる。
 //! 落とさなければ、不一致が増えるだけで、従来どおりの厳しい比較になる。
 //!
+//! 正規化が捨ててよいのは、CSS から観測できぬ差だけである。
+//! CSS から観測できるとは、selector の当たり（要素の名前、属性の名前と値、兄弟の順と数、子孫の有無）と、
+//! 宣言が描く物（`content` と `attr()` の文字列、`url()` の先、custom property の値、`white-space` の下の空白と改行）に、差が出ることである。
+//! 規則は、次の三つの形のどれかでなければならない。
+//!
+//! - 観測できない差を捨てる（属性の順、コメント、引用符の種類、CSS の空白の連なりの長さ）。
+//! - 名前を付け替える。名前が識別子として現れる所のすべてで同じ表を使い、対応を残す。
+//!   引用文字列と `url()` の中は識別子ではないので触れない。
+//!   CSS が名前を字として読む場合（`attr()`、CSS が書いた id）は付け替えない。
+//! - 条件を付けて捨てる。CSS が観測しうる時は手を引く。条件は多めに見積もる。
+//!
+//! 規則を足す時は、捨てる差を二つの入力に書き、それを観測する CSS を探す。
+//! 書けるなら、その差は捨てられない。
+//! `observation_tests` の両側の表に対を置くまで、試験が通らない。
+//!
 //! 参照で結ばれた id は、出現順の番号にする。
 //! 参照の属性（`for`、`aria-labelledby`、`aria-controls` など）と `href` の `#` 以降が指す id と、同じ値の `id` が対象である。
 //! build ごとに乱数が変わる id を、部品の名前に頼らずに畳むための、一般の形である。
@@ -44,10 +59,16 @@
 //! 参照で結ぶ規則が見逃すのは、次の変化である。
 //! - 参照された id の名前だけが変わり、CSS にも描画にも出ない変化。
 //! - 外の頁から `#id` で指される anchor の名前の変更（絵には出ない）。
-//! - CSS が id を 16 進の escape で書いている場合の、名前の変更（字の一致で見るので守れない）。
 //!
 //! `url(#id)` の形の参照は扱わない。
 //! その id は、参照されていないものとして、字のまま残る。
+//!
+//! 観測の見積もりが近似である所は、次のとおりである。
+//! - 描画しない要素（`script`、`style`、`link`、`noscript`、`head`）の属性と中身を捨てる規則は、
+//!   CSS がその要素の名前を裸で書いた時に手を引く。
+//!   `*` や属性だけの selector で `display` を上書きして、これらを描く CSS は、見落とす。
+//! - URL の URL らしさは、属性の名（`src`、`href` など）と、`url()` の引数で決める。
+//! - 外の頁から `#id` で指される `:target` は、撮る URL に fragment が無い前提である。
 //!
 //! 時刻と乱数の text は消さない。
 //! 消せば、本当の text の変化を同じ hash に畳み込む。
@@ -67,7 +88,7 @@ pub use rules::NormalizeRules;
 ///
 /// 規則を変えたら上げる。
 /// hash の入力にこの値を含めるので、版が違う hash は、字が同じでも一致しない。
-pub const NORM_VERSION: u16 = 1;
+pub const NORM_VERSION: u16 = 2;
 
 /// 受け取る字の大きさの上限（DOM と CSSOM のそれぞれ）。
 ///
@@ -129,18 +150,21 @@ impl ScopeIds {
     }
 
     /// 既に番号を振った印なら、その番号を返す（新しくは振らない）。
+    ///
+    /// `@keyframes` の名の後ろに付く印は、識別子の一部で、大文字と小文字を区別する。
+    /// 属性の名は小文字で記録してあるので、大文字の 16 進は同じ印として扱わない。
     pub(crate) fn lookup(&self, id: &str) -> Option<usize> {
-        self.numbers.get(&id.to_ascii_lowercase()).copied()
+        self.numbers.get(id).copied()
     }
 
     /// `v-bind()` が作る custom property の名に番号を振る。
     /// 既に振ってあれば、同じ番号を返す。
+    ///
+    /// custom property の名は、大文字と小文字を区別する。
+    /// `--V5AD87C78` と `--v5ad87c78` は別の変数なので、同じ番号にしない。
     pub(crate) fn number_for_css_var(&mut self, name: &str) -> usize {
         let next = self.css_vars.len() + 1;
-        *self
-            .css_vars
-            .entry(name.to_ascii_lowercase())
-            .or_insert(next)
+        *self.css_vars.entry(name.to_string()).or_insert(next)
     }
 
     /// これまでに振った番号の数。
@@ -180,12 +204,8 @@ pub fn normalize_dom_with_css(
     check_size(dom)?;
     check_size(cssom)?;
     let tokens = html::tokenize(dom)?;
-    let css_names = if rules.referenced_ids || rules.generated_ids {
-        css::referenced_names(cssom)
-    } else {
-        Default::default()
-    };
-    let tokens = rules::apply_to_dom(tokens, rules, scope_ids, &css_names);
+    let facts = css::CssFacts::read(cssom);
+    let tokens = rules::apply_to_dom(tokens, rules, scope_ids, &facts);
     Ok(html::render(&tokens))
 }
 
@@ -243,5 +263,7 @@ fn check_size(input: &str) -> Result<(), NormalizeError> {
     Ok(())
 }
 
+#[cfg(test)]
+mod observation_tests;
 #[cfg(test)]
 mod tests;

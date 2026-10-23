@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use super::ScopeIds;
+use super::css::{AttrReads, CssFacts, rewrite_declarations};
 use super::html::{Attr, Token, is_void};
 
 /// 正規化の規則の入れ切り。
@@ -16,8 +17,10 @@ pub struct NormalizeRules {
     /// コメントを落とす。
     /// DOM のコメントノードと、CSS のコメント。
     pub drop_comments: bool,
-    /// 描画しない要素を落とす。
-    /// `script`、`noscript`、`link`、`style`、`head` の中身。
+    /// 描画しない要素の属性と中身を落とす。
+    /// `script`、`noscript`、`link`、`style`、`head` が対象である。
+    /// 要素そのものは、兄弟の数と順を残すために、空の印として残す。
+    /// CSS が要素の名前を書いている場合は、何も落とさない。
     pub drop_non_rendering: bool,
     /// Vue の scoped style の印を、出現順の番号に置き換える。
     pub scope_ids: bool,
@@ -29,10 +32,13 @@ pub struct NormalizeRules {
     /// CSSOM の字に現れる id は残す。
     pub referenced_ids: bool,
     /// loopback の origin と `blob:` の識別子を、決まった記号に置き換える。
+    /// URL を取る属性の値と、CSS の `url()` の引数に限る。
     pub ephemeral_origins: bool,
-    /// 属性を名前の順に並べ、class の語を並べ替える。
+    /// 属性を名前の順に並べる。
+    /// 属性の値は、class も含めて、並べ替えない。
     pub sort_attributes: bool,
-    /// CSS の空白の連なりを一つの空白にする。
+    /// CSS の空白（space、tab、LF、CR、FF）の連なりを一つの空白にする。
+    /// NBSP などの非 ASCII の字は、CSS の空白ではないので畳まない。
     pub collapse_css_whitespace: bool,
 }
 
@@ -78,14 +84,14 @@ pub(crate) fn apply_to_dom(
     tokens: Vec<Token>,
     rules: &NormalizeRules,
     scope_ids: &mut ScopeIds,
-    css_names: &HashSet<String>,
+    facts: &CssFacts,
 ) -> Vec<Token> {
     let mut tokens = tokens;
     if rules.drop_comments {
         tokens = drop_comments(tokens);
     }
     if rules.drop_non_rendering {
-        tokens = drop_non_rendering(tokens);
+        tokens = drop_non_rendering(tokens, &facts.bare_words);
     }
     if rules.scope_ids {
         number_scope_ids(&mut tokens, scope_ids);
@@ -93,14 +99,17 @@ pub(crate) fn apply_to_dom(
     if rules.bound_css_vars {
         number_bound_css_vars(&mut tokens, scope_ids);
     }
-    if rules.referenced_ids {
-        number_referenced_ids(&mut tokens, css_names);
-    }
-    if rules.generated_ids {
-        number_generated_ids(&mut tokens, css_names);
+    // id の値を `attr()` が描くなら、id の名前は絵に出る。番号にしない。
+    if !id_attrs_are_read(&facts.attr_reads) {
+        if rules.referenced_ids {
+            number_referenced_ids(&mut tokens, &facts.names);
+        }
+        if rules.generated_ids {
+            number_generated_ids(&mut tokens, &facts.names);
+        }
     }
     if rules.ephemeral_origins {
-        mask_origins_in_attrs(&mut tokens);
+        mask_origins_in_attrs(&mut tokens, &facts.attr_reads);
     }
     if rules.sort_attributes {
         sort_attributes(&mut tokens);
@@ -124,11 +133,20 @@ fn is_dropped_element(name: &str) -> bool {
         .any(|d| d.eq_ignore_ascii_case(name))
 }
 
-/// 描画しない要素を、中身ごと落とす。
+/// 描画しない要素の属性と中身を落とし、要素は空の印として残す。
 ///
 /// `style` と `link` は、中身が CSSOM の側に入るので、DOM からは落とす。
 /// body の中の `title`（svg の説明）は、描画に関わりうるので落とさない。
-pub(crate) fn drop_non_rendering(tokens: Vec<Token>) -> Vec<Token> {
+///
+/// 要素そのものを消すと、CSS から見える差が消える。
+/// `:first-child`、`:nth-child`、`:empty`、`+`、`~`、`:has()` は、描画しないこれらの要素も兄弟として数える。
+/// 印を残せば、兄弟の数と順が残り、これらの selector の当たりは変わらない。
+/// 落とすのは、描画しない要素の属性（build ごとに変わる hash を含む）と中身だけである。
+///
+/// CSS が要素の名前を裸で書いている場合（`script { display: block }`、`link[rel]` など）は、
+/// CSS がその要素を描くか、属性や中身を読みうるので、その種類は何も落とさない。
+/// 名前の一覧は、[`super::css::bare_words`] が多めに集める。
+pub(crate) fn drop_non_rendering(tokens: Vec<Token>, named_in_css: &HashSet<String>) -> Vec<Token> {
     let mut out = Vec::with_capacity(tokens.len());
     // 落としている最中の要素の名と、同じ名の入れ子の深さ。
     let mut skipping: Option<(String, usize)> = None;
@@ -150,8 +168,14 @@ pub(crate) fn drop_non_rendering(tokens: Vec<Token>) -> Vec<Token> {
         }
         if let Token::Start { name, .. } = &token
             && is_dropped_element(name)
+            && !named_in_css.contains(&name.to_ascii_lowercase())
         {
+            out.push(Token::Start {
+                name: name.clone(),
+                attrs: Vec::new(),
+            });
             if !is_void(name) {
+                out.push(Token::End(name.clone()));
                 skipping = Some((name.clone(), 1));
             }
             continue;
@@ -191,31 +215,18 @@ pub(crate) fn scope_suffix_number(rest: &str, prev_ident: bool, ids: &ScopeIds) 
     ids.lookup(hex)
 }
 
-/// 文字列の中の、既知の scoped style の印を後ろに付けた名前を、番号に置き換える。
+/// 宣言の並びの中の、既知の scoped style の印を後ろに付けた名前を、番号に置き換える。
+///
+/// 置き換えるのは識別子の位置だけである。
+/// 引用文字列と `url()` の中は、`content` に描かれたり、URL として読まれたりする字なので、そのまま残す。
 pub(crate) fn rename_scope_suffixes<'a>(text: &'a str, ids: &ScopeIds) -> Cow<'a, str> {
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut changed = false;
-    let mut prev_ident = false;
-    while i < text.len() {
-        let rest = &text[i..];
-        if let Some(n) = scope_suffix_number(rest, prev_ident, ids) {
-            out.push_str(&format!("-#{n}"));
-            i += 9;
-            changed = true;
-            prev_ident = true;
-            continue;
-        }
-        let c = rest.chars().next().expect("rest は空でない");
-        out.push(c);
-        i += c.len_utf8();
-        prev_ident = c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii();
-    }
-    if changed {
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(text)
-    }
+    rewrite_declarations(
+        text,
+        |rest, prev_ident| {
+            scope_suffix_number(rest, prev_ident, ids).map(|n| (format!("-#{n}"), 9))
+        },
+        |_| None,
+    )
 }
 
 /// Vue の scoped style の印を、出現順の番号へ置き換える。
@@ -271,38 +282,28 @@ pub(crate) fn bound_var_name_len(s: &str) -> Option<usize> {
     Some(len)
 }
 
-/// 文字列の中の、`v-bind()` の作る custom property の名を、出現順の番号に置き換える。
+/// 宣言の並びの中の、`v-bind()` の作る custom property の名を、出現順の番号に置き換える。
 ///
-/// `style` 属性の値と、CSS の字の両方に使う。
+/// `style` 属性の値に使う。
+/// 置き換えるのは識別子の位置だけである。
+/// `--label: '--aaaaaaaa'` の引用文字列は、名前ではなく、`var(--label)` が描く字なので、そのまま残す。
 /// 名前の前が識別子の字なら、別の名前の一部なので置き換えない。
 pub(crate) fn rename_bound_vars<'a>(text: &'a str, ids: &mut ScopeIds) -> Cow<'a, str> {
     if !text.contains("--") {
         return Cow::Borrowed(text);
     }
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut changed = false;
-    let mut prev_ident = false;
-    while i < text.len() {
-        let rest = &text[i..];
-        if !prev_ident && let Some(len) = bound_var_name_len(rest) {
+    rewrite_declarations(
+        text,
+        |rest, prev_ident| {
+            if prev_ident {
+                return None;
+            }
+            let len = bound_var_name_len(rest)?;
             let n = ids.number_for_css_var(&rest[2..2 + len]);
-            out.push_str(&format!("--bound-#{n}"));
-            i += 2 + len;
-            changed = true;
-            prev_ident = true;
-            continue;
-        }
-        let c = rest.chars().next().expect("rest は空でない");
-        out.push(c);
-        i += c.len_utf8();
-        prev_ident = c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii();
-    }
-    if changed {
-        Cow::Owned(out)
-    } else {
-        Cow::Borrowed(text)
-    }
+            Some((format!("--bound-#{n}"), 2 + len))
+        },
+        |_| None,
+    )
 }
 
 /// `style` 属性の中の、`v-bind()` の作る custom property の名を、番号に置き換える。
@@ -341,6 +342,47 @@ const ID_LIST_ATTRS: &[&str] = &[
     "popovertarget",
     "commandfor",
 ];
+
+/// id を取る属性の名のうち、id の並びではなく、単独の `id` と URL の形のもの。
+const ID_SINGLE_ATTRS: &[&str] = &["id", "href", "xlink:href"];
+
+/// id の値を CSS が `attr()` で読むか。
+///
+/// 読まれる属性の値は、字のまま `content` に描かれる。
+/// その場合、id の名前は絵に出るので、id を番号にする規則は手を引く。
+fn id_attrs_are_read(reads: &AttrReads) -> bool {
+    reads.reads_any_of(ID_LIST_ATTRS) || reads.reads_any_of(ID_SINGLE_ATTRS)
+}
+
+/// 空白で区切られた id の並びの、それぞれの id に `map` を当てる。
+///
+/// 区切りの空白は、一つも畳まずに残す。
+/// 属性の値は、全体が字のまま属性セレクターに見える。
+/// どの id も変わらないなら、`None` を返し、値には手を付けない。
+fn map_id_list(value: &str, mut map: impl FnMut(&str) -> String) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut changed = false;
+    let mut rest = value;
+    while !rest.is_empty() {
+        let gap = rest.len()
+            - rest
+                .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                .len();
+        out.push_str(&rest[..gap]);
+        rest = &rest[gap..];
+        if rest.is_empty() {
+            break;
+        }
+        let end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let mapped = map(&rest[..end]);
+        changed |= mapped != rest[..end];
+        out.push_str(&mapped);
+        rest = &rest[end..];
+    }
+    changed.then_some(out)
+}
 
 /// 自動で生える id の部分を、`(開始, 終了)` の byte の範囲で返す。
 ///
@@ -423,12 +465,9 @@ pub(crate) fn number_generated_ids(tokens: &mut [Token], css_names: &HashSet<Str
             if name == "id" {
                 attr.value = mask(&attr.value);
             } else if ID_LIST_ATTRS.contains(&name.as_str()) {
-                attr.value = attr
-                    .value
-                    .split_ascii_whitespace()
-                    .map(&mut mask)
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                if let Some(mapped) = map_id_list(&attr.value, &mut mask) {
+                    attr.value = mapped;
+                }
             } else if (name == "href" || name == "xlink:href")
                 && let Some(target) = attr.value.strip_prefix('#')
             {
@@ -456,7 +495,6 @@ pub(crate) fn number_generated_ids(tokens: &mut [Token], css_names: &HashSet<Str
 /// 見逃すのは、次の変化である。
 /// - 参照された id の名前だけが変わり、CSS にも描画にも出ない変化。
 /// - 外の頁から `#id` で指される anchor の名前の変更（絵には出ない）。
-/// - CSS が id を 16 進の escape で書いている場合の、名前の変更（字の一致で見ているため、守れない）。
 ///
 /// `url(#id)` の形の参照は、まだ扱わない。
 /// その id は参照されていないものとして、残る。
@@ -499,12 +537,9 @@ pub(crate) fn number_referenced_ids(tokens: &mut [Token], css_names: &HashSet<St
             if name == "id" {
                 attr.value = mask(&attr.value);
             } else if ID_LIST_ATTRS.contains(&name.as_str()) {
-                attr.value = attr
-                    .value
-                    .split_ascii_whitespace()
-                    .map(&mut mask)
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                if let Some(mapped) = map_id_list(&attr.value, &mut mask) {
+                    attr.value = mapped;
+                }
             } else if (name == "href" || name == "xlink:href")
                 && let Some(target) = attr.value.strip_prefix('#')
                 && !target.is_empty()
@@ -607,36 +642,50 @@ const URL_ATTRS: &[&str] = &[
     "style",
 ];
 
-fn mask_origins_in_attrs(tokens: &mut [Token]) {
+/// URL を取る属性の値の origin を置き換える。
+///
+/// `style` の値は、`url()` の引数だけを置き換える。
+/// 引用文字列は、`content` に描かれるので、そのまま残す。
+/// CSS が `attr()` で読む属性は、値が字のまま描かれるので、置き換えない。
+fn mask_origins_in_attrs(tokens: &mut [Token], reads: &AttrReads) {
     for token in tokens {
         let Token::Start { attrs, .. } = token else {
             continue;
         };
         for attr in attrs {
-            if URL_ATTRS.contains(&attr.name.to_ascii_lowercase().as_str())
-                && let Cow::Owned(masked) = mask_ephemeral_origins(&attr.value)
-            {
+            let name = attr.name.to_ascii_lowercase();
+            if !URL_ATTRS.contains(&name.as_str()) || reads.reads(&name) {
+                continue;
+            }
+            let masked = if name == "style" {
+                rewrite_declarations(
+                    &attr.value,
+                    |_, _| None,
+                    |arg| match mask_ephemeral_origins(arg) {
+                        Cow::Owned(masked) => Some(masked),
+                        Cow::Borrowed(_) => None,
+                    },
+                )
+            } else {
+                mask_ephemeral_origins(&attr.value)
+            };
+            if let Cow::Owned(masked) = masked {
                 attr.value = masked;
             }
         }
     }
 }
 
-/// 属性を名前の順に並べ、class の語を並べ替える。
+/// 属性を名前の順に並べる。
 ///
-/// どちらも、描画に影響せず、順序は不定である。
+/// CSS は属性の順を見ない。順は不定である。
+/// 属性の値は並べ替えない。
+/// class の値も、語の順や空白の数を含めた全体が、`[class="a b"]` のような属性セレクターに字のまま見える。
 pub(crate) fn sort_attributes(tokens: &mut [Token]) {
     for token in tokens {
         let Token::Start { attrs, .. } = token else {
             continue;
         };
-        for attr in attrs.iter_mut() {
-            if attr.name.eq_ignore_ascii_case("class") {
-                let mut words: Vec<&str> = attr.value.split_ascii_whitespace().collect();
-                words.sort_unstable();
-                attr.value = words.join(" ");
-            }
-        }
         attrs.sort_by(|a: &Attr, b: &Attr| a.name.cmp(&b.name));
     }
 }
