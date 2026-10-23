@@ -1208,6 +1208,7 @@ mod tests {
         let story = RenderError::Story {
             story_id: "a--b".into(),
             message: "freeze failed: 1 animation(s) still running".into(),
+            play_trace: None,
         };
         assert!(is_story_scoped(&story));
 
@@ -1230,6 +1231,7 @@ mod tests {
         let story = anyhow::Error::new(RenderError::Story {
             story_id: "button--primary".into(),
             message: "play function failed".into(),
+            play_trace: None,
         });
         assert_eq!(
             classify_render_failure(&story),

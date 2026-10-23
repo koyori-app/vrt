@@ -14,7 +14,8 @@ pub mod bundle;
 pub mod cache;
 
 pub use browser::{
-    DEFAULT_STORY_TIMEOUT, RenderError, RenderOptions, StaticServer, StoryRenderer,
+    DEFAULT_STORY_TIMEOUT, PlayTrace, PlayTraceArg, PlayTraceCall, PlayTracePathSegment,
+    PlayTraceStatus, RenderError, RenderOptions, RenderedStory, StaticServer, StoryRenderer,
     discover_chromium, story_url,
 };
 pub use bundle::{
