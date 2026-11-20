@@ -10,6 +10,7 @@ pub mod build_logs;
 pub mod builds;
 pub mod comparisons;
 pub mod diff;
+pub mod dom_hash;
 pub mod github;
 pub mod http;
 pub mod oauth;
